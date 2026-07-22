@@ -5,8 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Generator
 
-
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_V1 = r"""
 BEGIN IMMEDIATE;
@@ -285,6 +284,61 @@ ADD COLUMN action_timeout_seconds REAL NOT NULL DEFAULT 300
     );
 """
 
+SCHEMA_V3 = (
+    """
+    CREATE TABLE acceptance_verifications (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        commit_sha TEXT NOT NULL,
+        attempt INTEGER NOT NULL CHECK (attempt > 0),
+        verifier_member_id TEXT NOT NULL REFERENCES team_members(id),
+        state TEXT NOT NULL CHECK (state IN (
+            'verifying', 'passed', 'failed', 'blocked', 'superseded'
+        )),
+        claims_json TEXT NOT NULL DEFAULT '[]',
+        screenshot_decision_json TEXT NOT NULL DEFAULT '{}',
+        report_json TEXT,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        UNIQUE (run_id, commit_sha, attempt)
+    )
+    """,
+    """
+    CREATE INDEX acceptance_verifications_run_commit
+        ON acceptance_verifications(run_id, commit_sha, attempt)
+    """,
+    """
+    CREATE TABLE acceptance_evidence (
+        id TEXT PRIMARY KEY,
+        verification_id TEXT NOT NULL
+            REFERENCES acceptance_verifications(id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL CHECK (sequence > 0),
+        action_json TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT NOT NULL,
+        log_path TEXT,
+        UNIQUE (verification_id, sequence)
+    )
+    """,
+    """
+    CREATE TABLE acceptance_artifacts (
+        id TEXT PRIMARY KEY,
+        verification_id TEXT NOT NULL
+            REFERENCES acceptance_verifications(id) ON DELETE CASCADE,
+        claim_key TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('screenshot', 'trace', 'log')),
+        path TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        description TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (verification_id, path)
+    )
+    """,
+)
+
 
 class Database:
     """Owns SQLite connection policy and transactional schema initialization."""
@@ -324,11 +378,8 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = self._open()
         try:
-            connection.execute("PRAGMA journal_mode = WAL")
-            existing = connection.execute(
-                """SELECT name FROM sqlite_master
-                   WHERE type='table' AND name='schema_version'"""
-            ).fetchone()
+            existing = connection.execute("""SELECT name FROM sqlite_master
+                   WHERE type='table' AND name='schema_version'""").fetchone()
             if existing is None:
                 connection.executescript(SCHEMA_V1)
             connection.execute("BEGIN IMMEDIATE")
@@ -347,14 +398,21 @@ class Database:
                 raise RuntimeError(f"database schema {version} is invalid")
             if version < 2:
                 connection.execute(SCHEMA_V2)
-                connection.execute(
-                    """INSERT INTO schema_version(version, applied_at)
+                connection.execute("""INSERT INTO schema_version(version, applied_at)
                        VALUES (
                            2,
                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                       )"""
-                )
+                       )""")
+            if version < 3:
+                for statement in SCHEMA_V3:
+                    connection.execute(statement)
+                connection.execute("""INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           3,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )""")
             connection.commit()
+            connection.execute("PRAGMA journal_mode = WAL")
         except BaseException:
             if connection.in_transaction:
                 connection.rollback()

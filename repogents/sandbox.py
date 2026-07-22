@@ -20,7 +20,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
-
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("GitHub credential pattern", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b")),
@@ -65,7 +64,9 @@ class SandboxPolicy:
             else root / "shared-cache"
         )
         if cache != root and root not in cache.parents:
-            raise ValueError("shared cache root must live below persistent sandbox root")
+            raise ValueError(
+                "shared cache root must live below persistent sandbox root"
+            )
         cache.mkdir(parents=True, exist_ok=True)
         targets = [mount.sandbox_path for mount in self.mounts]
         if len(targets) != len(set(targets)):
@@ -93,8 +94,12 @@ class RunLayout:
     @classmethod
     def create(cls, data_root: Path, repository_id: str, run_id: str) -> "RunLayout":
         if not repository_id or "/" in repository_id or not run_id or "/" in run_id:
-            raise ValueError("repository and run identifiers must be nonempty path components")
-        root = Path(data_root).resolve() / "repositories" / repository_id / "runs" / run_id
+            raise ValueError(
+                "repository and run identifiers must be nonempty path components"
+            )
+        root = (
+            Path(data_root).resolve() / "repositories" / repository_id / "runs" / run_id
+        )
         paths = {
             "checkout": root / "checkout",
             "agent_state": root / "agent-state",
@@ -135,7 +140,9 @@ class SecretScanner:
 
 def redact_text(text: str, known_secrets: Iterable[str]) -> str:
     redacted = text
-    for secret in sorted({value for value in known_secrets if value}, key=len, reverse=True):
+    for secret in sorted(
+        {value for value in known_secrets if value}, key=len, reverse=True
+    ):
         redacted = redacted.replace(secret, "[REDACTED]")
     return redacted
 
@@ -187,7 +194,9 @@ class RestrictedNetworkPolicy:
             return False
         return parsed.is_global and not parsed.is_multicast
 
-    def resolve(self, host: str, port: int) -> list[tuple[int, tuple[object, ...], str]]:
+    def resolve(
+        self, host: str, port: int
+    ) -> list[tuple[int, tuple[object, ...], str]]:
         if not self.host_allowed(host, port):
             raise PermissionError(f"destination is not allowlisted: {host}:{port}")
         try:
@@ -247,7 +256,9 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
                     raise ValueError("proxy requires an absolute HTTP URL or CONNECT")
                 host = parsed.hostname
                 port = parsed.port or 80
-                path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+                path = urllib.parse.urlunsplit(
+                    ("", "", parsed.path or "/", parsed.query, "")
+                )
                 rewritten = (
                     b" ".join((method_raw, path.encode("ascii"), version))
                     + b"\r\n"
@@ -261,8 +272,12 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
         except Exception as error:
             host_value = locals().get("host", "unknown")
             port_value = int(locals().get("port", 0))
-            _write_network_event(log_path, lock, str(host_value), port_value, "denied", str(error))
-            self.request.sendall(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+            _write_network_event(
+                log_path, lock, str(host_value), port_value, "denied", str(error)
+            )
+            self.request.sendall(
+                b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            )
             return
         try:
             if method == "CONNECT":
@@ -294,7 +309,9 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
 
 
 class RestrictedProxy(AbstractContextManager["RestrictedProxy"]):
-    def __init__(self, socket_path: Path, log_path: Path, policy: RestrictedNetworkPolicy) -> None:
+    def __init__(
+        self, socket_path: Path, log_path: Path, policy: RestrictedNetworkPolicy
+    ) -> None:
         self.socket_path = socket_path
         self.log_path = log_path
         self.policy = policy
@@ -311,7 +328,9 @@ class RestrictedProxy(AbstractContextManager["RestrictedProxy"]):
         server.network_log_path = self.log_path  # type: ignore[attr-defined]
         server.network_log_lock = threading.Lock()  # type: ignore[attr-defined]
         self._server = server
-        self._thread = threading.Thread(target=server.serve_forever, name="repogents-egress", daemon=True)
+        self._thread = threading.Thread(
+            target=server.serve_forever, name="repogents-egress", daemon=True
+        )
         self._thread.start()
         return self
 
@@ -337,9 +356,7 @@ def _persistent_tool_paths(root: Path) -> tuple[str, ...]:
     for child in sorted(tool_home.iterdir(), key=lambda value: value.name):
         candidate = child / "bin"
         if candidate.is_dir():
-            paths.append(
-                f"/repository-state/home/{child.name}/bin"
-            )
+            paths.append(f"/repository-state/home/{child.name}/bin")
     return tuple(dict.fromkeys(paths))
 
 
@@ -366,9 +383,7 @@ def _seed_read_only_dependencies(
             if target_entry.exists() or target_entry.is_symlink():
                 continue
             relative = entry.relative_to(source).as_posix()
-            target_entry.symlink_to(
-                f"{sandbox_source.rstrip('/')}/{relative}"
-            )
+            target_entry.symlink_to(f"{sandbox_source.rstrip('/')}/{relative}")
 
 
 class SandboxManager:
@@ -390,13 +405,16 @@ class SandboxManager:
         proxy_socket_host: Path | None = None,
         secrets: dict[str, str] | None = None,
         persistent_writable: bool = False,
+        checkout_writable: bool = True,
     ) -> tuple[list[str], dict[str, str]]:
         if not command or any("\x00" in item for item in command):
             raise ValueError("sandbox command must contain non-NUL arguments")
         secret_values = secrets or {}
         unknown = set(secret_values) - set(policy.allowed_secret_names)
         if unknown:
-            raise PermissionError(f"secrets are not authorized by sandbox policy: {','.join(sorted(unknown))}")
+            raise PermissionError(
+                f"secrets are not authorized by sandbox policy: {','.join(sorted(unknown))}"
+            )
         for name, value in secret_values.items():
             if not _ENVIRONMENT_NAME.fullmatch(name) or "\x00" in value:
                 raise ValueError("invalid secret binding")
@@ -418,9 +436,7 @@ class SandboxManager:
                     "/repository-state/node/node_modules",
                 ),
             ):
-                _seed_read_only_dependencies(
-                    source, target, sandbox_source
-                )
+                _seed_read_only_dependencies(source, target, sandbox_source)
         python_delta = layout.dependency_delta / "python"
         node_delta = layout.dependency_delta / "node"
         node_modules_delta = node_delta / "node_modules"
@@ -448,7 +464,12 @@ class SandboxManager:
             "--dir",
             "/etc",
         ]
-        for source in ("/etc/ssl", "/etc/alternatives", "/etc/ld.so.cache", "/etc/localtime"):
+        for source in (
+            "/etc/ssl",
+            "/etc/alternatives",
+            "/etc/ld.so.cache",
+            "/etc/localtime",
+        ):
             if Path(source).exists():
                 argv.extend(("--ro-bind", source, source))
         argv.extend(
@@ -483,22 +504,30 @@ class SandboxManager:
                 "--bind",
                 str(layout.build),
                 "/run-data/build",
-                "--bind",
+                "--bind" if checkout_writable else "--ro-bind",
                 str(layout.checkout),
                 "/workspace",
             )
         )
-        argv.extend(("--bind", str(node_modules_delta), "/workspace/node_modules"))
+        if checkout_writable:
+            argv.extend(("--bind", str(node_modules_delta), "/workspace/node_modules"))
         if proxy_socket_host is not None:
             if proxy_socket is None:
                 raise ValueError("proxy socket mount requires a sandbox target")
             argv.extend(("--bind", str(proxy_socket_host), proxy_socket))
         for mount in policy.mounts:
-            argv.extend(("--bind" if mount.writable else "--ro-bind", str(mount.host_path), mount.sandbox_path))
+            argv.extend(
+                (
+                    "--bind" if mount.writable else "--ro-bind",
+                    str(mount.host_path),
+                    mount.sandbox_path,
+                )
+            )
         python_environment = policy.persistent_root / "python-venv"
         runtime_path = ":".join(
             (
                 *_persistent_tool_paths(policy.persistent_root),
+                "/run-data/dependency-delta/node/node_modules/.bin",
                 "/usr/local/sbin",
                 "/usr/local/bin",
                 "/usr/sbin",
@@ -513,9 +542,7 @@ class SandboxManager:
             ("PATH", runtime_path),
             (
                 "HOME",
-                "/repository-state/home"
-                if persistent_writable
-                else "/home/agent",
+                "/repository-state/home" if persistent_writable else "/home/agent",
             ),
             ("LANG", "C.UTF-8"),
             ("LC_ALL", "C.UTF-8"),
@@ -531,7 +558,14 @@ class SandboxManager:
             ("GOCACHE", "/repository-cache/go-build"),
             ("GOMODCACHE", "/repository-cache/go-modules"),
             ("npm_config_cache", "/repository-cache/npm"),
-            ("NODE_PATH", "/workspace/node_modules"),
+            (
+                "NODE_PATH",
+                (
+                    "/workspace/node_modules"
+                    if checkout_writable
+                    else "/run-data/dependency-delta/node/node_modules"
+                ),
+            ),
             ("npm_config_prefix", "/run-data/dependency-delta/node"),
         ):
             argv.extend(("--setenv", key, value))
@@ -569,6 +603,7 @@ class SandboxManager:
         timeout: float,
         secrets: dict[str, str] | None = None,
         persistent_writable: bool = False,
+        checkout_writable: bool = True,
     ) -> SandboxResult:
         invocation_id = str(uuid.uuid4())
         log_path = layout.logs / f"command-{invocation_id}.json"
@@ -604,6 +639,7 @@ class SandboxManager:
                 proxy_socket_host=proxy_socket_host,
                 secrets=secrets,
                 persistent_writable=persistent_writable,
+                checkout_writable=checkout_writable,
             )
             process = subprocess.Popen(
                 argv,
@@ -616,7 +652,9 @@ class SandboxManager:
             with self._active_lock:
                 if layout.run_id in self._active:
                     process.kill()
-                    raise RuntimeError(f"run already has an active sandbox process: {layout.run_id}")
+                    raise RuntimeError(
+                        f"run already has an active sandbox process: {layout.run_id}"
+                    )
                 self._active[layout.run_id] = process
             try:
                 stdout_raw, stderr_raw = process.communicate(timeout=timeout)
@@ -649,7 +687,9 @@ class SandboxManager:
             "stdout": stdout,
             "stderr": stderr,
         }
-        log_path.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        log_path.write_text(
+            json.dumps(record, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+        )
         return SandboxResult(
             returncode=returncode,
             stdout=stdout,
@@ -696,7 +736,11 @@ def _split_authority(value: str, default_port: int) -> tuple[str, int]:
         if closing < 0:
             raise ValueError("invalid IPv6 authority")
         host = value[1:closing]
-        port = int(value[closing + 2 :]) if value[closing + 1 :].startswith(":") else default_port
+        port = (
+            int(value[closing + 2 :])
+            if value[closing + 1 :].startswith(":")
+            else default_port
+        )
         return host, port
     host, separator, port_value = value.rpartition(":")
     if separator and port_value.isdecimal():
@@ -704,7 +748,9 @@ def _split_authority(value: str, default_port: int) -> tuple[str, int]:
     return value, default_port
 
 
-def _connect_resolved(addresses: Sequence[tuple[int, tuple[object, ...], str]]) -> socket.socket:
+def _connect_resolved(
+    addresses: Sequence[tuple[int, tuple[object, ...], str]],
+) -> socket.socket:
     errors: list[OSError] = []
     for resolved in addresses:
         family, sockaddr = resolved[0], resolved[1]
@@ -717,7 +763,9 @@ def _connect_resolved(addresses: Sequence[tuple[int, tuple[object, ...], str]]) 
         except OSError as error:
             errors.append(error)
             connection.close()
-    raise ConnectionError(f"cannot connect to permitted destination: {errors[-1] if errors else 'no address'}")
+    raise ConnectionError(
+        f"cannot connect to permitted destination: {errors[-1] if errors else 'no address'}"
+    )
 
 
 def _relay(left: socket.socket, right: socket.socket) -> None:

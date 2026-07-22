@@ -42,6 +42,43 @@ class FakeActions:
                     "reason": None,
                     "pull_number": 7,
                     "pull_url": "https://github.com/owner/repo/pull/7",
+                    "acceptance_verification": {
+                        "id": "acceptance-1",
+                        "commit_sha": "b" * 40,
+                        "state": "passed",
+                        "summary": "Scrolling was independently observed.",
+                        "claims": [
+                            {
+                                "key": "scroll-history",
+                                "claim": "Wheel input navigates retained history.",
+                                "result": "pass",
+                                "observed": "Visible rows changed after wheel input.",
+                                "evidence": [1],
+                            }
+                        ],
+                        "scope": [
+                            {
+                                "path": "src/web/app.ts",
+                                "claim_keys": ["scroll-history"],
+                                "necessity": "Implements wheel navigation.",
+                                "result": "pass",
+                            }
+                        ],
+                        "screenshot_decision": {
+                            "required": True,
+                            "reason": "The claim is visual.",
+                        },
+                        "artifacts": [
+                            {
+                                "id": "artifact-1",
+                                "kind": "screenshot",
+                                "description": "Rows after wheel input.",
+                                "sha256": "c" * 64,
+                                "media_type": "image/png",
+                            }
+                        ],
+                        "limitations": [],
+                    },
                 }
             ],
             "notifications": [
@@ -68,7 +105,6 @@ class FakeActions:
         self.calls.append(("reonboard", repository_id, inputs))
         return "sandbox-2"
 
-
     def cancel(self, run_id: str) -> None:
         self.calls.append(("cancel", run_id))
 
@@ -77,6 +113,12 @@ class FakeActions:
 
     def poll(self) -> None:
         self.calls.append(("poll",))
+
+    def acceptance_artifact(self, artifact_id: str) -> tuple[bytes, str]:
+        self.calls.append(("artifact", artifact_id))
+        if artifact_id != "artifact-1":
+            raise KeyError(artifact_id)
+        return b"\x89PNG\r\n\x1a\nfixture", "image/png"
 
 
 class InterfaceTests(unittest.TestCase):
@@ -126,7 +168,9 @@ class InterfaceTests(unittest.TestCase):
         self.assertIn(b"<h1>Repogents</h1>", body)
         return headers["X-Repogents-CSRF"]
 
-    def test_dashboard_state_exposes_inventory_runs_links_and_notifications(self) -> None:
+    def test_dashboard_state_exposes_inventory_runs_links_and_notifications(
+        self,
+    ) -> None:
         token = self.token()
         self.assertTrue(token)
         status, _, body = self.request("GET", "/api/state")
@@ -140,10 +184,21 @@ class InterfaceTests(unittest.TestCase):
                 "secret_references": {"API_TOKEN": "configured"},
             },
         )
-        self.assertEqual(state["runs"][0]["issue_url"], "https://github.com/owner/repo/issues/3")
-        self.assertEqual(state["runs"][0]["pull_url"], "https://github.com/owner/repo/pull/7")
+        self.assertEqual(
+            state["runs"][0]["issue_url"], "https://github.com/owner/repo/issues/3"
+        )
+        self.assertEqual(
+            state["runs"][0]["pull_url"], "https://github.com/owner/repo/pull/7"
+        )
         self.assertIsNone(state["notifications"][0]["read_at"])
-    def test_dashboard_renders_display_inputs_and_prefills_reonboarding_from_them(self) -> None:
+        acceptance = state["runs"][0]["acceptance_verification"]
+        self.assertEqual(acceptance["state"], "passed")
+        self.assertEqual(acceptance["claims"][0]["key"], "scroll-history")
+        self.assertEqual(acceptance["artifacts"][0]["id"], "artifact-1")
+
+    def test_dashboard_renders_display_inputs_and_prefills_reonboarding_from_them(
+        self,
+    ) -> None:
         status, _, body = self.request("GET", "/")
         self.assertEqual(status, 200)
         dashboard = body.decode("utf-8")
@@ -163,7 +218,20 @@ class InterfaceTests(unittest.TestCase):
         self.assertNotIn("r.inputs", dashboard)
         self.assertNotIn("data-retry", dashboard)
         self.assertNotIn("/retry", dashboard)
+        self.assertIn("Issue acceptance", dashboard)
+        self.assertIn("/api/acceptance-artifacts/", dashboard)
+        self.assertIn("scope", dashboard)
 
+    def test_acceptance_artifact_is_served_from_controller_storage(self) -> None:
+        status, headers, body = self.request(
+            "GET",
+            "/api/acceptance-artifacts/artifact-1",
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "image/png")
+        self.assertEqual(body, b"\x89PNG\r\n\x1a\nfixture")
+        self.assertEqual(self.actions.calls, [("artifact", "artifact-1")])
 
     def test_mutations_require_exact_local_origin_and_csrf_token(self) -> None:
         token = self.token()
@@ -180,6 +248,7 @@ class InterfaceTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
         self.assertEqual(self.actions.calls, [])
+
     def test_mutations_pin_host_and_origin_to_bound_ephemeral_address(self) -> None:
         token = self.token()
         bound_host, bound_port = self.server.address
@@ -211,7 +280,6 @@ class InterfaceTests(unittest.TestCase):
             )
             self.assertEqual(status, 403, (host, origin))
         self.assertEqual(self.actions.calls, [("poll",)])
-
 
     def test_supported_actions_are_usable_through_http_client(self) -> None:
         token = self.token()

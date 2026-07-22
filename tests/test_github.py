@@ -20,6 +20,7 @@ class StubGitHubClient(GitHubClient):
         )
         self.responses = responses
         self.requests: list[tuple[str, str]] = []
+        self.request_bodies: list[dict[str, Any] | None] = []
 
     def _request(
         self,
@@ -30,6 +31,7 @@ class StubGitHubClient(GitHubClient):
         headers: dict[str, str] | None = None,
     ) -> tuple[Any, dict[str, str]]:
         self.requests.append((method, path))
+        self.request_bodies.append(body)
         key = path.split("?", 1)[0]
         if key not in self.responses:
             raise AssertionError(f"unexpected request {method} {path}")
@@ -172,7 +174,9 @@ class GitHubAdapterTests(unittest.TestCase):
         self.assertFalse(pull.merged)
         self.assertEqual(pull.head_sha, "c" * 40)
 
-    def test_find_response_requires_application_author_and_exact_inline_thread(self) -> None:
+    def test_find_response_requires_application_author_and_exact_inline_thread(
+        self,
+    ) -> None:
         self.responses["repos/owner/repo/pulls/7/comments"] = [
             {
                 "id": 801,
@@ -225,7 +229,9 @@ class GitHubAdapterTests(unittest.TestCase):
         self.assertEqual(output.object_id, "803")
         self.assertEqual(output.target_object_id, "703")
 
-    def test_find_response_resolves_and_caches_authenticated_application_author(self) -> None:
+    def test_find_response_resolves_and_caches_authenticated_application_author(
+        self,
+    ) -> None:
         self.responses["repos/owner/repo/issues/7/comments"] = [
             {
                 "id": 804,
@@ -259,8 +265,29 @@ class GitHubAdapterTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(client.requests.count(("GET", "user")), 1)
 
+    def test_update_pull_request_body_uses_controller_owned_patch(self) -> None:
+        self.responses["repos/owner/repo/pulls/7"] = {}
+
+        self.client.update_pull_request_body(
+            "owner",
+            "repo",
+            7,
+            "current SHA-bound proof",
+        )
+
+        self.assertEqual(
+            self.client.requests[-1],
+            ("PATCH", "repos/owner/repo/pulls/7"),
+        )
+        self.assertEqual(
+            self.client.request_bodies[-1],
+            {"body": "current SHA-bound proof"},
+        )
+
     def test_invalid_branch_sha_is_rejected(self) -> None:
-        self.responses["repos/owner/repo/branches/main"] = {"commit": {"sha": "not-a-sha"}}
+        self.responses["repos/owner/repo/branches/main"] = {
+            "commit": {"sha": "not-a-sha"}
+        }
         with self.assertRaises(GitHubError):
             self.client.get_branch_head("owner", "repo", "main")
 

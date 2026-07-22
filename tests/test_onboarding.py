@@ -719,7 +719,7 @@ class OnboardingTests(unittest.TestCase):
         self.assertEqual(first_evidence["languages"], ["javascript", "python"])
         self.assertEqual(second_evidence["languages"], ["ruby"])
         self.assertEqual(stored[first_id]["member_count"], 3)
-        self.assertEqual(stored[second_id]["member_count"], 1)
+        self.assertEqual(stored[second_id]["member_count"], 2)
         self.assertEqual(stored[first_id]["action_timeout"], 600)
         self.assertEqual(stored[second_id]["action_timeout"], 600)
         self.assertEqual(stored[first_id]["runtime"], "mini-swe-agent")

@@ -9,7 +9,6 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-
 _GITHUB_HOST = "github.com"
 _IDENTITY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
@@ -28,6 +27,7 @@ class RepositoryInfo:
     def identity(self) -> str:
         return f"{self.owner}/{self.name}"
 
+
 @dataclass(frozen=True)
 class IssueInfo:
     node_id: str
@@ -45,6 +45,7 @@ class ActivationEvent:
     applied_at: str
     issue: IssueInfo
 
+
 @dataclass(frozen=True)
 class PullRequestInfo:
     node_id: str
@@ -56,6 +57,8 @@ class PullRequestInfo:
     head_sha: str
     base_branch: str
     updated_at: str
+
+
 @dataclass(frozen=True)
 class FeedbackItem:
     feedback_type: str
@@ -80,16 +83,12 @@ class FeedbackOutput:
     created_at: str
 
 
-
-
-
-
 class GitHubError(RuntimeError):
     pass
+
+
 class GitHubNotFound(GitHubError):
     pass
-
-
 
 
 def parse_repository_identity(value: str) -> tuple[str, str]:
@@ -104,7 +103,9 @@ def parse_repository_identity(value: str) -> tuple[str, str]:
     if candidate.endswith(".git"):
         candidate = candidate[:-4]
     if not _IDENTITY.fullmatch(candidate):
-        raise ValueError("repository identity must be owner/name or a github.com repository URL")
+        raise ValueError(
+            "repository identity must be owner/name or a github.com repository URL"
+        )
     owner, name = candidate.split("/", 1)
     return owner, name
 
@@ -123,7 +124,11 @@ class GitHubClient:
         api_url: str = "https://api.github.com",
         application_author: str | None = None,
     ) -> None:
-        self._token = token if token is not None else os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        self._token = (
+            token
+            if token is not None
+            else os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        )
         self._api_url = api_url.rstrip("/")
         self._application_author = (
             application_author.strip() if application_author is not None else None
@@ -160,14 +165,22 @@ class GitHubClient:
             with urllib.request.urlopen(request, timeout=30) as response:
                 raw = response.read()
                 payload = json.loads(raw) if raw else None
-                return payload, {key.lower(): value for key, value in response.headers.items()}
+                return payload, {
+                    key.lower(): value for key, value in response.headers.items()
+                }
         except urllib.error.HTTPError as error:
             if error.code == 404:
-                raise GitHubNotFound(f"GitHub {method} {path} returned HTTP 404") from error
+                raise GitHubNotFound(
+                    f"GitHub {method} {path} returned HTTP 404"
+                ) from error
             detail = error.read().decode("utf-8", "replace")
-            raise GitHubError(f"GitHub {method} {path} failed with HTTP {error.code}: {detail}") from error
+            raise GitHubError(
+                f"GitHub {method} {path} failed with HTTP {error.code}: {detail}"
+            ) from error
         except urllib.error.URLError as error:
-            raise GitHubError(f"GitHub {method} {path} failed: {error.reason}") from error
+            raise GitHubError(
+                f"GitHub {method} {path} failed: {error.reason}"
+            ) from error
 
     def get_repository(self, identity: str) -> RepositoryInfo:
         owner, name = parse_repository_identity(identity)
@@ -186,7 +199,9 @@ class GitHubClient:
                 is_private=bool(payload["private"]),
             )
         except (KeyError, TypeError, ValueError) as error:
-            raise GitHubError("GitHub repository response omitted required identity fields") from error
+            raise GitHubError(
+                "GitHub repository response omitted required identity fields"
+            ) from error
 
     def _paginate(self, path: str) -> list[dict[str, Any]]:
         separator = "&" if "?" in path else "?"
@@ -207,7 +222,9 @@ class GitHubClient:
     def get_issue(self, owner: str, name: str, number: int) -> IssueInfo:
         payload, _ = self._request("GET", f"repos/{owner}/{name}/issues/{number}")
         if not isinstance(payload, dict) or "pull_request" in payload:
-            raise GitHubError("GitHub issue response was missing or represented a pull request")
+            raise GitHubError(
+                "GitHub issue response was missing or represented a pull request"
+            )
         comments = self._paginate(f"repos/{owner}/{name}/issues/{number}/comments")
         discussion = tuple(
             {
@@ -232,7 +249,9 @@ class GitHubClient:
                 updated_at=str(payload["updated_at"]),
             )
         except (KeyError, TypeError, ValueError) as error:
-            raise GitHubError("GitHub issue response omitted required fields") from error
+            raise GitHubError(
+                "GitHub issue response omitted required fields"
+            ) from error
 
     def list_ready_events(self, owner: str, name: str) -> list[ActivationEvent]:
         events = self._paginate(f"repos/{owner}/{name}/issues/events")
@@ -276,9 +295,7 @@ class GitHubClient:
             raise GitHubError("GitHub branch response returned an invalid head SHA")
         return sha
 
-    def get_remote_branch_head(
-        self, owner: str, name: str, branch: str
-    ) -> str | None:
+    def get_remote_branch_head(self, owner: str, name: str, branch: str) -> str | None:
         encoded = urllib.parse.quote(branch, safe="")
         try:
             payload, _ = self._request(
@@ -298,9 +315,7 @@ class GitHubClient:
         self, owner: str, name: str, branch: str
     ) -> PullRequestInfo | None:
         head = urllib.parse.quote(f"{owner}:{branch}", safe="")
-        pulls = self._paginate(
-            f"repos/{owner}/{name}/pulls?state=all&head={head}"
-        )
+        pulls = self._paginate(f"repos/{owner}/{name}/pulls?state=all&head={head}")
         if not pulls:
             return None
         matching = [
@@ -309,7 +324,9 @@ class GitHubClient:
             if payload.get("head", {}).get("ref") == branch
         ]
         if len(matching) > 1:
-            raise GitHubError("multiple pull requests exist for the deterministic run branch")
+            raise GitHubError(
+                "multiple pull requests exist for the deterministic run branch"
+            )
         return matching[0] if matching else None
 
     def create_pull_request(
@@ -334,12 +351,21 @@ class GitHubClient:
         )
         return self._pull_request(payload)
 
-    def get_pull_request(
-        self, owner: str, name: str, number: int
-    ) -> PullRequestInfo:
-        payload, _ = self._request(
-            "GET", f"repos/{owner}/{name}/pulls/{number}"
+    def update_pull_request_body(
+        self,
+        owner: str,
+        name: str,
+        number: int,
+        body: str,
+    ) -> None:
+        self._request(
+            "PATCH",
+            f"repos/{owner}/{name}/pulls/{number}",
+            body={"body": body},
         )
+
+    def get_pull_request(self, owner: str, name: str, number: int) -> PullRequestInfo:
+        payload, _ = self._request("GET", f"repos/{owner}/{name}/pulls/{number}")
         return self._pull_request(payload)
 
     @staticmethod
@@ -366,15 +392,11 @@ class GitHubClient:
     def list_feedback(
         self, owner: str, name: str, pull_number: int
     ) -> list[FeedbackItem]:
-        reviews = self._paginate(
-            f"repos/{owner}/{name}/pulls/{pull_number}/reviews"
-        )
+        reviews = self._paginate(f"repos/{owner}/{name}/pulls/{pull_number}/reviews")
         inline_comments = self._paginate(
             f"repos/{owner}/{name}/pulls/{pull_number}/comments"
         )
-        comments = self._paginate(
-            f"repos/{owner}/{name}/issues/{pull_number}/comments"
-        )
+        comments = self._paginate(f"repos/{owner}/{name}/issues/{pull_number}/comments")
         values: list[FeedbackItem] = []
         for review in reviews:
             body = str(review.get("body") or "")
@@ -404,14 +426,20 @@ class GitHubClient:
                 FeedbackItem(
                     feedback_type="inline_comment",
                     object_id=str(comment["id"]),
-                    version=str(comment.get("updated_at") or comment.get("created_at") or ""),
+                    version=str(
+                        comment.get("updated_at") or comment.get("created_at") or ""
+                    ),
                     author=str(comment.get("user", {}).get("login", "")),
                     body=str(comment.get("body") or ""),
                     path=str(comment.get("path") or "") or None,
-                    line=_optional_int(comment.get("line") or comment.get("original_line")),
+                    line=_optional_int(
+                        comment.get("line") or comment.get("original_line")
+                    ),
                     url=str(comment.get("html_url") or ""),
                     created_at=str(comment.get("created_at") or ""),
-                    updated_at=str(comment.get("updated_at") or comment.get("created_at") or ""),
+                    updated_at=str(
+                        comment.get("updated_at") or comment.get("created_at") or ""
+                    ),
                 )
             )
         for comment in comments:
@@ -419,14 +447,18 @@ class GitHubClient:
                 FeedbackItem(
                     feedback_type="comment",
                     object_id=str(comment["id"]),
-                    version=str(comment.get("updated_at") or comment.get("created_at") or ""),
+                    version=str(
+                        comment.get("updated_at") or comment.get("created_at") or ""
+                    ),
                     author=str(comment.get("user", {}).get("login", "")),
                     body=str(comment.get("body") or ""),
                     path=None,
                     line=None,
                     url=str(comment.get("html_url") or ""),
                     created_at=str(comment.get("created_at") or ""),
-                    updated_at=str(comment.get("updated_at") or comment.get("created_at") or ""),
+                    updated_at=str(
+                        comment.get("updated_at") or comment.get("created_at") or ""
+                    ),
                 )
             )
         values.sort(
@@ -481,7 +513,6 @@ class GitHubClient:
             )
         self._application_author = login.strip()
         return self._application_author
-
 
     def find_response(
         self,

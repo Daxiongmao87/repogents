@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -21,9 +22,7 @@ class FakeOnboarding:
         self.calls.append(("onboard", identity, inputs))
         return "repo-2"
 
-    def reonboard(
-        self, repository_id: str, inputs: dict[str, object]
-    ) -> str:
+    def reonboard(self, repository_id: str, inputs: dict[str, object]) -> str:
         self.calls.append(("reonboard", repository_id, inputs))
         return repository_id
 
@@ -43,13 +42,20 @@ class FakeLifecycle:
 
     def get_run(self, run_id: str) -> dict[str, object]:
         with self.database.connect() as connection:
-            return dict(connection.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+            return dict(
+                connection.execute(
+                    "SELECT * FROM runs WHERE id=?", (run_id,)
+                ).fetchone()
+            )
 
-    def transition(self, run_id: str, target: object, *, reason: str | None = None) -> None:
+    def transition(
+        self, run_id: str, target: object, *, reason: str | None = None
+    ) -> None:
         value = getattr(target, "value", str(target))
         with self.database.transaction() as connection:
-            connection.execute("UPDATE runs SET state=?, reason=? WHERE id=?", (value, reason, run_id))
-
+            connection.execute(
+                "UPDATE runs SET state=?, reason=? WHERE id=?", (value, reason, run_id)
+            )
 
     def cancel(self, run_id: str, reason: str) -> None:
         self.calls.append(("cancel", run_id, reason))
@@ -63,7 +69,9 @@ class FakeExecution:
     def execute(self, run_id: str) -> str:
         self.calls.append(run_id)
         with self.database.transaction() as connection:
-            connection.execute("UPDATE runs SET state='publishing' WHERE id=?", (run_id,))
+            connection.execute(
+                "UPDATE runs SET state='publishing' WHERE id=?", (run_id,)
+            )
         return "b" * 40
 
 
@@ -75,7 +83,9 @@ class FakePublication:
     def publish(self, run_id: str) -> object:
         self.calls.append(run_id)
         with self.database.transaction() as connection:
-            connection.execute("UPDATE runs SET state='waiting_for_feedback' WHERE id=?", (run_id,))
+            connection.execute(
+                "UPDATE runs SET state='waiting_for_feedback' WHERE id=?", (run_id,)
+            )
         return object()
 
 
@@ -87,7 +97,9 @@ class FakeFeedback:
     def resolve_run(self, run_id: str) -> int:
         self.calls.append(run_id)
         with self.database.transaction() as connection:
-            connection.execute("UPDATE runs SET state='quiet_period' WHERE id=?", (run_id,))
+            connection.execute(
+                "UPDATE runs SET state='quiet_period' WHERE id=?", (run_id,)
+            )
         return 0
 
 
@@ -161,11 +173,9 @@ class ApplicationTests(unittest.TestCase):
                    VALUES ('team-1', 'repo-1', 1, '{}', ?)""",
                 (now,),
             )
-            connection.execute(
-                """UPDATE repositories
+            connection.execute("""UPDATE repositories
                    SET current_sandbox_version_id='sandbox-1', current_team_version_id='team-1'
-                   WHERE id='repo-1'"""
-            )
+                   WHERE id='repo-1'""")
             connection.execute(
                 """INSERT INTO team_members
                    (id, team_version_id, stable_key, role, responsibilities,
@@ -193,7 +203,13 @@ class ApplicationTests(unittest.TestCase):
                     base_sha, state, checkout_path, run_path, created_at, updated_at)
                    VALUES ('run-1', 'repo-1', 'issue-1', 'activation-1',
                            'sandbox-1', 'team-1', 'main', ?, 'queued', ?, ?, ?, ?)""",
-                ("a" * 40, str(self.root / "checkout"), str(self.root / "run"), now, now),
+                (
+                    "a" * 40,
+                    str(self.root / "checkout"),
+                    str(self.root / "run"),
+                    now,
+                    now,
+                ),
             )
 
     def test_tick_polls_ready_inventory_and_advances_composed_run_path(self) -> None:
@@ -220,7 +236,84 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(feedback.calls, ["run-1", "run-1"])
         self.assertEqual(quiet.calls, ["run-1"])
 
-    def test_application_actions_expose_durable_state_and_controller_operations(self) -> None:
+    def test_application_actions_expose_durable_state_and_controller_operations(
+        self,
+    ) -> None:
+        artifact_path = self.root / "acceptance-proof.png"
+        artifact_body = b"\x89PNG\r\n\x1a\napplication-proof"
+        artifact_path.write_bytes(artifact_body)
+        commit_sha = "b" * 40
+        report = {
+            "id": "acceptance-1",
+            "run_id": "run-1",
+            "commit_sha": commit_sha,
+            "state": "passed",
+            "summary": "Scrolling works.",
+            "claims": [
+                {
+                    "key": "scroll",
+                    "claim": "Wheel input navigates history.",
+                    "result": "pass",
+                    "observed": "Rows changed.",
+                    "evidence": [1],
+                }
+            ],
+            "scope": [],
+            "screenshot_decision": {"required": True, "reason": "Visual issue."},
+            "artifacts": [
+                {
+                    "id": "artifact-1",
+                    "claim_key": "scroll",
+                    "kind": "screenshot",
+                    "path": str(artifact_path),
+                    "sha256": hashlib.sha256(artifact_body).hexdigest(),
+                    "media_type": "image/png",
+                    "description": "Scrolled history.",
+                    "commit_sha": commit_sha,
+                    "metadata": {},
+                }
+            ],
+            "limitations": [],
+        }
+        with self.db.transaction() as connection:
+            connection.execute("""INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, responsibilities,
+                    permitted_tools_json, runtime, model, instructions)
+                   VALUES ('verifier-1', 'team-1', 'verification', 'verifier',
+                           'Verify', '["read","run"]', 'mini-swe-agent',
+                           'test', '')""")
+            connection.execute(
+                "UPDATE runs SET validated_sha=? WHERE id='run-1'",
+                (commit_sha,),
+            )
+            connection.execute(
+                """INSERT INTO acceptance_verifications
+                   (id, run_id, commit_sha, attempt, verifier_member_id, state,
+                    claims_json, screenshot_decision_json, report_json,
+                    started_at, completed_at)
+                   VALUES ('acceptance-1', 'run-1', ?, 1, 'verifier-1',
+                           'passed', ?, ?, ?, ?, ?)""",
+                (
+                    commit_sha,
+                    json.dumps(report["claims"]),
+                    json.dumps(report["screenshot_decision"]),
+                    json.dumps(report),
+                    "2026-01-01T00:01:00Z",
+                    "2026-01-01T00:02:00Z",
+                ),
+            )
+            connection.execute(
+                """INSERT INTO acceptance_artifacts
+                   (id, verification_id, claim_key, kind, path, sha256,
+                    media_type, description, metadata_json, created_at)
+                   VALUES ('artifact-1', 'acceptance-1', 'scroll', 'screenshot',
+                           ?, ?, 'image/png', 'Scrolled history.', '{}',
+                           '2026-01-01T00:02:00Z')""",
+                (
+                    str(artifact_path),
+                    report["artifacts"][0]["sha256"],
+                ),
+            )
         onboarding = FakeOnboarding()
         lifecycle = FakeLifecycle(self.db)
         quiet = FakeQuiet()
@@ -260,10 +353,27 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(run["team_version_id"], "team-1")
         self.assertEqual(run["validation_results"], [])
         self.assertEqual(run["assignments"], [])
-        self.assertEqual(actions.add_repository("owner/second", {"allowed_services": []}), "repo-2")
+        self.assertEqual(
+            run["acceptance_verification"]["commit_sha"],
+            commit_sha,
+        )
+        self.assertEqual(
+            run["acceptance_verification"]["claims"][0]["key"],
+            "scroll",
+        )
+        body, media_type = actions.acceptance_artifact("artifact-1")
+        self.assertEqual(body, artifact_body)
+        self.assertEqual(media_type, "image/png")
+        self.assertEqual(
+            actions.add_repository("owner/second", {"allowed_services": []}), "repo-2"
+        )
         actions.reonboard("repo-1", {"allowed_services": ["api.github.com:443"]})
         with self.db.connect() as connection:
-            stored = json.loads(connection.execute("SELECT inputs_json FROM repositories WHERE id='repo-1'").fetchone()[0])
+            stored = json.loads(
+                connection.execute(
+                    "SELECT inputs_json FROM repositories WHERE id='repo-1'"
+                ).fetchone()[0]
+            )
         self.assertEqual(stored["allowed_services"], ["packages.example:443"])
         actions.cancel("run-1")
         actions.acknowledge("notice-1")
@@ -276,12 +386,12 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(quiet.acks, ["notice-1"])
         self.assertEqual(scheduler.requests, 3)
 
-    def test_processing_feedback_in_publishing_routes_through_feedback_recovery(self) -> None:
+    def test_processing_feedback_in_publishing_routes_through_feedback_recovery(
+        self,
+    ) -> None:
         now = "2026-01-01T00:00:00Z"
         with self.db.transaction() as connection:
-            connection.execute(
-                "UPDATE runs SET state='publishing' WHERE id='run-1'"
-            )
+            connection.execute("UPDATE runs SET state='publishing' WHERE id='run-1'")
             connection.execute(
                 """INSERT INTO pull_requests
                    (id, run_id, github_node_id, number, url, branch_name,
@@ -398,7 +508,9 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(run["state"], "implementing")
         self.assertIsNone(run["reason"])
         self.assertEqual(execution.calls, ["run-1"])
-        self.assertIn("temporary controller boundary failure", orchestrator.last_errors[0])
+        self.assertIn(
+            "temporary controller boundary failure", orchestrator.last_errors[0]
+        )
 
     def test_build_runtime_rejects_missing_model_without_ambient_discovery(
         self,
@@ -445,7 +557,9 @@ class ApplicationTests(unittest.TestCase):
             patch("repogents.app.MiniSweFeedbackEvaluator") as feedback_evaluator_type,
             patch.dict(
                 os.environ,
-                {"REPOGENTS_SECRET_PACKAGE_TOKEN": "canary-value"},  # pragma: allowlist secret
+                {
+                    "REPOGENTS_SECRET_PACKAGE_TOKEN": "canary-value"  # pragma: allowlist secret
+                },
                 clear=False,
             ),
         ):
@@ -490,21 +604,13 @@ class ApplicationTests(unittest.TestCase):
             )
         resolved_root = runtime_root.resolve()
         expected_state_roots = {
-            onboarding_analyzer_type: resolved_root
-            / "model-state"
-            / "onboarding",
-            scope_reviewer_type: resolved_root
-            / "model-state"
-            / "scope-review",
-            feedback_evaluator_type: resolved_root
-            / "model-state"
-            / "feedback",
+            onboarding_analyzer_type: resolved_root / "model-state" / "onboarding",
+            scope_reviewer_type: resolved_root / "model-state" / "scope-review",
+            feedback_evaluator_type: resolved_root / "model-state" / "feedback",
         }
         observed_state_roots: set[Path] = set()
         for boundary_type, expected_state_root in expected_state_roots.items():
-            state_root = Path(
-                boundary_type.call_args.kwargs["state_root"]
-            ).resolve()
+            state_root = Path(boundary_type.call_args.kwargs["state_root"]).resolve()
             self.assertEqual(state_root, expected_state_root)
             self.assertTrue(state_root.is_relative_to(resolved_root))
             observed_state_roots.add(state_root)

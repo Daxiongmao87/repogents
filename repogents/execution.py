@@ -20,7 +20,6 @@ from .sandbox import (
 )
 from .team import Assignment, StoredTeam, TeamMember, TeamService
 
-
 _ACTION_HISTORY_LIMIT = 2_000
 _ACTION_FIELD_ORDER = (
     "action",
@@ -88,9 +87,9 @@ def _action_history_value(
         retained_dict: dict[str, object] = {}
         items = list(value.items())
         for key, item in items[:16]:
-            retained_dict[
-                _bounded_redacted_text(str(key), secret_values, 128)
-            ] = _action_history_value(item, secret_values)
+            retained_dict[_bounded_redacted_text(str(key), secret_values, 128)] = (
+                _action_history_value(item, secret_values)
+            )
         if len(items) > 16:
             retained_dict["[truncated]"] = len(items) - 16
         return retained_dict
@@ -111,12 +110,12 @@ def _serialize_action_for_history(
         *(key for key in sorted(action) if key not in _ACTION_FIELD_ORDER),
     ]
     for key in keys:
-        ordered[
-            _bounded_redacted_text(key, secret_values, 128)
-        ] = _action_history_value(
-            action[key],
-            secret_values,
-            string_limit=_ACTION_STRING_LIMITS.get(key, 256),
+        ordered[_bounded_redacted_text(key, secret_values, 128)] = (
+            _action_history_value(
+                action[key],
+                secret_values,
+                string_limit=_ACTION_STRING_LIMITS.get(key, 256),
+            )
         )
     return json.dumps(
         ordered,
@@ -243,6 +242,8 @@ Read before editing. Do not reread evidence already present in action history un
         timeout: float = 600,
         supervisor: RunProcessSupervisor | None = None,
         run_id: str | None = None,
+        system_prompt: str | None = None,
+        response_schema: dict[str, object] | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("stored-agent model timeout must be positive")
@@ -251,6 +252,8 @@ Read before editing. Do not reread evidence already present in action history un
         self.timeout = timeout
         self.supervisor = supervisor
         self.run_id = run_id
+        self.system_prompt = system_prompt or self._SYSTEM_PROMPT
+        self.response_schema = response_schema or self._RESPONSE_SCHEMA
 
     def next_action(
         self,
@@ -265,11 +268,12 @@ Read before editing. Do not reread evidence already present in action history un
             run_id=self.run_id,
         )
         return inference.infer(
-            system_prompt=self._SYSTEM_PROMPT,
+            system_prompt=self.system_prompt,
             prompt=context,
-            response_schema=self._RESPONSE_SCHEMA,
+            response_schema=self.response_schema,
             state_directory=state_directory,
         )
+
 
 RuntimeFactory = Callable[[str, str, float], ModelRuntime]
 SecretResolver = Callable[[str], str]
@@ -309,6 +313,7 @@ class AgentToolExecutor:
         layout: RunLayout,
         action: dict[str, object],
         secrets: dict[str, str] | None = None,
+        checkout_writable: bool = True,
     ) -> str:
         name = action.get("action")
         if not isinstance(name, str) or name not in self._TOOL_PERMISSION:
@@ -333,7 +338,12 @@ class AgentToolExecutor:
                 raise ValueError("run action timeout must be a number")
             timeout = min(max(float(timeout_value), 1), 300)
             result = self.sandbox.run(
-                policy, layout, tuple(argv), timeout=timeout, secrets=secrets
+                policy,
+                layout,
+                tuple(argv),
+                timeout=timeout,
+                secrets=secrets,
+                checkout_writable=checkout_writable,
             )
             if result.canceled:
                 raise _RunCanceled(layout.run_id)
@@ -360,6 +370,7 @@ class AgentToolExecutor:
                 encoded.decode("ascii"),
             ),
             timeout=60,
+            checkout_writable=checkout_writable,
         )
         if result.canceled:
             raise _RunCanceled(layout.run_id)
@@ -385,10 +396,12 @@ class AgentToolExecutor:
 class MissingValidationCommands(RuntimeError):
     pass
 
+
 class RevisionRequired(RuntimeError):
     """A safe, source-fixable revision that must return to the stored agent."""
 
     pass
+
 
 class _RunCanceled(RuntimeError):
     pass
@@ -420,7 +433,9 @@ class ExecutionService:
         self.tools = AgentToolExecutor(sandbox)
         self.scanner = SecretScanner()
 
-    def execute(self, run_id: str, *, additional_context: str | None = None) -> str | None:
+    def execute(
+        self, run_id: str, *, additional_context: str | None = None
+    ) -> str | None:
         run, issue, sandbox_row = self._load_context(run_id)
         current = RunState(str(run["state"]))
         resume_validation = current == RunState.VALIDATING
@@ -463,9 +478,7 @@ class ExecutionService:
         if not resume_validation:
             for assignment in assignments:
                 member = assignment.member
-                if member.role == "lead" or self._member_finished(
-                    transcript, member
-                ):
+                if member.role == "lead" or self._member_finished(transcript, member):
                     continue
                 outcome, yielded = self._agent_cycle(
                     self._runtime(member, run_id),
@@ -560,7 +573,10 @@ class ExecutionService:
             if self._is_canceled(run_id):
                 return None
             transcript.append(
-                "Validation for commit " + commit_sha + " failed. Revise the implementation:\n" + validation_feedback
+                "Validation for commit "
+                + commit_sha
+                + " failed. Revise the implementation:\n"
+                + validation_feedback
             )
             self._store_transcript(layout, transcript)
             if cycle + 1 >= self.max_revision_cycles:
@@ -630,10 +646,7 @@ class ExecutionService:
                         safe_reason,
                     )
                     transcript.append(
-                        "Lead assigned "
-                        + ", ".join(members)
-                        + ": "
-                        + safe_reason
+                        "Lead assigned " + ", ".join(members) + ": " + safe_reason
                     )
                     self._store_transcript(layout, transcript)
                     return None, False
@@ -783,7 +796,9 @@ class ExecutionService:
     ) -> str:
         self._ensure_not_canceled(layout.run_id)
         self._git(policy, layout, ("add", "-A"))
-        check = self._git(policy, layout, ("diff", "--cached", "--check"), allow_failure=True)
+        check = self._git(
+            policy, layout, ("diff", "--cached", "--check"), allow_failure=True
+        )
         if check.returncode != 0:
             raise RevisionRequired(check.stderr.strip() or check.stdout.strip())
         full_diff = self._git(
@@ -797,7 +812,9 @@ class ExecutionService:
             raise RevisionRequired(
                 "potential secret in committed changes: " + ", ".join(findings)
             )
-        staged = self._git(policy, layout, ("diff", "--cached", "--quiet"), allow_failure=True)
+        staged = self._git(
+            policy, layout, ("diff", "--cached", "--quiet"), allow_failure=True
+        )
         if staged.returncode not in {0, 1}:
             raise RuntimeError(staged.stderr.strip() or "cannot inspect staged changes")
         if staged.returncode == 1:
@@ -851,7 +868,9 @@ class ExecutionService:
         failures: list[str] = []
         for row in rows:
             command = json.loads(row["command_json"])
-            if not isinstance(command, list) or not all(isinstance(value, str) for value in command):
+            if not isinstance(command, list) or not all(
+                isinstance(value, str) for value in command
+            ):
                 raise RuntimeError("stored validation command is invalid")
             self._ensure_not_canceled(run_id)
             secrets = self._command_secrets(
@@ -952,7 +971,9 @@ class ExecutionService:
             raise _RunCanceled(layout.run_id)
         self._ensure_not_canceled(layout.run_id)
         if result.returncode != 0 and not allow_failure:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git command failed")
+            raise RuntimeError(
+                result.stderr.strip() or result.stdout.strip() or "git command failed"
+            )
         return result
 
     def _command_secrets(
@@ -971,13 +992,17 @@ class ExecutionService:
                 )
             value = self.secret_resolver(reference)
             if not isinstance(value, str):
-                raise TypeError(f"secret resolver returned a non-string value for {name}")
+                raise TypeError(
+                    f"secret resolver returned a non-string value for {name}"
+                )
             secrets[name] = value
             resolved_secret_values.add(value)
         return secrets
 
     def _is_canceled(self, run_id: str) -> bool:
-        return RunState(str(self.lifecycle.get_run(run_id)["state"])) == RunState.CANCELED
+        return (
+            RunState(str(self.lifecycle.get_run(run_id)["state"])) == RunState.CANCELED
+        )
 
     def _ensure_not_canceled(self, run_id: str) -> None:
         if self._is_canceled(run_id):
@@ -1023,7 +1048,6 @@ class ExecutionService:
             )
         )
 
-
     def _load_context(
         self, run_id: str
     ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
@@ -1038,7 +1062,8 @@ class ExecutionService:
             if row is None:
                 raise KeyError(run_id)
             sandbox_row = connection.execute(
-                "SELECT * FROM sandbox_versions WHERE id=?", (row["sandbox_version_id"],)
+                "SELECT * FROM sandbox_versions WHERE id=?",
+                (row["sandbox_version_id"],),
             ).fetchone()
         run = dict(row)
         issue = {
@@ -1113,9 +1138,12 @@ def _sandbox_policy(row: dict[str, object]) -> SandboxPolicy:
     return SandboxPolicy(
         persistent_root=Path(str(row["root_path"])),
         mounts=tuple(mounts),
-        allowed_services=tuple(str(value) for value in payload.get("allowed_services", [])),
+        allowed_services=tuple(
+            str(value) for value in payload.get("allowed_services", [])
+        ),
         allowed_secret_names=names,
     )
+
 
 def _secret_bindings(row: dict[str, object]) -> tuple[SecretBinding, ...]:
     payload = json.loads(str(row["policy_json"]))
@@ -1143,7 +1171,9 @@ def _secret_bindings(row: dict[str, object]) -> tuple[SecretBinding, ...]:
             if (
                 not isinstance(command, list)
                 or not command
-                or not all(isinstance(argument, str) and argument for argument in command)
+                or not all(
+                    isinstance(argument, str) and argument for argument in command
+                )
             ):
                 raise ValueError(f"stored secret binding command is invalid for {name}")
             normalized_commands.append(tuple(command))

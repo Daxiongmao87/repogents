@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
+from .acceptance import (
+    AcceptanceUnavailable,
+    render_acceptance_failure,
+    render_acceptance_markdown,
+)
 from .controller import RunProcessSupervisor, git_environment
 from .database import Database
 from .github import GitHubClient, PullRequestInfo
@@ -33,8 +38,19 @@ class ScopeReviewer(Protocol):
     ) -> ScopeDecision: ...
 
 
+class AcceptanceGate(Protocol):
+    def verify(
+        self,
+        run_id: str,
+        commit_sha: str,
+        changed_files: Sequence[str],
+    ) -> dict[str, object]: ...
+
+
 class PublicationGateway(Protocol):
-    def get_remote_branch_head(self, owner: str, name: str, branch: str) -> str | None: ...
+    def get_remote_branch_head(
+        self, owner: str, name: str, branch: str
+    ) -> str | None: ...
 
     def fetch_intended_base_head(
         self,
@@ -61,6 +77,14 @@ class PublicationGateway(Protocol):
         title: str,
         body: str,
     ) -> PullRequestInfo: ...
+
+    def update_pull_request_body(
+        self,
+        owner: str,
+        name: str,
+        number: int,
+        body: str,
+    ) -> None: ...
 
 
 class GitPublicationGateway:
@@ -157,7 +181,9 @@ class GitPublicationGateway:
                 env=environment,
             )
         if result.returncode != 0:
-            raise RuntimeError(f"git push failed: {result.stderr.strip() or result.stdout.strip()}")
+            raise RuntimeError(
+                f"git push failed: {result.stderr.strip() or result.stdout.strip()}"
+            )
 
     def find_pull_request(
         self, owner: str, name: str, branch: str
@@ -174,6 +200,15 @@ class GitPublicationGateway:
         body: str,
     ) -> PullRequestInfo:
         return self.github.create_pull_request(owner, name, branch, base, title, body)
+
+    def update_pull_request_body(
+        self,
+        owner: str,
+        name: str,
+        number: int,
+        body: str,
+    ) -> None:
+        self.github.update_pull_request_body(owner, name, number, body)
 
 
 class MiniSweScopeReviewer:
@@ -226,9 +261,7 @@ class MiniSweScopeReviewer:
         stored_lead = issue.get("stored_lead")
         if stored_lead is not None:
             if not isinstance(stored_lead, dict):
-                raise RuntimeError(
-                    "stored scope-review lead configuration is invalid"
-                )
+                raise RuntimeError("stored scope-review lead configuration is invalid")
             if stored_lead.get("runtime") != MINI_SWE_RUNTIME:
                 raise RuntimeError(
                     "unsupported stored scope-review runtime: "
@@ -297,8 +330,7 @@ class MiniSweScopeReviewer:
         )
         value = inference.infer(
             system_prompt=(
-                "Return exactly one JSON object with in_scope and reason. "
-                "No prose."
+                "Return exactly one JSON object with in_scope and reason. " "No prose."
             ),
             prompt=prompt,
             response_schema=self._RESPONSE_SCHEMA,
@@ -318,6 +350,8 @@ class MiniSweScopeReviewer:
 
 class PublicationBlocked(RuntimeError):
     pass
+
+
 class PublicationRevisionRequired(PublicationBlocked):
     pass
 
@@ -335,6 +369,7 @@ class PublicationService:
         lifecycle: RunLifecycle,
         gateway: PublicationGateway,
         scope_reviewer: ScopeReviewer,
+        acceptance: AcceptanceGate,
         known_secret_values: Callable[[str], Sequence[str]] | None = None,
     ) -> None:
         self.database = database
@@ -342,6 +377,7 @@ class PublicationService:
         self.gateway = gateway
         self.scope_reviewer = scope_reviewer
         self.known_secret_values = known_secret_values or _no_secret_values
+        self.acceptance = acceptance
         self.scanner = SecretScanner()
 
     def publish(self, run_id: str) -> PullRequestInfo | None:
@@ -360,10 +396,41 @@ class PublicationService:
                 raise PublicationRevisionRequired(
                     f"scope review rejected publication: {scope.reason}"
                 )
+            try:
+                acceptance = self.acceptance.verify(
+                    run_id,
+                    validated_sha,
+                    changed_files,
+                )
+            except AcceptanceUnavailable as error:
+                raise PublicationBlocked(
+                    f"issue acceptance verification unavailable: {error}"
+                ) from error
+            acceptance_state = acceptance.get("state")
+            if acceptance_state == "failed":
+                raise PublicationRevisionRequired(
+                    "issue acceptance verification failed:\n"
+                    + render_acceptance_failure(acceptance)
+                )
+            if acceptance_state == "blocked":
+                raise PublicationBlocked(
+                    "issue acceptance verification blocked: "
+                    + str(acceptance.get("summary") or "no blocking detail")
+                )
+            if acceptance_state != "passed":
+                raise PublicationBlocked(
+                    "issue acceptance verification did not produce a passing report"
+                )
+            proof_body = self._pull_body(context, validated_sha, acceptance)
             branch = f"agent/issue-{context['issue_number']}-{run_id}"
             pull_row = self._stage_pull_request(context, branch, validated_sha)
             self._reconcile_push(context, pull_row, checkout, branch, validated_sha)
-            pull = self._reconcile_pull_request(context, branch, validated_sha)
+            pull = self._reconcile_pull_request(
+                context,
+                branch,
+                validated_sha,
+                proof_body,
+            )
             self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
             return pull
         except PublicationRevisionRequired as error:
@@ -393,9 +460,7 @@ class PublicationService:
         validated_sha: str,
     ) -> dict[str, object]:
         try:
-            sandbox_evidence = json.loads(
-                str(context["sandbox_evidence_json"])
-            )
+            sandbox_evidence = json.loads(str(context["sandbox_evidence_json"]))
             team_evidence = json.loads(str(context["team_evidence_json"]))
             discussion = json.loads(str(context["discussion_json"]))
         except (KeyError, TypeError, json.JSONDecodeError) as error:
@@ -443,7 +508,6 @@ class PublicationService:
             "lead_instructions": context["lead_instructions"],
         }
 
-
     def _preflight(
         self,
         context: dict[str, object],
@@ -462,7 +526,9 @@ class PublicationService:
             checkout, ("merge-base", "--is-ancestor", base_sha, validated_sha)
         )
         if ancestor.returncode != 0:
-            raise PublicationBlocked("validated commit does not descend from the stored base SHA")
+            raise PublicationBlocked(
+                "validated commit does not descend from the stored base SHA"
+            )
         current_base_sha = self.gateway.fetch_intended_base_head(
             checkout,
             str(context["owner"]),
@@ -507,7 +573,15 @@ class PublicationService:
                 "every required validation command must pass for the exact published SHA"
             )
         changed_output = _git(
-            checkout, ("diff", "--name-only", "--diff-filter=ACMRTD", base_sha, validated_sha, "--")
+            checkout,
+            (
+                "diff",
+                "--name-only",
+                "--diff-filter=ACMRTD",
+                base_sha,
+                validated_sha,
+                "--",
+            ),
         )
         changed_files = tuple(line for line in changed_output.splitlines() if line)
         if not changed_files:
@@ -586,16 +660,14 @@ class PublicationService:
                 )
             with self.lifecycle.external_effect(str(context["id"])) as active:
                 if not active:
-                    raise PublicationBlocked(
-                        "run was canceled at publication boundary"
-                    )
+                    raise PublicationBlocked("run was canceled at publication boundary")
                 self._require_publishing(str(context["id"]))
-                self.gateway.push_branch(
-                    checkout, owner, name, branch, validated_sha
-                )
+                self.gateway.push_branch(checkout, owner, name, branch, validated_sha)
             confirmed = self._confirm_remote(owner, name, branch, validated_sha)
             if not confirmed:
-                raise PublicationBlocked("remote branch head did not confirm the validated SHA")
+                raise PublicationBlocked(
+                    "remote branch head did not confirm the validated SHA"
+                )
             self._complete_operation(operation_id, "completed", validated_sha)
         with self.database.transaction() as connection:
             self._require_publishing(
@@ -613,6 +685,7 @@ class PublicationService:
         context: dict[str, object],
         branch: str,
         validated_sha: str,
+        proof_body: str,
     ) -> PullRequestInfo:
         operation_id = self._stage_operation(
             str(context["id"]),
@@ -627,16 +700,10 @@ class PublicationService:
         if pull is None:
             with self.lifecycle.external_effect(str(context["id"])) as active:
                 if not active:
-                    raise PublicationBlocked(
-                        "run was canceled at publication boundary"
-                    )
+                    raise PublicationBlocked("run was canceled at publication boundary")
                 self._require_publishing(str(context["id"]))
                 title = f"Resolve #{context['issue_number']}: {' '.join(str(context['issue_title']).split())}"
-                body = (
-                    f"Automated implementation for {context['issue_url']}.\n\n"
-                    f"Validated commit: `{validated_sha}`\n\n"
-                    "This pull request is intentionally unmerged."
-                )
+                body = proof_body
                 pull = self.gateway.create_pull_request(
                     owner,
                     name,
@@ -662,6 +729,35 @@ class PublicationService:
             raise PublicationBlocked("pull request targets an unexpected base branch")
         if pull.merged or pull.state != "open":
             raise PublicationBlocked("pull request is not open and unmerged")
+        if reconciled:
+            update_id = self._stage_operation(
+                str(context["id"]),
+                "update_pull_request",
+                f"{context['id']}:update_pull_request:{validated_sha}",
+                {
+                    "number": pull.number,
+                    "commit_sha": validated_sha,
+                    "body_hash": _stable_id(proof_body),
+                },
+            )
+            if not self._operation_completed(update_id):
+                with self.lifecycle.external_effect(str(context["id"])) as active:
+                    if not active:
+                        raise PublicationBlocked(
+                            "run was canceled at pull-request proof boundary"
+                        )
+                    self._require_publishing(str(context["id"]))
+                    self.gateway.update_pull_request_body(
+                        owner,
+                        name,
+                        pull.number,
+                        proof_body,
+                    )
+                self._complete_operation(
+                    update_id,
+                    "completed",
+                    pull.node_id,
+                )
         now = _utc_now()
         with self.database.transaction() as connection:
             self._require_publishing(
@@ -690,6 +786,28 @@ class PublicationService:
         )
         return pull
 
+    @staticmethod
+    def _pull_body(
+        context: dict[str, object],
+        validated_sha: str,
+        acceptance: dict[str, object],
+    ) -> str:
+        proof = render_acceptance_markdown(acceptance)
+        body = (
+            f"Automated implementation for {context['issue_url']}.\n\n"
+            f"{proof}\n\n"
+            "This pull request is intentionally unmerged."
+        )
+        if validated_sha not in body:
+            raise PublicationBlocked(
+                "acceptance proof does not identify the validated commit SHA"
+            )
+        if len(body.encode("utf-8")) > 60_000:
+            raise PublicationBlocked(
+                "acceptance proof exceeds the pull-request body limit"
+            )
+        return body
+
     def _confirm_remote(
         self, owner: str, name: str, branch: str, expected_sha: str
     ) -> bool:
@@ -699,6 +817,14 @@ class PublicationService:
             if attempt < 4:
                 time.sleep(0.2 * (attempt + 1))
         return False
+
+    def _operation_completed(self, operation_id: str) -> bool:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT state FROM outbound_operations WHERE id=?",
+                (operation_id,),
+            ).fetchone()
+        return row is not None and row["state"] in {"completed", "reconciled"}
 
     def _stage_operation(
         self,
@@ -827,11 +953,15 @@ def _forbidden_artifact(path: str) -> bool:
 def _git(checkout: Path, arguments: Sequence[str]) -> str:
     result = _git_result(checkout, arguments)
     if result.returncode != 0:
-        raise PublicationBlocked(result.stderr.strip() or result.stdout.strip() or "git inspection failed")
+        raise PublicationBlocked(
+            result.stderr.strip() or result.stdout.strip() or "git inspection failed"
+        )
     return result.stdout
 
 
-def _git_result(checkout: Path, arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
+def _git_result(
+    checkout: Path, arguments: Sequence[str]
+) -> subprocess.CompletedProcess[str]:
     with git_environment(None) as environment:
         return subprocess.run(
             ["git", "-c", "core.hooksPath=/dev/null", *arguments],
@@ -845,8 +975,6 @@ def _git_result(checkout: Path, arguments: Sequence[str]) -> subprocess.Complete
             check=False,
             env=environment,
         )
-
-
 
 
 def _stable_id(value: str) -> str:

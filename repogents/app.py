@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import urllib.parse
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
+from .acceptance import (
+    AcceptanceService,
+    current_acceptance_verification,
+    load_acceptance_artifact,
+)
 from .controller import (
     EnvironmentSecretResolver,
     RunProcessSupervisor,
@@ -32,7 +38,6 @@ from .publication import (
 from .quiet import QuietPeriodService, TransientQuietCheckError
 from .sandbox import SandboxManager
 from .team import EvidenceTeamFormulator, TeamService
-
 
 _TERMINAL_OR_IDLE = {
     RunState.BLOCKED.value,
@@ -119,11 +124,9 @@ class Orchestrator:
                     f"restart reconciliation: {error or error.__class__.__name__}"
                 )
             with self.database.connect() as connection:
-                repositories = connection.execute(
-                    """SELECT id FROM repositories
+                repositories = connection.execute("""SELECT id FROM repositories
                        WHERE onboarding_state='ready'
-                       ORDER BY created_at, id"""
-                ).fetchall()
+                       ORDER BY created_at, id""").fetchall()
             for repository in repositories:
                 repository_id = str(repository["id"])
                 try:
@@ -133,11 +136,9 @@ class Orchestrator:
                         f"poll {repository_id}: {error or error.__class__.__name__}"
                     )
             with self.database.connect() as connection:
-                runs = connection.execute(
-                    """SELECT id FROM runs
+                runs = connection.execute("""SELECT id FROM runs
                        WHERE state NOT IN ('blocked', 'canceled', 'closed')
-                       ORDER BY created_at, id"""
-                ).fetchall()
+                       ORDER BY created_at, id""").fetchall()
             for row in runs:
                 self._advance(str(row["id"]))
 
@@ -188,6 +189,7 @@ class Orchestrator:
             after = str(self.lifecycle.get_run(run_id)["state"])
             if after == state or after in _TERMINAL_OR_IDLE:
                 return
+
     def _has_processing_feedback(self, run_id: str) -> bool:
         with self.database.connect() as connection:
             row = connection.execute(
@@ -201,7 +203,6 @@ class Orchestrator:
                 (run_id,),
             ).fetchone()
         return row is not None
-
 
 
 class Scheduler:
@@ -267,8 +268,7 @@ class ApplicationActions:
 
     def state(self) -> dict[str, object]:
         with self.database.connect() as connection:
-            repositories = connection.execute(
-                """SELECT repositories.id,
+            repositories = connection.execute("""SELECT repositories.id,
                           repositories.owner || '/' || repositories.name AS identity,
                           repositories.url, repositories.default_branch,
                           repositories.onboarding_state, repositories.inputs_json,
@@ -283,10 +283,8 @@ class ApplicationActions:
                    LEFT JOIN team_versions
                      ON team_versions.id=repositories.current_team_version_id
                    ORDER BY repositories.owner COLLATE NOCASE,
-                            repositories.name COLLATE NOCASE"""
-            ).fetchall()
-            runs = connection.execute(
-                """SELECT runs.id,
+                            repositories.name COLLATE NOCASE""").fetchall()
+            runs = connection.execute("""SELECT runs.id,
                           repositories.owner || '/' || repositories.name AS repository,
                           issues.number AS issue_number,
                           issues.title AS issue_title,
@@ -307,8 +305,7 @@ class ApplicationActions:
                    JOIN team_versions AS run_team
                      ON run_team.id=runs.team_version_id
                    LEFT JOIN pull_requests ON pull_requests.run_id=runs.id
-                   ORDER BY runs.created_at DESC"""
-            ).fetchall()
+                   ORDER BY runs.created_at DESC""").fetchall()
             validations = connection.execute(
                 """SELECT run_id, commit_sha, command_json, started_at,
                           completed_at, exit_status, log_path
@@ -340,6 +337,15 @@ class ApplicationActions:
             run_id = str(run["id"])
             run["validation_results"] = validation_by_run.get(run_id, [])
             run["assignments"] = assignments_by_run.get(run_id, [])
+            acceptance = current_acceptance_verification(
+                self.database,
+                run_id,
+            )
+            run["acceptance_verification"] = (
+                _display_acceptance_verification(acceptance)
+                if acceptance is not None
+                else None
+            )
         repository_values: list[dict[str, object]] = []
         for row in repositories:
             value = dict(row)
@@ -353,18 +359,18 @@ class ApplicationActions:
             "notifications": self.quiet.list_notifications(),
         }
 
+    def acceptance_artifact(self, artifact_id: str) -> tuple[bytes, str]:
+        return load_acceptance_artifact(self.database, artifact_id)
+
     def add_repository(self, identity: str, inputs: dict[str, object]) -> str:
         repository_id = self.onboarding.onboard(identity, inputs)
         self.scheduler.request_tick()
         return str(repository_id)
 
-    def reonboard(
-        self, repository_id: str, inputs: dict[str, object]
-    ) -> str:
+    def reonboard(self, repository_id: str, inputs: dict[str, object]) -> str:
         version_id = self.onboarding.reonboard(repository_id, inputs)
         self.scheduler.request_tick()
         return str(version_id)
-
 
     def cancel(self, run_id: str) -> None:
         self.lifecycle.cancel(run_id, "canceled by user")
@@ -404,6 +410,7 @@ class RuntimeComponents:
     onboarding: OnboardingService
     lifecycle: RunLifecycle
     execution: ExecutionService
+    acceptance: AcceptanceService
     publication: PublicationService
     feedback: FeedbackService
     quiet: QuietPeriodService
@@ -460,6 +467,7 @@ def build_runtime(
         sandbox=sandbox,
         processes=processes,
     )
+
     def runtime_factory(
         runtime: str,
         stored_model: str,
@@ -473,11 +481,22 @@ def build_runtime(
             timeout=timeout,
         )
 
+    teams = TeamService(database)
     execution = ExecutionService(
         database=database,
         lifecycle=lifecycle,
-        teams=TeamService(database),
+        teams=teams,
         sandbox=sandbox,
+        runtime_factory=runtime_factory,
+        secret_resolver=secret_resolver,
+        process_supervisor=processes,
+    )
+    acceptance = AcceptanceService(
+        database=database,
+        lifecycle=lifecycle,
+        teams=teams,
+        sandbox=sandbox,
+        data_root=root,
         runtime_factory=runtime_factory,
         secret_resolver=secret_resolver,
         process_supervisor=processes,
@@ -491,6 +510,7 @@ def build_runtime(
             state_root=model_state_root / "scope-review",
             processes=processes,
         ),
+        acceptance=acceptance,
         known_secret_values=lambda run_id: _run_secret_values(
             database, secret_resolver, run_id
         ),
@@ -541,6 +561,7 @@ def build_runtime(
         onboarding=onboarding,
         lifecycle=lifecycle,
         execution=execution,
+        acceptance=acceptance,
         publication=publication,
         feedback=feedback,
         quiet=quiet,
@@ -548,6 +569,30 @@ def build_runtime(
         scheduler=scheduler,
         actions=actions,
     )
+
+
+def _display_acceptance_verification(
+    value: dict[str, object],
+) -> dict[str, object]:
+    display = json.loads(json.dumps(value))
+    artifacts = display.get("artifacts")
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            artifact.pop("path", None)
+            artifact_id = artifact.get("id")
+            if isinstance(artifact_id, str):
+                artifact["url"] = "/api/acceptance-artifacts/" + urllib.parse.quote(
+                    artifact_id, safe=""
+                )
+    evidence = display.get("evidence")
+    if isinstance(evidence, list):
+        for observation in evidence:
+            if not isinstance(observation, dict):
+                continue
+            observation["log_recorded"] = bool(observation.pop("log_path", None))
+    return display
 
 
 def _display_repository_inputs(raw: str) -> dict[str, object]:

@@ -29,9 +29,7 @@ class TeamTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_team_members([lead, dict(lead, role="verifier")])
         with self.assertRaisesRegex(ValueError, "action timeout"):
-            validate_team_members(
-                [dict(lead, action_timeout_seconds=0)]
-            )
+            validate_team_members([dict(lead, action_timeout_seconds=0)])
 
     def test_formulation_varies_from_repository_evidence(self) -> None:
         formulator = EvidenceTeamFormulator(
@@ -59,18 +57,24 @@ class TeamTests(unittest.TestCase):
         )
         small_members = formulator.formulate(small)
         complex_members = formulator.formulate(complex_repository)
-        self.assertEqual([member["role"] for member in small_members], ["lead"])
+        self.assertEqual(
+            [member["role"] for member in small_members],
+            ["lead", "verifier"],
+        )
         self.assertEqual(
             [member["role"] for member in complex_members],
             ["lead", "implementer", "verifier"],
         )
         self.assertNotEqual(small_members, complex_members)
         self.assertTrue(
-            all(
-                member["action_timeout_seconds"] == 601
-                for member in complex_members
-            )
+            all(member["action_timeout_seconds"] == 601 for member in complex_members)
         )
+        for members in (small_members, complex_members):
+            verifier = next(
+                member for member in members if member["role"] == "verifier"
+            )
+            self.assertEqual(verifier["permitted_tools"], ["read", "run", "git_diff"])
+            self.assertNotIn("write", verifier["permitted_tools"])
 
 
 class TeamServiceTests(unittest.TestCase):
@@ -140,7 +144,9 @@ class TeamServiceTests(unittest.TestCase):
     def test_loads_stored_version_and_records_valid_assignment(self) -> None:
         team = self.service.load("team-1")
         self.assertEqual(team.version, 1)
-        self.assertEqual([member.stable_key for member in team.members], ["lead", "verify"])
+        self.assertEqual(
+            [member.stable_key for member in team.members], ["lead", "verify"]
+        )
         self.assertTrue(
             all(member.action_timeout_seconds == 301 for member in team.members)
         )
@@ -149,12 +155,17 @@ class TeamServiceTests(unittest.TestCase):
             ("lead", "verify"),
             "Lead implements; verifier independently checks repository-required behavior.",
         )
-        self.assertEqual([assignment.member.stable_key for assignment in assignments], ["lead", "verify"])
+        self.assertEqual(
+            [assignment.member.stable_key for assignment in assignments],
+            ["lead", "verify"],
+        )
         reloaded = self.service.assignments_for_run("run-1")
         self.assertEqual(len(reloaded), 2)
         self.assertTrue(all(assignment.reasoning for assignment in reloaded))
 
-    def test_existing_run_keeps_prior_team_after_repository_version_changes(self) -> None:
+    def test_existing_run_keeps_prior_team_after_repository_version_changes(
+        self,
+    ) -> None:
         with self.db.transaction() as connection:
             connection.execute(
                 """INSERT INTO team_versions
@@ -162,15 +173,13 @@ class TeamServiceTests(unittest.TestCase):
                    VALUES ('team-2', 'repo-1', 2, '{}', ?)""",
                 ("2026-01-02T00:00:00Z",),
             )
-            connection.execute(
-                """INSERT INTO team_members
+            connection.execute("""INSERT INTO team_members
                    (id, team_version_id, stable_key, role, responsibilities,
                     permitted_tools_json, runtime, model, instructions,
                     action_timeout_seconds)
                    VALUES ('member-new-lead', 'team-2', 'new-lead', 'lead',
                            'Own later runs', '["read"]', 'mini-swe-agent', 'configured',
-                           '', 777)"""
-            )
+                           '', 777)""")
             connection.execute(
                 "UPDATE repositories SET current_team_version_id='team-2' WHERE id='repo-1'"
             )
@@ -208,18 +217,15 @@ class TeamServiceTests(unittest.TestCase):
     def test_rejects_obsolete_omp_runtime_in_stored_member(self) -> None:
         """Stored team member with runtime='omp' must not be used for execution."""
         with self.db.transaction() as connection:
-            connection.execute(
-                """INSERT INTO team_members
+            connection.execute("""INSERT INTO team_members
                    (id, team_version_id, stable_key, role, responsibilities,
                     permitted_tools_json, runtime, model, instructions,
                     action_timeout_seconds)
                    VALUES ('legacy-lead', 'team-1', 'legacy', 'verifier', 'Legacy check',
-                           '["read"]', 'omp', 'openai/legacy', '', 300)"""
-            )
+                           '["read"]', 'omp', 'openai/legacy', '', 300)""")
         team = self.service.load("team-1")
         legacy_member = next(m for m in team.members if m.stable_key == "legacy")
         self.assertEqual(legacy_member.runtime, "omp")
-
 
     def test_rejects_assignment_outside_runs_stored_team(self) -> None:
         with self.assertRaises(ValueError):

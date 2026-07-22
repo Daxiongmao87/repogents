@@ -37,14 +37,71 @@ class NoCheckoutManager:
 
 @dataclass
 class FakeScopeReviewer:
-    decision: ScopeDecision = ScopeDecision(True, "diff implements only the fixture issue")
+    decision: ScopeDecision = ScopeDecision(
+        True, "diff implements only the fixture issue"
+    )
     reviews: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
     issues: list[dict[str, object]] = field(default_factory=list)
 
-    def review(self, issue: dict[str, object], diff: str, changed_files: tuple[str, ...]) -> ScopeDecision:
+    def review(
+        self, issue: dict[str, object], diff: str, changed_files: tuple[str, ...]
+    ) -> ScopeDecision:
         self.issues.append(issue)
         self.reviews.append((diff, changed_files))
         return self.decision
+
+
+@dataclass
+class FakeAcceptanceGate:
+    state: str = "passed"
+    summary: str = "The issue-required behavior was independently observed."
+    observed: str | None = None
+    calls: list[tuple[str, str, tuple[str, ...]]] = field(default_factory=list)
+
+    def verify(
+        self,
+        run_id: str,
+        commit_sha: str,
+        changed_files: tuple[str, ...],
+    ) -> dict[str, object]:
+        self.calls.append((run_id, commit_sha, changed_files))
+        return {
+            "id": f"acceptance-{commit_sha}",
+            "run_id": run_id,
+            "commit_sha": commit_sha,
+            "state": self.state,
+            "summary": self.summary,
+            "claims": [
+                {
+                    "key": "value-output",
+                    "claim": "The requested value is observable.",
+                    "expected": "VALUE=2",
+                    "method": "fixture command",
+                    "result": "pass" if self.state == "passed" else "fail",
+                    "observed": self.observed or self.summary,
+                    "evidence": [1],
+                }
+            ],
+            "scope": [
+                {
+                    "path": path,
+                    "claim_keys": ["value-output"],
+                    "necessity": "Implements or protects the issue behavior.",
+                    "result": "pass",
+                }
+                for path in changed_files
+            ],
+            "screenshot_decision": {
+                "required": False,
+                "reason": "The fixture contract is nonvisual.",
+            },
+            "artifacts": [],
+            "limitations": [],
+        }
+
+
+def passing_acceptance() -> FakeAcceptanceGate:
+    return FakeAcceptanceGate()
 
 
 class FakePublicationGateway:
@@ -53,6 +110,8 @@ class FakePublicationGateway:
         self.pull_requests: list[PullRequestInfo] = []
         self.pushes: list[tuple[str, str]] = []
         self.create_calls = 0
+        self.pull_bodies: dict[int, str] = {}
+        self.update_body_calls: list[tuple[int, str]] = []
         self.fail_before_push = False
         self.crash_after_push = False
         self.fail_before_create = False
@@ -82,7 +141,9 @@ class FakePublicationGateway:
             raise AssertionError("fixture intended-base head was not configured")
         return self.intended_base_head
 
-    def push_branch(self, checkout: Path, owner: str, name: str, branch: str, sha: str) -> None:
+    def push_branch(
+        self, checkout: Path, owner: str, name: str, branch: str, sha: str
+    ) -> None:
         if self.before_push is not None:
             self.before_push()
         if self.fail_before_push:
@@ -94,7 +155,9 @@ class FakePublicationGateway:
             self.crash_after_push = False
             raise RuntimeError("connection lost after GitHub accepted push")
 
-    def find_pull_request(self, owner: str, name: str, branch: str) -> PullRequestInfo | None:
+    def find_pull_request(
+        self, owner: str, name: str, branch: str
+    ) -> PullRequestInfo | None:
         pull = next(
             (item for item in self.pull_requests if item.head_branch == branch),
             None,
@@ -138,19 +201,35 @@ class FakePublicationGateway:
             updated_at="2026-01-01T00:00:00Z",
         )
         self.pull_requests.append(pull)
+        self.pull_bodies[pull.number] = body
         if self.crash_after_create:
             self.crash_after_create = False
             raise RuntimeError("connection lost after GitHub accepted pull request")
         return pull
 
+    def update_pull_request_body(
+        self,
+        owner: str,
+        name: str,
+        number: int,
+        body: str,
+    ) -> None:
+        del owner, name
+        self.pull_bodies[number] = body
+        self.update_body_calls.append((number, body))
+
 
 class GitPublicationGatewayTests(unittest.TestCase):
-    def test_push_uses_configured_token_without_ambient_gh_credential_helper(self) -> None:
+    def test_push_uses_configured_token_without_ambient_gh_credential_helper(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             checkout = Path(directory)
             observed: dict[str, object] = {}
 
-            def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            def run(
+                argv: list[str], **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
                 environment = dict(kwargs["env"])  # type: ignore[arg-type]
                 observed["argv"] = argv
                 observed["environment"] = environment
@@ -179,7 +258,9 @@ class GitPublicationGatewayTests(unittest.TestCase):
             checkout = Path(directory)
             calls: list[tuple[list[str], dict[str, str]]] = []
 
-            def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            def run(
+                argv: list[str], **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
                 environment = dict(kwargs["env"])  # type: ignore[arg-type]
                 calls.append((argv, environment))
                 self.assertTrue(Path(environment["GIT_ASKPASS"]).is_file())
@@ -199,17 +280,21 @@ class GitPublicationGatewayTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("fetch", calls[0][0])
         self.assertIn("refs/heads/main", calls[0][0])
-        self.assertTrue(all(call[1]["REPOGENTS_GITHUB_TOKEN"] == "configured-token" for call in calls))
         self.assertTrue(
             all(
-                "gh auth git-credential" not in " ".join(call[0])
+                call[1]["REPOGENTS_GITHUB_TOKEN"] == "configured-token"
                 for call in calls
             )
+        )
+        self.assertTrue(
+            all("gh auth git-credential" not in " ".join(call[0]) for call in calls)
         )
 
 
 class MiniSweScopeReviewerTests(unittest.TestCase):
-    def test_passes_stored_model_base_url_state_directory_supervisor_and_run_id(self) -> None:
+    def test_passes_stored_model_base_url_state_directory_supervisor_and_run_id(
+        self,
+    ) -> None:
         observed: dict[str, object] = {}
         state_root = Path("/model-state/scope-review")
 
@@ -218,7 +303,14 @@ class MiniSweScopeReviewerTests(unittest.TestCase):
 
         supervisor = FakeSupervisor()
 
-        def fake_infer(self, *, system_prompt: str, prompt: str, response_schema: dict, state_directory: Path) -> dict:
+        def fake_infer(
+            self,
+            *,
+            system_prompt: str,
+            prompt: str,
+            response_schema: dict,
+            state_directory: Path,
+        ) -> dict:
             observed["model"] = self.model
             observed["base_url"] = self.base_url
             observed["timeout"] = self.timeout
@@ -282,7 +374,14 @@ class MiniSweScopeReviewerTests(unittest.TestCase):
         observed: dict[str, object] = {}
         large_diff = "+" + ("changed line\n" * 20_000)
 
-        def fake_infer(self, *, system_prompt: str, prompt: str, response_schema: dict, state_directory: Path) -> dict:
+        def fake_infer(
+            self,
+            *,
+            system_prompt: str,
+            prompt: str,
+            response_schema: dict,
+            state_directory: Path,
+        ) -> dict:
             observed["system_prompt"] = system_prompt
             observed["prompt"] = prompt
             return {"in_scope": True, "reason": "large change is in scope"}
@@ -309,21 +408,11 @@ class MiniSweScopeReviewerTests(unittest.TestCase):
         prompt_data = json.loads(observed["prompt"])
         self.assertEqual(prompt_data["diff"], large_diff)
         rules = prompt_data.get("decision_rules", [])
+        self.assertTrue(any("ambient host" in rule for rule in rules))
         self.assertTrue(
-            any("ambient host" in rule for rule in rules)
+            any("must not be required in the committed diff" in rule for rule in rules)
         )
-        self.assertTrue(
-            any(
-                "must not be required in the committed diff" in rule
-                for rule in rules
-            )
-        )
-        self.assertTrue(
-            any(
-                "reject them when present" in rule
-                for rule in rules
-            )
-        )
+        self.assertTrue(any("reject them when present" in rule for rule in rules))
         self.assertNotIn("changed line", observed["system_prompt"])
         self.assertLess(len(observed["system_prompt"]), 1_000)
 
@@ -344,7 +433,9 @@ class MiniSweScopeReviewerTests(unittest.TestCase):
             )
         self.assertIn("omp", str(raised.exception))
 
-    def test_requires_explicit_model_when_no_constructor_or_stored_override(self) -> None:
+    def test_requires_explicit_model_when_no_constructor_or_stored_override(
+        self,
+    ) -> None:
         reviewer = MiniSweScopeReviewer()
         with self.assertRaises(RuntimeError) as raised:
             reviewer.review(
@@ -358,7 +449,14 @@ class MiniSweScopeReviewerTests(unittest.TestCase):
         state_root = Path("/model-state/scope-review")
         observed_dirs: list[Path] = []
 
-        def fake_infer(self, *, system_prompt: str, prompt: str, response_schema: dict, state_directory: Path) -> dict:
+        def fake_infer(
+            self,
+            *,
+            system_prompt: str,
+            prompt: str,
+            response_schema: dict,
+            state_directory: Path,
+        ) -> dict:
             observed_dirs.append(state_directory)
             return {"in_scope": True, "reason": "ok"}
 
@@ -400,22 +498,41 @@ class MiniSweScopeReviewerTests(unittest.TestCase):
         self.assertIn("alpha", str(observed_dirs[0]))
         self.assertIn("beta", str(observed_dirs[1]))
 
+
 class PublicationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         self.root = Path(self.tempdir.name)
         self.data_root = self.root / "data"
-        self.checkout = self.data_root / "repositories" / "repo-1" / "runs" / "run-1" / "checkout"
+        self.checkout = (
+            self.data_root / "repositories" / "repo-1" / "runs" / "run-1" / "checkout"
+        )
         self.checkout.mkdir(parents=True)
         (self.checkout / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
         self._git("init", "-q", "-b", "main")
         self._git("add", "-A")
-        self._git("-c", "user.name=Fixture", "-c", "user.email=f@example.com", "commit", "-qm", "base")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=f@example.com",
+            "commit",
+            "-qm",
+            "base",
+        )
         self.base_sha = self._git("rev-parse", "HEAD").strip()
         (self.checkout / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
         self._git("add", "-A")
-        self._git("-c", "user.name=Fixture", "-c", "user.email=f@example.com", "commit", "-qm", "fix")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=f@example.com",
+            "commit",
+            "-qm",
+            "fix",
+        )
         self.validated_sha = self._git("rev-parse", "HEAD").strip()
         self.sandbox_root = self.data_root / "repositories" / "repo-1" / "sandbox" / "1"
         self.sandbox_root.mkdir(parents=True)
@@ -449,13 +566,11 @@ class PublicationTests(unittest.TestCase):
                            '{"instructions":[],"summary":"fixture repository"}', ?)""",
                 (now,),
             )
-            connection.execute(
-                """INSERT INTO team_members
+            connection.execute("""INSERT INTO team_members
                    (id, team_version_id, stable_key, role, responsibilities,
                     permitted_tools_json, runtime, model, instructions)
                    VALUES ('lead-1', 'team-1', 'lead', 'lead', 'Own result', '[]',
-                           'mini-swe-agent', 'openai/gpt-stored', '')"""
-            )
+                           'mini-swe-agent', 'openai/gpt-stored', '')""")
             connection.execute(
                 """INSERT INTO issues
                    (id, repository_id, github_node_id, number, url, title, body,
@@ -509,11 +624,13 @@ class PublicationTests(unittest.TestCase):
             checkouts=NoCheckoutManager(),
             sandbox=self.sandbox,
         )
+        self.acceptance = passing_acceptance()
         self.service = PublicationService(
             database=self.db,
             lifecycle=self.lifecycle,
             gateway=self.gateway,
             scope_reviewer=FakeScopeReviewer(),
+            acceptance=self.acceptance,
         )
 
     def _git(self, *arguments: str) -> str:
@@ -529,17 +646,17 @@ class PublicationTests(unittest.TestCase):
 
     def _cancel_durably(self) -> None:
         with self.db.transaction() as connection:
-            connection.execute(
-                """UPDATE runs
+            connection.execute("""UPDATE runs
                    SET state='canceled', reason='fixture cancellation'
-                   WHERE id='run-1'"""
-            )
+                   WHERE id='run-1'""")
 
     @property
     def branch(self) -> str:
         return "agent/issue-3-run-1"
 
-    def test_publishes_validated_sha_to_one_deterministic_unmerged_pull_request(self) -> None:
+    def test_publishes_validated_sha_to_one_deterministic_unmerged_pull_request(
+        self,
+    ) -> None:
         pull = self.service.publish("run-1")
         self.assertIsNotNone(pull)
         self.assertEqual(self.gateway.pushes, [(self.branch, self.validated_sha)])
@@ -549,26 +666,106 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(pull.base_branch, "main")
         with self.db.connect() as connection:
             records = connection.execute("SELECT * FROM pull_requests").fetchall()
-            operations = connection.execute("SELECT state FROM outbound_operations ORDER BY kind").fetchall()
+            operations = connection.execute(
+                "SELECT state FROM outbound_operations ORDER BY kind"
+            ).fetchall()
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["remote_head_sha"], self.validated_sha)
         self.assertEqual(records[0]["state"], "open")
-        self.assertTrue(all(row["state"] in {"completed", "reconciled"} for row in operations))
-        self.assertEqual(self.lifecycle.get_run("run-1")["state"], "waiting_for_feedback")
+        self.assertTrue(
+            all(row["state"] in {"completed", "reconciled"} for row in operations)
+        )
+        self.assertEqual(
+            self.lifecycle.get_run("run-1")["state"], "waiting_for_feedback"
+        )
         reviewer = self.service.scope_reviewer
         self.assertEqual(
             reviewer.issues[0]["stored_lead"],  # type: ignore[attr-defined,index]
             {"runtime": "mini-swe-agent", "model": "openai/gpt-stored"},
         )
+        self.assertEqual(
+            self.acceptance.calls,
+            [("run-1", self.validated_sha, ("app.py",))],
+        )
+        body = self.gateway.pull_bodies[pull.number]
+        self.assertIn("Issue acceptance verification", body)
+        self.assertIn(self.validated_sha, body)
+        self.assertIn("The requested value is observable", body)
+
+    def test_failed_issue_acceptance_returns_to_implementation_before_push(
+        self,
+    ) -> None:
+        acceptance = FakeAcceptanceGate(
+            state="failed",
+            summary="The issue-required value was not observed.",
+            observed="Command exited 0 but stdout contained VALUE=1.",
+        )
+        service = PublicationService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            gateway=self.gateway,
+            scope_reviewer=FakeScopeReviewer(),
+            acceptance=acceptance,
+        )
+
+        self.assertIsNone(service.publish("run-1"))
+
+        run = self.lifecycle.get_run("run-1")
+        self.assertEqual(run["state"], "implementing")
+        self.assertIn("VALUE=1", run["reason"])
+        self.assertEqual(self.gateway.pushes, [])
+
+    def test_revised_sha_refreshes_existing_pull_request_proof(self) -> None:
+        pull = self.service.publish("run-1")
+        self.assertIsNotNone(pull)
+        old_body = self.gateway.pull_bodies[pull.number]
+        (self.checkout / "app.py").write_text("VALUE = 3\n", encoding="utf-8")
+        self._git("add", "-A")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=f@example.com",
+            "commit",
+            "-qm",
+            "feedback revision",
+        )
+        revised_sha = self._git("rev-parse", "HEAD").strip()
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs
+                   SET state='publishing', last_completed_state='validating',
+                       validated_sha=?, reason=NULL
+                   WHERE id='run-1'""",
+                (revised_sha,),
+            )
+            connection.execute(
+                """UPDATE validation_results SET commit_sha=?
+                   WHERE id='result-1'""",
+                (revised_sha,),
+            )
+
+        revised = self.service.publish("run-1")
+
+        self.assertIsNotNone(revised)
+        self.assertEqual(self.gateway.create_calls, 1)
+        self.assertEqual(len(self.gateway.pull_requests), 1)
+        self.assertEqual(
+            self.acceptance.calls[-1],
+            ("run-1", revised_sha, ("app.py",)),
+        )
+        current_body = self.gateway.pull_bodies[pull.number]
+        self.assertNotEqual(current_body, old_body)
+        self.assertIn(revised_sha, current_body)
+        self.assertNotIn(self.validated_sha, current_body)
+        self.assertEqual(self.gateway.update_body_calls[-1][0], pull.number)
 
     def test_scope_review_receives_stored_repository_context_and_commit_ids(
         self,
     ) -> None:
         repository_evidence = {
             "summary": "fixture repository",
-            "instructions": [
-                ["AGENTS.md", "Do not modify generated files."]
-            ],
+            "instructions": [["AGENTS.md", "Do not modify generated files."]],
         }
         with self.db.transaction() as connection:
             connection.execute(
@@ -590,6 +787,7 @@ class PublicationTests(unittest.TestCase):
             lifecycle=self.lifecycle,
             gateway=self.gateway,
             scope_reviewer=reviewer,
+            acceptance=passing_acceptance(),
         )
 
         self.assertIsNone(service.publish("run-1"))
@@ -661,7 +859,9 @@ class PublicationTests(unittest.TestCase):
             [(self.branch, self.validated_sha), (self.branch, revised_sha)],
         )
 
-    def test_next_attempt_retries_push_that_failed_before_external_mutation(self) -> None:
+    def test_next_attempt_retries_push_that_failed_before_external_mutation(
+        self,
+    ) -> None:
         self.gateway.fail_before_push = True
         self.assertIsNone(self.service.publish("run-1"))
         self.assertEqual(self.gateway.pushes, [])
@@ -706,7 +906,10 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(len(self.gateway.pull_requests), 1)
         self.assertEqual(len(self.gateway.pushes), 1)
         with self.db.connect() as connection:
-            self.assertEqual(connection.execute("SELECT COUNT(*) FROM pull_requests").fetchone()[0], 1)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM pull_requests").fetchone()[0],
+                1,
+            )
 
     def test_unexpected_remote_branch_sha_blocks_without_overwrite(self) -> None:
         self.gateway.branches[self.branch] = "c" * 40
@@ -775,7 +978,9 @@ class PublicationTests(unittest.TestCase):
         )
         self.assertIn(self.gateway.create_calls, {0, 1})
 
-    def test_durable_cancellation_prevents_branch_reconciliation_mutations(self) -> None:
+    def test_durable_cancellation_prevents_branch_reconciliation_mutations(
+        self,
+    ) -> None:
         self.gateway.branches[self.branch] = self.validated_sha
         self.gateway.after_remote_head_read = self._cancel_durably
 
@@ -785,10 +990,8 @@ class PublicationTests(unittest.TestCase):
             pull = connection.execute(
                 "SELECT remote_head_sha FROM pull_requests WHERE run_id='run-1'"
             ).fetchone()
-            operation = connection.execute(
-                """SELECT state FROM outbound_operations
-                   WHERE run_id='run-1' AND kind='push_branch'"""
-            ).fetchone()
+            operation = connection.execute("""SELECT state FROM outbound_operations
+                   WHERE run_id='run-1' AND kind='push_branch'""").fetchone()
         self.assertEqual(self.lifecycle.get_run("run-1")["state"], "canceled")
         self.assertIsNone(pull["remote_head_sha"])
         self.assertEqual(operation["state"], "pending")
@@ -815,14 +1018,10 @@ class PublicationTests(unittest.TestCase):
         self.assertIsNone(self.service.publish("run-1"))
 
         with self.db.connect() as connection:
-            pull = connection.execute(
-                """SELECT github_node_id, url, state
-                   FROM pull_requests WHERE run_id='run-1'"""
-            ).fetchone()
-            operation = connection.execute(
-                """SELECT state FROM outbound_operations
-                   WHERE run_id='run-1' AND kind='create_pull_request'"""
-            ).fetchone()
+            pull = connection.execute("""SELECT github_node_id, url, state
+                   FROM pull_requests WHERE run_id='run-1'""").fetchone()
+            operation = connection.execute("""SELECT state FROM outbound_operations
+                   WHERE run_id='run-1' AND kind='create_pull_request'""").fetchone()
         self.assertEqual(self.lifecycle.get_run("run-1")["state"], "canceled")
         self.assertIsNone(pull["github_node_id"])
         self.assertEqual(pull["url"], "")
@@ -830,7 +1029,9 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(operation["state"], "pending")
         self.assertEqual(self.gateway.create_calls, 0)
 
-    def test_current_intended_base_conflict_blocks_without_changing_activation_base(self) -> None:
+    def test_current_intended_base_conflict_blocks_without_changing_activation_base(
+        self,
+    ) -> None:
         self._git("switch", "-qc", "advanced-base", self.base_sha)
         (self.checkout / "app.py").write_text("VALUE = 99\n", encoding="utf-8")
         self._git("add", "-A")
@@ -888,6 +1089,7 @@ class PublicationTests(unittest.TestCase):
             lifecycle=self.lifecycle,
             gateway=self.gateway,
             scope_reviewer=reviewer,
+            acceptance=passing_acceptance(),
         )
 
         pull = service.publish("run-1")
@@ -900,9 +1102,7 @@ class PublicationTests(unittest.TestCase):
         self.assertIn("deleted file mode", diff)
 
     def test_binary_diff_is_preserved_for_scope_review_and_publication(self) -> None:
-        (self.checkout / "asset.bin").write_bytes(
-            bytes(range(256)) * 8
-        )
+        (self.checkout / "asset.bin").write_bytes(bytes(range(256)) * 8)
         self._git("add", "-A")
         self._git(
             "-c",
@@ -929,6 +1129,7 @@ class PublicationTests(unittest.TestCase):
             lifecycle=self.lifecycle,
             gateway=self.gateway,
             scope_reviewer=reviewer,
+            acceptance=passing_acceptance(),
         )
 
         pull = service.publish("run-1")
@@ -944,7 +1145,10 @@ class PublicationTests(unittest.TestCase):
             database=self.db,
             lifecycle=self.lifecycle,
             gateway=self.gateway,
-            scope_reviewer=FakeScopeReviewer(ScopeDecision(False, "unrelated file changed")),
+            scope_reviewer=FakeScopeReviewer(
+                ScopeDecision(False, "unrelated file changed")
+            ),
+            acceptance=passing_acceptance(),
         )
         self.assertIsNone(service.publish("run-1"))
         run = self.lifecycle.get_run("run-1")
@@ -956,12 +1160,23 @@ class PublicationTests(unittest.TestCase):
         secret = "ghp_" + "A" * 36  # pragma: allowlist secret
         (self.checkout / ".env").write_text(f"TOKEN={secret}\n", encoding="utf-8")
         self._git("add", "-A")
-        self._git("-c", "user.name=Fixture", "-c", "user.email=f@example.com", "commit", "-qm", "bad")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=f@example.com",
+            "commit",
+            "-qm",
+            "bad",
+        )
         bad_sha = self._git("rev-parse", "HEAD").strip()
         with self.db.transaction() as connection:
-            connection.execute("UPDATE runs SET validated_sha=? WHERE id='run-1'", (bad_sha,))
             connection.execute(
-                "UPDATE validation_results SET commit_sha=? WHERE id='result-1'", (bad_sha,)
+                "UPDATE runs SET validated_sha=? WHERE id='run-1'", (bad_sha,)
+            )
+            connection.execute(
+                "UPDATE validation_results SET commit_sha=? WHERE id='result-1'",
+                (bad_sha,),
             )
         self.assertIsNone(self.service.publish("run-1"))
         self.assertEqual(self.gateway.pushes, [])

@@ -33,7 +33,16 @@ class SandboxPolicyTests(unittest.TestCase):
 
     def test_run_layout_is_isolated_by_run(self) -> None:
         other = RunLayout.create(self.root / "data", "repo-1", "run-2")
-        fields = ("root", "checkout", "agent_state", "logs", "temp", "validation", "dependency_delta", "build")
+        fields = (
+            "root",
+            "checkout",
+            "agent_state",
+            "logs",
+            "temp",
+            "validation",
+            "dependency_delta",
+            "build",
+        )
         for field in fields:
             first_path = getattr(self.layout, field)
             second_path = getattr(other, field)
@@ -41,7 +50,9 @@ class SandboxPolicyTests(unittest.TestCase):
             self.assertTrue(second_path.is_dir())
             self.assertNotEqual(first_path, second_path)
 
-    def test_bwrap_policy_mounts_only_declared_paths_and_sanitizes_environment(self) -> None:
+    def test_bwrap_policy_mounts_only_declared_paths_and_sanitizes_environment(
+        self,
+    ) -> None:
         allowed = self.root / "allowed"
         allowed.mkdir()
         policy = SandboxPolicy(
@@ -50,8 +61,13 @@ class SandboxPolicyTests(unittest.TestCase):
             allowed_services=(),
         )
         manager = SandboxManager()
-        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "controller-secret", "OPENAI_API_KEY": "model-secret"}):  # pragma: allowlist secret
-            argv, environment = manager.build_command(policy, self.layout, ("python3", "-c", "print('ok')"))
+        with mock.patch.dict(
+            os.environ,
+            {"GITHUB_TOKEN": "controller-secret", "OPENAI_API_KEY": "model-secret"},  # pragma: allowlist secret
+        ):
+            argv, environment = manager.build_command(
+                policy, self.layout, ("python3", "-c", "print('ok')")
+            )
         joined = "\0".join(argv)
         self.assertIn(str(allowed.resolve()), joined)
         self.assertIn("/mnt/inputs/allowed", argv)
@@ -80,9 +96,7 @@ class SandboxPolicyTests(unittest.TestCase):
             self.assertEqual(
                 sandbox_mounts[sandbox_path], ("--bind", str(host_path.resolve()))
             )
-        node_delta = (
-            self.layout.dependency_delta / "node" / "node_modules"
-        ).resolve()
+        node_delta = (self.layout.dependency_delta / "node" / "node_modules").resolve()
         self.assertEqual(
             sandbox_mounts["/workspace/node_modules"],
             ("--bind", str(node_delta)),
@@ -110,8 +124,7 @@ class SandboxPolicyTests(unittest.TestCase):
         )
         self.assertTrue(
             sandbox_environment["PATH"].startswith(
-                "/repository-state/bin:"
-                "/repository-state/home/.local/bin:"
+                "/repository-state/bin:" "/repository-state/home/.local/bin:"
             )
         )
         self.assertNotIn(str(Path.home()), mounted_sources)
@@ -121,12 +134,33 @@ class SandboxPolicyTests(unittest.TestCase):
         ro_index = argv.index(str(allowed.resolve())) - 1
         self.assertEqual(argv[ro_index], "--ro-bind")
 
+    def test_verifier_checkout_can_be_mounted_read_only(self) -> None:
+        policy = SandboxPolicy(persistent_root=self.persistent)
+        manager = SandboxManager()
+        argv, _ = manager.build_command(
+            policy,
+            self.layout,
+            ("python3", "-c", "print('verify')"),
+            checkout_writable=False,
+        )
+        sandbox_mounts = {
+            argv[index + 2]: (argument, argv[index + 1])
+            for index, argument in enumerate(argv[:-2])
+            if argument in {"--bind", "--ro-bind"}
+        }
+        self.assertEqual(
+            sandbox_mounts["/workspace"],
+            ("--ro-bind", str(self.layout.checkout.resolve())),
+        )
+        self.assertEqual(
+            sandbox_mounts["/run-data/temp"],
+            ("--bind", str(self.layout.temp.resolve())),
+        )
+
     def test_provisioning_can_write_only_persistent_environment_state(self) -> None:
         policy = SandboxPolicy(persistent_root=self.persistent)
         manager = SandboxManager()
-        discovered_bin = (
-            self.persistent / "home" / ".toolchain" / "bin"
-        )
+        discovered_bin = self.persistent / "home" / ".toolchain" / "bin"
         discovered_bin.mkdir(parents=True)
         argv, _ = manager.build_command(
             policy,
@@ -139,23 +173,23 @@ class SandboxPolicyTests(unittest.TestCase):
         self.assertEqual(argv[state_index + 1], "/repository-state")
         workspace_index = argv.index(str(self.layout.checkout.resolve()))
         self.assertEqual(argv[workspace_index - 1], "--bind")
-        self.assertNotIn(str(Path.home()), {
-            argv[index + 1]
-            for index, argument in enumerate(argv[:-2])
-            if argument in {"--bind", "--ro-bind"}
-        })
+        self.assertNotIn(
+            str(Path.home()),
+            {
+                argv[index + 1]
+                for index, argument in enumerate(argv[:-2])
+                if argument in {"--bind", "--ro-bind"}
+            },
+        )
         provisioning_environment = {
             argv[index + 1]: argv[index + 2]
             for index, argument in enumerate(argv[:-2])
             if argument == "--setenv"
         }
-        self.assertEqual(
-            provisioning_environment["HOME"], "/repository-state/home"
-        )
+        self.assertEqual(provisioning_environment["HOME"], "/repository-state/home")
         self.assertTrue(
             provisioning_environment["PATH"].startswith(
-                "/repository-state/bin:"
-                "/repository-state/home/.local/bin:"
+                "/repository-state/bin:" "/repository-state/home/.local/bin:"
             )
         )
         self.assertIn(
@@ -163,7 +197,9 @@ class SandboxPolicyTests(unittest.TestCase):
             provisioning_environment["PATH"].split(":"),
         )
 
-    def test_network_policy_rejects_prohibited_addresses_and_non_allowlisted_hosts(self) -> None:
+    def test_network_policy_rejects_prohibited_addresses_and_non_allowlisted_hosts(
+        self,
+    ) -> None:
         policy = RestrictedNetworkPolicy(("api.github.com", "*.python.org:443"))
         self.assertTrue(policy.host_allowed("api.github.com", 443))
         self.assertTrue(policy.host_allowed("docs.python.org", 443))
@@ -180,6 +216,7 @@ class SandboxPolicyTests(unittest.TestCase):
         ):
             self.assertFalse(policy.address_allowed(address), address)
         self.assertTrue(policy.address_allowed("140.82.112.5"))
+
     def test_restricted_proxy_forwards_post_body_coalesced_with_headers(self) -> None:
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
@@ -231,9 +268,7 @@ class SandboxPolicyTests(unittest.TestCase):
             (socket.AF_INET, ("127.0.0.1", port), "93.184.216.34")
         ]
         proxy_socket = self.root / "restricted-proxy.sock"
-        with RestrictedProxy(
-            proxy_socket, self.layout.logs / "network.jsonl", policy
-        ):
+        with RestrictedProxy(proxy_socket, self.layout.logs / "network.jsonl", policy):
             with socket.socket(socket.AF_UNIX) as client:
                 client.settimeout(3)
                 client.connect(str(proxy_socket))
@@ -248,8 +283,9 @@ class SandboxPolicyTests(unittest.TestCase):
         self.assertEqual(received, [expected])
         self.assertIn(b"204 No Content", response)
 
-
-    def test_restricted_proxy_forwards_connect_bytes_coalesced_with_headers(self) -> None:
+    def test_restricted_proxy_forwards_connect_bytes_coalesced_with_headers(
+        self,
+    ) -> None:
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
         listener.listen()
@@ -278,8 +314,7 @@ class SandboxPolicyTests(unittest.TestCase):
         request = (
             b"CONNECT allowed.test:443 HTTP/1.1\r\n"
             b"Host: allowed.test:443\r\n"
-            b"\r\n"
-            + payload
+            b"\r\n" + payload
         )
         policy = mock.Mock()
         policy.resolve.return_value = [
@@ -307,14 +342,13 @@ class SandboxPolicyTests(unittest.TestCase):
         self.assertFalse(upstream.is_alive())
         self.assertEqual(received, [payload])
         self.assertTrue(
-            bytes(response).startswith(
-                b"HTTP/1.1 200 Connection Established\r\n\r\n"
-            )
+            bytes(response).startswith(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         )
         self.assertIn(b"tunnel response", response)
 
-
-    def test_redaction_and_secret_scanning_cover_known_values_and_credentials(self) -> None:
+    def test_redaction_and_secret_scanning_cover_known_values_and_credentials(
+        self,
+    ) -> None:
         secret = "canary-super-secret"  # pragma: allowlist secret
         credential_fixture = "".join(("ghp_", "A" * 36))
         text = f"value={secret} token={credential_fixture}"
@@ -337,15 +371,26 @@ class SandboxPolicyTests(unittest.TestCase):
             "print(json.dumps({'host': pathlib.Path('" + str(marker) + "').exists(), "
             "'github': 'GITHUB_TOKEN' in os.environ, 'model': 'OPENAI_API_KEY' in os.environ}))"
         )
-        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "controller-secret", "OPENAI_API_KEY": "model-secret"}):  # pragma: allowlist secret
-            result = manager.run(policy, self.layout, ("python3", "-c", code), timeout=20)
+        with mock.patch.dict(
+            os.environ,
+            {"GITHUB_TOKEN": "controller-secret", "OPENAI_API_KEY": "model-secret"},  # pragma: allowlist secret
+        ):
+            result = manager.run(
+                policy, self.layout, ("python3", "-c", code), timeout=20
+            )
         self.assertEqual(result.returncode, 0, result.stderr)
         observation = json.loads(result.stdout)
         self.assertEqual(observation, {"host": False, "github": False, "model": False})
-        self.assertEqual((self.layout.checkout / "result").read_text(encoding="utf-8"), "written")
+        self.assertEqual(
+            (self.layout.checkout / "result").read_text(encoding="utf-8"), "written"
+        )
 
-    def test_secret_is_scoped_to_one_command_and_redacted_before_persistence(self) -> None:
-        policy = SandboxPolicy(persistent_root=self.persistent, allowed_secret_names=("CANARY",))
+    def test_secret_is_scoped_to_one_command_and_redacted_before_persistence(
+        self,
+    ) -> None:
+        policy = SandboxPolicy(
+            persistent_root=self.persistent, allowed_secret_names=("CANARY",)
+        )
         manager = SandboxManager()
         secret = "canary-value-123"  # pragma: allowlist secret
         result = manager.run(
@@ -401,8 +446,16 @@ class SandboxPolicyTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "200")
-        events = [json.loads(line) for line in result.network_log_path.read_text(encoding="utf-8").splitlines()]
-        self.assertTrue(any(event["host"] == "api.github.com" and event["decision"] == "allowed" for event in events))
+        events = [
+            json.loads(line)
+            for line in result.network_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertTrue(
+            any(
+                event["host"] == "api.github.com" and event["decision"] == "allowed"
+                for event in events
+            )
+        )
         self.assertTrue(all("payload" not in event for event in events))
 
     def test_restricted_proxy_supports_long_durable_run_paths(self) -> None:
@@ -511,7 +564,9 @@ finally:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "200")
 
-    def test_cancel_terminates_descendant_process_tree_and_preserves_sandbox(self) -> None:
+    def test_cancel_terminates_descendant_process_tree_and_preserves_sandbox(
+        self,
+    ) -> None:
         policy = SandboxPolicy(persistent_root=self.persistent)
         manager = SandboxManager()
         finished: list[object] = []

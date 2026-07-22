@@ -62,14 +62,20 @@ def validate_team_members(members: Sequence[dict[str, object]]) -> None:
         raise ValueError("repository team must contain exactly one lead")
     keys = [str(member.get("stable_key", "")) for member in members]
     if any(not key for key in keys) or len(keys) != len(set(keys)):
-        raise ValueError("repository team member identities must be nonempty and unique")
+        raise ValueError(
+            "repository team member identities must be nonempty and unique"
+        )
     allowed_roles = {"lead", "scout", "implementer", "verifier"}
     for member in members:
         if member.get("role") not in allowed_roles:
             raise ValueError(f"unsupported repository team role: {member.get('role')}")
         tools = member.get("permitted_tools")
-        if not isinstance(tools, list) or not all(isinstance(tool, str) and tool for tool in tools):
-            raise ValueError("team member permitted tools must be a nonempty string list")
+        if not isinstance(tools, list) or not all(
+            isinstance(tool, str) and tool for tool in tools
+        ):
+            raise ValueError(
+                "team member permitted tools must be a nonempty string list"
+            )
         for field in ("responsibilities", "runtime", "model", "instructions"):
             if not isinstance(member.get(field), str):
                 raise ValueError(f"team member {field} must be a string")
@@ -82,9 +88,7 @@ def validate_team_members(members: Sequence[dict[str, object]]) -> None:
             or not isinstance(action_timeout, (int, float))
             or action_timeout <= 0
         ):
-            raise ValueError(
-                "team member action timeout must be a positive number"
-            )
+            raise ValueError("team member action timeout must be a positive number")
 
 
 class EvidenceTeamFormulator:
@@ -102,16 +106,12 @@ class EvidenceTeamFormulator:
         model: str = "configured",
         action_timeout_seconds: float = DEFAULT_ACTION_TIMEOUT_SECONDS,
     ) -> None:
-        if (
-            isinstance(action_timeout_seconds, bool)
-            or action_timeout_seconds <= 0
-        ):
-            raise ValueError(
-                "team member action timeout must be positive"
-            )
+        if isinstance(action_timeout_seconds, bool) or action_timeout_seconds <= 0:
+            raise ValueError("team member action timeout must be positive")
         self.runtime = runtime
         self.model = model
         self.action_timeout_seconds = action_timeout_seconds
+
     def formulate(self, inspection: InspectionEvidence) -> list[dict[str, object]]:
         repository_instructions = getattr(inspection, "instructions", ())
         instruction_text = inspection.summary
@@ -132,7 +132,9 @@ class EvidenceTeamFormulator:
                 "action_timeout_seconds": self.action_timeout_seconds,
             }
         ]
-        complex_repository = inspection.file_count >= 500 or len(inspection.languages) > 1
+        complex_repository = (
+            inspection.file_count >= 500 or len(inspection.languages) > 1
+        )
         if complex_repository:
             members.append(
                 {
@@ -146,19 +148,21 @@ class EvidenceTeamFormulator:
                     "action_timeout_seconds": self.action_timeout_seconds,
                 }
             )
-        if complex_repository or len(inspection.validation_commands) > 1:
-            members.append(
-                {
-                    "stable_key": "verification",
-                    "role": "verifier",
-                    "responsibilities": "Independently verify issue behavior, scope, and repository-required validation",
-                    "permitted_tools": ["read", "run", "git_diff"],
-                    "runtime": self.runtime,
-                    "model": self.model,
-                    "instructions": instruction_text,
-                    "action_timeout_seconds": self.action_timeout_seconds,
-                }
-            )
+        members.append(
+            {
+                "stable_key": "verification",
+                "role": "verifier",
+                "responsibilities": (
+                    "Independently verify issue behavior, scope, and "
+                    "repository-required validation"
+                ),
+                "permitted_tools": ["read", "run", "git_diff"],
+                "runtime": self.runtime,
+                "model": self.model,
+                "instructions": instruction_text,
+                "action_timeout_seconds": self.action_timeout_seconds,
+            }
+        )
         validate_team_members(members)
         return members
 
@@ -214,7 +218,9 @@ class TeamService:
             raise ValueError(
                 f"assignment contains members outside the stored team: {','.join(sorted(unknown))}"
             )
-        lead_key = next(member.stable_key for member in team.members if member.role == "lead")
+        lead_key = next(
+            member.stable_key for member in team.members if member.role == "lead"
+        )
         if lead_key not in stable_keys:
             raise ValueError("every issue assignment must include the stored lead")
         now = _utc_now()
