@@ -15,6 +15,7 @@ A pull-request feedback revision can merge a newer intended-base commit than the
 - [x] A feedback-bound revision rejected by publication as source-fixable durably reopens its revision batch and resumes source execution instead of retrying publication from `implementing`.
 - [x] Later ordinary feedback on the same pull request reuses the latest durably integrated conflict base instead of reverting source comparison to the activation base.
 - [x] Ordinary issue execution without a prepared feedback base retains its existing activation-base behavior.
+- [x] Publication preflight uses the candidate/current merge base after an integrated-base revision, so a later clean base advance neither creates a false conflict nor broadens issue scope review to inherited base changes.
 
 ## Verification
 
@@ -29,6 +30,7 @@ A pull-request feedback revision can merge a newer intended-base commit than the
 - [x] `REGRESSION` - prove feedback resolution requests validation-only execution for a recognized recovery reason and ordinary feedback retains agent execution.
 - [x] `REGRESSION` - recover the recognized post-replay stale-base blocker exactly once while unrelated blockers remain unchanged.
 - [x] `REGRESSION` - reject a bound feedback revision during publication, restart in `implementing`, and prove the same batch is durably reopened, revised, and republished once.
+- [x] `REGRESSION` - integrate one newer base into a candidate, advance that base again without conflict, and prove publication reviews only the candidate delta while the existing true-conflict case still blocks.
 - [x] `REGRESSION` - run the focused execution, feedback, and orchestration suites.
 - [x] `REGRESSION` - run the complete project suite.
-- [x] `LIVE` - resume Repogents issue #1 / pull request #6 and observe exact-SHA validation and same-pull publication against current `main`.
+- [ ] `LIVE` - resume Repogents issue #1 / pull request #6 and observe exact-SHA validation and same-pull publication against current `main`.

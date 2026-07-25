@@ -641,6 +641,7 @@ class PublicationService:
             raise PublicationBlocked(
                 "current intended-base head does not descend from the stored activation base"
             )
+        comparison_base_sha = current_base_sha
         includes_current_base = (
             _git_result(
                 checkout,
@@ -654,16 +655,28 @@ class PublicationService:
             == 0
         )
         if not includes_current_base:
+            comparison_base_sha = _git(
+                checkout,
+                ("merge-base", current_base_sha, validated_sha),
+            ).strip()
+            if not re.fullmatch(r"[0-9a-f]{40}", comparison_base_sha):
+                raise PublicationBlocked(
+                    "cannot determine the candidate/current-base merge base"
+                )
             merge = _git(
                 checkout,
-                ("merge-tree", base_sha, current_base_sha, validated_sha),
+                (
+                    "merge-tree",
+                    comparison_base_sha,
+                    current_base_sha,
+                    validated_sha,
+                ),
             )
             if "<<<<<<< .our" in merge:
                 raise PublicationBlocked(
                     "validated commit has a merge conflict with the current "
                     "intended-base head"
                 )
-        comparison_base_sha = current_base_sha if includes_current_base else base_sha
         status = _git(checkout, ("status", "--porcelain", "--untracked-files=no"))
         if status.strip():
             raise PublicationBlocked("tracked checkout state changed after validation")
