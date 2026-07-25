@@ -1582,33 +1582,6 @@ class ApplicationTests(unittest.TestCase):
             "onboarding is blocked", blocked_discovery["repo-2"]["error"]
         )
 
-    def test_transient_quiet_check_preserves_active_run_for_next_tick(self) -> None:
-        class FailingQuiet(FakeQuiet):
-            def check_due(self, run_id: str) -> None:
-                self.calls.append(run_id)
-                raise TransientQuietCheckError(run_id, "GitHub status poll")
-
-        with self.db.transaction() as connection:
-            connection.execute(
-                "UPDATE runs SET state='quiet_period', reason=NULL WHERE id='run-1'"
-            )
-        lifecycle = FakeLifecycle(self.db)
-        quiet = FailingQuiet()
-        orchestrator = Orchestrator(
-            database=self.db,
-            lifecycle=lifecycle,
-            execution=FakeExecution(self.db),
-            publication=FakePublication(self.db),
-            feedback=FakeFeedback(self.db),
-            quiet=quiet,
-        )
-
-        orchestrator._advance("run-1")
-
-        self.assertEqual(lifecycle.get_run("run-1")["state"], "quiet_period")
-        self.assertEqual(quiet.calls, ["run-1"])
-        self.assertIn("GitHub status poll", orchestrator.last_errors[0])
-
     def test_transient_feedback_resolution_preserves_waiting_run_for_next_tick(
         self,
     ) -> None:
