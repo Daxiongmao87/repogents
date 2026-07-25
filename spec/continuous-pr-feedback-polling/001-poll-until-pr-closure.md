@@ -31,4 +31,4 @@ Supersedes the deadline and notification behavior in `spec/repository-agent-mvp/
 - [x] `MIGRATION` — schema upgrade maps legacy `quiet_period`/`notified` rows to `waiting_for_feedback`, cancels active generations, and preserves associated durable evidence.
 - [x] `CLIENT` — the dashboard shows the waiting run and contains no quiet-period notification panel or acknowledgment route.
 - [x] `REGRESSION` — focused lifecycle, feedback, scheduler, database, interface, and complete project suites pass.
-- [ ] `LIVE` — the Websesh fixture reaches an open `waiting_for_feedback` run, later real feedback is resolved on that same run, and no quiet deadline or notification is created.
+- [x] `LIVE` — the Websesh fixture reaches an open `waiting_for_feedback` run, later real feedback is resolved on that same run, and no quiet deadline or notification is created.

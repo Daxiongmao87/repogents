@@ -15,7 +15,7 @@ Extends `spec/feedback-conflict-team-expansion/001-expand-assignment-during-feed
 - [x] A stored lead can hand remaining source work back to a currently assigned implementation member without changing durable assignment membership.
 - [x] The targeted member executes again after restart while unrelated completed members do not repeat; the lead integrates and the independent verifier reviews the new candidate.
 - [x] Invalid or unauthorized targeted revision requests are rejected without changing assignment or completion state.
-- [ ] The blocked `Daxiongmao87/repogents` issue #1 run resumes through its existing pull request #6 and pending feedback-revision batch, removes out-of-scope conflict artifacts, validates the corrected merged source, and publishes to the same branch and pull request.
+- [x] The blocked `Daxiongmao87/repogents` issue #1 run resumes through its existing pull request #6 and pending feedback-revision batch, removes out-of-scope conflict artifacts, validates the corrected merged source, and publishes to the same branch and pull request.
 
 ## Verification
 
@@ -23,4 +23,4 @@ Extends `spec/feedback-conflict-team-expansion/001-expand-assignment-during-feed
 - [x] `REGRESSION` - reject non-lead, unknown, unassigned, lead, verifier, empty, and duplicate targeted revision requests without assignment or checkpoint mutation.
 - [x] `REGRESSION` - recover the recognized pre-fix assigned-member feedback block exactly once while unrelated blocked runs remain unchanged.
 - [x] `REGRESSION` - run the focused execution, feedback, lifecycle, application, team, and publication suites plus the complete project suite.
-- [ ] `LIVE` - deploy the handoff action, resume issue #1 / pull request #6 through the existing batch, and observe the selected member complete the requested cleanup before exact-SHA validation and same-pull publication.
+- [x] `LIVE` - deploy the handoff action, resume issue #1 / pull request #6 through the existing batch, and observe the selected member complete the requested cleanup before exact-SHA validation and same-pull publication.
