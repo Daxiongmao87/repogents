@@ -238,6 +238,7 @@ class FakeExecutor:
         self.lifecycle = lifecycle
         self.calls: list[tuple[str, str | None, str | None]] = []
         self.validation_only_calls: list[bool] = []
+        self.source_sha = "c" * 40
         self.after_execute: Callable[[], None] | None = None
 
     def execute(
@@ -260,10 +261,11 @@ class FakeExecutor:
             self.lifecycle.transition(run_id, RunState.VALIDATING)
         with self.lifecycle.database.transaction() as connection:
             connection.execute(
-                "UPDATE runs SET validated_sha=? WHERE id=?", ("c" * 40, run_id)
+                "UPDATE runs SET validated_sha=? WHERE id=?",
+                (self.source_sha, run_id),
             )
         self.lifecycle.transition(run_id, RunState.PUBLISHING)
-        return "c" * 40
+        return self.source_sha
 
 
 class FakePublisher:
@@ -281,6 +283,7 @@ class FakePublisher:
         self.fail_once = False
         self.prepared_bases: list[tuple[str, str]] = []
         self.base_change_once: str | None = None
+        self.revision_required_once = False
 
     def prepare_base_revision(self, run_id: str, expected_base_sha: str) -> str:
         self.prepared_bases.append((run_id, expected_base_sha))
@@ -304,6 +307,19 @@ class FakePublisher:
         self.source_shas_at_call.append(
             str(feedback["source_sha"]) if feedback and feedback["source_sha"] else None
         )
+        if self.revision_required_once:
+            self.revision_required_once = False
+            self.lifecycle.transition(
+                run_id,
+                RunState.IMPLEMENTING,
+                reason=(
+                    "publication revision required: "
+                    "scope review rejected publication"
+                ),
+            )
+            return None
+        if self.lifecycle.get_run(run_id)["state"] != RunState.PUBLISHING.value:
+            return None
         if self.fail_once:
             self.fail_once = False
             return None
@@ -893,6 +909,113 @@ class FeedbackTests(unittest.TestCase):
                 ("implementing", "validating"),
             ],
         )
+
+    def test_publication_revision_reopens_feedback_batch_after_restart(
+        self,
+    ) -> None:
+        self.publisher.revision_required_once = True
+        self.gateway.items = [
+            self.item(
+                "inline_comment",
+                "publication-revision",
+                "v1",
+                "Please change this behavior.",
+            )
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 0)
+
+        with self.db.connect() as connection:
+            initial_feedback = connection.execute(
+                """SELECT state, source_sha FROM feedback_versions
+                   WHERE github_object_id='publication-revision'"""
+            ).fetchone()
+            initial_operation = connection.execute(
+                """SELECT id, state, external_id
+                   FROM outbound_operations
+                   WHERE kind='feedback_revision_batch'"""
+            ).fetchone()
+        self.assertEqual(
+            self.lifecycle.get_run("run-1")["state"],
+            RunState.IMPLEMENTING.value,
+        )
+        self.assertEqual(initial_feedback["state"], "processing")
+        self.assertEqual(initial_feedback["source_sha"], "c" * 40)
+        self.assertEqual(initial_operation["state"], "completed")
+        self.assertEqual(initial_operation["external_id"], "c" * 40)
+
+        restarted_executor = FakeExecutor(self.lifecycle)
+        restarted_executor.source_sha = "d" * 40
+        reopened: dict[str, object] = {}
+
+        def capture_reopened_batch() -> None:
+            with self.db.connect() as connection:
+                feedback = connection.execute(
+                    """SELECT source_sha FROM feedback_versions
+                       WHERE github_object_id='publication-revision'"""
+                ).fetchone()
+                operation = connection.execute(
+                    """SELECT state, external_id, completed_at
+                       FROM outbound_operations
+                       WHERE kind='feedback_revision_batch'"""
+                ).fetchone()
+            reopened.update(
+                source_sha=feedback["source_sha"],
+                operation_state=operation["state"],
+                external_id=operation["external_id"],
+                completed_at=operation["completed_at"],
+            )
+
+        restarted_executor.after_execute = capture_reopened_batch
+        restarted_publisher = FakePublisher(
+            self.db,
+            self.lifecycle,
+            self.gateway,
+        )
+        restarted_evaluator = FakeEvaluator()
+        restarted = FeedbackService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            gateway=self.gateway,
+            evaluator=restarted_evaluator,
+            executor=restarted_executor,
+            publisher=restarted_publisher,
+        )
+
+        self.assertEqual(restarted.resolve_run("run-1"), 1)
+
+        with self.db.connect() as connection:
+            revised_feedback = connection.execute(
+                """SELECT state, source_sha FROM feedback_versions
+                   WHERE github_object_id='publication-revision'"""
+            ).fetchone()
+            revised_operations = connection.execute(
+                """SELECT id, state, external_id
+                   FROM outbound_operations
+                   WHERE kind='feedback_revision_batch'"""
+            ).fetchall()
+        self.assertEqual(
+            reopened,
+            {
+                "source_sha": None,
+                "operation_state": "pending",
+                "external_id": None,
+                "completed_at": None,
+            },
+        )
+        self.assertEqual(restarted_evaluator.calls, [])
+        self.assertEqual(len(restarted_executor.calls), 1)
+        self.assertEqual(restarted_publisher.calls, ["run-1"])
+        self.assertEqual(restarted_publisher.source_shas_at_call, ["d" * 40])
+        self.assertEqual(revised_feedback["state"], "resolved")
+        self.assertEqual(revised_feedback["source_sha"], "d" * 40)
+        self.assertEqual(len(revised_operations), 1)
+        self.assertEqual(
+            revised_operations[0]["id"],
+            initial_operation["id"],
+        )
+        self.assertEqual(revised_operations[0]["state"], "completed")
+        self.assertEqual(revised_operations[0]["external_id"], "d" * 40)
 
     def test_resolved_inline_thread_is_ignored_without_work(self) -> None:
         self.gateway.items = [
