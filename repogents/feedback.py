@@ -13,7 +13,11 @@ from .controller import RunProcessSupervisor
 from .database import Database
 from .github import FeedbackItem, FeedbackOutput, PullRequestInfo
 from .mini_swe import MINI_SWE_RUNTIME, MiniSweInference
-from .lifecycle import RunLifecycle, RunState
+from .lifecycle import (
+    FEEDBACK_VALIDATION_RECOVERY_REASONS,
+    RunLifecycle,
+    RunState,
+)
 from .publication import PublicationBaseChanged
 
 
@@ -562,16 +566,37 @@ class FeedbackService:
                 continue
 
             if not all_bound:
-                state = RunState(str(self.lifecycle.get_run(run_id)["state"]))
+                run = self.lifecycle.get_run(run_id)
+                state = RunState(str(run["state"]))
+                run_reason = str(run.get("reason") or "")
+                validation_only = (
+                    run_reason in FEEDBACK_VALIDATION_RECOVERY_REASONS
+                )
                 if state == RunState.PUBLISHING:
                     self.lifecycle.transition(
                         run_id,
                         RunState.IMPLEMENTING,
                         reason=(
-                            "new pull-request feedback arrived before publication"
+                            run_reason
+                            if validation_only
+                            else (
+                                "new pull-request feedback arrived "
+                                "before publication"
+                            )
                         ),
                     )
-                elif state not in {
+                    state = RunState.IMPLEMENTING
+                if validation_only and state in {
+                    RunState.RESOLVING_FEEDBACK,
+                    RunState.IMPLEMENTING,
+                }:
+                    self.lifecycle.transition(
+                        run_id,
+                        RunState.VALIDATING,
+                        reason=run_reason,
+                    )
+                    state = RunState.VALIDATING
+                if state not in {
                     RunState.RESOLVING_FEEDBACK,
                     RunState.IMPLEMENTING,
                     RunState.VALIDATING,

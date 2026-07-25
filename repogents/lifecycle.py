@@ -85,8 +85,18 @@ _LEGACY_FEEDBACK_TEAM_EXPANSION_RECOVERY_REASON = (
 _LEGACY_FEEDBACK_MEMBER_HANDOFF_RECOVERY_REASON = (
     "automatic feedback conflict retry with assigned-member handoff available"
 )
-_LEGACY_FEEDBACK_VALIDATION_BASE_RECOVERY_REASON = (
+FEEDBACK_VALIDATION_BASE_RECOVERY_REASON = (
     "automatic feedback validation retry against prepared base"
+)
+FEEDBACK_VALIDATION_REPLAY_RECOVERY_REASON = (
+    "automatic feedback validation retry against prepared base "
+    "without agent replay"
+)
+FEEDBACK_VALIDATION_RECOVERY_REASONS = frozenset(
+    {
+        FEEDBACK_VALIDATION_BASE_RECOVERY_REASON,
+        FEEDBACK_VALIDATION_REPLAY_RECOVERY_REASON,
+    }
 )
 _LEGACY_VISUAL_BLOCK_TERMS = (
     "browser",
@@ -598,7 +608,7 @@ class RunLifecycle:
     ) -> bool:
         with self.database.transaction() as connection:
             row = connection.execute(
-                """SELECT runs.state, issues.current_version_id
+                """SELECT runs.state, runs.reason, issues.current_version_id
                    FROM runs
                    JOIN issues ON issues.id=runs.issue_id
                    WHERE runs.id=?""",
@@ -611,23 +621,28 @@ class RunLifecycle:
                 or row["current_version_id"] != issue_version_id
             ):
                 return False
+            recovery_reason = (
+                str(row["reason"])
+                if row["reason"] in FEEDBACK_VALIDATION_RECOVERY_REASONS
+                else None
+            )
             now = _utc_now()
             connection.execute(
                 """UPDATE runs
                    SET state='publishing',
                        last_completed_state='validating',
-                       reason=NULL,
+                       reason=?,
                        validated_sha=?,
                        validated_issue_version_id=?,
                        updated_at=?
                    WHERE id=?""",
-                (commit_sha, issue_version_id, now, run_id),
+                (recovery_reason, commit_sha, issue_version_id, now, run_id),
             )
             connection.execute(
                 """INSERT INTO run_transitions
-                   (run_id, from_state, to_state, occurred_at)
-                   VALUES (?, 'validating', 'publishing', ?)""",
-                (run_id, now),
+                   (run_id, from_state, to_state, reason, occurred_at)
+                   VALUES (?, 'validating', 'publishing', ?, ?)""",
+                (run_id, recovery_reason, now),
             )
             return True
 
@@ -1144,6 +1159,7 @@ class RunLifecycle:
         blocker_pattern: str,
         recovery_reason: str,
         requires_unassigned_member: bool,
+        requires_prior_recovery_reason: str | None = None,
     ) -> tuple[str, ...]:
         with self.database.connect() as connection:
             rows = connection.execute(
@@ -1244,6 +1260,18 @@ class RunLifecycle:
                                      )
                                  )
                              )
+                             AND (
+                                 ? IS NULL
+                                 OR EXISTS (
+                                     SELECT 1
+                                     FROM run_transitions
+                                     WHERE run_transitions.run_id=runs.id
+                                       AND run_transitions.from_state='blocked'
+                                       AND run_transitions.to_state=
+                                           'resolving_feedback'
+                                       AND run_transitions.reason=?
+                                 )
+                             )
                              AND NOT EXISTS (
                                  SELECT 1
                                  FROM run_transitions
@@ -1257,6 +1285,8 @@ class RunLifecycle:
                             blocker_pattern,
                             int(requires_unassigned_member),
                             int(requires_unassigned_member),
+                            requires_prior_recovery_reason,
+                            requires_prior_recovery_reason,
                             recovery_reason,
                         ),
                     ).fetchone()
@@ -1305,8 +1335,27 @@ class RunLifecycle:
                 "%validation%inherited unchanged%"
                 "controller-required fetched base%zero base-to-head diff%"
             ),
-            recovery_reason=_LEGACY_FEEDBACK_VALIDATION_BASE_RECOVERY_REASON,
+            recovery_reason=FEEDBACK_VALIDATION_BASE_RECOVERY_REASON,
             requires_unassigned_member=False,
+        )
+
+    def _recover_legacy_feedback_validation_replay_blocks(
+        self,
+    ) -> tuple[str, ...]:
+        return self._recover_legacy_feedback_blocks(
+            blocker_pattern=(
+                "%required controller validation cannot pass without "
+                "out-of-scope changes%reported as adding broad source "
+                "suppression%zero diff from the fetched conflict base%"
+                "roll back inherited base behavior%restricted-proxy failures%"
+                "sandbox returns 403 for api.github.com%strict required "
+                "validation remains externally blocked%"
+            ),
+            recovery_reason=FEEDBACK_VALIDATION_REPLAY_RECOVERY_REASON,
+            requires_unassigned_member=False,
+            requires_prior_recovery_reason=(
+                FEEDBACK_VALIDATION_BASE_RECOVERY_REASON
+            ),
         )
 
     def reconcile_recoverable_blocked_runs(self) -> tuple[str, ...]:
@@ -1322,6 +1371,7 @@ class RunLifecycle:
         recovered = list(self._recover_legacy_feedback_assignment_blocks())
         recovered.extend(self._recover_legacy_feedback_handoff_blocks())
         recovered.extend(self._recover_legacy_feedback_validation_base_blocks())
+        recovered.extend(self._recover_legacy_feedback_validation_replay_blocks())
         for row in rows:
             run_id = str(row["id"])
             with self._run_lock(run_id):

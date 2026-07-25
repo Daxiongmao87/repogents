@@ -666,6 +666,73 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "pass")
         self.assertNotIn("src/base.py", comparison["contract_changed"])
 
+    def test_prepared_feedback_validation_resume_skips_model_replay(
+        self,
+    ) -> None:
+        self._seed_default_delta_baseline()
+        inherited = self.checkout / "src" / "base.py"
+        inherited.parent.mkdir(parents=True)
+        inherited.write_text("# noqa\nvalue = 1\n", encoding="utf-8")
+        self._git("add", "-A")
+        self._git(
+            "-c",
+            "user.name=Upstream",
+            "-c",
+            "user.email=upstream@example.com",
+            "commit",
+            "-qm",
+            "prepared intended base",
+        )
+        prepared_base_sha = self._git("rev-parse", "HEAD").strip()
+        (self.checkout / "value.py").write_text(
+            "def value():\n    return 2\n",
+            encoding="utf-8",
+        )
+        self._git("add", "-A")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-qm",
+            "existing feedback candidate",
+        )
+        candidate_sha = self._git("rev-parse", "HEAD").strip()
+        self.lifecycle.transition("run-1", RunState.IMPLEMENTING)
+        self.lifecycle.transition("run-1", RunState.VALIDATING)
+        self.lifecycle.transition("run-1", RunState.PUBLISHING)
+        self.lifecycle.transition("run-1", RunState.WAITING_FOR_FEEDBACK)
+        self.lifecycle.transition("run-1", RunState.RESOLVING_FEEDBACK)
+        recovery_reason = (
+            "automatic feedback validation retry against prepared base"
+        )
+        self.lifecycle.transition(
+            "run-1",
+            RunState.VALIDATING,
+            reason=recovery_reason,
+        )
+        runtime = ScriptedRuntime([])
+        service = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=lambda _runtime, _model, _timeout: runtime,
+        )
+
+        validated_sha = service.execute(
+            "run-1",
+            comparison_base_sha=prepared_base_sha,
+        )
+
+        self.assertEqual(validated_sha, candidate_sha)
+        self.assertEqual(runtime.contexts, [])
+        self.assertEqual(
+            self.lifecycle.get_run("run-1")["reason"],
+            recovery_reason,
+        )
+
     def test_prepared_feedback_base_must_be_candidate_ancestor(self) -> None:
         self._seed_default_delta_baseline()
         self._git("checkout", "-qb", "prepared-base")

@@ -1153,6 +1153,38 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertIn("prepared base", recovered["reason"])
         self.assertEqual(self.lifecycle.reconcile_recoverable_blocked_runs(), ())
 
+        post_replay_reason = (
+            "Required controller validation cannot pass without out-of-scope "
+            "changes: repogents/execution.py is reported as adding broad "
+            "source suppression, but it has zero diff from the fetched "
+            "conflict base dddff524770d8d3bfcc856009996a71fff9a9699 to clean "
+            "candidate e7ea7f5, so removing it would roll back inherited base "
+            "behavior. The full suite also has two irreducible "
+            "restricted-proxy failures because the sandbox returns 403 for "
+            "api.github.com; weakening proxy policy is not valid. "
+            "Issue-specific compileall, 28 app tests, 8 interface tests, and "
+            "git diff --check pass, and the requested feedback is implemented, "
+            "but strict required validation remains externally blocked."
+        )
+        self.lifecycle.transition(
+            run_id,
+            RunState.BLOCKED,
+            reason=post_replay_reason,
+        )
+        self.assertEqual(
+            self.lifecycle.reconcile_recoverable_blocked_runs(),
+            (run_id,),
+        )
+        recovered = self.lifecycle.get_run(run_id)
+        self.assertEqual(recovered["state"], RunState.RESOLVING_FEEDBACK.value)
+        self.assertIn("without agent replay", recovered["reason"])
+        self.lifecycle.transition(
+            run_id,
+            RunState.BLOCKED,
+            reason=post_replay_reason,
+        )
+        self.assertEqual(self.lifecycle.reconcile_recoverable_blocked_runs(), ())
+
     def test_classified_irreducible_acceptance_block_is_not_requeued(self) -> None:
         run_id = self.lifecycle.poll_repository("repo-1")[0]
         self.lifecycle.transition(run_id, RunState.IMPLEMENTING)

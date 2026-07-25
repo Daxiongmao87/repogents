@@ -237,6 +237,7 @@ class FakeExecutor:
     def __init__(self, lifecycle: RunLifecycle) -> None:
         self.lifecycle = lifecycle
         self.calls: list[tuple[str, str | None, str | None]] = []
+        self.validation_only_calls: list[bool] = []
         self.after_execute: Callable[[], None] | None = None
 
     def execute(
@@ -247,11 +248,16 @@ class FakeExecutor:
         comparison_base_sha: str | None = None,
     ) -> str:
         self.calls.append((run_id, additional_context, comparison_base_sha))
+        self.validation_only_calls.append(
+            RunState(str(self.lifecycle.get_run(run_id)["state"]))
+            == RunState.VALIDATING
+        )
         if self.after_execute is not None:
             callback = self.after_execute
             self.after_execute = None
             callback()
-        self.lifecycle.transition(run_id, RunState.VALIDATING)
+        if RunState(str(self.lifecycle.get_run(run_id)["state"])) != RunState.VALIDATING:
+            self.lifecycle.transition(run_id, RunState.VALIDATING)
         with self.lifecycle.database.transaction() as connection:
             connection.execute(
                 "UPDATE runs SET validated_sha=? WHERE id=?", ("c" * 40, run_id)
@@ -810,6 +816,83 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(self.evaluator.calls, [body])
         self.assertEqual(len(self.executor.calls), 1)
         self.assertEqual(self.publisher.calls, ["run-1"])
+        self.assertEqual(self.executor.validation_only_calls, [False])
+
+    def test_validation_base_recovery_skips_stale_agent_replay(self) -> None:
+        self.lifecycle.transition("run-1", RunState.RESOLVING_FEEDBACK)
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs
+                   SET last_completed_state='validating',
+                       reason=?
+                   WHERE id='run-1'""",
+                (
+                    "automatic feedback validation retry "
+                    "against prepared base",
+                ),
+            )
+        self.gateway.items = [
+            self.item(
+                "inline_comment",
+                "validation-base-recovery",
+                "v1",
+                "Please change this behavior.",
+            )
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 1)
+
+        self.assertEqual(self.executor.validation_only_calls, [True])
+        self.assertEqual(len(self.executor.calls), 1)
+        self.assertEqual(self.publisher.calls, ["run-1"])
+
+    def test_validation_base_recovery_survives_publishing_interruption(
+        self,
+    ) -> None:
+        recovery_reason = (
+            "automatic feedback validation retry against prepared base "
+            "without agent replay"
+        )
+        self.lifecycle.transition("run-1", RunState.RESOLVING_FEEDBACK)
+        self.lifecycle.transition(
+            "run-1",
+            RunState.VALIDATING,
+            reason=recovery_reason,
+        )
+        self.lifecycle.transition(
+            "run-1",
+            RunState.PUBLISHING,
+            reason=recovery_reason,
+        )
+        self.gateway.items = [
+            self.item(
+                "inline_comment",
+                "interrupted-validation-base-recovery",
+                "v1",
+                "Please change this behavior.",
+            )
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 1)
+
+        self.assertEqual(self.executor.validation_only_calls, [True])
+        with self.db.connect() as connection:
+            transitions = connection.execute(
+                """SELECT from_state, to_state
+                   FROM run_transitions
+                   WHERE run_id='run-1' AND reason=?
+                   ORDER BY occurred_at""",
+                (recovery_reason,),
+            ).fetchall()
+        self.assertEqual(
+            [(row["from_state"], row["to_state"]) for row in transitions],
+            [
+                ("resolving_feedback", "validating"),
+                ("validating", "publishing"),
+                ("publishing", "implementing"),
+                ("implementing", "validating"),
+            ],
+        )
 
     def test_resolved_inline_thread_is_ignored_without_work(self) -> None:
         self.gateway.items = [
