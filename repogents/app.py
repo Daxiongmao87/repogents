@@ -146,7 +146,7 @@ class Orchestrator:
                 self.lifecycle.reconcile_recoverable_blocked_runs()
             except Exception as error:
                 self.last_errors.append(
-                    "blocked acceptance recovery: "
+                    "blocked run recovery: "
                     f"{error or error.__class__.__name__}"
                 )
             self._poll_ready_repositories()
@@ -326,7 +326,13 @@ class Orchestrator:
                     RunState.IMPLEMENTING.value,
                     RunState.VALIDATING.value,
                 }:
-                    self.execution.execute(run_id)
+                    if (
+                        state != RunState.QUEUED.value
+                        and self._has_processing_feedback(run_id)
+                    ):
+                        self.feedback.resolve_run(run_id)
+                    else:
+                        self.execution.execute(run_id)
                 elif state == RunState.PUBLISHING.value:
                     if self._has_processing_feedback(run_id):
                         self.feedback.resolve_run(run_id)

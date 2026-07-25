@@ -614,6 +614,34 @@ class TeamService:
         stable_keys: Sequence[str],
         reasoning: str,
     ) -> tuple[Assignment, ...]:
+        return self._assign(
+            run_id,
+            stable_keys,
+            reasoning,
+            require_expansion=False,
+        )
+
+    def expand_assignment(
+        self,
+        run_id: str,
+        stable_keys: Sequence[str],
+        reasoning: str,
+    ) -> tuple[Assignment, ...]:
+        return self._assign(
+            run_id,
+            stable_keys,
+            reasoning,
+            require_expansion=True,
+        )
+
+    def _assign(
+        self,
+        run_id: str,
+        stable_keys: Sequence[str],
+        reasoning: str,
+        *,
+        require_expansion: bool,
+    ) -> tuple[Assignment, ...]:
         if not reasoning.strip():
             raise ValueError("assignment reasoning is required")
         if not stable_keys or len(stable_keys) != len(set(stable_keys)):
@@ -626,7 +654,8 @@ class TeamService:
             raise KeyError(run_id)
         team = self.load(str(run["team_version_id"]))
         by_key = {member.stable_key: member for member in team.members}
-        unknown = set(stable_keys) - set(by_key)
+        requested_keys = set(stable_keys)
+        unknown = requested_keys - set(by_key)
         if unknown:
             raise ValueError(
                 f"assignment contains members outside the stored team: {','.join(sorted(unknown))}"
@@ -634,19 +663,41 @@ class TeamService:
         lead_key = next(
             member.stable_key for member in team.members if member.coordinates
         )
-        if lead_key not in stable_keys:
+        if lead_key not in requested_keys:
             raise ValueError("every issue assignment must include the stored lead")
         verifier_key = next(
             member.stable_key
             for member in team.members
             if member.independent_verifier
         )
-        if verifier_key not in stable_keys:
+        if verifier_key not in requested_keys:
             raise ValueError(
                 "every issue assignment must include the stored independent verifier"
             )
         now = _utc_now()
         with self.database.transaction() as connection:
+            existing_rows = connection.execute(
+                """SELECT team_members.stable_key
+                   FROM agent_assignments
+                   JOIN team_members
+                     ON team_members.id=agent_assignments.team_member_id
+                   WHERE agent_assignments.run_id=?""",
+                (run_id,),
+            ).fetchall()
+            existing_keys = {str(row["stable_key"]) for row in existing_rows}
+            if require_expansion:
+                if not existing_keys:
+                    raise ValueError(
+                        "assignment expansion requires an existing assignment"
+                    )
+                if not existing_keys.issubset(requested_keys):
+                    raise ValueError(
+                        "expanded assignment must retain every currently assigned member"
+                    )
+                if requested_keys == existing_keys:
+                    raise ValueError(
+                        "expanded assignment must add at least one previously unassigned member"
+                    )
             for key in stable_keys:
                 connection.execute(
                     """INSERT OR IGNORE INTO agent_assignments

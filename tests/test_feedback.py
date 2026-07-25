@@ -22,7 +22,7 @@ from repogents.github import FeedbackItem, FeedbackOutput, PullRequestInfo
 from repogents.lifecycle import RunLifecycle, RunState
 from repogents.team import TeamService
 from repogents.publication import PublicationBaseChanged
-from repogents.sandbox import SandboxManager
+from repogents.sandbox import RunLayout, SandboxManager
 
 
 class NoActivationClient:
@@ -236,11 +236,17 @@ class FakeEvaluator:
 class FakeExecutor:
     def __init__(self, lifecycle: RunLifecycle) -> None:
         self.lifecycle = lifecycle
-        self.calls: list[tuple[str, str | None]] = []
+        self.calls: list[tuple[str, str | None, str | None]] = []
         self.after_execute: Callable[[], None] | None = None
 
-    def execute(self, run_id: str, *, additional_context: str | None = None) -> str:
-        self.calls.append((run_id, additional_context))
+    def execute(
+        self,
+        run_id: str,
+        *,
+        additional_context: str | None = None,
+        comparison_base_sha: str | None = None,
+    ) -> str:
+        self.calls.append((run_id, additional_context, comparison_base_sha))
         if self.after_execute is not None:
             callback = self.after_execute
             self.after_execute = None
@@ -1316,6 +1322,7 @@ class FeedbackTests(unittest.TestCase):
         context = str(self.executor.calls[0][1])
         self.assertIn(latest_base_sha, context)
         self.assertNotIn(observed_base_sha, context)
+        self.assertEqual(self.executor.calls[0][2], latest_base_sha)
         self.assertEqual(observed["state"], "resolved")
         self.assertIsNotNone(observed["superseded_at"])
         self.assertEqual(
@@ -1707,6 +1714,7 @@ class FeedbackTests(unittest.TestCase):
         )
         self.assertEqual(len(self.executor.calls), 1)
         self.assertIn(base_sha, str(self.executor.calls[0][1]))
+        self.assertEqual(self.executor.calls[0][2], base_sha)
         self.assertEqual(self.evaluator.calls, [])
         self.assertEqual(self.publisher.calls, ["run-1"])
         with self.db.connect() as connection:
@@ -1719,7 +1727,42 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(pull_count, 1)
         self.assertEqual(branch, "agent/issue-3-run-1")
 
-    def test_conflict_revision_runs_real_validation_before_updating_same_pull(
+    def test_later_feedback_reuses_latest_integrated_conflict_base(self) -> None:
+        integrated_base_sha = "d" * 40
+        now = "2026-01-01T00:02:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO feedback_versions
+                   (id, pull_request_id, feedback_type, github_object_id,
+                    github_version, author, body, state, decision_json,
+                    source_sha, observed_at)
+                   VALUES ('integrated-conflict', 'pr-1', 'base_conflict',
+                           'conflict-generation', ?, 'github',
+                           'Merge conflict with current intended base',
+                           'resolved',
+                           '{"action":"revise","reason":"conflict","response":""}',
+                           ?, ?)""",
+                (
+                    f"{self.gateway.pull.head_sha}:{integrated_base_sha}",
+                    self.gateway.pull.head_sha,
+                    now,
+                ),
+            )
+        self.gateway.items = [
+            self.item(
+                "comment",
+                "later-change",
+                "v1",
+                "Please change the related behavior",
+            )
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 1)
+
+        self.assertEqual(len(self.executor.calls), 1)
+        self.assertEqual(self.executor.calls[0][2], integrated_base_sha)
+
+    def test_conflict_revision_expands_team_after_work_starts_and_survives_restart(
         self,
     ) -> None:
         checkout, base_sha, prior_validated_sha = self._seed_commit_history()
@@ -1799,35 +1842,164 @@ class FeedbackTests(unittest.TestCase):
                    SET permitted_tools_json='["read","git_diff","git_commit"]',
                        model='test/lead'
                    WHERE id='lead-1'""")
-            connection.execute("""INSERT INTO team_members
+            connection.executemany(
+                """INSERT INTO team_members
                    (id, team_version_id, stable_key, role, atomic_role,
                     responsibilities, permitted_tools_json, runtime, model,
                     instructions)
-                   VALUES ('implementation-1', 'team-1', 'implementation',
-                           'implementer', 'conflict resolver',
-                           'Resolve source conflicts',
-                           '["read","write","run","git_diff"]',
-                           'mini-swe-agent', 'test/implementation', '')""")
-            connection.execute("""INSERT INTO team_members
-                   (id, team_version_id, stable_key, role, atomic_role,
-                    responsibilities, permitted_tools_json, runtime, model,
-                    instructions)
-                   VALUES ('verification-1', 'team-1', 'verification',
-                           'verifier', 'behavior verifier',
-                           'Independently review the conflict resolution',
-                           '["read","run","git_diff"]',
-                           'mini-swe-agent', 'test/verification', '')""")
+                   VALUES (?, 'team-1', ?, ?, ?, ?, ?,
+                           'mini-swe-agent', ?, '')""",
+                (
+                    (
+                        "interface-1",
+                        "interface",
+                        "implementer",
+                        "interface maintainer",
+                        "Resolve interface feedback",
+                        '["read","write","run","git_diff"]',
+                        "test/interface",
+                    ),
+                    (
+                        "conflict-resolution-1",
+                        "conflict-resolution",
+                        "implementer",
+                        "conflict resolver",
+                        "Resolve source conflicts",
+                        '["read","write","run","git_diff"]',
+                        "test/conflict-resolution",
+                    ),
+                    (
+                        "verification-1",
+                        "verification",
+                        "verifier",
+                        "behavior verifier",
+                        "Independently review the conflict resolution",
+                        '["read","run","git_diff"]',
+                        "test/verification",
+                    ),
+                ),
+            )
             connection.executemany(
                 """INSERT INTO agent_assignments
                    (id, run_id, team_member_id, reasoning, assigned_at)
-                   VALUES (?, 'run-1', ?, 'Resolve the current base conflict', ?)""",
+                   VALUES (?, 'run-1', ?, 'Resolve the original interface issue', ?)""",
                 (
                     ("lead-assignment", "lead-1", now),
-                    ("implementation-assignment", "implementation-1", now),
+                    ("interface-assignment", "interface-1", now),
                 ),
             )
 
-        implementation = ScriptedRuntime(
+        completed_interface = ScriptedRuntime(
+            [
+                {
+                    "action": "finish",
+                    "summary": (
+                        "completed assigned interface work; the remaining conflict "
+                        "belongs to the stored conflict resolver"
+                    ),
+                }
+            ]
+        )
+        expansion_reason = (
+            "The fetched-base conflict requires the stored conflict resolver."
+        )
+        assigning_lead = ScriptedRuntime(
+            [
+                {
+                    "action": "assign",
+                    "members": [
+                        "lead",
+                        "interface",
+                        "conflict-resolution",
+                        "verification",
+                    ],
+                    "reason": expansion_reason,
+                }
+            ]
+        )
+        unused = ScriptedRuntime([])
+        first_executor = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=(
+                lambda _runtime, model, _timeout: (
+                    assigning_lead
+                    if model == "test/lead"
+                    else completed_interface
+                    if model == "test/interface"
+                    else unused
+                )
+            ),
+            max_actions=10,
+            max_revision_cycles=1,
+        )
+        first_publisher = FakePublisher(self.db, self.lifecycle, self.gateway)
+        first_service = FeedbackService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            gateway=self.gateway,
+            evaluator=self.evaluator,
+            executor=first_executor,
+            publisher=first_publisher,
+        )
+        self.gateway.pull = replace(
+            self.gateway.pull,
+            head_sha=prior_validated_sha,
+            base_sha=current_base_sha,
+            mergeable=False,
+        )
+
+        self.assertEqual(first_service.resolve_run("run-1"), 0)
+        assignments = TeamService(self.db).assignments_for_run("run-1")
+        self.assertEqual(
+            [assignment.member.stable_key for assignment in assignments],
+            ["lead", "conflict-resolution", "interface", "verification"],
+        )
+        reasons = {
+            assignment.member.stable_key: assignment.reasoning
+            for assignment in assignments
+        }
+        self.assertEqual(reasons["conflict-resolution"], expansion_reason)
+        self.assertEqual(
+            reasons["interface"],
+            "Resolve the original interface issue",
+        )
+        with self.db.connect() as connection:
+            interrupted = connection.execute(
+                """SELECT runs.state, feedback_versions.source_sha,
+                          outbound_operations.state AS operation_state
+                   FROM runs
+                   JOIN pull_requests ON pull_requests.run_id=runs.id
+                   JOIN feedback_versions
+                     ON feedback_versions.pull_request_id=pull_requests.id
+                   JOIN outbound_operations
+                     ON outbound_operations.run_id=runs.id
+                    AND outbound_operations.kind='feedback_revision_batch'
+                   WHERE runs.id='run-1'"""
+            ).fetchone()
+        self.assertEqual(interrupted["state"], RunState.RESOLVING_FEEDBACK.value)
+        self.assertIsNone(interrupted["source_sha"])
+        self.assertEqual(interrupted["operation_state"], "pending")
+
+        layout = RunLayout.create(self.data_root, "repo-1", "run-1")
+        interrupted_history = first_executor._load_transcript(layout)
+        interrupted_history.extend(
+            f"Action retained recovery evidence {index}\nResult observed"
+            for index in range(30)
+        )
+        first_executor._store_transcript(layout, interrupted_history)
+
+        resumed_db = Database(self.db.path)
+        resumed_lifecycle = FeedbackLifecycle(
+            database=resumed_db,
+            data_root=self.data_root,
+            github=NoActivationClient(),
+            checkouts=NoCheckoutManager(),
+            sandbox=self.sandbox,
+        )
+        conflict_resolution = ScriptedRuntime(
             [
                 {
                     "action": "run",
@@ -1859,43 +2031,43 @@ class FeedbackTests(unittest.TestCase):
         verification = ScriptedRuntime(
             [{"action": "finish", "summary": "conflict resolution approved"}]
         )
-        executor = ExecutionService(
-            database=self.db,
-            lifecycle=self.lifecycle,
-            teams=TeamService(self.db),
+        previously_completed = ScriptedRuntime([])
+        resumed_executor = ExecutionService(
+            database=resumed_db,
+            lifecycle=resumed_lifecycle,
+            teams=TeamService(resumed_db),
             sandbox=self.sandbox,
             runtime_factory=(
                 lambda _runtime, model, _timeout: (
                     lead
                     if model == "test/lead"
+                    else conflict_resolution
+                    if model == "test/conflict-resolution"
                     else verification
                     if model == "test/verification"
-                    else implementation
+                    else previously_completed
                 )
             ),
             max_actions=10,
             max_revision_cycles=1,
         )
-        publisher = FakePublisher(self.db, self.lifecycle, self.gateway)
-        service = FeedbackService(
-            database=self.db,
-            lifecycle=self.lifecycle,
+        resumed_publisher = FakePublisher(
+            resumed_db,
+            resumed_lifecycle,
+            self.gateway,
+        )
+        resumed_service = FeedbackService(
+            database=resumed_db,
+            lifecycle=resumed_lifecycle,
             gateway=self.gateway,
             evaluator=self.evaluator,
-            executor=executor,
-            publisher=publisher,
-        )
-        self.gateway.pull = replace(
-            self.gateway.pull,
-            head_sha=prior_validated_sha,
-            base_sha=current_base_sha,
-            mergeable=False,
+            executor=resumed_executor,
+            publisher=resumed_publisher,
         )
 
-        processed = service.resolve_run("run-1")
-        self.assertEqual(processed, 1)
+        self.assertEqual(resumed_service.resolve_run("run-1"), 1)
 
-        with self.db.connect() as connection:
+        with resumed_db.connect() as connection:
             run = connection.execute(
                 "SELECT state, validated_sha FROM runs WHERE id='run-1'"
             ).fetchone()
@@ -1912,6 +2084,10 @@ class FeedbackTests(unittest.TestCase):
             pull_count = connection.execute(
                 "SELECT COUNT(*) FROM pull_requests WHERE run_id='run-1'"
             ).fetchone()[0]
+            run_count = connection.execute(
+                "SELECT COUNT(*) FROM runs WHERE id='run-1'"
+            ).fetchone()[0]
+        self.assertEqual(previously_completed.contexts, [])
         self.assertNotEqual(run["validated_sha"], prior_validated_sha)
         self.assertEqual(run["state"], RunState.WAITING_FOR_FEEDBACK.value)
         self.assertIsNotNone(validation)
@@ -1919,8 +2095,16 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(validation["exit_status"], 0)
         self.assertEqual(validation["verdict"], "pass")
         self.assertTrue(Path(validation["log_path"]).is_file())
-        self.assertEqual(publisher.prepared_bases, [("run-1", current_base_sha)])
-        self.assertEqual(publisher.calls, ["run-1"])
+        self.assertEqual(
+            first_publisher.prepared_bases,
+            [("run-1", current_base_sha)],
+        )
+        self.assertEqual(
+            resumed_publisher.prepared_bases,
+            [("run-1", current_base_sha)],
+        )
+        self.assertEqual(resumed_publisher.calls, ["run-1"])
+        self.assertEqual(run_count, 1)
         self.assertEqual(pull_count, 1)
         self.assertEqual(pull["github_node_id"], "PR1")
         self.assertEqual(pull["branch_name"], "agent/issue-3-run-1")

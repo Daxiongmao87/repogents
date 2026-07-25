@@ -618,6 +618,104 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(comparison["contract_changed"], ["src/a.py"])
         self.assertTrue(comparison["weakening_detected"])
 
+    def test_prepared_feedback_base_excludes_inherited_source_suppression(
+        self,
+    ) -> None:
+        self._seed_default_delta_baseline()
+        inherited = self.checkout / "src" / "base.py"
+        inherited.parent.mkdir(parents=True)
+        inherited.write_text("# noqa\nvalue = 1\n", encoding="utf-8")
+        self._git("add", "-A")
+        self._git(
+            "-c",
+            "user.name=Upstream",
+            "-c",
+            "user.email=upstream@example.com",
+            "commit",
+            "-qm",
+            "prepared intended base",
+        )
+        prepared_base_sha = self._git("rev-parse", "HEAD").strip()
+        service, _ = self.service(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 2",
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "implemented issue delta"},
+            ]
+        )
+
+        validated_sha = service.execute(
+            "run-1",
+            comparison_base_sha=prepared_base_sha,
+        )
+
+        self.assertIsNotNone(validated_sha)
+        with self.db.connect() as connection:
+            result = connection.execute(
+                """SELECT verdict, comparison_json
+                   FROM validation_results
+                   WHERE commit_sha=?""",
+                (validated_sha,),
+            ).fetchone()
+        comparison = json.loads(result["comparison_json"])
+        self.assertEqual(result["verdict"], "pass")
+        self.assertNotIn("src/base.py", comparison["contract_changed"])
+
+    def test_prepared_feedback_base_must_be_candidate_ancestor(self) -> None:
+        self._seed_default_delta_baseline()
+        self._git("checkout", "-qb", "prepared-base")
+        inherited = self.checkout / "src" / "base.py"
+        inherited.parent.mkdir(parents=True)
+        inherited.write_text("value = 1\n", encoding="utf-8")
+        self._git("add", "-A")
+        self._git(
+            "-c",
+            "user.name=Upstream",
+            "-c",
+            "user.email=upstream@example.com",
+            "commit",
+            "-qm",
+            "prepared intended base",
+        )
+        prepared_base_sha = self._git("rev-parse", "HEAD").strip()
+        self._git("checkout", "-q", "main")
+        service, _ = self.service(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 2",
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "implemented without prepared base"},
+            ]
+        )
+        service.max_revision_cycles = 1
+
+        self.assertIsNone(
+            service.execute(
+                "run-1",
+                comparison_base_sha=prepared_base_sha,
+            )
+        )
+
+        layout = RunLayout.create(self.data_root, "repo-1", "run-1")
+        self.assertIn(
+            "candidate does not descend from the prepared source base",
+            "\n".join(service._load_transcript(layout)),
+        )
+        with self.db.connect() as connection:
+            validation_count = connection.execute(
+                "SELECT COUNT(*) FROM validation_results WHERE run_id='run-1'"
+            ).fetchone()[0]
+        self.assertEqual(validation_count, 0)
+
     def test_narrow_suppression_with_source_change_remains_reviewable(
         self,
     ) -> None:
@@ -1591,6 +1689,224 @@ class ExecutionTests(unittest.TestCase):
         self.assertIn(
             "Lead finished: integrated member work",
             verification.contexts[0],
+        )
+
+    def test_lead_repeats_one_assigned_member_across_restart(self) -> None:
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions)
+                   VALUES ('other-1', 'team-1', 'other', 'implementer',
+                           'unrelated maintainer', 'Maintain unrelated source',
+                           '["read","write","run","git_diff"]',
+                           'mini-swe-agent', 'test/other', '')"""
+            )
+        team_service = TeamService(self.db)
+        team_service.assign(
+            "run-1",
+            ("lead", "implementation", "other", "verification"),
+            "Complete the existing issue with independent verification.",
+        )
+        self.lifecycle.transition("run-1", RunState.IMPLEMENTING)
+        requesting_lead = ScriptedRuntime(
+            [
+                {
+                    "action": "revise",
+                    "members": ["implementation"],
+                    "reason": "Remove the remaining out-of-scope source change.",
+                }
+            ]
+        )
+        unused = ScriptedRuntime([])
+        first = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=team_service,
+            sandbox=self.sandbox,
+            runtime_factory=lambda _runtime, model, _timeout: (
+                requesting_lead if model == "test/lead" else unused
+            ),
+            max_actions=10,
+            max_revision_cycles=1,
+        )
+        layout = RunLayout.create(self.data_root, "repo-1", "run-1")
+        prior_history = [
+            "Member implementation finished: completed the prior candidate",
+            "Member other finished: completed unrelated prior work",
+        ]
+        prior_history.extend(
+            f"Action retained prior evidence {index}\nResult observed"
+            for index in range(30)
+        )
+        first._store_transcript(layout, prior_history)
+        before = {
+            assignment.id: assignment.reasoning
+            for assignment in team_service.assignments_for_run("run-1")
+        }
+
+        self.assertIsNone(first.execute("run-1"))
+
+        interrupted = first._load_transcript(layout)
+        interrupted.extend(
+            f"Action after handoff {index}\nResult observed"
+            for index in range(30)
+        )
+        first._store_transcript(layout, interrupted)
+        interrupted = first._load_transcript(layout)
+        self.assertTrue(
+            any(
+                item.startswith(
+                    "Revision requested for member implementation:"
+                )
+                for item in interrupted
+            )
+        )
+        self.assertEqual(
+            {
+                assignment.id: assignment.reasoning
+                for assignment in team_service.assignments_for_run("run-1")
+            },
+            before,
+        )
+        implementation = ScriptedRuntime(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 2",
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "removed the remaining change"},
+            ]
+        )
+        lead = ScriptedRuntime(
+            [{"action": "finish", "summary": "integrated the targeted revision"}]
+        )
+        verification = ScriptedRuntime(
+            [{"action": "finish", "summary": "targeted revision approved"}]
+        )
+        other = ScriptedRuntime([])
+        runtimes = {
+            "test/lead": lead,
+            "test/implementation": implementation,
+            "test/other": other,
+            "test/verification": verification,
+        }
+        resumed = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=lambda _runtime, model, _timeout: runtimes[model],
+            max_actions=10,
+            max_revision_cycles=1,
+        )
+
+        self.assertIsNotNone(resumed.execute("run-1"))
+        self.assertEqual(other.contexts, [])
+        self.assertIn(
+            "Revision requested for member implementation:",
+            implementation.contexts[0],
+        )
+
+    def test_targeted_revision_rejects_invalid_requesters_and_members(
+        self,
+    ) -> None:
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions)
+                   VALUES ('other-1', 'team-1', 'other', 'implementer',
+                           'unassigned maintainer', 'Maintain unrelated source',
+                           '["read","write","run","git_diff"]',
+                           'mini-swe-agent', 'test/other', '')"""
+            )
+        team_service = TeamService(self.db)
+        team_service.assign(
+            "run-1",
+            ("lead", "implementation", "verification"),
+            "Complete the existing issue with independent verification.",
+        )
+        self.lifecycle.transition("run-1", RunState.IMPLEMENTING)
+        implementation = ScriptedRuntime(
+            [
+                {
+                    "action": "revise",
+                    "members": ["implementation"],
+                    "reason": "A non-lead cannot request another execution.",
+                },
+                {"action": "finish", "summary": "implementation unchanged"},
+            ]
+        )
+        invalid_lead_actions = [
+            {
+                "action": "revise",
+                "members": members,
+                "reason": "Invalid targeted revision request.",
+            }
+            for members in (
+                [],
+                ["implementation", "implementation"],
+                ["lead"],
+                ["verification"],
+                ["missing"],
+                ["other"],
+            )
+        ]
+        invalid_lead_actions.append(
+            {
+                "action": "block",
+                "reason": "invalid requests were safely rejected",
+            }
+        )
+        lead = ScriptedRuntime(invalid_lead_actions)
+        verification = ScriptedRuntime([])
+        runtimes = {
+            "test/lead": lead,
+            "test/implementation": implementation,
+            "test/verification": verification,
+        }
+        before = {
+            assignment.id
+            for assignment in team_service.assignments_for_run("run-1")
+        }
+        service = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=team_service,
+            sandbox=self.sandbox,
+            runtime_factory=lambda _runtime, model, _timeout: runtimes[model],
+            max_actions=10,
+            max_revision_cycles=1,
+        )
+
+        self.assertIsNone(service.execute("run-1"))
+
+        history = service._load_transcript(
+            RunLayout.create(self.data_root, "repo-1", "run-1")
+        )
+        self.assertFalse(
+            any(
+                item.startswith("Revision requested for member ")
+                for item in history
+            )
+        )
+        rejections = "\n".join(history)
+        self.assertIn("only the stored lead", rejections)
+        self.assertIn("nonempty and unique", rejections)
+        self.assertIn("lead or independent verifier", rejections)
+        self.assertIn("currently assigned implementation members", rejections)
+        self.assertEqual(
+            {
+                assignment.id
+                for assignment in team_service.assignments_for_run("run-1")
+            },
+            before,
         )
 
     def test_action_history_is_bounded_for_model_context(self) -> None:

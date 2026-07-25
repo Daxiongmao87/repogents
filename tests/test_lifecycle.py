@@ -831,6 +831,222 @@ class RunLifecycleTests(unittest.TestCase):
             RunState.BLOCKED.value,
         )
 
+    def test_legacy_feedback_conflict_assignment_block_is_requeued_once(
+        self,
+    ) -> None:
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        self.lifecycle.transition(run_id, RunState.VALIDATING)
+        self.lifecycle.transition(run_id, RunState.PUBLISHING)
+        self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
+        self.lifecycle.transition(run_id, RunState.RESOLVING_FEEDBACK)
+        now = "2026-01-01T01:00:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions)
+                   VALUES ('conflict-member', 'team-1', 'conflict-owner',
+                           'implementer', 'conflict owner',
+                           'Resolve repository conflicts',
+                           '["read","write","run","git_diff"]',
+                           'mini-swe-agent', 'configured', '')"""
+            )
+            connection.execute(
+                """INSERT INTO agent_assignments
+                   (id, run_id, team_member_id, reasoning, assigned_at)
+                   VALUES ('lead-assignment', ?, 'lead-1',
+                           'Original issue assignment', ?)""",
+                (run_id, now),
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('pull-1', ?, 'PR1', 6, 'pull-url',
+                           'agent/issue-3-run-1', 'main', ?, ?, ?, 'open', ?, ?)""",
+                (run_id, "a" * 40, "b" * 40, "b" * 40, now, now),
+            )
+            connection.execute(
+                """INSERT INTO feedback_versions
+                   (id, pull_request_id, feedback_type, github_object_id,
+                    github_version, author, body, state, observed_at,
+                    decision_json)
+                   VALUES ('conflict-feedback', 'pull-1', 'base_conflict',
+                           'PR1', ?, 'repogents', 'merge current main',
+                           'processing', ?, ?)""",
+                (
+                    f"{'b' * 40}:{'c' * 40}",
+                    now,
+                    json.dumps(
+                        {
+                            "action": "revise",
+                            "reason": "The pull request conflicts with current main.",
+                            "response": "Resolved the current base conflict.",
+                        }
+                    ),
+                ),
+            )
+            connection.execute(
+                """INSERT INTO outbound_operations
+                   (id, run_id, kind, idempotency_key, request_json, state,
+                    created_at)
+                   VALUES ('revision-batch', ?, 'feedback_revision_batch',
+                           'batch-key', ?, 'pending', ?)""",
+                (
+                    run_id,
+                    json.dumps({"feedback_ids": ["conflict-feedback"]}),
+                    now,
+                ),
+            )
+        legacy_reason = (
+            "The remaining fetched-base conflicts require repository writes, "
+            "but the active stored lead is permitted only read/git_diff. "
+            "Assignment to conflict-owner is now rejected because issue work "
+            "already began, and no permitted controller action can resolve "
+            "or validate the merge."
+        )
+        self.lifecycle.transition(
+            run_id,
+            RunState.BLOCKED,
+            reason=legacy_reason,
+        )
+
+        self.assertEqual(
+            self.lifecycle.reconcile_recoverable_blocked_runs(),
+            (run_id,),
+        )
+        recovered = self.lifecycle.get_run(run_id)
+        self.assertEqual(recovered["state"], RunState.RESOLVING_FEEDBACK.value)
+        self.assertIn("stored-team expansion", recovered["reason"])
+        with self.db.connect() as connection:
+            durable = connection.execute(
+                """SELECT feedback_versions.state AS feedback_state,
+                          feedback_versions.source_sha,
+                          outbound_operations.state AS operation_state,
+                          (SELECT COUNT(*) FROM agent_assignments
+                           WHERE run_id=?) AS assignment_count,
+                          (SELECT COUNT(*) FROM run_transitions
+                           WHERE run_id=? AND from_state='blocked'
+                             AND to_state='resolving_feedback') AS recovery_count
+                   FROM feedback_versions
+                   JOIN outbound_operations
+                     ON outbound_operations.run_id=?
+                    AND outbound_operations.kind='feedback_revision_batch'
+                   WHERE feedback_versions.id='conflict-feedback'""",
+                (run_id, run_id, run_id),
+            ).fetchone()
+        self.assertEqual(durable["feedback_state"], "processing")
+        self.assertIsNone(durable["source_sha"])
+        self.assertEqual(durable["operation_state"], "pending")
+        self.assertEqual(durable["assignment_count"], 1)
+        self.assertEqual(durable["recovery_count"], 1)
+        self.assertEqual(self.lifecycle.reconcile_recoverable_blocked_runs(), ())
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO agent_assignments
+                   (id, run_id, team_member_id, reasoning, assigned_at)
+                   VALUES ('conflict-assignment', ?, 'conflict-member',
+                           'Expanded conflict assignment', ?)""",
+                (run_id, now),
+            )
+        handoff_reason = (
+            "The recorded next action is to restore unrelated paths while "
+            "preserving the issue changes, but the stored lead cannot run or "
+            "write. Every stored implementation member is already selected, "
+            "so the assignment cannot be expanded through a strict superset, "
+            "and no controller action exists to execute a repository mutation "
+            "as an already-assigned member."
+        )
+        self.lifecycle.transition(
+            run_id,
+            RunState.BLOCKED,
+            reason=handoff_reason,
+        )
+
+        self.assertEqual(
+            self.lifecycle.reconcile_recoverable_blocked_runs(),
+            (run_id,),
+        )
+        recovered = self.lifecycle.get_run(run_id)
+        self.assertEqual(recovered["state"], RunState.RESOLVING_FEEDBACK.value)
+        self.assertIn("assigned-member handoff", recovered["reason"])
+        with self.db.connect() as connection:
+            durable = connection.execute(
+                """SELECT feedback_versions.state AS feedback_state,
+                          feedback_versions.source_sha,
+                          outbound_operations.state AS operation_state,
+                          (SELECT COUNT(*) FROM agent_assignments
+                           WHERE run_id=?) AS assignment_count,
+                          (SELECT COUNT(*) FROM run_transitions
+                           WHERE run_id=? AND from_state='blocked'
+                             AND to_state='resolving_feedback'
+                             AND reason LIKE
+                                 '%assigned-member handoff%') AS recovery_count
+                   FROM feedback_versions
+                   JOIN outbound_operations
+                     ON outbound_operations.run_id=?
+                    AND outbound_operations.kind='feedback_revision_batch'
+                   WHERE feedback_versions.id='conflict-feedback'""",
+                (run_id, run_id, run_id),
+            ).fetchone()
+        self.assertEqual(durable["feedback_state"], "processing")
+        self.assertIsNone(durable["source_sha"])
+        self.assertEqual(durable["operation_state"], "pending")
+        self.assertEqual(durable["assignment_count"], 2)
+        self.assertEqual(durable["recovery_count"], 1)
+
+        self.lifecycle.transition(
+            run_id,
+            RunState.BLOCKED,
+            reason=handoff_reason,
+        )
+        self.assertEqual(self.lifecycle.reconcile_recoverable_blocked_runs(), ())
+        self.assertEqual(
+            self.lifecycle.get_run(run_id)["state"],
+            RunState.BLOCKED.value,
+        )
+
+        validation_base_reason = (
+            "The issue-scoped candidate is complete, but required validation "
+            "cannot pass: strict validation flags source code that is inherited "
+            "unchanged from the controller-required fetched base with zero "
+            "base-to-HEAD diff."
+        )
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET reason=? WHERE id=? AND state='blocked'",
+                (validation_base_reason, run_id),
+            )
+        self.assertEqual(
+            self.lifecycle.reconcile_recoverable_blocked_runs(),
+            (run_id,),
+        )
+        recovered = self.lifecycle.get_run(run_id)
+        self.assertEqual(recovered["state"], RunState.RESOLVING_FEEDBACK.value)
+        self.assertIn("prepared base", recovered["reason"])
+        self.lifecycle.transition(
+            run_id,
+            RunState.BLOCKED,
+            reason=validation_base_reason,
+        )
+        self.assertEqual(self.lifecycle.reconcile_recoverable_blocked_runs(), ())
+
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs SET reason=?
+                   WHERE id=? AND state='blocked'""",
+                ("irreducible external dependency is unavailable", run_id),
+            )
+        self.assertEqual(self.lifecycle.reconcile_recoverable_blocked_runs(), ())
+        self.assertEqual(
+            self.lifecycle.get_run(run_id)["state"],
+            RunState.BLOCKED.value,
+        )
+
     def test_classified_irreducible_acceptance_block_is_not_requeued(self) -> None:
         run_id = self.lifecycle.poll_repository("repo-1")[0]
         self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
