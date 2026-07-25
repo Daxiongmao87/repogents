@@ -79,6 +79,25 @@ _TRANSITIONS: dict[RunState, frozenset[RunState]] = {
 _LEGACY_ACCEPTANCE_RECOVERY_REASON = (
     "automatic acceptance recheck for legacy unchallenged visual blocker"
 )
+_LEGACY_FEEDBACK_TEAM_EXPANSION_RECOVERY_REASON = (
+    "automatic feedback conflict retry after stored-team expansion became available"
+)
+_LEGACY_FEEDBACK_MEMBER_HANDOFF_RECOVERY_REASON = (
+    "automatic feedback conflict retry with assigned-member handoff available"
+)
+FEEDBACK_VALIDATION_BASE_RECOVERY_REASON = (
+    "automatic feedback validation retry against prepared base"
+)
+FEEDBACK_VALIDATION_REPLAY_RECOVERY_REASON = (
+    "automatic feedback validation retry against prepared base "
+    "without agent replay"
+)
+FEEDBACK_VALIDATION_RECOVERY_REASONS = frozenset(
+    {
+        FEEDBACK_VALIDATION_BASE_RECOVERY_REASON,
+        FEEDBACK_VALIDATION_REPLAY_RECOVERY_REASON,
+    }
+)
 _LEGACY_VISUAL_BLOCK_TERMS = (
     "browser",
     "capture",
@@ -668,7 +687,7 @@ class RunLifecycle:
     ) -> bool:
         with self.database.transaction() as connection:
             row = connection.execute(
-                """SELECT runs.state, issues.current_version_id
+                """SELECT runs.state, runs.reason, issues.current_version_id
                    FROM runs
                    JOIN issues ON issues.id=runs.issue_id
                    WHERE runs.id=?""",
@@ -681,23 +700,28 @@ class RunLifecycle:
                 or row["current_version_id"] != issue_version_id
             ):
                 return False
+            recovery_reason = (
+                str(row["reason"])
+                if row["reason"] in FEEDBACK_VALIDATION_RECOVERY_REASONS
+                else None
+            )
             now = _utc_now()
             connection.execute(
                 """UPDATE runs
                    SET state='publishing',
                        last_completed_state='validating',
-                       reason=NULL,
+                       reason=?,
                        validated_sha=?,
                        validated_issue_version_id=?,
                        updated_at=?
                    WHERE id=?""",
-                (commit_sha, issue_version_id, now, run_id),
+                (recovery_reason, commit_sha, issue_version_id, now, run_id),
             )
             connection.execute(
                 """INSERT INTO run_transitions
-                   (run_id, from_state, to_state, occurred_at)
-                   VALUES (?, 'validating', 'publishing', ?)""",
-                (run_id, now),
+                   (run_id, from_state, to_state, reason, occurred_at)
+                   VALUES (?, 'validating', 'publishing', ?, ?)""",
+                (run_id, recovery_reason, now),
             )
             return True
 
@@ -1208,6 +1232,211 @@ class RunLifecycle:
         with self._run_locks_guard:
             return self._run_locks.setdefault(run_id, threading.RLock())
 
+    def _recover_legacy_feedback_blocks(
+        self,
+        *,
+        blocker_pattern: str,
+        recovery_reason: str,
+        requires_unassigned_member: bool,
+        requires_prior_recovery_reason: str | None = None,
+    ) -> tuple[str, ...]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT runs.id
+                   FROM runs
+                   JOIN repositories ON repositories.id=runs.repository_id
+                   WHERE runs.state='blocked'
+                     AND repositories.enabled=1
+                     AND repositories.removed_at IS NULL
+                     AND lower(runs.reason) LIKE ?
+                   ORDER BY runs.created_at, runs.id""",
+                (blocker_pattern,),
+            ).fetchall()
+        recovered: list[str] = []
+        for row in rows:
+            run_id = str(row["id"])
+            with self._run_lock(run_id):
+                with self.database.transaction() as connection:
+                    candidate = connection.execute(
+                        """SELECT runs.id
+                           FROM runs
+                           JOIN repositories
+                             ON repositories.id=runs.repository_id
+                           WHERE runs.id=?
+                             AND runs.state='blocked'
+                             AND repositories.enabled=1
+                             AND repositories.removed_at IS NULL
+                             AND lower(runs.reason) LIKE ?
+                             AND EXISTS (
+                                 SELECT 1
+                                 FROM run_transitions
+                                 WHERE run_transitions.run_id=runs.id
+                                   AND run_transitions.from_state='resolving_feedback'
+                                   AND run_transitions.to_state='blocked'
+                             )
+                             AND (
+                                 (?=1 AND EXISTS (
+                                     SELECT 1
+                                     FROM team_members
+                                     WHERE team_members.team_version_id=
+                                           runs.team_version_id
+                                       AND NOT EXISTS (
+                                           SELECT 1
+                                           FROM agent_assignments
+                                           WHERE agent_assignments.run_id=runs.id
+                                             AND agent_assignments.team_member_id=
+                                                 team_members.id
+                                       )
+                                 ))
+                                 OR
+                                 (?=0 AND EXISTS (
+                                     SELECT 1
+                                     FROM agent_assignments
+                                     JOIN team_members
+                                       ON team_members.id=
+                                          agent_assignments.team_member_id
+                                     WHERE agent_assignments.run_id=runs.id
+                                       AND team_members.team_version_id=
+                                           runs.team_version_id
+                                       AND team_members.role='implementer'
+                                 ))
+                             )
+                             AND (
+                                 EXISTS (
+                                     SELECT 1
+                                     FROM pull_requests
+                                     JOIN feedback_versions
+                                       ON feedback_versions.pull_request_id=
+                                          pull_requests.id
+                                     WHERE pull_requests.run_id=runs.id
+                                       AND feedback_versions.feedback_type=
+                                           'base_conflict'
+                                       AND feedback_versions.state='pending'
+                                       AND feedback_versions.source_sha IS NULL
+                                       AND feedback_versions.superseded_at IS NULL
+                                 )
+                                 OR (
+                                     EXISTS (
+                                         SELECT 1
+                                         FROM pull_requests
+                                         JOIN feedback_versions
+                                           ON feedback_versions.pull_request_id=
+                                              pull_requests.id
+                                         WHERE pull_requests.run_id=runs.id
+                                           AND feedback_versions.feedback_type=
+                                               'base_conflict'
+                                           AND feedback_versions.state='processing'
+                                           AND feedback_versions.source_sha IS NULL
+                                           AND feedback_versions.superseded_at IS NULL
+                                     )
+                                     AND EXISTS (
+                                         SELECT 1
+                                         FROM outbound_operations
+                                         WHERE outbound_operations.run_id=runs.id
+                                           AND outbound_operations.kind=
+                                               'feedback_revision_batch'
+                                           AND outbound_operations.state='pending'
+                                     )
+                                 )
+                             )
+                             AND (
+                                 ? IS NULL
+                                 OR EXISTS (
+                                     SELECT 1
+                                     FROM run_transitions
+                                     WHERE run_transitions.run_id=runs.id
+                                       AND run_transitions.from_state='blocked'
+                                       AND run_transitions.to_state=
+                                           'resolving_feedback'
+                                       AND run_transitions.reason=?
+                                 )
+                             )
+                             AND NOT EXISTS (
+                                 SELECT 1
+                                 FROM run_transitions
+                                 WHERE run_transitions.run_id=runs.id
+                                   AND run_transitions.from_state='blocked'
+                                   AND run_transitions.to_state='resolving_feedback'
+                                   AND run_transitions.reason=?
+                             )""",
+                        (
+                            run_id,
+                            blocker_pattern,
+                            int(requires_unassigned_member),
+                            int(requires_unassigned_member),
+                            requires_prior_recovery_reason,
+                            requires_prior_recovery_reason,
+                            recovery_reason,
+                        ),
+                    ).fetchone()
+                    if candidate is None:
+                        continue
+                    now = _utc_now()
+                    updated = connection.execute(
+                        """UPDATE runs
+                           SET state='resolving_feedback', reason=?, updated_at=?
+                           WHERE id=? AND state='blocked'""",
+                        (recovery_reason, now, run_id),
+                    ).rowcount
+                    if updated != 1:
+                        continue
+                    connection.execute(
+                        """INSERT INTO run_transitions
+                           (run_id, from_state, to_state, reason, occurred_at)
+                           VALUES (?, 'blocked', 'resolving_feedback', ?, ?)""",
+                        (run_id, recovery_reason, now),
+                    )
+                    recovered.append(run_id)
+        return tuple(recovered)
+
+    def _recover_legacy_feedback_assignment_blocks(self) -> tuple[str, ...]:
+        return self._recover_legacy_feedback_blocks(
+            blocker_pattern=(
+                "%assignment to %rejected because issue work already began%"
+            ),
+            recovery_reason=_LEGACY_FEEDBACK_TEAM_EXPANSION_RECOVERY_REASON,
+            requires_unassigned_member=True,
+        )
+
+    def _recover_legacy_feedback_handoff_blocks(self) -> tuple[str, ...]:
+        return self._recover_legacy_feedback_blocks(
+            blocker_pattern=(
+                "%every stored implementation member is already selected%"
+                "no controller action exists%already-assigned member%"
+            ),
+            recovery_reason=_LEGACY_FEEDBACK_MEMBER_HANDOFF_RECOVERY_REASON,
+            requires_unassigned_member=False,
+        )
+
+    def _recover_legacy_feedback_validation_base_blocks(self) -> tuple[str, ...]:
+        return self._recover_legacy_feedback_blocks(
+            blocker_pattern=(
+                "%validation%inherited unchanged%"
+                "controller-required fetched base%zero base-to-head diff%"
+            ),
+            recovery_reason=FEEDBACK_VALIDATION_BASE_RECOVERY_REASON,
+            requires_unassigned_member=False,
+        )
+
+    def _recover_legacy_feedback_validation_replay_blocks(
+        self,
+    ) -> tuple[str, ...]:
+        return self._recover_legacy_feedback_blocks(
+            blocker_pattern=(
+                "%required controller validation cannot pass without "
+                "out-of-scope changes%reported as adding broad source "
+                "suppression%zero diff from the fetched conflict base%"
+                "roll back inherited base behavior%restricted-proxy failures%"
+                "sandbox returns 403 for api.github.com%strict required "
+                "validation remains externally blocked%"
+            ),
+            recovery_reason=FEEDBACK_VALIDATION_REPLAY_RECOVERY_REASON,
+            requires_unassigned_member=False,
+            requires_prior_recovery_reason=(
+                FEEDBACK_VALIDATION_BASE_RECOVERY_REASON
+            ),
+        )
+
     def reconcile_recoverable_blocked_runs(self) -> tuple[str, ...]:
         with self.database.connect() as connection:
             rows = connection.execute("""SELECT runs.id FROM runs
@@ -1218,7 +1447,10 @@ class RunLifecycle:
                      AND runs.reason LIKE
                          'publication blocked: issue acceptance verification blocked:%'
                    ORDER BY runs.created_at, runs.id""").fetchall()
-        recovered: list[str] = []
+        recovered = list(self._recover_legacy_feedback_assignment_blocks())
+        recovered.extend(self._recover_legacy_feedback_handoff_blocks())
+        recovered.extend(self._recover_legacy_feedback_validation_base_blocks())
+        recovered.extend(self._recover_legacy_feedback_validation_replay_blocks())
         for row in rows:
             run_id = str(row["id"])
             with self._run_lock(run_id):

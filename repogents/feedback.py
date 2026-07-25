@@ -13,7 +13,11 @@ from .controller import RunProcessSupervisor
 from .database import Database
 from .github import FeedbackItem, FeedbackOutput, PullRequestInfo
 from .mini_swe import MINI_SWE_RUNTIME, MiniSweInference
-from .lifecycle import RunLifecycle, RunState
+from .lifecycle import (
+    FEEDBACK_VALIDATION_RECOVERY_REASONS,
+    RunLifecycle,
+    RunState,
+)
 from .publication import PublicationBaseChanged
 
 
@@ -74,7 +78,11 @@ class FeedbackEvaluator(Protocol):
 
 class SourceExecutor(Protocol):
     def execute(
-        self, run_id: str, *, additional_context: str | None = None
+        self,
+        run_id: str,
+        *,
+        additional_context: str | None = None,
+        comparison_base_sha: str | None = None,
     ) -> str | None: ...
 
 
@@ -558,16 +566,37 @@ class FeedbackService:
                 continue
 
             if not all_bound:
-                state = RunState(str(self.lifecycle.get_run(run_id)["state"]))
+                run = self.lifecycle.get_run(run_id)
+                state = RunState(str(run["state"]))
+                run_reason = str(run.get("reason") or "")
+                validation_only = (
+                    run_reason in FEEDBACK_VALIDATION_RECOVERY_REASONS
+                )
                 if state == RunState.PUBLISHING:
                     self.lifecycle.transition(
                         run_id,
                         RunState.IMPLEMENTING,
                         reason=(
-                            "new pull-request feedback arrived before publication"
+                            run_reason
+                            if validation_only
+                            else (
+                                "new pull-request feedback arrived "
+                                "before publication"
+                            )
                         ),
                     )
-                elif state not in {
+                    state = RunState.IMPLEMENTING
+                if validation_only and state in {
+                    RunState.RESOLVING_FEEDBACK,
+                    RunState.IMPLEMENTING,
+                }:
+                    self.lifecycle.transition(
+                        run_id,
+                        RunState.VALIDATING,
+                        reason=run_reason,
+                    )
+                    state = RunState.VALIDATING
+                if state not in {
                     RunState.RESOLVING_FEEDBACK,
                     RunState.IMPLEMENTING,
                     RunState.VALIDATING,
@@ -578,12 +607,14 @@ class FeedbackService:
                         run_id,
                         revisions,
                     )
+                    revision_context, comparison_base_sha = self._revision_context(
+                        run_id,
+                        revisions,
+                    )
                     source_sha = self.executor.execute(
                         run_id,
-                        additional_context=self._revision_context(
-                            run_id,
-                            revisions,
-                        ),
+                        additional_context=revision_context,
+                        comparison_base_sha=comparison_base_sha,
                     )
                 except PublicationBaseChanged:
                     continue
@@ -730,12 +761,34 @@ class FeedbackService:
             return None
         return str(row["remote_head_sha"])
 
+    def _latest_integrated_conflict_base(self, run_id: str) -> str | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT feedback_versions.github_version
+                   FROM feedback_versions
+                   JOIN pull_requests
+                     ON pull_requests.id=feedback_versions.pull_request_id
+                   WHERE pull_requests.run_id=?
+                     AND feedback_versions.feedback_type='base_conflict'
+                     AND feedback_versions.state='resolved'
+                     AND feedback_versions.source_sha IS NOT NULL
+                     AND feedback_versions.superseded_at IS NULL
+                   ORDER BY feedback_versions.observed_at DESC,
+                            feedback_versions.id DESC
+                   LIMIT 1""",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _conflict_base_sha(dict(row))
+
     def _revision_context(
         self,
         run_id: str,
         rows: list[dict[str, object]],
-    ) -> str:
+    ) -> tuple[str, str | None]:
         batch: list[dict[str, object]] = []
+        comparison_base_sha: str | None = None
         for row in rows:
             decision = self._stored_decision(row)
             instruction = (
@@ -744,6 +797,14 @@ class FeedbackService:
             )
             if row["feedback_type"] == "base_conflict":
                 current_base_sha = _conflict_base_sha(row)
+                if (
+                    comparison_base_sha is not None
+                    and comparison_base_sha != current_base_sha
+                ):
+                    raise RuntimeError(
+                        "feedback batch contains conflicting prepared base revisions"
+                    )
+                comparison_base_sha = current_base_sha
                 if not row.get("source_sha"):
                     prepared_sha = self.publisher.prepare_base_revision(
                         run_id,
@@ -768,15 +829,20 @@ class FeedbackService:
                     "instruction": instruction,
                 }
             )
-        return json.dumps(
-            {
-                "instruction": (
-                    "Implement every revision in this feedback batch as one "
-                    "candidate, internally review it, then validate it once."
-                ),
-                "feedback_batch": batch,
-            },
-            sort_keys=True,
+        if comparison_base_sha is None:
+            comparison_base_sha = self._latest_integrated_conflict_base(run_id)
+        return (
+            json.dumps(
+                {
+                    "instruction": (
+                        "Implement every revision in this feedback batch as one "
+                        "candidate, internally review it, then validate it once."
+                    ),
+                    "feedback_batch": batch,
+                },
+                sort_keys=True,
+            ),
+            comparison_base_sha,
         )
 
     def _decision(self, run_id: str, row: dict[str, object]) -> FeedbackDecision:

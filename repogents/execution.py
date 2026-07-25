@@ -436,10 +436,11 @@ class MiniSweModelRuntime:
 {"action":"replace","path":"relative/file","old":"exact text","new":"replacement","count":1}
 {"action":"run","argv":["program","arg"],"timeout":120}
 {"action":"assign","members":["lead","member-key"],"reason":"why these stored members are needed"}
+{"action":"revise","members":["member-key"],"reason":"why these assigned implementers must run again"}
 {"action":"note","summary":"concise findings and exact next action"}
 {"action":"finish","summary":"implemented behavior and why it satisfies the issue"}
 {"action":"block","reason":"specific irreducible missing or contradictory prerequisite"} (lead only; non-leads finish with blocker evidence for the lead)
-Read before editing. Do not reread evidence already present in action history unless its result was incomplete or the source changed. Once inspection supports a decision, persist one concise note with the findings and exact next action, then execute that action instead of continuing to inspect. After a note, the next decision must execute the stated action; the controller rejects another note until a repository write or replacement succeeds. Assignment is available only before issue work begins. A note neither finishes nor blocks the work. Keep changes strictly in issue scope. Do not create or retain plans, specification ledgers, coordination files, agent instructions, or other process artifacts in the repository; change only product source, repository-required tests, and directly required configuration. Never publish, merge, close, push, expose credentials, or invent missing external resources."""
+Read before editing. Do not reread evidence already present in action history unless its result was incomplete or the source changed. Once inspection supports a decision, persist one concise note with the findings and exact next action, then execute that action instead of continuing to inspect. After a note, the next decision must execute the stated action; the controller rejects another note until a repository write or replacement succeeds. Only the stored lead may assign or request a targeted revision. Before issue work begins, the lead must select the initial assignment. If a later issue revision, feedback item, or base conflict requires stored-team responsibilities or permissions outside the current assignment, the lead may expand it by emitting the complete strict superset of selected member keys; never remove or replace an assigned member. If later work instead requires one or more already-assigned implementers to run again, the lead may request those exact members with a revise action; never select the lead, verifier, unassigned members, or duplicate keys. A note neither finishes nor blocks the work. Keep changes strictly in issue scope. Do not create or retain plans, specification ledgers, coordination files, agent instructions, or other process artifacts in the repository; change only product source, repository-required tests, and directly required configuration. Never publish, merge, close, push, expose credentials, or invent missing external resources."""
     _RESPONSE_SCHEMA: dict[str, object] = {
         "type": "object",
         "properties": {
@@ -452,6 +453,7 @@ Read before editing. Do not reread evidence already present in action history un
                     "replace",
                     "run",
                     "assign",
+                    "revise",
                     "note",
                     "finish",
                     "block",
@@ -765,7 +767,11 @@ class ExecutionService:
         self.scanner = SecretScanner()
 
     def execute(
-        self, run_id: str, *, additional_context: str | None = None
+        self,
+        run_id: str,
+        *,
+        additional_context: str | None = None,
+        comparison_base_sha: str | None = None,
     ) -> str | None:
         if self._is_canceled(run_id):
             return None
@@ -789,6 +795,9 @@ class ExecutionService:
             run_id,
         )
         policy = _sandbox_policy(sandbox_row)
+        source_base_sha = comparison_base_sha or str(run["base_sha"])
+        if not re.fullmatch(r"[0-9a-f]{40}", source_base_sha):
+            raise ValueError("source comparison base SHA is invalid")
         secret_bindings = _secret_bindings(sandbox_row)
         resolved_secret_values: set[str] = set()
         try:
@@ -810,9 +819,6 @@ class ExecutionService:
                     reason=str(error),
                 )
             return None
-        base_context = self._base_prompt(
-            run, issue, sandbox_row, team, additional_context
-        )
         transcript = self._load_transcript(layout)
         assignments = self.teams.assignments_for_run(run_id)
         if assignments and not any(
@@ -830,6 +836,9 @@ class ExecutionService:
                 "Complete the existing assignment with mandatory independent review.",
             )
             assignments = self.teams.assignments_for_run(run_id)
+        base_context = self._base_prompt(
+            run, issue, sandbox_row, team, assignments, additional_context
+        )
         if not assignments:
             self._agent_cycle(
                 self._runtime(lead, run_id),
@@ -841,6 +850,7 @@ class ExecutionService:
                 secret_bindings,
                 resolved_secret_values,
                 allow_assignment=True,
+                require_assignment=True,
             )
             return None
         runtime = self._runtime(lead, run_id)
@@ -876,6 +886,7 @@ class ExecutionService:
                         transcript,
                         secret_bindings,
                         resolved_secret_values,
+                        allow_assignment=True,
                     )
                     if yielded or outcome is None:
                         return None
@@ -914,7 +925,12 @@ class ExecutionService:
                     self.lifecycle.transition(run_id, RunState.VALIDATING)
                 self._ensure_not_canceled(run_id)
                 commit_sha = self._commit(
-                    run, issue, policy, layout, resolved_secret_values
+                    run,
+                    issue,
+                    policy,
+                    layout,
+                    resolved_secret_values,
+                    source_base_sha,
                 )
             except _RunCanceled:
                 return None
@@ -944,6 +960,7 @@ class ExecutionService:
                     layout,
                     secret_bindings,
                     resolved_secret_values,
+                    source_base_sha,
                 )
             except _RunCanceled:
                 return None
@@ -1003,11 +1020,13 @@ class ExecutionService:
         resolved_secret_values: set[str],
         *,
         allow_assignment: bool = False,
+        require_assignment: bool = False,
     ) -> tuple[str | None, bool]:
         for _ in range(self.max_actions):
             context = base_context
-            if transcript:
-                context += "\n\nAction history:\n" + "\n".join(transcript[-24:])
+            model_history = self._bounded_transcript(transcript)
+            if model_history:
+                context += "\n\nAction history:\n" + "\n".join(model_history)
             try:
                 action = runtime.next_action(context, layout.agent_state)
             except _RunCanceled:
@@ -1021,9 +1040,7 @@ class ExecutionService:
                 name = action.get("action")
                 if name == "assign":
                     if not allow_assignment:
-                        raise ValueError(
-                            "assignment is allowed only before issue work begins"
-                        )
+                        raise ValueError("only the stored lead may assign issue members")
                     members = action.get("members")
                     reason = action.get("reason")
                     if (
@@ -1038,13 +1055,82 @@ class ExecutionService:
                         reason,
                         resolved_secret_values,
                     )
-                    self.teams.assign(
-                        layout.run_id,
-                        tuple(members),
-                        safe_reason,
+                    if require_assignment:
+                        self.teams.assign(
+                            layout.run_id,
+                            tuple(members),
+                            safe_reason,
+                        )
+                        label = "Lead assigned "
+                    else:
+                        self.teams.expand_assignment(
+                            layout.run_id,
+                            tuple(members),
+                            safe_reason,
+                        )
+                        label = "Lead expanded assignment to "
+                    transcript.append(label + ", ".join(members) + ": " + safe_reason)
+                    self._store_transcript(layout, transcript)
+                    return None, False
+                if name == "revise":
+                    if not allow_assignment or not member.coordinates:
+                        raise ValueError(
+                            "only the stored lead may request targeted member revisions"
+                        )
+                    members = action.get("members")
+                    reason = action.get("reason")
+                    if (
+                        not isinstance(members, list)
+                        or not members
+                        or not all(
+                            isinstance(value, str) and bool(value)
+                            for value in members
+                        )
+                        or len(set(members)) != len(members)
+                    ):
+                        raise ValueError(
+                            "revise action requires nonempty and unique "
+                            "stored member keys"
+                        )
+                    if not isinstance(reason, str) or not reason.strip():
+                        raise ValueError(
+                            "revise action requires a specific revision reason"
+                        )
+                    assigned = {
+                        assignment.member.stable_key: assignment.member
+                        for assignment in self.teams.assignments_for_run(
+                            layout.run_id
+                        )
+                    }
+                    selected = [assigned.get(key) for key in members]
+                    if any(
+                        selected_member is not None
+                        and (
+                            selected_member.coordinates
+                            or selected_member.independent_verifier
+                        )
+                        for selected_member in selected
+                    ):
+                        raise ValueError(
+                            "targeted revisions cannot select the lead or "
+                            "independent verifier"
+                        )
+                    if any(
+                        selected_member is None
+                        or selected_member.execution_class != "implementer"
+                        for selected_member in selected
+                    ):
+                        raise ValueError(
+                            "revise action may select only currently assigned "
+                            "implementation members"
+                        )
+                    safe_reason = _bounded_redacted_text(
+                        reason,
+                        resolved_secret_values,
                     )
-                    transcript.append(
-                        "Lead assigned " + ", ".join(members) + ": " + safe_reason
+                    transcript.extend(
+                        f"Revision requested for member {key}: {safe_reason}"
+                        for key in members
                     )
                     self._store_transcript(layout, transcript)
                     return None, False
@@ -1072,7 +1158,7 @@ class ExecutionService:
                     self._store_transcript(layout, transcript)
                     continue
                 if name == "finish":
-                    if allow_assignment:
+                    if require_assignment:
                         raise ValueError(
                             "the stored lead must assign issue members before finishing"
                         )
@@ -1171,6 +1257,59 @@ class ExecutionService:
     def _transcript_path(layout: RunLayout) -> Path:
         return layout.agent_state / "action-history.json"
 
+    @staticmethod
+    def _member_completion_key(item: str) -> str | None:
+        if item.startswith("Lead finished:"):
+            return "Lead"
+        if not item.startswith("Member "):
+            return None
+        marker = " finished:"
+        marker_index = item.find(marker)
+        if marker_index <= len("Member "):
+            return None
+        return item[:marker_index]
+
+    @staticmethod
+    def _targeted_revision_key(item: str) -> str | None:
+        prefix = "Revision requested for member "
+        if not item.startswith(prefix):
+            return None
+        marker_index = item.find(":", len(prefix))
+        if marker_index <= len(prefix):
+            return None
+        return "Member " + item[len(prefix):marker_index]
+
+    @classmethod
+    def _bounded_transcript(cls, transcript: Sequence[str]) -> list[str]:
+        tail_start = max(0, len(transcript) - 24)
+        latest_general_revision = max(
+            (
+                index
+                for index, item in enumerate(transcript)
+                if item.startswith("Revision requested for assigned members:")
+            ),
+            default=-1,
+        )
+        completions: dict[str, int] = {}
+        targeted_revisions: dict[str, int] = {}
+        for index in range(latest_general_revision + 1, len(transcript)):
+            item = transcript[index]
+            completion_key = cls._member_completion_key(item)
+            if completion_key is not None:
+                completions[completion_key] = index
+            revision_key = cls._targeted_revision_key(item)
+            if revision_key is not None:
+                targeted_revisions[revision_key] = index
+        checkpoint_indices = {
+            index
+            for index in (*completions.values(), *targeted_revisions.values())
+            if index < tail_start
+        }
+        return [
+            transcript[index]
+            for index in sorted(checkpoint_indices)
+        ] + list(transcript[tail_start:])
+
     def _load_transcript(self, layout: RunLayout) -> list[str]:
         path = self._transcript_path(layout)
         if not path.exists():
@@ -1183,13 +1322,14 @@ class ExecutionService:
             isinstance(item, str) for item in value
         ):
             raise RuntimeError("stored agent action history is invalid")
-        return value[-24:]
+        return self._bounded_transcript(value)
 
     def _store_transcript(self, layout: RunLayout, transcript: list[str]) -> None:
         path = self._transcript_path(layout)
         temporary = path.with_name(path.name + ".tmp")
+        bounded = self._bounded_transcript(transcript)
         temporary.write_text(
-            json.dumps(transcript[-24:], ensure_ascii=False, separators=(",", ":")),
+            json.dumps(bounded, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
         )
         temporary.replace(path)
@@ -1234,6 +1374,7 @@ class ExecutionService:
         policy: SandboxPolicy,
         layout: RunLayout,
         resolved_secret_values: set[str],
+        source_base_sha: str,
     ) -> str:
         self._ensure_not_canceled(layout.run_id)
         self._git(policy, layout, ("add", "-A"))
@@ -1245,7 +1386,7 @@ class ExecutionService:
         full_diff = self._git(
             policy,
             layout,
-            ("diff", "--binary", str(run["base_sha"]), "--"),
+            ("diff", "--binary", source_base_sha, "--"),
             allow_failure=False,
         ).stdout
         findings = self.scanner.scan(full_diff, resolved_secret_values)
@@ -1289,7 +1430,17 @@ class ExecutionService:
         head = self._git(policy, layout, ("rev-parse", "HEAD")).stdout.strip()
         if not re.fullmatch(r"[0-9a-f]{40}", head):
             raise RuntimeError("git returned an invalid commit SHA")
-        if head == str(run["base_sha"]):
+        ancestor = self._git(
+            policy,
+            layout,
+            ("merge-base", "--is-ancestor", source_base_sha, head),
+            allow_failure=True,
+        )
+        if ancestor.returncode != 0:
+            raise RevisionRequired(
+                "candidate does not descend from the prepared source base"
+            )
+        if head == source_base_sha:
             raise RevisionRequired("agent produced no committed issue change")
         return head
 
@@ -1509,6 +1660,7 @@ class ExecutionService:
         layout: RunLayout,
         secret_bindings: tuple[SecretBinding, ...],
         resolved_secret_values: set[str],
+        source_base_sha: str,
     ) -> tuple[bool, str]:
         self._ensure_not_canceled(run_id)
         with self.database.connect() as connection:
@@ -1567,7 +1719,7 @@ class ExecutionService:
         contract_changes, weakening_detected = self._validation_contract_changes(
             policy,
             layout,
-            base_sha,
+            source_base_sha,
             commit_sha,
             all_baseline_findings,
         )
@@ -1802,11 +1954,20 @@ class ExecutionService:
             if member.coordinates
             else f"Member {member.stable_key} finished:"
         )
-        revision_prefix = "Revision requested for assigned members:"
+        general_revision_prefix = "Revision requested for assigned members:"
+        targeted_revision_prefix = (
+            f"Revision requested for member {member.stable_key}:"
+        )
         for item in reversed(transcript):
             if item.startswith(prefix):
                 return True
-            if item.startswith(revision_prefix):
+            if item.startswith(general_revision_prefix):
+                return False
+            if item.startswith("Revision requested for member ") and (
+                member.coordinates
+                or member.independent_verifier
+                or item.startswith(targeted_revision_prefix)
+            ):
                 return False
         return False
 
@@ -1890,6 +2051,7 @@ class ExecutionService:
         issue: dict[str, object],
         sandbox_row: dict[str, object],
         team: StoredTeam,
+        assignments: Sequence[Assignment],
         additional_context: str | None,
     ) -> str:
         evidence = json.loads(str(sandbox_row["evidence_json"]))
@@ -1910,12 +2072,16 @@ class ExecutionService:
                 }
                 for member in team.members
             ],
+            "current_assignment": [
+                assignment.member.stable_key for assignment in assignments
+            ],
             "assignment": (
                 "If this run has no durable assignment yet, inspect enough "
                 "repository evidence to select stored members, then emit assign. "
                 "Every assignment must include the stored lead and stored "
-                "independent verifier; select only the implementation members "
-                "needed for this issue."
+                "independent verifier. If later work requires an unselected stored "
+                "member, the lead may emit assign again with the complete strict "
+                "superset of current_assignment; never remove or replace members."
             ),
             "constraints": [
                 "Infer terse requirements from issue discussion, repository instructions, source, and tests.",

@@ -1457,12 +1457,11 @@ class ApplicationTests(unittest.TestCase):
         self.assertIn(("cancel", "run-1", "canceled by user"), lifecycle.calls)
         self.assertEqual(scheduler.requests, 3)
 
-    def test_processing_feedback_in_publishing_routes_through_feedback_recovery(
+    def test_processing_feedback_in_source_states_routes_through_recovery(
         self,
     ) -> None:
         now = "2026-01-01T00:00:00Z"
         with self.db.transaction() as connection:
-            connection.execute("UPDATE runs SET state='publishing' WHERE id='run-1'")
             connection.execute(
                 """INSERT INTO pull_requests
                    (id, run_id, github_node_id, number, url, branch_name,
@@ -1481,21 +1480,31 @@ class ApplicationTests(unittest.TestCase):
                            '{"action":"revise","reason":"valid","response":"done"}', ?)""",
                 (now,),
             )
-        lifecycle = FakeLifecycle(self.db)
-        publication = FakePublication(self.db)
-        feedback = FakeFeedback(self.db)
-        orchestrator = Orchestrator(
-            database=self.db,
-            lifecycle=lifecycle,
-            execution=FakeExecution(self.db),
-            publication=publication,
-            feedback=feedback,
-        )
 
-        orchestrator._advance("run-1")
+        for state in ("implementing", "validating", "publishing"):
+            with self.subTest(state=state):
+                with self.db.transaction() as connection:
+                    connection.execute(
+                        "UPDATE runs SET state=? WHERE id='run-1'",
+                        (state,),
+                    )
+                lifecycle = FakeLifecycle(self.db)
+                execution = FakeExecution(self.db)
+                publication = FakePublication(self.db)
+                feedback = FakeFeedback(self.db)
+                orchestrator = Orchestrator(
+                    database=self.db,
+                    lifecycle=lifecycle,
+                    execution=execution,
+                    publication=publication,
+                    feedback=feedback,
+                )
 
-        self.assertEqual(publication.calls, [])
-        self.assertGreaterEqual(feedback.calls.count("run-1"), 1)
+                orchestrator._advance("run-1")
+
+                self.assertEqual(execution.calls, [])
+                self.assertEqual(publication.calls, [])
+                self.assertGreaterEqual(feedback.calls.count("run-1"), 1)
 
     def test_state_reads_cached_ready_issue_discovery_without_github_calls(self) -> None:
         with self.db.transaction() as connection:

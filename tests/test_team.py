@@ -448,6 +448,63 @@ class TeamServiceTests(unittest.TestCase):
         self.assertEqual(len(reloaded), 3)
         self.assertTrue(all(assignment.reasoning for assignment in reloaded))
 
+    def test_assignment_expansion_requires_a_strict_superset(self) -> None:
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions, action_timeout_seconds)
+                   VALUES ('member-database', 'team-1', 'z-database', 'implementer',
+                           'database migration maintainer',
+                           'Resolve later database conflicts',
+                           '["read","write","run","git_diff"]',
+                           'mini-swe-agent', 'configured', '', 301)"""
+            )
+        initial_reason = "Implement the original issue and verify it."
+        self.service.assign(
+            "run-1",
+            ("lead", "build", "verify"),
+            initial_reason,
+        )
+        expansion_reason = "Later feedback introduces a database conflict."
+
+        expanded = self.service.expand_assignment(
+            "run-1",
+            ("lead", "build", "z-database", "verify"),
+            expansion_reason,
+        )
+
+        self.assertEqual(
+            [assignment.member.stable_key for assignment in expanded],
+            ["lead", "build", "z-database", "verify"],
+        )
+        reasons = {
+            assignment.member.stable_key: assignment.reasoning
+            for assignment in expanded
+        }
+        self.assertEqual(reasons["build"], initial_reason)
+        self.assertEqual(reasons["z-database"], expansion_reason)
+        with self.assertRaisesRegex(ValueError, "retain every currently assigned"):
+            self.service.expand_assignment(
+                "run-1",
+                ("lead", "z-database", "verify"),
+                "Replace the original implementer.",
+            )
+        with self.assertRaisesRegex(ValueError, "at least one previously unassigned"):
+            self.service.expand_assignment(
+                "run-1",
+                ("lead", "build", "z-database", "verify"),
+                "Repeat the expanded assignment.",
+            )
+        self.assertEqual(
+            [
+                assignment.member.stable_key
+                for assignment in self.service.assignments_for_run("run-1")
+            ],
+            ["lead", "build", "z-database", "verify"],
+        )
+
     def test_existing_run_keeps_prior_team_after_repository_version_changes(
         self,
     ) -> None:
