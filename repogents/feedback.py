@@ -40,6 +40,8 @@ class FeedbackGateway(Protocol):
         self, owner: str, name: str, pull_number: int
     ) -> list[FeedbackItem]: ...
 
+    def application_login(self) -> str: ...
+
     def find_response(
         self,
         owner: str,
@@ -152,14 +154,48 @@ class MiniSweFeedbackEvaluator:
                 ),
                 "context": context,
                 "actions": {
-                    "revise": "valid in-scope source change required",
+                    "revise": "concrete valid in-scope source change required",
                     "answer": (
-                        "relevant question or explanation without source change"
+                        "actual concrete question or requested explanation "
+                        "without source change"
                     ),
                     "decline": (
-                        "incorrect, contradictory, or out-of-scope request"
+                        "concrete incorrect, contradictory, or out-of-scope request"
                     ),
                     "ignore": "no response or source action is warranted",
+                },
+                "routing": {
+                    "eligible": [
+                        (
+                            "a general comment explicitly addressed to "
+                            "context.application_login"
+                        ),
+                        (
+                            "a concrete pull-request question, requested change, "
+                            "contradiction, or substantive review finding, even "
+                            "when it begins with another account mention"
+                        ),
+                        (
+                            "an unresolved inline review finding, which does not "
+                            "require an @ mention"
+                        ),
+                    ],
+                    "ignore": [
+                        (
+                            "a recognized standalone external-integration command "
+                            "whose leading @login addresses another account, "
+                            "including @login review and @login address that feedback"
+                        ),
+                        (
+                            "a generic review wrapper, acknowledgment, status "
+                            "remark, or input with no concrete question, request, "
+                            "contradiction, or finding"
+                        ),
+                    ],
+                    "response": (
+                        "Never invent a review or status summary for non-actionable "
+                        "input. Return ignore with an empty response instead."
+                    ),
                 },
                 "response_schema": {
                     "action": "revise|answer|decline|ignore",
@@ -652,10 +688,29 @@ class FeedbackService:
                 row["state"] = "processing"
             value = json.loads(str(existing))
             return FeedbackDecision(**value)
-        context = self._evaluation_context(run_id, row)
-        if not self._ensure_resolving(run_id):
-            raise RuntimeError("run stopped during feedback evaluation")
-        decision = self.evaluator.evaluate(context)
+
+        application_login: str | None = None
+        if (
+            row.get("feedback_type") == "inline_comment"
+            and bool(row.get("review_thread_resolved"))
+        ):
+            decision = FeedbackDecision(
+                action="ignore",
+                reason="The GitHub review thread is already resolved.",
+                response="",
+            )
+        else:
+            if row.get("feedback_type") == "comment":
+                application_login = self.gateway.application_login()
+            decision = _addressing_decision(row, application_login)
+        if decision is None:
+            context = self._evaluation_context(
+                run_id,
+                row,
+                application_login=application_login,
+            )
+            decision = self.evaluator.evaluate(context)
+
         self.poll_run(run_id)
         if not self._ensure_resolving(run_id):
             raise RuntimeError("run stopped during feedback evaluation")
@@ -1123,7 +1178,11 @@ class FeedbackService:
         return dict(row)
 
     def _evaluation_context(
-        self, run_id: str, feedback: dict[str, object]
+        self,
+        run_id: str,
+        feedback: dict[str, object],
+        *,
+        application_login: str | None = None,
     ) -> dict[str, object]:
         with self.database.connect() as connection:
             row = connection.execute(
@@ -1167,6 +1226,7 @@ class FeedbackService:
         )
         return {
             "run_id": run_id,
+            "application_login": application_login,
             "issue": {
                 "title": row["title"],
                 "body": row["body"],
@@ -1197,6 +1257,37 @@ class FeedbackService:
             "line": row.get("line"),
             "url": row.get("url"),
         }
+
+
+def _addressing_decision(
+    row: dict[str, object],
+    application_login: str | None,
+) -> FeedbackDecision | None:
+    if row.get("feedback_type") != "comment":
+        return None
+    match = re.fullmatch(
+        (
+            r"\s*@(?P<login>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))"
+            r"(?:\s*[:,]\s*|\s+)"
+            r"(?:review|address\s+that\s+feedback)\s*[.!]?\s*"
+        ),
+        str(row.get("body") or ""),
+        flags=re.IGNORECASE,
+    )
+    if (
+        match is None
+        or match.group("login").casefold() == str(application_login).casefold()
+    ):
+        return None
+    return FeedbackDecision(
+        action="ignore",
+        reason=(
+            "The recognized external-integration command is addressed to "
+            f"@{match.group('login')}, not the authenticated Repogents account "
+            f"@{application_login}."
+        ),
+        response="",
+    )
 
 
 def _base_conflict_item(

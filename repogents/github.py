@@ -747,6 +747,9 @@ class GitHubClient:
         self._application_author = login.strip()
         return self._application_author
 
+    def application_login(self) -> str:
+        return self._application_login()
+
     def find_response(
         self,
         owner: str,

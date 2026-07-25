@@ -89,6 +89,7 @@ class FakeFeedbackGateway:
         self.post_calls = 0
         self.polls = 0
         self.status_calls = 0
+        self.application_author = "configured-user"
         self.pull = PullRequestInfo(
             node_id="PR1",
             number=11,
@@ -113,6 +114,9 @@ class FakeFeedbackGateway:
     def get_pull_request(self, owner: str, name: str, number: int) -> PullRequestInfo:
         self.status_calls += 1
         return self.pull
+
+    def application_login(self) -> str:
+        return self.application_author
 
     def list_feedback(
         self, owner: str, name: str, pull_number: int
@@ -374,6 +378,12 @@ class MiniSweFeedbackEvaluatorTests(unittest.TestCase):
         self.assertEqual(
             prompt_data["response_schema"]["action"], "revise|answer|decline|ignore"
         )
+        routing = json.dumps(prompt_data["routing"])
+        self.assertIn("context.application_login", routing)
+        self.assertIn("leading @login", routing)
+        self.assertIn("concrete pull-request", routing)
+        self.assertIn("begins with another account mention", routing)
+        self.assertIn("Never invent a review or status summary", routing)
         self.assertTrue(
             "Return exactly one JSON object" in observed["system_prompt"]
             or "Return one JSON" in observed["system_prompt"]
@@ -676,6 +686,139 @@ class FeedbackTests(unittest.TestCase):
             review_thread_id=review_thread_id,
             review_thread_resolved=review_thread_resolved,
         )
+
+    def test_command_addressed_to_other_account_is_ignored_without_work(
+        self,
+    ) -> None:
+        self.gateway.items = [
+            self.item(
+                "comment",
+                "codex-command",
+                "v1",
+                "@codex review",
+                author="configured-user",
+            ),
+            self.item(
+                "comment",
+                "codex-address-command",
+                "v1",
+                "@codex address that feedback",
+                author="configured-user",
+            ),
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 2)
+
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                """SELECT state, decision_json FROM feedback_versions
+                   ORDER BY github_object_id"""
+            ).fetchall()
+            operation_count = connection.execute(
+                "SELECT COUNT(*) FROM outbound_operations"
+            ).fetchone()[0]
+        decisions = [json.loads(str(row["decision_json"])) for row in rows]
+        self.assertEqual([row["state"] for row in rows], ["resolved", "resolved"])
+        self.assertEqual(
+            [decision["action"] for decision in decisions],
+            ["ignore", "ignore"],
+        )
+        self.assertEqual(
+            [decision["response"] for decision in decisions],
+            ["", ""],
+        )
+        self.assertEqual(self.evaluator.calls, [])
+        self.assertEqual(self.executor.calls, [])
+        self.assertEqual(self.publisher.calls, [])
+        self.assertEqual(self.gateway.post_calls, 0)
+        self.assertEqual(operation_count, 0)
+
+    def test_configured_addressee_and_incidental_mention_remain_evaluable(
+        self,
+    ) -> None:
+        self.gateway.items = [
+            self.item(
+                "comment",
+                "addressed-question",
+                "v1",
+                "@configured-user why is this correct?",
+            ),
+            self.item(
+                "comment",
+                "incidental-mention",
+                "v1",
+                "Why does the note from @alice matter?",
+            ),
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 2)
+
+        self.assertEqual(
+            self.evaluator.calls,
+            [
+                "@configured-user why is this correct?",
+                "Why does the note from @alice matter?",
+            ],
+        )
+        self.assertEqual(self.gateway.post_calls, 2)
+
+    def test_actionable_feedback_with_other_leading_addressee_is_evaluated(
+        self,
+    ) -> None:
+        body = "@alice, please change the null handling."
+        self.gateway.items = [
+            self.item(
+                "comment",
+                "other-addressee-actionable",
+                "v1",
+                body,
+            )
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 1)
+
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT state, decision_json FROM feedback_versions"
+            ).fetchone()
+        decision = json.loads(str(row["decision_json"]))
+        self.assertEqual(row["state"], "resolved")
+        self.assertEqual(decision["action"], "revise")
+        self.assertEqual(self.evaluator.calls, [body])
+        self.assertEqual(len(self.executor.calls), 1)
+        self.assertEqual(self.publisher.calls, ["run-1"])
+
+    def test_resolved_inline_thread_is_ignored_without_work(self) -> None:
+        self.gateway.items = [
+            self.item(
+                "inline_comment",
+                "resolved-inline",
+                "v1",
+                "Change this implementation.",
+                review_thread_id="THREAD-resolved",
+                review_thread_resolved=True,
+            )
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 1)
+
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT state, decision_json FROM feedback_versions"
+            ).fetchone()
+            operation_count = connection.execute(
+                "SELECT COUNT(*) FROM outbound_operations"
+            ).fetchone()[0]
+        decision = json.loads(str(row["decision_json"]))
+        self.assertEqual(row["state"], "resolved")
+        self.assertEqual(decision["action"], "ignore")
+        self.assertEqual(decision["response"], "")
+        self.assertEqual(self.evaluator.calls, [])
+        self.assertEqual(self.executor.calls, [])
+        self.assertEqual(self.publisher.calls, [])
+        self.assertEqual(self.gateway.resolve_thread_calls, [])
+        self.assertEqual(self.gateway.post_calls, 0)
+        self.assertEqual(operation_count, 0)
 
     def test_unknown_mergeability_does_not_create_conflict_feedback(
         self,
