@@ -648,7 +648,11 @@ class FeedbackService:
                 ):
                     continue
 
+            if self._reopen_publication_rejected_batch(run_id, revisions):
+                continue
             if self.publisher.publish(run_id) is None:
+                if self._reopen_publication_rejected_batch(run_id, revisions):
+                    continue
                 return processed
             self._complete_feedback(tuple(revisions), "resolved")
             processed += len(revisions)
@@ -700,6 +704,79 @@ class FeedbackService:
                 ),
             )
         return operation_id
+
+    def _reopen_publication_rejected_batch(
+        self,
+        run_id: str,
+        rows: list[dict[str, object]],
+    ) -> bool:
+        source_shas = {str(row.get("source_sha") or "") for row in rows}
+        if len(source_shas) != 1 or "" in source_shas:
+            return False
+        rejected_sha = next(iter(source_shas))
+        feedback_ids = sorted(str(row["id"]) for row in rows)
+        idempotency_key = (
+            f"{run_id}:feedback-revision-batch:" + ",".join(feedback_ids)
+        )
+        operation_id = _stable_id(idempotency_key)
+        request_json = _json({"feedback_ids": feedback_ids})
+        now = _utc_now()
+        with self.database.transaction() as connection:
+            run = connection.execute(
+                "SELECT state, reason FROM runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+            if (
+                run is None
+                or run["state"] != RunState.IMPLEMENTING.value
+                or not str(run["reason"] or "").startswith(
+                    "publication revision required:"
+                )
+            ):
+                return False
+            current_rows = [
+                connection.execute(
+                    """SELECT state, source_sha, superseded_at
+                       FROM feedback_versions WHERE id=?""",
+                    (feedback_id,),
+                ).fetchone()
+                for feedback_id in feedback_ids
+            ]
+            if any(
+                row is None
+                or row["state"] not in {"pending", "processing"}
+                or row["source_sha"] != rejected_sha
+                or row["superseded_at"] is not None
+                for row in current_rows
+            ):
+                return False
+            for feedback_id in feedback_ids:
+                connection.execute(
+                    "UPDATE feedback_versions SET source_sha=NULL WHERE id=?",
+                    (feedback_id,),
+                )
+            connection.execute(
+                """INSERT OR IGNORE INTO outbound_operations
+                   (id, run_id, kind, idempotency_key, request_json, state,
+                    created_at)
+                   VALUES (?, ?, 'feedback_revision_batch', ?, ?, 'pending', ?)""",
+                (
+                    operation_id,
+                    run_id,
+                    idempotency_key,
+                    request_json,
+                    now,
+                ),
+            )
+            connection.execute(
+                """UPDATE outbound_operations
+                   SET request_json=?, state='pending', external_id=NULL,
+                       attempted_at=NULL, completed_at=NULL, error=NULL
+                   WHERE id=? AND run_id=?
+                     AND kind='feedback_revision_batch'""",
+                (request_json, operation_id, run_id),
+            )
+        return True
 
     def _recover_revision_batch(
         self,
