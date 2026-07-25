@@ -31,4 +31,4 @@ A pull-request feedback revision can merge a newer intended-base commit than the
 - [x] `REGRESSION` - reject a bound feedback revision during publication, restart in `implementing`, and prove the same batch is durably reopened, revised, and republished once.
 - [x] `REGRESSION` - run the focused execution, feedback, and orchestration suites.
 - [x] `REGRESSION` - run the complete project suite.
-- [ ] `LIVE` - resume Repogents issue #1 / pull request #6 and observe exact-SHA validation and same-pull publication against current `main`.
+- [x] `LIVE` - resume Repogents issue #1 / pull request #6 and observe exact-SHA validation and same-pull publication against current `main`.
