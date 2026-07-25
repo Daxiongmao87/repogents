@@ -17,12 +17,12 @@ Changes the issue-assignment timing established by `spec/stored-team-activation/
 - [x] The added member resolves all fetched-base conflicts, after which the lead integrates and the independent verifier approves a validated commit on the existing run, branch, and pull request.
 - [x] Assignment expansion survives controller restart without repeating already completed members or losing pending feedback and revision-batch state.
 - [x] Redundant, reducing, replacing, out-of-team, and non-lead assignment attempts are rejected without durable assignment changes.
-- [ ] The blocked `Daxiongmao87/repogents` issue #1 run resumes through its existing pull request #6, preserves both actionable inline findings, resolves both review threads, and reaches a validated remote head that GitHub reports mergeable with current `main`.
+- [x] The blocked `Daxiongmao87/repogents` issue #1 run resumes through its existing pull request #6, preserves both actionable inline findings, resolves both review threads, and reaches a validated remote head that GitHub reports mergeable with current `main`.
 
 ## Verification
 
 - [x] `REGRESSION` - begin real base-conflict feedback with an initial assignment that omits the required conflict owner; prove the lead expands the assignment after work starts, reconstruct the services, and complete merge, validation, and same-pull publication without repeating the completed member.
 - [x] `REGRESSION` - prove redundant and reducing expansions are rejected while the original assignment remains intact.
 - [x] `REGRESSION` - run the focused execution, team, feedback, lifecycle, publication, and orchestration suites.
-- [ ] `LIVE` - deploy the corrected controller, resume the existing issue #1 / pull request #6 revision batch once, and observe the newly assigned stored member complete every unresolved checkout conflict.
-- [ ] `LIVE` - verify pull request #6 uses the original run, branch, and PR; both inline review threads are resolved; the published head has passing exact-SHA validation; and GitHub reports it mergeable with current `main`.
+- [x] `LIVE` - deploy the corrected controller, resume the existing issue #1 / pull request #6 revision batch once, and observe the newly assigned stored member complete every unresolved checkout conflict.
+- [x] `LIVE` - verify pull request #6 uses the original run, branch, and PR; both inline review threads are resolved; the published head has passing exact-SHA validation; and GitHub reports it mergeable with current `main`.

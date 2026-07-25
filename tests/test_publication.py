@@ -1404,6 +1404,93 @@ class PublicationTests(unittest.TestCase):
             ("app.py",),
         )
 
+    def test_clean_second_base_advance_uses_latest_merge_base(self) -> None:
+        self._git("switch", "-qc", "integrated-base", self.base_sha)
+        (self.checkout / "shared.txt").write_text(
+            "integrated base\n",
+            encoding="utf-8",
+        )
+        self._git("add", "-A")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=f@example.com",
+            "commit",
+            "-qm",
+            "integrated base",
+        )
+        integrated_base_sha = self._git("rev-parse", "HEAD").strip()
+
+        self._git("switch", "-q", "main")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=f@example.com",
+            "merge",
+            "--no-edit",
+            integrated_base_sha,
+        )
+        (self.checkout / "shared.txt").write_text(
+            "candidate revision\n",
+            encoding="utf-8",
+        )
+        self._git("add", "-A")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=f@example.com",
+            "commit",
+            "-qm",
+            "revise integrated file",
+        )
+        candidate_sha = self._git("rev-parse", "HEAD").strip()
+
+        self._git("switch", "-qc", "later-base", integrated_base_sha)
+        (self.checkout / "later-base.txt").write_text(
+            "later base work\n",
+            encoding="utf-8",
+        )
+        self._git("add", "-A")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=f@example.com",
+            "commit",
+            "-qm",
+            "advance integrated base",
+        )
+        self.gateway.intended_base_head = self._git("rev-parse", "HEAD").strip()
+        self._git("switch", "-q", "main")
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET validated_sha=? WHERE id='run-1'",
+                (candidate_sha,),
+            )
+            connection.execute(
+                "UPDATE validation_results SET commit_sha=? WHERE id='result-1'",
+                (candidate_sha,),
+            )
+
+        reviewer = FakeScopeReviewer()
+        service = PublicationService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            gateway=self.gateway,
+            scope_reviewer=reviewer,
+            acceptance=passing_acceptance(self.issue_version_id),
+        )
+
+        pull = service.publish("run-1")
+
+        self.assertIsNotNone(pull)
+        self.assertEqual(self.gateway.branches[self.branch], candidate_sha)
+        self.assertEqual(reviewer.reviews[-1][1], ("app.py", "shared.txt"))
+        self.assertNotIn("later-base.txt", reviewer.reviews[-1][0])
+
     def test_current_intended_base_conflict_blocks_without_changing_activation_base(
         self,
     ) -> None:

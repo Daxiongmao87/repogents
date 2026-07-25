@@ -98,6 +98,13 @@ FEEDBACK_VALIDATION_RECOVERY_REASONS = frozenset(
         FEEDBACK_VALIDATION_REPLAY_RECOVERY_REASON,
     }
 )
+_LEGACY_PUBLICATION_MERGE_CONFLICT_BLOCKER = (
+    "publication blocked: validated commit has a merge conflict with the "
+    "current intended-base head"
+)
+_LEGACY_PUBLICATION_MERGE_BASE_RECOVERY_REASON = (
+    "automatic publication retry with corrected candidate/current merge base"
+)
 _LEGACY_VISUAL_BLOCK_TERMS = (
     "browser",
     "capture",
@@ -1480,6 +1487,78 @@ class RunLifecycle:
             ),
         )
 
+    def _recover_legacy_publication_merge_base_blocks(self) -> tuple[str, ...]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT runs.id
+                   FROM runs
+                   JOIN repositories ON repositories.id=runs.repository_id
+                   WHERE runs.state='blocked'
+                     AND runs.reason=?
+                     AND runs.validated_sha IS NOT NULL
+                     AND repositories.enabled=1
+                     AND repositories.removed_at IS NULL
+                   ORDER BY runs.created_at, runs.id""",
+                (_LEGACY_PUBLICATION_MERGE_CONFLICT_BLOCKER,),
+            ).fetchall()
+        recovered: list[str] = []
+        for row in rows:
+            run_id = str(row["id"])
+            with self._run_lock(run_id):
+                with self.database.transaction() as connection:
+                    candidate = connection.execute(
+                        """SELECT runs.id
+                           FROM runs
+                           JOIN repositories
+                             ON repositories.id=runs.repository_id
+                           WHERE runs.id=?
+                             AND runs.state='blocked'
+                             AND runs.reason=?
+                             AND runs.validated_sha IS NOT NULL
+                             AND repositories.enabled=1
+                             AND repositories.removed_at IS NULL
+                             AND NOT EXISTS (
+                                 SELECT 1
+                                 FROM run_transitions
+                                 WHERE run_transitions.run_id=runs.id
+                                   AND run_transitions.from_state='blocked'
+                                   AND run_transitions.to_state='publishing'
+                                   AND run_transitions.reason=?
+                             )""",
+                        (
+                            run_id,
+                            _LEGACY_PUBLICATION_MERGE_CONFLICT_BLOCKER,
+                            _LEGACY_PUBLICATION_MERGE_BASE_RECOVERY_REASON,
+                        ),
+                    ).fetchone()
+                    if candidate is None:
+                        continue
+                    now = _utc_now()
+                    updated = connection.execute(
+                        """UPDATE runs
+                           SET state='publishing', reason=?, updated_at=?
+                           WHERE id=? AND state='blocked'""",
+                        (
+                            _LEGACY_PUBLICATION_MERGE_BASE_RECOVERY_REASON,
+                            now,
+                            run_id,
+                        ),
+                    ).rowcount
+                    if updated != 1:
+                        continue
+                    connection.execute(
+                        """INSERT INTO run_transitions
+                           (run_id, from_state, to_state, reason, occurred_at)
+                           VALUES (?, 'blocked', 'publishing', ?, ?)""",
+                        (
+                            run_id,
+                            _LEGACY_PUBLICATION_MERGE_BASE_RECOVERY_REASON,
+                            now,
+                        ),
+                    )
+                    recovered.append(run_id)
+        return tuple(recovered)
+
     def reconcile_recoverable_blocked_runs(self) -> tuple[str, ...]:
         with self.database.connect() as connection:
             rows = connection.execute("""SELECT runs.id FROM runs
@@ -1490,7 +1569,10 @@ class RunLifecycle:
                      AND runs.reason LIKE
                          'publication blocked: issue acceptance verification blocked:%'
                    ORDER BY runs.created_at, runs.id""").fetchall()
-        recovered = list(self._recover_legacy_feedback_assignment_blocks())
+        recovered = list(
+            self._recover_legacy_publication_merge_base_blocks()
+        )
+        recovered.extend(self._recover_legacy_feedback_assignment_blocks())
         recovered.extend(self._recover_legacy_feedback_handoff_blocks())
         recovered.extend(self._recover_legacy_feedback_validation_base_blocks())
         recovered.extend(self._recover_legacy_feedback_validation_replay_blocks())
