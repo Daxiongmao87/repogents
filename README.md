@@ -1,6 +1,6 @@
 # Repogents
 
-Repogents is a local, restart-safe repository agent for one user on one Linux host. Add GitHub repositories, delegate an issue with the `agent:ready` label, and Repogents will inspect the repository, work in an isolated checkout, run the repository's validation commands, and open an unmerged pull request. It then monitors that pull request, resolves new feedback on the same branch, and notifies you after 30 continuously verified feedback-free minutes.
+Repogents is a local, restart-safe repository agent for one user on one Linux host. Add GitHub repositories, delegate an issue with the `agent:ready` label, and Repogents will inspect the repository, work in an isolated checkout, run the repository's validation commands, and open an unmerged pull request. It then monitors that pull request until GitHub reports it merged or closed, resolving new feedback on the same branch for as long as it remains open.
 
 Repogents is intentionally an orchestrator, not a general-purpose agent shell. Repository commands run through a constrained Bubblewrap sandbox; GitHub and model credentials stay in the controller process.
 
@@ -13,7 +13,7 @@ Repogents is intentionally an orchestrator, not a general-purpose agent shell. R
 5. Uses the stored mini-SWE-agent team to inspect, implement, commit, and validate the requested change.
 6. Reviews the complete committed diff for scope and secrets before publishing one deterministic, unmerged pull request.
 7. Ingests reviews, inline review comments, and pull-request comments; resolves each version once and updates the same pull request when source changes are required.
-8. Creates a persistent notification only after a successful GitHub check confirms 30 continuous quiet minutes.
+8. Continues polling every open application-owned pull request; a merge ends the run, while closure without merge starts one fresh run when the linked issue remains open.
 
 Repogents never merges or closes pull requests.
 
@@ -48,13 +48,14 @@ python -m pip install .
 
 ## Configure
 
-Repogents requires an explicit model selector. It does not discover model settings from another agent tool or from a user-level mini-SWE configuration.
+Model-backed work requires an explicit model selector, but the server can start before one is configured. Repogents never discovers model settings from another agent tool or from a user-level mini-SWE configuration. You can provide bootstrap values through the environment:
 
 ```bash
 export REPOGENTS_MODEL="openai/<model-id>"
+export OPENAI_API_KEY="<key>"
 ```
 
-Set the credential required by that provider in the process environment—for example, `OPENAI_API_KEY` for an OpenAI model. Do not put credentials in this repository or in repository-specific input JSON.
+Use the credential variable required by the selected provider. Do not put credentials in this repository or in repository-specific input JSON.
 
 Authenticate GitHub with either:
 
@@ -75,10 +76,10 @@ The token must be authorized to read the selected repositories and issues, push 
 | CLI option | Environment variable | Default | Purpose |
 | --- | --- | --- | --- |
 | `--data-dir PATH` | `REPOGENTS_DATA_DIR` | `~/.local/share/repogents` | Durable database, repository environments, run evidence, logs, and model state |
-| `--model SELECTOR` | `REPOGENTS_MODEL` | none | Required explicit LiteLLM model selector |
-| `--model-base-url URL` | `REPOGENTS_MODEL_BASE_URL` | provider default | Optional explicit OpenAI-compatible endpoint |
+| `--model SELECTOR` | `REPOGENTS_MODEL` | none | Optional bootstrap LiteLLM model selector; required before model-backed work |
+| `--model-base-url URL` | `REPOGENTS_MODEL_BASE_URL` | provider default | Optional bootstrap OpenAI-compatible endpoint |
 
-Command-line options take precedence over environment defaults. Global options must appear before the subcommand.
+Command-line options take precedence over environment defaults. Browser-saved provider settings then become authoritative across restarts. Global options must appear before the subcommand.
 
 ## Start Repogents
 
@@ -100,6 +101,53 @@ ssh -L 8765:127.0.0.1:8765 user@host
 ```
 
 Then open <http://127.0.0.1:8765> on your local machine. Do not bind Repogents to a public interface without a separately authenticated, trusted access layer.
+
+### Configure the model provider in the browser
+
+Open **Model provider** at the top of the dashboard:
+
+1. Set **API endpoint** only when using a custom OpenAI-compatible endpoint; leave it blank for the provider default.
+2. Enter the **API key**. The key is write-only: later page loads show only whether it is configured.
+3. Set the required **Default model** LiteLLM selector, such as `openai/<model-id>`.
+4. Optionally set separate **Lead**, **Implementer**, and **Verifier** model selectors. Blank role fields inherit the default.
+5. Select **Save model configuration**.
+
+Endpoint and key changes apply to subsequent inference without restarting Repogents. New model selectors are stored by future repository onboarding; select **Re-onboard** for an existing repository when its immutable stored team should use the new selectors.
+
+Non-secret settings are stored under the durable data directory. The API key is stored separately in a mode-`0600` file and is never returned by the HTTP API. A blank key field preserves the current key; **Remove stored API key** explicitly deletes a dashboard-saved key. A provider credential inherited from the daemon environment remains active until that environment is changed.
+
+
+### Trusted-LAN user daemon
+
+`deploy/systemd/repogents.service` is an explicit opt-in user service for a checkout at `~/projects/repogents`. It uses the checkout's `.venv`, restarts after failure, and reads host-specific values from `~/.config/repogents/daemon.env`.
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+install -Dm644 deploy/systemd/repogents.service \
+  ~/.config/systemd/user/repogents.service
+install -d -m700 ~/.config/repogents
+touch ~/.config/repogents/daemon.env
+chmod 600 ~/.config/repogents/daemon.env
+```
+
+Configure one concrete LAN address rather than `0.0.0.0` so the browser authority continues to match Repogents' exact `Host` and `Origin` checks:
+
+```text
+REPOGENTS_DATA_DIR=/home/you/.local/share/repogents
+REPOGENTS_MODEL=openai/<model-id>
+REPOGENTS_LAN_HOST=192.168.1.20
+REPOGENTS_LAN_PORT=8766
+```
+
+Provider credentials may instead be added to that mode-`0600` environment file as bootstrap/fallback values; never commit them. Then enable the daemon:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now repogents.service
+```
+
+Every device that can reach the selected address can open this unauthenticated single-user interface. Use this mode only on a trusted LAN, never forward the port to the internet, and retain the loopback/tunnel setup on untrusted networks. The LAN service uses plain HTTP, so enter API keys only from a trusted network path. Dashboard state refreshes every 10 seconds; selected-repository activity is pushed immediately over a reconnecting Server-Sent Events stream.
 
 ## Onboard a repository
 
@@ -163,13 +211,11 @@ The activating label event has a stable identity. Repeated polling and applicati
 
 When the exact commit passes every discovered validation command and scope review, Repogents pushes a deterministic `agent/issue-<issue-number>-<run-id>` branch and opens one pull request. The pull request remains unmerged for you to review.
 
-## Feedback and notifications
+## Feedback monitoring
 
-Keep Repogents running while a pull request is open. It polls submitted reviews, inline comments, and general pull-request comments. New or edited feedback is persisted before evaluation. Valid changes are implemented, revalidated, and pushed to the same branch; questions and rejected requests receive a response without inventing a source change.
+Keep Repogents running while a pull request is open. It polls submitted reviews, inline comments, general pull-request comments, and pull-request status independently of repository-local agent work. New or edited feedback is persisted before evaluation. Valid changes are implemented, revalidated, and pushed to the same branch; questions and rejected requests receive a response without inventing a source change.
 
-After all observed feedback is resolved, Repogents starts a durable quiet-period generation. Feedback resets that generation. A local clock alone is not sufficient: at or after the deadline, Repogents must successfully check GitHub, find the pull request still open, and confirm no newer feedback before creating one notification.
-
-Notifications remain in the browser interface across restarts. Select **Acknowledge** to mark one read.
+After all observed feedback is resolved, the same run remains in `waiting_for_feedback`. Elapsed time does not complete the run or stop polling. A merge moves the run to `closed`. Closing the pull request without merge closes that attempt and creates one fresh run from the repository's current stored sandbox and team when the linked issue remains open.
 
 ## Other commands
 
@@ -179,7 +225,7 @@ Run one scheduler cycle:
 repogents tick
 ```
 
-Print current durable inventory, run, and notification state as JSON:
+Print current durable inventory and run state as JSON:
 
 ```bash
 repogents state

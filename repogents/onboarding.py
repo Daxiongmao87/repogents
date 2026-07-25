@@ -14,11 +14,27 @@ from .controller import git_environment
 from .database import Database
 from .mini_swe import MiniSweInference
 from .github import RepositoryInfo
-from .sandbox import Mount, RestrictedNetworkPolicy, RunLayout, SandboxManager, SandboxPolicy
+from .sandbox import (
+    Mount,
+    RestrictedNetworkPolicy,
+    RunLayout,
+    SandboxManager,
+    SandboxPolicy,
+)
 from .team import DEFAULT_ACTION_TIMEOUT_SECONDS, validate_team_members
 
-
-_SKIP_DIRECTORIES = {".git", ".hg", ".svn", "node_modules", "vendor", "target", "dist", "build", ".venv", "venv"}
+_SKIP_DIRECTORIES = {
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "vendor",
+    "target",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+}
 _INSTRUCTION_NAMES = ("AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "README.md")
 _LOCKFILE_NAMES = {
     "package-lock.json",
@@ -81,6 +97,7 @@ class RepositoryInspection:
             list(command) for command in self.provisioning_commands
         ]
         return value
+
 
 @dataclass(frozen=True)
 class RepositoryInference:
@@ -268,8 +285,7 @@ def _largest_fitting_content_prefix(
             }
         )
         fits = (
-            len(_compact_json(payload).encode("utf-8"))
-            <= _INFERENCE_PROMPT_LIMIT_BYTES
+            len(_compact_json(payload).encode("utf-8")) <= _INFERENCE_PROMPT_LIMIT_BYTES
         )
         contents.pop()
         if fits:
@@ -286,6 +302,7 @@ def _compact_json(value: object) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
 
 def _bounded_utf8(value: str, byte_limit: int) -> str:
     encoded = value.encode("utf-8")
@@ -340,22 +357,26 @@ class MiniSweRepositoryEvidenceAnalyzer:
     def __init__(
         self,
         *,
-        model: str,
+        model: str | None,
         state_root: Path,
         base_url: str | None = None,
+        api_key: str | None = None,
+        configuration_resolver: (
+            Callable[[], tuple[str, str | None, str | None]] | None
+        ) = None,
         timeout: float = 600,
     ) -> None:
-        if not model.strip():
-            raise ValueError(
-                "repository evidence analyzer requires an explicit model"
-            )
+        if configuration_resolver is None and (
+            not isinstance(model, str) or not model.strip()
+        ):
+            raise ValueError("repository evidence analyzer requires an explicit model")
         if timeout <= 0:
-            raise ValueError(
-                "repository evidence analyzer timeout must be positive"
-            )
+            raise ValueError("repository evidence analyzer timeout must be positive")
         self.model = model
         self.state_root = Path(state_root).expanduser().resolve()
         self.base_url = base_url
+        self.api_key = api_key
+        self.configuration_resolver = configuration_resolver
         self.timeout = timeout
 
     def analyze(
@@ -368,13 +389,22 @@ class MiniSweRepositoryEvidenceAnalyzer:
             inspection,
             prior_failure=prior_failure,
         )
-        state_directory = self.state_root / uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            prompt,
-        ).hex
+        state_directory = (
+            self.state_root
+            / uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                prompt,
+            ).hex
+        )
+        model = self.model
+        base_url = self.base_url
+        api_key = self.api_key
+        if self.configuration_resolver is not None:
+            model, base_url, api_key = self.configuration_resolver()
         inference = MiniSweInference(
-            model=self.model,
-            base_url=self.base_url,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
             timeout=self.timeout,
         )
         try:
@@ -403,13 +433,13 @@ class SourceManager(Protocol):
     def prepare(self, repository: RepositoryInfo, destination: Path) -> str: ...
 
 
-ProvisioningSecretBinding = tuple[
-    str, str, tuple[tuple[str, ...], ...]
-]
+ProvisioningSecretBinding = tuple[str, str, tuple[tuple[str, ...], ...]]
 
 
 class TeamFormulator(Protocol):
-    def formulate(self, inspection: RepositoryInspection) -> list[dict[str, object]]: ...
+    def formulate(
+        self, inspection: RepositoryInspection
+    ) -> list[dict[str, object]]: ...
 
 
 class EnvironmentProvisioner(Protocol):
@@ -483,8 +513,7 @@ class SandboxEnvironmentProvisioner:
                     "environment provisioning requires a controller secret resolver"
                 )
             return {
-                name: self.secret_resolver(reference)
-                for name, reference in matched
+                name: self.secret_resolver(reference) for name, reference in matched
             }
 
         def run(command: tuple[str, ...], timeout: float = 600) -> None:
@@ -501,9 +530,7 @@ class SandboxEnvironmentProvisioner:
                     "environment provisioning command failed: "
                     + (result.stderr.strip() or " ".join(command))
                 )
-            records.append(
-                {"command": list(command), "log_path": str(result.log_path)}
-            )
+            records.append({"command": list(command), "log_path": str(result.log_path)})
 
         if provisioning_commands:
             for command in provisioning_commands:
@@ -604,8 +631,6 @@ class GitSourceManager:
         return sha
 
 
-
-
 class RepositoryInspector:
     """Derives non-executing repository evidence without target-specific rules."""
 
@@ -640,10 +665,20 @@ class RepositoryInspector:
             if len(relative_files) >= 50_000:
                 break
 
-        manifests = tuple(sorted(path for path in relative_files if Path(path).name in _MANIFEST_NAMES))
-        lockfiles = tuple(sorted(path for path in relative_files if Path(path).name in _LOCKFILE_NAMES))
+        manifests = tuple(
+            sorted(
+                path for path in relative_files if Path(path).name in _MANIFEST_NAMES
+            )
+        )
+        lockfiles = tuple(
+            sorted(
+                path for path in relative_files if Path(path).name in _LOCKFILE_NAMES
+            )
+        )
         instruction_files = tuple(
-            sorted(path for path in relative_files if Path(path).name in _INSTRUCTION_NAMES)
+            sorted(
+                path for path in relative_files if Path(path).name in _INSTRUCTION_NAMES
+            )
         )
         instruction_contents: list[tuple[str, str]] = []
         remaining_instruction_bytes = 256_000
@@ -656,9 +691,7 @@ class RepositoryInspector:
             ).open("rb") as source:
                 raw = source.read(min(64_000, remaining_instruction_bytes))
             remaining_instruction_bytes -= len(raw)
-            instruction_contents.append(
-                (relative, raw.decode("utf-8", "replace"))
-            )
+            instruction_contents.append((relative, raw.decode("utf-8", "replace")))
         source_evidence = _bounded_source_evidence(source_root, relative_files)
         languages = self._languages(manifests, suffixes)
         commands = self._validation_commands(
@@ -686,9 +719,18 @@ class RepositoryInspector:
     def _languages(manifests: Sequence[str], suffixes: set[str]) -> tuple[str, ...]:
         values: set[str] = set()
         manifest_names = {Path(path).name for path in manifests}
-        if "package.json" in manifest_names or suffixes & {".js", ".jsx", ".ts", ".tsx"}:
+        if "package.json" in manifest_names or suffixes & {
+            ".js",
+            ".jsx",
+            ".ts",
+            ".tsx",
+        }:
             values.add("javascript")
-        if manifest_names & {"pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"} or ".py" in suffixes:
+        if (
+            manifest_names
+            & {"pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"}
+            or ".py" in suffixes
+        ):
             values.add("python")
         if "Cargo.toml" in manifest_names or ".rs" in suffixes:
             values.add("rust")
@@ -736,8 +778,7 @@ class RepositoryInspector:
                     commands.append((manager, "run", script))
         has_python = any(Path(path).suffix.lower() == ".py" for path in relative_files)
         has_python_tests = any(
-            Path(path).suffix.lower() == ".py"
-            and Path(path).name.startswith("test")
+            Path(path).suffix.lower() == ".py" and Path(path).name.startswith("test")
             for path in relative_files
         )
         has_pytest = False
@@ -754,7 +795,11 @@ class RepositoryInspector:
         if has_python:
             commands.append(("python3", "-m", "compileall", "-q", "."))
         if "Cargo.toml" in by_name:
-            commands.append(("cargo", "test", "--locked") if "Cargo.lock" in locks else ("cargo", "test"))
+            commands.append(
+                ("cargo", "test", "--locked")
+                if "Cargo.lock" in locks
+                else ("cargo", "test")
+            )
         if "go.mod" in by_name:
             commands.append(("go", "test", "./..."))
         if "Makefile" in by_name:
@@ -765,9 +810,11 @@ class RepositoryInspector:
             if any(line.startswith("test:") for line in text.splitlines()):
                 commands.append(("make", "test"))
         seen: set[tuple[str, ...]] = set()
-        return tuple(command for command in commands if not (command in seen or seen.add(command)))
-
-
+        return tuple(
+            command
+            for command in commands
+            if not (command in seen or seen.add(command))
+        )
 
 
 def _inspection_summary(
@@ -819,7 +866,9 @@ def _safe_inspection_path(source_root: Path, path: Path) -> Path:
     try:
         resolved = candidate.resolve(strict=True)
     except OSError as error:
-        raise RuntimeError(f"cannot resolve repository inspection path: {error}") from error
+        raise RuntimeError(
+            f"cannot resolve repository inspection path: {error}"
+        ) from error
     if resolved != root and root not in resolved.parents:
         raise RuntimeError(
             f"repository inspection path resolves outside source: {candidate}"
@@ -864,9 +913,17 @@ class OnboardingService:
         now = _utc_now()
         with self.database.transaction() as connection:
             existing = connection.execute(
-                "SELECT onboarding_state FROM repositories WHERE id = ?", (repository_id,)
+                """SELECT onboarding_state, removed_at
+                   FROM repositories WHERE id = ?""",
+                (repository_id,),
             ).fetchone()
             if existing is not None and existing["onboarding_state"] == "ready":
+                connection.execute(
+                    """UPDATE repositories
+                       SET enabled=1, removed_at=NULL, updated_at=?
+                       WHERE id=?""",
+                    (now, repository_id),
+                )
                 return repository_id
             connection.execute(
                 """INSERT INTO repositories
@@ -882,6 +939,8 @@ class OnboardingService:
                      onboarding_state=excluded.onboarding_state,
                      blocking_reason=excluded.blocking_reason,
                      inputs_json=excluded.inputs_json,
+                     enabled=1,
+                     removed_at=NULL,
                      updated_at=excluded.updated_at""",
                 (
                     repository_id,
@@ -916,9 +975,7 @@ class OnboardingService:
         repository_record = self.get_repository(repository_id)
         prior_failure_value = repository_record["blocking_reason"]
         prior_failure = (
-            str(prior_failure_value)
-            if prior_failure_value is not None
-            else None
+            str(prior_failure_value) if prior_failure_value is not None else None
         )
         try:
             retained_inputs = json.loads(str(repository_record["inputs_json"]))
@@ -1122,25 +1179,35 @@ class OnboardingService:
                 """INSERT INTO sandbox_versions
                    (id, repository_id, version, root_path, policy_json, evidence_json, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (sandbox_id, repository_id, sandbox_version, str(sandbox_path), _json(policy), _json(evidence), now),
+                (
+                    sandbox_id,
+                    repository_id,
+                    sandbox_version,
+                    str(sandbox_path),
+                    _json(policy),
+                    _json(evidence),
+                    now,
+                ),
             )
             connection.execute(
                 """INSERT INTO team_versions
-                   (id, repository_id, version, evidence_json, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   (id, repository_id, version, evidence_json,
+                    design_contract_version, created_at)
+                   VALUES (?, ?, ?, ?, 2, ?)""",
                 (team_id, repository_id, team_version, _json(evidence), now),
             )
             for member in members:
                 connection.execute(
                     """INSERT INTO team_members
-                       (id, team_version_id, stable_key, role, responsibilities,
-                        permitted_tools_json, runtime, model, instructions,
-                        action_timeout_seconds)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (id, team_version_id, stable_key, role, atomic_role,
+                        responsibilities, permitted_tools_json, runtime, model,
+                        instructions, action_timeout_seconds)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         str(uuid.uuid4()),
                         team_id,
                         member["stable_key"],
+                        member["execution_class"],
                         member["role"],
                         member["responsibilities"],
                         _json(member["permitted_tools"]),
@@ -1181,17 +1248,14 @@ class OnboardingService:
             )
         return repository_id
 
-
     def recover_interrupted(self) -> tuple[str, ...]:
         """Make startup-interrupted onboarding records explicitly retriable."""
         now = _utc_now()
         recovered: list[str] = []
         with self.database.transaction() as connection:
-            rows = connection.execute(
-                """SELECT id, onboarding_state FROM repositories
+            rows = connection.execute("""SELECT id, onboarding_state FROM repositories
                    WHERE onboarding_state IN ('inspecting', 'provisioning')
-                   ORDER BY id"""
-            ).fetchall()
+                   ORDER BY id""").fetchall()
             for row in rows:
                 repository_id = str(row["id"])
                 interrupted_state = str(row["onboarding_state"])
@@ -1210,7 +1274,6 @@ class OnboardingService:
                 recovered.append(repository_id)
         return tuple(recovered)
 
-
     def _set_failure(self, repository_id: str, state: str, reason: str) -> None:
         with self.database.transaction() as connection:
             connection.execute(
@@ -1220,14 +1283,16 @@ class OnboardingService:
 
     def list_repositories(self) -> list[dict[str, object]]:
         with self.database.connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM repositories ORDER BY owner COLLATE NOCASE, name COLLATE NOCASE"
-            ).fetchall()
+            rows = connection.execute("""SELECT * FROM repositories
+                   WHERE removed_at IS NULL
+                   ORDER BY owner COLLATE NOCASE, name COLLATE NOCASE""").fetchall()
         return [dict(row) for row in rows]
 
     def get_repository(self, repository_id: str) -> dict[str, object]:
         with self.database.connect() as connection:
-            row = connection.execute("SELECT * FROM repositories WHERE id=?", (repository_id,)).fetchone()
+            row = connection.execute(
+                "SELECT * FROM repositories WHERE id=?", (repository_id,)
+            ).fetchone()
         if row is None:
             raise KeyError(repository_id)
         return dict(row)
@@ -1306,14 +1371,15 @@ def _normalize_repository_inputs(inputs: dict[str, object]) -> dict[str, Any]:
             if name in names:
                 raise ValueError(f"duplicate secret binding name: {name}")
             if not isinstance(reference, str) or not reference.strip():
-                raise ValueError(
-                    f"secret_bindings[{index}] reference must be a string"
-                )
+                raise ValueError(f"secret_bindings[{index}] reference must be a string")
             reference_value = reference.strip()
-            if re.fullmatch(
-                r"secret://[A-Za-z0-9][A-Za-z0-9_.-]*",
-                reference_value,
-            ) is None:
+            if (
+                re.fullmatch(
+                    r"secret://[A-Za-z0-9][A-Za-z0-9_.-]*",
+                    reference_value,
+                )
+                is None
+            ):
                 raise ValueError(
                     f"secret_bindings[{index}] reference must use secret://name"
                 )
@@ -1397,8 +1463,7 @@ def _parse_repository_inference(
     def strings(name: str) -> tuple[str, ...]:
         raw = value[name]
         if not isinstance(raw, list) or not all(
-            isinstance(item, str) and item and item == item.strip()
-            for item in raw
+            isinstance(item, str) and item and item == item.strip() for item in raw
         ):
             raise ValueError(f"{name} must be a list of nonempty strings")
         return tuple(dict.fromkeys(raw))

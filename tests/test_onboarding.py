@@ -34,7 +34,9 @@ class FakeGitHub:
 
 
 class FakeSources:
-    def __init__(self, files: dict[str, str] | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self, files: dict[str, str] | None = None, error: Exception | None = None
+    ) -> None:
         self.files = files or {}
         self.error = error
         self.calls = 0
@@ -49,6 +51,7 @@ class FakeSources:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
         return "a" * 40
+
 
 class RecordingSandbox:
     def __init__(self) -> None:
@@ -69,20 +72,66 @@ class RecordingSandbox:
         )
 
 
-
 class FakeTeamFormulator:
+    def __init__(
+        self,
+        *,
+        runtime: str = "configured",
+        model: str = "configured",
+        role_prefixes: list[str] | None = None,
+    ) -> None:
+        self.runtime = runtime
+        self.model = model
+        self.role_prefixes = list(role_prefixes or [])
+        self.inspections: list[RepositoryInspection] = []
+
     def formulate(self, inspection: RepositoryInspection) -> list[dict[str, object]]:
+        self.inspections.append(inspection)
+        prefix = (
+            self.role_prefixes.pop(0)
+            if self.role_prefixes
+            else (inspection.languages[0] if inspection.languages else "repository")
+        )
+        instructions = inspection.summary
         return [
             {
-                "stable_key": "lead",
-                "role": "lead",
-                "responsibilities": "Own implementation and validation",
-                "permitted_tools": ["read", "write", "run"],
-                "runtime": "configured",
-                "model": "configured",
-                "instructions": inspection.summary,
-            }
+                "stable_key": f"{prefix}-coordination",
+                "role": f"{prefix} delivery coordinator",
+                "execution_class": "lead",
+                "coordinates": True,
+                "independent_verifier": False,
+                "responsibilities": "Coordinate assignments and integrate outputs.",
+                "permitted_tools": ["read", "git_diff", "git_commit"],
+                "runtime": self.runtime,
+                "model": self.model,
+                "instructions": instructions,
+            },
+            {
+                "stable_key": f"{prefix}-implementation",
+                "role": f"{prefix} implementation maintainer",
+                "execution_class": "implementer",
+                "coordinates": False,
+                "independent_verifier": False,
+                "responsibilities": "Implement repository changes.",
+                "permitted_tools": ["read", "write", "run", "git_diff"],
+                "runtime": self.runtime,
+                "model": self.model,
+                "instructions": instructions,
+            },
+            {
+                "stable_key": f"{prefix}-verification",
+                "role": f"{prefix} behavior verifier",
+                "execution_class": "verifier",
+                "coordinates": False,
+                "independent_verifier": True,
+                "responsibilities": "Independently verify repository behavior.",
+                "permitted_tools": ["read", "run", "git_diff"],
+                "runtime": self.runtime,
+                "model": self.model,
+                "instructions": instructions,
+            },
         ]
+
 
 class ScriptedEvidenceAnalyzer:
     def __init__(self, outcomes: list[RepositoryInference | Exception]) -> None:
@@ -119,9 +168,7 @@ class MiniSweRepositoryEvidenceAnalyzerTests(unittest.TestCase):
             )
             inspection = RepositoryInspector().inspect(checkout)
             state_root = Path(directory) / "runtime-state"
-            with mock.patch(
-                "repogents.onboarding.MiniSweInference"
-            ) as inference_type:
+            with mock.patch("repogents.onboarding.MiniSweInference") as inference_type:
                 inference_type.return_value.infer.return_value = {
                     "languages": ["ruby"],
                     "manifests": ["Gemfile"],
@@ -137,9 +184,7 @@ class MiniSweRepositoryEvidenceAnalyzerTests(unittest.TestCase):
                     state_root=state_root,
                 ).analyze(
                     inspection,
-                    prior_failure=(
-                        "previous provisioning failure: denied destination"
-                    ),
+                    prior_failure=("previous provisioning failure: denied destination"),
                 )
 
         self.assertEqual(inference.languages, ("ruby",))
@@ -147,6 +192,7 @@ class MiniSweRepositoryEvidenceAnalyzerTests(unittest.TestCase):
         inference_type.assert_called_once_with(
             model="openai/gpt-stored",
             base_url="https://models.example.test/v1",
+            api_key=None,
             timeout=601,
         )
         inference_call = inference_type.return_value.infer
@@ -238,14 +284,12 @@ class MiniSweRepositoryEvidenceAnalyzerTests(unittest.TestCase):
             summary="large repository " + ("summary " * 40_000),
             source_files=files,
             source_evidence=(
-                ("pyproject.toml", "[project]\nname = \"large\"\n" + ("#" * 200_000)),
+                ("pyproject.toml", '[project]\nname = "large"\n' + ("#" * 200_000)),
                 ("src/generated/file-00000.py", "value = 1\n" * 20_000),
             ),
         )
         with tempfile.TemporaryDirectory() as directory:
-            with mock.patch(
-                "repogents.onboarding.MiniSweInference"
-            ) as inference_type:
+            with mock.patch("repogents.onboarding.MiniSweInference") as inference_type:
                 inference_type.return_value.infer.return_value = {
                     "languages": ["python"],
                     "manifests": ["pyproject.toml"],
@@ -262,9 +306,7 @@ class MiniSweRepositoryEvidenceAnalyzerTests(unittest.TestCase):
                     prior_failure="é" * 100_000,
                 )
 
-        prompt = str(
-            inference_type.return_value.infer.call_args.kwargs["prompt"]
-        )
+        prompt = str(inference_type.return_value.infer.call_args.kwargs["prompt"])
         self.assertLessEqual(len(prompt.encode("utf-8")), 96_000)
         payload = json.loads(prompt)
         self.assertLessEqual(
@@ -382,7 +424,10 @@ class OnboardingTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             parse_repository_identity("https://example.com/example/demo")
-    def test_git_source_manager_transports_configured_token_only_in_git_environment(self) -> None:
+
+    def test_git_source_manager_transports_configured_token_only_in_git_environment(
+        self,
+    ) -> None:
         completed = [
             SimpleNamespace(returncode=0, stdout="", stderr=""),
             SimpleNamespace(returncode=0, stdout="b" * 40 + "\n", stderr=""),
@@ -410,7 +455,6 @@ class OnboardingTests(unittest.TestCase):
             )
             self.assertIn("GIT_ASKPASS", environment)
 
-
     def test_inspector_derives_commands_and_evidence_from_source(self) -> None:
         checkout = self.root / "checkout"
         checkout.mkdir()
@@ -419,10 +463,14 @@ class OnboardingTests(unittest.TestCase):
             encoding="utf-8",
         )
         (checkout / "package-lock.json").write_text("{}", encoding="utf-8")
-        (checkout / "AGENTS.md").write_text("Run tests before commits.", encoding="utf-8")
+        (checkout / "AGENTS.md").write_text(
+            "Run tests before commits.", encoding="utf-8"
+        )
         inspection = RepositoryInspector().inspect(checkout)
         self.assertEqual(inspection.languages, ("javascript",))
-        self.assertEqual(inspection.validation_commands, (("npm", "test"), ("npm", "run", "lint")))
+        self.assertEqual(
+            inspection.validation_commands, (("npm", "test"), ("npm", "run", "lint"))
+        )
         self.assertIn("AGENTS.md", inspection.instruction_files)
         self.assertIn("package-lock.json", inspection.lockfiles)
         self.assertEqual(
@@ -457,7 +505,9 @@ class OnboardingTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "symlink|outside"):
                     RepositoryInspector().inspect(checkout)
 
-    def test_inspector_derives_standard_library_python_validation_without_project_config(self) -> None:
+    def test_inspector_derives_standard_library_python_validation_without_project_config(
+        self,
+    ) -> None:
         checkout = self.root / "python-checkout"
         checkout.mkdir()
         (checkout / "requirements.txt").write_text("Flask==2.3.2\n", encoding="utf-8")
@@ -588,7 +638,6 @@ class OnboardingTests(unittest.TestCase):
             },
         )
 
-
     def test_inference_failure_is_visible_and_reonboarding_retries_it(self) -> None:
         inference = RepositoryInference(
             languages=("ruby",),
@@ -671,7 +720,7 @@ class OnboardingTests(unittest.TestCase):
             sources=sources,
             inspector=RepositoryInspector(),
             evidence_analyzer=analyzer,
-            team_formulator=EvidenceTeamFormulator(
+            team_formulator=FakeTeamFormulator(
                 runtime="mini-swe-agent",
                 model="openai/gpt-stored",
             ),
@@ -713,19 +762,37 @@ class OnboardingTests(unittest.TestCase):
                    ORDER BY repositories.id""",
                 (first_id, second_id),
             ).fetchall()
+            role_rows = connection.execute(
+                """SELECT team_versions.repository_id, team_members.atomic_role
+                   FROM team_versions
+                   JOIN team_members
+                     ON team_members.team_version_id=team_versions.id
+                   WHERE team_versions.repository_id IN (?, ?)
+                   ORDER BY team_versions.repository_id, team_members.stable_key""",
+                (first_id, second_id),
+            ).fetchall()
         stored = {str(row["id"]): row for row in rows}
         first_evidence = json.loads(stored[first_id]["evidence_json"])
         second_evidence = json.loads(stored[second_id]["evidence_json"])
         self.assertEqual(first_evidence["languages"], ["javascript", "python"])
         self.assertEqual(second_evidence["languages"], ["ruby"])
         self.assertEqual(stored[first_id]["member_count"], 3)
-        self.assertEqual(stored[second_id]["member_count"], 2)
+        self.assertEqual(stored[second_id]["member_count"], 3)
         self.assertEqual(stored[first_id]["action_timeout"], 600)
         self.assertEqual(stored[second_id]["action_timeout"], 600)
         self.assertEqual(stored[first_id]["runtime"], "mini-swe-agent")
         self.assertEqual(stored[second_id]["runtime"], "mini-swe-agent")
         self.assertEqual(stored[first_id]["model"], "openai/gpt-stored")
         self.assertEqual(stored[second_id]["model"], "openai/gpt-stored")
+        roles_by_repository: dict[str, list[str]] = {}
+        for row in role_rows:
+            roles_by_repository.setdefault(str(row["repository_id"]), []).append(
+                str(row["atomic_role"])
+            )
+        self.assertTrue(
+            any("javascript" in role for role in roles_by_repository[first_id])
+        )
+        self.assertTrue(any("ruby" in role for role in roles_by_repository[second_id]))
         self.assertIn(
             "registry.npmjs.org:443",
             json.loads(stored[first_id]["policy_json"])["allowed_services"],
@@ -735,12 +802,18 @@ class OnboardingTests(unittest.TestCase):
             json.loads(stored[second_id]["policy_json"])["allowed_services"],
         )
 
-    def test_environment_provisioning_derives_python_and_node_dependencies(self) -> None:
+    def test_environment_provisioning_derives_python_and_node_dependencies(
+        self,
+    ) -> None:
         source = self.root / "source"
         source.mkdir()
         (source / "requirements.txt").write_text("Flask==2.3.2\n", encoding="utf-8")
-        (source / "package.json").write_text('{"scripts":{"build":"vite build"}}', encoding="utf-8")
-        (source / "package-lock.json").write_text('{"lockfileVersion":3}', encoding="utf-8")
+        (source / "package.json").write_text(
+            '{"scripts":{"build":"vite build"}}', encoding="utf-8"
+        )
+        (source / "package-lock.json").write_text(
+            '{"lockfileVersion":3}', encoding="utf-8"
+        )
         inspection = RepositoryInspector().inspect(source)
         sandbox_root = self.root / "sandbox" / "1"
         sandbox_root.mkdir(parents=True)
@@ -771,9 +844,7 @@ class OnboardingTests(unittest.TestCase):
         self.assertIn("pip", commands[1])
         self.assertEqual(commands[2][:2], ("npm", "ci"))
         self.assertTrue(all(call[3]["persistent_writable"] for call in sandbox.calls))
-        self.assertTrue(
-            all(call[3]["timeout"] == 600 for call in sandbox.calls)
-        )
+        self.assertTrue(all(call[3]["timeout"] == 600 for call in sandbox.calls))
         services = set(sandbox.calls[0][0].allowed_services)
         self.assertIn("pypi.org:443", services)
         self.assertIn("registry.npmjs.org:443", services)
@@ -800,9 +871,7 @@ class OnboardingTests(unittest.TestCase):
                 command: tuple[str, ...],
                 **options: object,
             ) -> object:
-                result = super().run(
-                    policy, layout, command, **options
-                )
+                result = super().run(policy, layout, command, **options)
                 checkout = Path(getattr(layout, "checkout"))
                 if (checkout / "Gemfile").is_file():
                     installed = (
@@ -812,9 +881,7 @@ class OnboardingTests(unittest.TestCase):
                         / "fixture.gemspec"
                     )
                     installed.parent.mkdir(parents=True, exist_ok=True)
-                    installed.write_text(
-                        "Gem::Specification.new\n", encoding="utf-8"
-                    )
+                    installed.write_text("Gem::Specification.new\n", encoding="utf-8")
                 return result
 
         sandbox = InstallingSandbox()
@@ -837,25 +904,12 @@ class OnboardingTests(unittest.TestCase):
 
         self.assertTrue(
             (
-                sandbox_root
-                / "dependencies"
-                / "ruby"
-                / "gems"
-                / "fixture.gemspec"
+                sandbox_root / "dependencies" / "ruby" / "gems" / "fixture.gemspec"
             ).is_file()
         )
-        later = RunLayout.create(
-            self.root / "inferred-data", "repo-1", "run-1"
-        )
-        SandboxManager().build_command(
-            policy, later, ("bundle", "exec", "rspec")
-        )
-        restored = (
-            later.dependency_delta
-            / "ruby"
-            / "gems"
-            / "fixture.gemspec"
-        )
+        later = RunLayout.create(self.root / "inferred-data", "repo-1", "run-1")
+        SandboxManager().build_command(policy, later, ("bundle", "exec", "rspec"))
+        restored = later.dependency_delta / "ruby" / "gems" / "fixture.gemspec"
         self.assertTrue(restored.is_symlink())
         self.assertEqual(
             str(restored.readlink()),
@@ -871,6 +925,7 @@ class OnboardingTests(unittest.TestCase):
         def resolve_secret(reference: str) -> str:
             resolved_references.append(reference)
             return "resolved-package-token"
+
         service = OnboardingService(
             database=self.db,
             data_root=self.root / "data",
@@ -1094,13 +1149,40 @@ class OnboardingTests(unittest.TestCase):
                 "SELECT command_json FROM validation_commands ORDER BY position"
             ).fetchall()
             members = connection.execute(
-                "SELECT role, action_timeout_seconds FROM team_members"
+                """SELECT role, atomic_role, action_timeout_seconds
+                   FROM team_members
+                   ORDER BY CASE role
+                     WHEN 'lead' THEN 0
+                     WHEN 'implementer' THEN 1
+                     ELSE 2
+                   END"""
             ).fetchall()
-        self.assertEqual(json.loads(commands[0]["command_json"]), ["python3", "-m", "pytest"])
-        self.assertEqual([row["role"] for row in members], ["lead"])
+            design_contract_version = connection.execute(
+                """SELECT design_contract_version
+                   FROM team_versions
+                   WHERE id=?""",
+                (record["current_team_version_id"],),
+            ).fetchone()[0]
+        self.assertEqual(
+            json.loads(commands[0]["command_json"]),
+            ["python3", "-m", "pytest"],
+        )
+        self.assertEqual(
+            [row["role"] for row in members],
+            ["lead", "implementer", "verifier"],
+        )
+        self.assertEqual(design_contract_version, 2)
+        self.assertEqual(
+            [row["atomic_role"] for row in members],
+            [
+                "python delivery coordinator",
+                "python implementation maintainer",
+                "python behavior verifier",
+            ],
+        )
         self.assertEqual(
             [row["action_timeout_seconds"] for row in members],
-            [600],
+            [600, 600, 600],
         )
 
     def test_reopen_lists_inventory_without_rerunning_onboarding(self) -> None:
@@ -1120,7 +1202,41 @@ class OnboardingTests(unittest.TestCase):
         self.assertEqual(github.calls, 1)
         self.assertEqual(sources.calls, 1)
 
-    def test_restart_recovery_blocks_interrupted_onboarding_with_retained_inputs(self) -> None:
+    def test_readding_archived_ready_repository_restores_stored_versions(self) -> None:
+        sources = FakeSources({"go.mod": "module example.com/demo\n"})
+        service, github = self.service(sources)
+        repository_id = service.onboard("example/demo")
+        before = service.get_repository(repository_id)
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE repositories
+                   SET enabled=0, removed_at='2026-01-02T00:00:00Z'
+                   WHERE id=?""",
+                (repository_id,),
+            )
+        self.assertEqual(service.list_repositories(), [])
+
+        restored_id = service.onboard("example/demo")
+
+        restored = service.get_repository(repository_id)
+        self.assertEqual(restored_id, repository_id)
+        self.assertEqual(restored["enabled"], 1)
+        self.assertIsNone(restored["removed_at"])
+        self.assertEqual(
+            restored["current_sandbox_version_id"],
+            before["current_sandbox_version_id"],
+        )
+        self.assertEqual(
+            restored["current_team_version_id"],
+            before["current_team_version_id"],
+        )
+        self.assertEqual(len(service.list_repositories()), 1)
+        self.assertEqual(github.calls, 2)
+        self.assertEqual(sources.calls, 1)
+
+    def test_restart_recovery_blocks_interrupted_onboarding_with_retained_inputs(
+        self,
+    ) -> None:
         service, github = self.service(
             FakeSources({"go.mod": "module example.com/demo\n"})
         )
@@ -1177,7 +1293,9 @@ class OnboardingTests(unittest.TestCase):
             {"validation_commands": [["python3", "-m", "unittest"]]},
         )
 
-    def test_reonboarding_refreshes_metadata_and_retains_or_replaces_sanitized_inputs(self) -> None:
+    def test_reonboarding_refreshes_metadata_and_retains_or_replaces_sanitized_inputs(
+        self,
+    ) -> None:
         service, github = self.service(
             FakeSources({"go.mod": "module example.com/demo\n"})
         )
@@ -1224,7 +1342,18 @@ class OnboardingTests(unittest.TestCase):
         )
 
     def test_explicit_reonboarding_creates_new_versions(self) -> None:
-        service, _ = self.service(FakeSources({"Cargo.toml": "[package]\nname='demo'\n"}))
+        sources = FakeSources({"Cargo.toml": "[package]\nname='demo'\n"})
+        formulator = FakeTeamFormulator(
+            role_prefixes=["initial", "renewed"],
+        )
+        service = OnboardingService(
+            database=self.db,
+            data_root=self.root / "data",
+            github=FakeGitHub(self.repository),
+            sources=sources,
+            inspector=RepositoryInspector(),
+            team_formulator=formulator,
+        )
         repository_id = service.onboard("example/demo")
         first = service.get_repository(repository_id)
         with self.db.transaction() as connection:
@@ -1259,8 +1388,12 @@ class OnboardingTests(unittest.TestCase):
             )
         service.reonboard(repository_id)
         second = service.get_repository(repository_id)
-        self.assertNotEqual(first["current_sandbox_version_id"], second["current_sandbox_version_id"])
-        self.assertNotEqual(first["current_team_version_id"], second["current_team_version_id"])
+        self.assertNotEqual(
+            first["current_sandbox_version_id"], second["current_sandbox_version_id"]
+        )
+        self.assertNotEqual(
+            first["current_team_version_id"], second["current_team_version_id"]
+        )
         with self.db.connect() as connection:
             sandbox_versions = connection.execute(
                 "SELECT version FROM sandbox_versions ORDER BY version"
@@ -1271,6 +1404,16 @@ class OnboardingTests(unittest.TestCase):
             run_version = connection.execute(
                 "SELECT sandbox_version_id, team_version_id FROM runs WHERE id='run-1'"
             ).fetchone()
+            stored_roles = connection.execute(
+                """SELECT team_version_id, atomic_role
+                   FROM team_members
+                   WHERE team_version_id IN (?, ?)
+                   ORDER BY team_version_id, stable_key""",
+                (
+                    first["current_team_version_id"],
+                    second["current_team_version_id"],
+                ),
+            ).fetchall()
         self.assertEqual([row["version"] for row in sandbox_versions], [1, 2])
         self.assertEqual([row["version"] for row in team_versions], [1, 2])
         self.assertEqual(
@@ -1281,9 +1424,29 @@ class OnboardingTests(unittest.TestCase):
             run_version["team_version_id"],
             first["current_team_version_id"],
         )
+        roles_by_version: dict[str, list[str]] = {}
+        for row in stored_roles:
+            roles_by_version.setdefault(str(row["team_version_id"]), []).append(
+                str(row["atomic_role"])
+            )
+        self.assertTrue(
+            all(
+                role.startswith("initial ")
+                for role in roles_by_version[first["current_team_version_id"]]
+            )
+        )
+        self.assertTrue(
+            all(
+                role.startswith("renewed ")
+                for role in roles_by_version[second["current_team_version_id"]]
+            )
+        )
+        self.assertEqual(len(formulator.inspections), 2)
 
     def test_missing_input_and_other_failure_remain_visible(self) -> None:
-        missing_service, _ = self.service(FakeSources(error=MissingRepositoryInput("license", "SDK license path")))
+        missing_service, _ = self.service(
+            FakeSources(error=MissingRepositoryInput("license", "SDK license path"))
+        )
         missing_id = missing_service.onboard("example/demo")
         missing = missing_service.get_repository(missing_id)
         self.assertEqual(missing["onboarding_state"], "needs_input")

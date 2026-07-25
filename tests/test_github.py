@@ -35,7 +35,10 @@ class StubGitHubClient(GitHubClient):
         key = path.split("?", 1)[0]
         if key not in self.responses:
             raise AssertionError(f"unexpected request {method} {path}")
-        return self.responses[key], {}
+        response = self.responses[key]
+        if callable(response):
+            return response(body), {}
+        return response, {}
 
 
 class GitHubAdapterTests(unittest.TestCase):
@@ -79,6 +82,7 @@ class GitHubAdapterTests(unittest.TestCase):
                 "html_url": "https://github.com/owner/repo/issues/3",
                 "title": "Terse issue",
                 "body": "Fix it",
+                "state": "open",
                 "updated_at": "2026-01-01T00:00:00Z",
             },
             "repos/owner/repo/issues/3/comments": [
@@ -94,6 +98,33 @@ class GitHubAdapterTests(unittest.TestCase):
             ],
             "repos/owner/repo/branches/main": {"commit": {"sha": "a" * 40}},
             "user": {"login": "configured-user"},
+            "graphql": {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": [
+                                    {
+                                        "id": "THREAD-703",
+                                        "isResolved": False,
+                                        "comments": {
+                                            "nodes": [{"databaseId": 703}],
+                                            "pageInfo": {
+                                                "hasNextPage": False,
+                                                "endCursor": None,
+                                            },
+                                        },
+                                    }
+                                ],
+                                "pageInfo": {
+                                    "hasNextPage": False,
+                                    "endCursor": None,
+                                },
+                            }
+                        }
+                    }
+                }
+            },
         }
         self.client = StubGitHubClient(self.responses)
 
@@ -106,12 +137,62 @@ class GitHubAdapterTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].event_id, "501")
         self.assertEqual(events[0].issue.node_id, "I3")
+        self.assertEqual(events[0].issue.state, "open")
         self.assertEqual(events[0].issue.discussion[0]["author"], "reviewer")
         self.assertEqual(sha, "a" * 40)
         self.assertEqual(
             self.client.list_ready_events("owner", "repo")[0].event_id,
             events[0].event_id,
         )
+
+    def test_ready_label_event_on_later_page_is_returned(self) -> None:
+        class PagedClient(StubGitHubClient):
+            def _request(
+                self,
+                method: str,
+                path: str,
+                *,
+                body: dict[str, Any] | None = None,
+                headers: dict[str, str] | None = None,
+            ) -> tuple[Any, dict[str, str]]:
+                if path.startswith("repos/owner/repo/issues/events?"):
+                    page = int(path.rsplit("page=", 1)[1])
+                    if page == 1:
+                        return (
+                            [
+                                {
+                                    "id": index,
+                                    "event": "unlabeled",
+                                    "created_at": "2026-01-01T00:00:00Z",
+                                    "label": {"name": "agent:ready"},
+                                    "issue": {"number": 3},
+                                }
+                                for index in range(100)
+                            ],
+                            {},
+                        )
+                    return (
+                        [
+                            {
+                                "id": 9001,
+                                "event": "labeled",
+                                "created_at": "2026-01-02T00:00:00Z",
+                                "label": {"name": "agent:ready"},
+                                "issue": {"number": 3},
+                            }
+                        ],
+                        {},
+                    )
+                return super()._request(
+                    method,
+                    path,
+                    body=body,
+                    headers=headers,
+                )
+
+        events = PagedClient(self.responses).list_ready_events("owner", "repo")
+
+        self.assertEqual([event.event_id for event in events], ["9001"])
 
     def test_empty_review_container_is_ignored_but_inline_comment_remains(self) -> None:
         self.responses.update(
@@ -156,6 +237,130 @@ class GitHubAdapterTests(unittest.TestCase):
             [("inline_comment", "703"), ("review", "702")],
         )
 
+    def test_inline_comments_include_paginated_review_thread_state(self) -> None:
+        def graphql(body: dict[str, Any] | None) -> dict[str, Any]:
+            self.assertIsNotNone(body)
+            variables = body["variables"]
+            after = variables["after"]
+            if after is None:
+                nodes = [
+                    {
+                        "id": "THREAD-1",
+                        "isResolved": False,
+                        "comments": {
+                            "nodes": [
+                                {"databaseId": 703},
+                                {"databaseId": 705},
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": False,
+                                "endCursor": None,
+                            },
+                        },
+                    }
+                ]
+                page_info = {"hasNextPage": True, "endCursor": "cursor-1"}
+            else:
+                self.assertEqual(after, "cursor-1")
+                nodes = [
+                    {
+                        "id": "THREAD-2",
+                        "isResolved": True,
+                        "comments": {
+                            "nodes": [{"databaseId": 704}],
+                            "pageInfo": {
+                                "hasNextPage": False,
+                                "endCursor": None,
+                            },
+                        },
+                    }
+                ]
+                page_info = {"hasNextPage": False, "endCursor": "cursor-2"}
+            return {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": nodes,
+                                "pageInfo": page_info,
+                            }
+                        }
+                    }
+                }
+            }
+
+        self.responses.update(
+            {
+                "graphql": graphql,
+                "repos/owner/repo/pulls/7/reviews": [],
+                "repos/owner/repo/pulls/7/comments": [
+                    {
+                        "id": 703,
+                        "user": {"login": "reviewer"},
+                        "body": "First",
+                        "path": "app.py",
+                        "line": 10,
+                        "created_at": "2026-01-01T00:03:00Z",
+                        "updated_at": "2026-01-01T00:03:00Z",
+                    },
+                    {
+                        "id": 704,
+                        "user": {"login": "reviewer"},
+                        "body": "Second",
+                        "path": "app.py",
+                        "line": 20,
+                        "created_at": "2026-01-01T00:04:00Z",
+                        "updated_at": "2026-01-01T00:04:00Z",
+                    },
+                    {
+                        "id": 705,
+                        "user": {"login": "reviewer"},
+                        "body": "Third",
+                        "path": "app.py",
+                        "line": 30,
+                        "created_at": "2026-01-01T00:05:00Z",
+                        "updated_at": "2026-01-01T00:05:00Z",
+                    },
+                ],
+                "repos/owner/repo/issues/7/comments": [],
+            }
+        )
+
+        feedback = self.client.list_feedback("owner", "repo", 7)
+
+        self.assertEqual(
+            [
+                (
+                    item.object_id,
+                    item.review_thread_id,
+                    item.review_thread_resolved,
+                )
+                for item in feedback
+            ],
+            [
+                ("703", "THREAD-1", False),
+                ("704", "THREAD-2", True),
+                ("705", "THREAD-1", False),
+            ],
+        )
+
+    def test_resolve_review_thread_requires_resolved_mutation_result(self) -> None:
+        self.responses["graphql"] = {
+            "data": {
+                "resolveReviewThread": {
+                    "thread": {"id": "THREAD-1", "isResolved": True}
+                }
+            }
+        }
+
+        self.client.resolve_review_thread("THREAD-1")
+
+        self.assertEqual(self.client.requests[-1], ("POST", "graphql"))
+        self.assertEqual(
+            self.client.request_bodies[-1]["variables"],
+            {"threadId": "THREAD-1"},
+        )
+
     def test_closed_pull_request_status_is_parsed(self) -> None:
         self.responses["repos/owner/repo/pulls/7"] = {
             "node_id": "PR7",
@@ -164,7 +369,8 @@ class GitHubAdapterTests(unittest.TestCase):
             "state": "closed",
             "merged": False,
             "head": {"ref": "agent/run-7", "sha": "c" * 40},
-            "base": {"ref": "main"},
+            "base": {"ref": "main", "sha": "d" * 40},
+            "mergeable": False,
             "updated_at": "2026-01-01T00:07:00Z",
         }
 
@@ -173,6 +379,8 @@ class GitHubAdapterTests(unittest.TestCase):
         self.assertEqual(pull.state, "closed")
         self.assertFalse(pull.merged)
         self.assertEqual(pull.head_sha, "c" * 40)
+        self.assertEqual(pull.base_sha, "d" * 40)
+        self.assertIs(pull.mergeable, False)
 
     def test_find_response_requires_application_author_and_exact_inline_thread(
         self,

@@ -12,6 +12,7 @@ from unittest.mock import patch
 from repogents.controller import (
     EnvironmentSecretResolver,
     RunProcessSupervisor,
+    RunPaused,
     git_environment,
     require_explicit_model,
     run_file_backed,
@@ -155,9 +156,7 @@ class ControllerBoundaryTests(unittest.TestCase):
             while not marker.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(marker.exists())
-            process_ids = tuple(
-                int(value) for value in marker.read_text().split()
-            )
+            process_ids = tuple(int(value) for value in marker.read_text().split())
 
             supervisor.cancel("run-1")
             thread.join(5)
@@ -172,9 +171,69 @@ class ControllerBoundaryTests(unittest.TestCase):
                 and time.monotonic() < deadline
             ):
                 time.sleep(0.01)
-            self.assertTrue(
-                all(not _process_is_running(pid) for pid in process_ids)
+            self.assertTrue(all(not _process_is_running(pid) for pid in process_ids))
+
+    def test_paused_run_terminates_model_process_and_resumes_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "started"
+            supervisor = RunProcessSupervisor()
+            outcomes: list[BaseException] = []
+
+            def run_model() -> None:
+                try:
+                    run_file_backed(
+                        [
+                            "python3",
+                            "-c",
+                            (
+                                "from pathlib import Path; import time; "
+                                f"Path({str(marker)!r}).write_text('started'); "
+                                "time.sleep(60)"
+                            ),
+                        ],
+                        "ignored prompt",
+                        root,
+                        30,
+                        environment={"PATH": os.environ["PATH"]},
+                        supervisor=supervisor,
+                        run_id="run-1",
+                    )
+                except BaseException as error:
+                    outcomes.append(error)
+
+            thread = threading.Thread(target=run_model)
+            thread.start()
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+
+            supervisor.pause("run-1")
+            thread.join(5)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(supervisor.active("run-1"), ())
+            self.assertEqual(len(outcomes), 1)
+            self.assertIsInstance(outcomes[0], RunPaused)
+            with self.assertRaises(RunPaused):
+                supervisor.run(
+                    "run-1",
+                    ["python3", "-c", "raise SystemExit(0)"],
+                    cwd=root,
+                    environment={"PATH": os.environ["PATH"]},
+                    timeout=5,
+                )
+
+            supervisor.resume("run-1")
+            resumed = supervisor.run(
+                "run-1",
+                ["python3", "-c", "raise SystemExit(0)"],
+                cwd=root,
+                environment={"PATH": os.environ["PATH"]},
+                timeout=5,
             )
+            self.assertEqual(resumed.returncode, 0)
 
     def test_environment_secret_resolver_maps_only_explicit_secret_references(
         self,
@@ -196,7 +255,6 @@ class ControllerBoundaryTests(unittest.TestCase):
             resolver("secret://missing")
 
 
-
 def _process_is_running(process_id: int) -> bool:
     stat_path = Path(f"/proc/{process_id}/stat")
     try:
@@ -204,6 +262,7 @@ def _process_is_running(process_id: int) -> bool:
     except FileNotFoundError:
         return False
     return len(fields) > 2 and fields[2] != "Z"
+
 
 if __name__ == "__main__":
     unittest.main()

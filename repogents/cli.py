@@ -21,25 +21,25 @@ def parser() -> argparse.ArgumentParser:
         "--data-dir",
         type=Path,
         default=Path(
-            os.environ.get(
-                "REPOGENTS_DATA_DIR", "~/.local/share/repogents"
-            )
+            os.environ.get("REPOGENTS_DATA_DIR", "~/.local/share/repogents")
         ).expanduser(),
         help="durable application data directory",
     )
     value.add_argument(
         "--model",
         default=os.environ.get("REPOGENTS_MODEL"),
-        help="explicit mini-SWE model selector",
+        help="optional bootstrap mini-SWE model selector",
     )
     value.add_argument(
         "--model-base-url",
         default=os.environ.get("REPOGENTS_MODEL_BASE_URL"),
-        help="optional explicit OpenAI-compatible model endpoint",
+        help="optional bootstrap OpenAI-compatible model endpoint",
     )
     subcommands = value.add_subparsers(dest="command", required=True)
 
-    serve = subcommands.add_parser("serve", help="run scheduler and local web interface")
+    serve = subcommands.add_parser(
+        "serve", help="run scheduler and local web interface"
+    )
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
     serve.add_argument("--poll-interval", type=float, default=10.0)
@@ -59,9 +59,7 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     token = _github_token()
-    poll_interval = (
-        arguments.poll_interval if arguments.command == "serve" else 10.0
-    )
+    poll_interval = arguments.poll_interval if arguments.command == "serve" else 10.0
     runtime = build_runtime(
         arguments.data_dir,
         github_token=token,

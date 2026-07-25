@@ -5,6 +5,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -14,6 +15,7 @@ import threading
 import tempfile
 import urllib.parse
 import uuid
+from functools import lru_cache
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -386,10 +388,152 @@ def _seed_read_only_dependencies(
             target_entry.symlink_to(f"{sandbox_source.rstrip('/')}/{relative}")
 
 
+def _workspace_node_dependency_mounts(
+    node_delta: Path,
+    checkout: Path,
+) -> tuple[tuple[Path, str], ...]:
+    mounts: list[tuple[Path, str]] = []
+    for current, directory_names, _ in os.walk(
+        node_delta, followlinks=False
+    ):
+        directory_names.sort()
+        source = Path(current) / "node_modules"
+        if "node_modules" not in directory_names:
+            continue
+        directory_names.remove("node_modules")
+        if source.is_symlink() or not source.is_dir():
+            continue
+        relative_parent = Path(current).relative_to(node_delta)
+        package_root = checkout / relative_parent
+        if package_root.is_symlink() or not package_root.is_dir():
+            continue
+        destination = package_root / "node_modules"
+        if destination.is_symlink():
+            continue
+        if destination.exists() and not destination.is_dir():
+            raise RuntimeError(
+                "workspace dependency mount target is not a directory: "
+                + str(destination)
+            )
+        destination.mkdir(exist_ok=True)
+        relative_destination = relative_parent / "node_modules"
+        sandbox_destination = "/workspace/" + relative_destination.as_posix()
+        mounts.append((source, sandbox_destination))
+    return tuple(mounts)
+
+
+def _validated_browser_executable(candidate: str | Path | None) -> Path | None:
+    if candidate is None:
+        return None
+    try:
+        executable = Path(candidate).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        return None
+    try:
+        result = subprocess.run(
+            (str(executable), "--version"),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    version = (result.stdout + "\n" + result.stderr).lower()
+    if result.returncode != 0 or not any(
+        name in version for name in ("chromium", "chrome")
+    ):
+        return None
+    return executable
+
+
+@lru_cache(maxsize=1)
+def _default_browser_executable() -> Path | None:
+    configured = os.environ.get("REPOGENTS_BROWSER_EXECUTABLE")
+    if configured is not None:
+        return _validated_browser_executable(configured)
+    cache = Path.home() / ".cache" / "ms-playwright"
+    cached: set[Path] = set()
+    for pattern in (
+        "chromium-*/chrome-linux*/chrome",
+        "chromium_headless_shell-*/chrome-linux*/headless_shell",
+    ):
+        cached.update(cache.glob(pattern))
+    for candidate in sorted(cached, reverse=True):
+        validated = _validated_browser_executable(candidate)
+        if validated is not None:
+            return validated
+    for name in ("google-chrome", "chromium", "chromium-browser"):
+        validated = _validated_browser_executable(shutil.which(name))
+        if validated is not None:
+            return validated
+    return None
+
+
+def _browser_mount(executable: Path | None) -> tuple[Path | None, str | None]:
+    if executable is None:
+        return None, None
+    if executable.is_relative_to(Path("/usr")):
+        return None, executable.as_posix()
+    bundle = executable.parent
+    return bundle, f"/opt/repogents-browser/{executable.name}"
+
+
+_BROWSER_LAUNCHER_NAME = ".repogents-browser-launcher"
+_BROWSER_LAUNCHER_SANDBOX_PATH = f"/run-data/temp/{_BROWSER_LAUNCHER_NAME}"
+_BROWSER_RUNTIME_SANDBOX_PATH = "/run-data/temp/.repogents-browser-runtime"
+
+
+def _prepare_browser_launcher(
+    layout: RunLayout,
+    sandbox_executable: str,
+) -> None:
+    launcher = layout.temp / _BROWSER_LAUNCHER_NAME
+    temporary = launcher.with_name(f"{launcher.name}.{uuid.uuid4().hex}")
+    runtime = _BROWSER_RUNTIME_SANDBOX_PATH
+    content = (
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "umask 077\n"
+        f"runtime={shlex.quote(runtime)}\n"
+        'mkdir -p "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/run"\n'
+        'chmod 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/run"\n'
+        'export HOME="$runtime/home"\n'
+        'export XDG_CONFIG_HOME="$runtime/config"\n'
+        'export XDG_CACHE_HOME="$runtime/cache"\n'
+        'export XDG_RUNTIME_DIR="$runtime/run"\n'
+        f"exec {shlex.quote(sandbox_executable)} "
+        '--disable-crash-reporter --disable-breakpad "$@"\n'
+    )
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        temporary.chmod(0o700)
+        temporary.replace(launcher)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 class SandboxManager:
-    def __init__(self, *, bwrap: str = "bwrap") -> None:
+    def __init__(
+        self,
+        *,
+        bwrap: str = "bwrap",
+        browser_executable: str | Path | None = None,
+    ) -> None:
         self.bwrap = bwrap
         self.package_root = Path(__file__).parent.resolve()
+        self.browser_executable = (
+            _default_browser_executable()
+            if browser_executable is None
+            else _validated_browser_executable(browser_executable)
+        )
+        self.browser_bundle, self.sandbox_browser_executable = _browser_mount(
+            self.browser_executable
+        )
         self._active: dict[str, subprocess.Popen[bytes]] = {}
         self._active_lock = threading.Lock()
         if shutil.which(self.bwrap) is None:
@@ -509,8 +653,21 @@ class SandboxManager:
                 "/workspace",
             )
         )
-        if checkout_writable:
-            argv.extend(("--bind", str(node_modules_delta), "/workspace/node_modules"))
+        if self.sandbox_browser_executable is not None:
+            _prepare_browser_launcher(layout, self.sandbox_browser_executable)
+        if self.browser_bundle is not None:
+            argv.extend(
+                (
+                    "--ro-bind",
+                    str(self.browser_bundle),
+                    "/opt/repogents-browser",
+                )
+            )
+        dependency_mount_mode = "--bind" if checkout_writable else "--ro-bind"
+        for source, destination in _workspace_node_dependency_mounts(
+            node_delta, layout.checkout
+        ):
+            argv.extend((dependency_mount_mode, str(source), destination))
         if proxy_socket_host is not None:
             if proxy_socket is None:
                 raise ValueError("proxy socket mount requires a sandbox target")
@@ -558,17 +715,18 @@ class SandboxManager:
             ("GOCACHE", "/repository-cache/go-build"),
             ("GOMODCACHE", "/repository-cache/go-modules"),
             ("npm_config_cache", "/repository-cache/npm"),
-            (
-                "NODE_PATH",
-                (
-                    "/workspace/node_modules"
-                    if checkout_writable
-                    else "/run-data/dependency-delta/node/node_modules"
-                ),
-            ),
+            ("NODE_PATH", "/workspace/node_modules"),
             ("npm_config_prefix", "/run-data/dependency-delta/node"),
         ):
             argv.extend(("--setenv", key, value))
+        if self.sandbox_browser_executable is not None:
+            argv.extend(
+                (
+                    "--setenv",
+                    "CHROME_BIN",
+                    _BROWSER_LAUNCHER_SANDBOX_PATH,
+                )
+            )
         if (python_environment / "bin" / "python3").exists():
             argv.extend(("--setenv", "VIRTUAL_ENV", "/repository-state/python-venv"))
         for name, value in sorted(secret_values.items()):

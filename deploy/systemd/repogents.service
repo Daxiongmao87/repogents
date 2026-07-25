@@ -1,0 +1,20 @@
+[Unit]
+Description=Repogents LAN repository agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/repogents
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/projects/repogents/.venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/repogents/daemon.env
+ExecStart=%h/projects/repogents/.venv/bin/repogents serve --host ${REPOGENTS_LAN_HOST} --port ${REPOGENTS_LAN_PORT} --poll-interval 10
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=default.target

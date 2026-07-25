@@ -134,6 +134,204 @@ class SandboxPolicyTests(unittest.TestCase):
         ro_index = argv.index(str(allowed.resolve())) - 1
         self.assertEqual(argv[ro_index], "--ro-bind")
 
+    def test_nested_onboarded_node_dependencies_are_mounted_at_package_root(
+        self,
+    ) -> None:
+        executable = (
+            self.persistent
+            / "dependencies"
+            / "node"
+            / "client"
+            / "node_modules"
+            / ".bin"
+            / "fixture-tool"
+        )
+        executable.parent.mkdir(parents=True)
+        executable.write_text(
+            "#!/bin/sh\nprintf nested-dependency-ready",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        (self.layout.checkout / "client").mkdir()
+        policy = SandboxPolicy(persistent_root=self.persistent)
+
+        result = SandboxManager().run(
+            policy,
+            self.layout,
+            ("/workspace/client/node_modules/.bin/fixture-tool",),
+            timeout=20,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "nested-dependency-ready")
+
+    def test_read_only_checkout_mounts_nested_onboarded_node_dependencies(
+        self,
+    ) -> None:
+        executable = (
+            self.persistent
+            / "dependencies"
+            / "node"
+            / "client"
+            / "node_modules"
+            / ".bin"
+            / "fixture-tool"
+        )
+        executable.parent.mkdir(parents=True)
+        executable.write_text(
+            "#!/bin/sh\nprintf readonly-dependency-ready",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        (self.layout.checkout / "client").mkdir()
+        policy = SandboxPolicy(persistent_root=self.persistent)
+        manager = SandboxManager()
+
+        argv, _ = manager.build_command(
+            policy,
+            self.layout,
+            ("/workspace/client/node_modules/.bin/fixture-tool",),
+            checkout_writable=False,
+        )
+        sandbox_mounts = {
+            argv[index + 2]: (argument, argv[index + 1])
+            for index, argument in enumerate(argv[:-2])
+            if argument in {"--bind", "--ro-bind"}
+        }
+        self.assertEqual(
+            sandbox_mounts["/workspace/client/node_modules"],
+            (
+                "--ro-bind",
+                str(
+                    self.layout.dependency_delta
+                    / "node"
+                    / "client"
+                    / "node_modules"
+                ),
+            ),
+        )
+        result = manager.run(
+            policy,
+            self.layout,
+            ("/workspace/client/node_modules/.bin/fixture-tool",),
+            timeout=20,
+            checkout_writable=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "readonly-dependency-ready")
+
+    def test_validated_browser_bundle_is_mounted_without_its_host_cache(
+        self,
+    ) -> None:
+        cache = self.root / "browser-cache"
+        bundle = cache / "chromium-123" / "chrome-linux"
+        browser = bundle / "chrome"
+        bundle.mkdir(parents=True)
+        browser.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = \"--version\" ]; then\n"
+            "  printf 'Chromium 123 fixture'\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        browser.chmod(0o755)
+        policy = SandboxPolicy(persistent_root=self.persistent)
+
+        argv, _ = SandboxManager(browser_executable=browser).build_command(
+            policy,
+            self.layout,
+            ("python3", "-c", "print('browser-ready')"),
+            checkout_writable=False,
+        )
+        sandbox_mounts = {
+            argv[index + 2]: (argument, argv[index + 1])
+            for index, argument in enumerate(argv[:-2])
+            if argument in {"--bind", "--ro-bind"}
+        }
+        sandbox_environment = {
+            argv[index + 1]: argv[index + 2]
+            for index, argument in enumerate(argv[:-2])
+            if argument == "--setenv"
+        }
+
+        self.assertEqual(
+            sandbox_mounts["/opt/repogents-browser"],
+            ("--ro-bind", str(bundle.resolve())),
+        )
+        mounted_sources = {source for _, source in sandbox_mounts.values()}
+        self.assertNotIn(str(cache.resolve()), mounted_sources)
+        self.assertEqual(
+            sandbox_environment["CHROME_BIN"],
+            "/run-data/temp/.repogents-browser-launcher",
+        )
+
+    def test_browser_launcher_uses_run_writable_profile_when_home_is_read_only(
+        self,
+    ) -> None:
+        bundle = self.root / "browser-bundle"
+        browser = bundle / "chrome"
+        bundle.mkdir()
+        browser.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${1:-}\" = \"--version\" ]; then\n"
+            "  printf 'Chromium 123 fixture'\n"
+            "  exit 0\n"
+            "fi\n"
+            "case \" $* \" in *' --disable-crash-reporter '*) ;; *) exit 2 ;; esac\n"
+            "case \" $* \" in *' --disable-breakpad '*) ;; *) exit 3 ;; esac\n"
+            "printf '%s\\n%s\\n%s' \"$HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_CACHE_HOME\"\n",
+            encoding="utf-8",
+        )
+        browser.chmod(0o755)
+        policy = SandboxPolicy(persistent_root=self.persistent)
+
+        result = SandboxManager(browser_executable=browser).run(
+            policy,
+            self.layout,
+            (
+                "bash",
+                "-lc",
+                "export HOME=/repository-state/home; \"$CHROME_BIN\"",
+            ),
+            timeout=20,
+            checkout_writable=False,
+        )
+
+        runtime = "/run-data/temp/.repogents-browser-runtime"
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [f"{runtime}/home", f"{runtime}/config", f"{runtime}/cache"],
+        )
+
+    def test_invalid_browser_candidate_is_not_advertised(self) -> None:
+        browser = self.root / "not-a-browser"
+        browser.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        browser.chmod(0o755)
+        policy = SandboxPolicy(persistent_root=self.persistent)
+
+        argv, _ = SandboxManager(browser_executable=browser).build_command(
+            policy,
+            self.layout,
+            ("python3", "-c", "print('no-browser')"),
+        )
+        mounted_targets = {
+            argv[index + 2]
+            for index, argument in enumerate(argv[:-2])
+            if argument in {"--bind", "--ro-bind"}
+        }
+        sandbox_environment = {
+            argv[index + 1]: argv[index + 2]
+            for index, argument in enumerate(argv[:-2])
+            if argument == "--setenv"
+        }
+
+        self.assertNotIn("/opt/repogents-browser", mounted_targets)
+        self.assertNotIn("CHROME_BIN", sandbox_environment)
+
     def test_verifier_checkout_can_be_mounted_read_only(self) -> None:
         policy = SandboxPolicy(persistent_root=self.persistent)
         manager = SandboxManager()
