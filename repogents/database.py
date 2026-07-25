@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Generator
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 SCHEMA_V1 = r"""
 BEGIN IMMEDIATE;
@@ -828,6 +828,17 @@ SCHEMA_V14 = (
     """,
 )
 
+SCHEMA_V15 = (
+    """
+    ALTER TABLE feedback_versions
+    ADD COLUMN superseded_at TEXT
+    """,
+    """
+    ALTER TABLE feedback_versions
+    ADD COLUMN superseded_by_feedback_id TEXT
+        REFERENCES feedback_versions(id)
+    """,
+)
 
 
 class Database:
@@ -1013,6 +1024,14 @@ class Database:
                 connection.execute("""INSERT INTO schema_version(version, applied_at)
                        VALUES (
                            14,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )""")
+            if version < 15:
+                for statement in SCHEMA_V15:
+                    connection.execute(statement)
+                connection.execute("""INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           15,
                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                        )""")
             connection.commit()

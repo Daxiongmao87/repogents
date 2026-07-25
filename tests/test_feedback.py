@@ -21,6 +21,7 @@ from repogents.feedback import (
 from repogents.github import FeedbackItem, FeedbackOutput, PullRequestInfo
 from repogents.lifecycle import RunLifecycle, RunState
 from repogents.team import TeamService
+from repogents.publication import PublicationBaseChanged
 from repogents.sandbox import SandboxManager
 
 
@@ -110,10 +111,20 @@ class FakeFeedbackGateway:
         self.resolve_thread_output_counts: list[int] = []
         self.fail_before_thread_resolution = False
         self.crash_after_thread_resolution = False
+        self.remote_base_head: str | None = None
+        self.base_head_reads: list[tuple[str, str, str]] = []
 
     def get_pull_request(self, owner: str, name: str, number: int) -> PullRequestInfo:
         self.status_calls += 1
         return self.pull
+
+    def get_remote_branch_head(
+        self, owner: str, name: str, branch: str
+    ) -> str | None:
+        self.base_head_reads.append((owner, name, branch))
+        if self.remote_base_head is not None:
+            return self.remote_base_head
+        return self.pull.base_sha
 
     def application_login(self) -> str:
         return self.application_author
@@ -257,9 +268,15 @@ class FakePublisher:
         self.source_shas_at_call: list[str | None] = []
         self.fail_once = False
         self.prepared_bases: list[tuple[str, str]] = []
+        self.base_change_once: str | None = None
 
     def prepare_base_revision(self, run_id: str, expected_base_sha: str) -> str:
         self.prepared_bases.append((run_id, expected_base_sha))
+        if self.base_change_once is not None:
+            actual_base_sha = self.base_change_once
+            self.base_change_once = None
+            self.gateway.remote_base_head = actual_base_sha
+            raise PublicationBaseChanged(expected_base_sha, actual_base_sha)
         return expected_base_sha
 
     def publish(self, run_id: str) -> object | None:
@@ -1250,6 +1267,271 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(notification_count, 0)
         self.assertEqual(self.evaluator.calls, [])
         self.assertEqual(self.executor.calls, [])
+
+    def test_base_advance_during_preparation_retries_only_latest_generation(
+        self,
+    ) -> None:
+        observed_base_sha = "d" * 40
+        latest_base_sha = "e" * 40
+        pull_head_sha = self.gateway.pull.head_sha
+        self.gateway.remote_base_head = observed_base_sha
+        self.gateway.pull = replace(
+            self.gateway.pull,
+            base_sha="a" * 40,
+            mergeable=False,
+        )
+        self.publisher.base_change_once = latest_base_sha
+
+        processed = self.service.resolve_run("run-1")
+
+        with self.db.connect() as connection:
+            conflicts = connection.execute(
+                """SELECT id, github_version, state, source_sha, superseded_at,
+                          superseded_by_feedback_id
+                   FROM feedback_versions
+                   WHERE pull_request_id='pr-1'
+                     AND feedback_type='base_conflict'"""
+            ).fetchall()
+            operations = connection.execute(
+                """SELECT state FROM outbound_operations
+                   WHERE run_id='run-1'
+                     AND kind='feedback_revision_batch'
+                   ORDER BY created_at, id"""
+            ).fetchall()
+        by_version = {str(row["github_version"]): row for row in conflicts}
+        observed_version = f"{pull_head_sha}:{observed_base_sha}"
+        latest_version = f"{pull_head_sha}:{latest_base_sha}"
+        observed = by_version[observed_version]
+        latest = by_version[latest_version]
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(
+            self.publisher.prepared_bases,
+            [
+                ("run-1", observed_base_sha),
+                ("run-1", latest_base_sha),
+            ],
+        )
+        self.assertEqual(len(self.executor.calls), 1)
+        context = str(self.executor.calls[0][1])
+        self.assertIn(latest_base_sha, context)
+        self.assertNotIn(observed_base_sha, context)
+        self.assertEqual(observed["state"], "resolved")
+        self.assertIsNotNone(observed["superseded_at"])
+        self.assertEqual(
+            observed["superseded_by_feedback_id"],
+            latest["id"],
+        )
+        self.assertIsNone(observed["source_sha"])
+        self.assertEqual(latest["state"], "resolved")
+        self.assertEqual(latest["source_sha"], "c" * 40)
+        self.assertIsNone(latest["superseded_at"])
+        self.assertEqual(
+            sorted(str(row["state"]) for row in operations),
+            ["completed", "reconciled"],
+        )
+        self.assertEqual(self.gateway.post_calls, 0)
+        self.assertEqual(self.publisher.calls, ["run-1"])
+
+    def test_restart_supersedes_stale_mixed_batch_and_reuses_other_feedback(
+        self,
+    ) -> None:
+        stale_base_sha = "d" * 40
+        current_base_sha = "e" * 40
+        pull_head_sha = self.gateway.pull.head_sha
+        self.gateway.remote_base_head = stale_base_sha
+        self.gateway.pull = replace(
+            self.gateway.pull,
+            base_sha="a" * 40,
+            mergeable=False,
+        )
+        self.gateway.items = [
+            self.item("inline_comment", "finding-1", "v1", "Change the first path"),
+            self.item("inline_comment", "finding-2", "v1", "Change the second path"),
+        ]
+        self.assertEqual(self.service.poll_run("run-1"), 3)
+        decision_json = json.dumps(
+            asdict(
+                FeedbackDecision(
+                    "revise",
+                    "valid in-scope change",
+                    "Implemented and validated the requested change.",
+                )
+            ),
+            sort_keys=True,
+        )
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE feedback_versions
+                   SET state='processing',
+                       decision_json=COALESCE(decision_json, ?)
+                   WHERE pull_request_id='pr-1'""",
+                (decision_json,),
+            )
+            original_rows = connection.execute(
+                """SELECT id, feedback_type, github_version
+                   FROM feedback_versions
+                   WHERE pull_request_id='pr-1'
+                   ORDER BY id"""
+            ).fetchall()
+            original_ids = [str(row["id"]) for row in original_rows]
+            connection.execute(
+                """INSERT INTO outbound_operations
+                   (id, run_id, kind, idempotency_key, request_json, state,
+                    created_at)
+                   VALUES ('stale-batch', 'run-1', 'feedback_revision_batch',
+                           'stale-batch-key', ?, 'pending',
+                           '2026-01-01T00:02:00Z')""",
+                (json.dumps({"feedback_ids": original_ids}),),
+            )
+        stale_conflict = next(
+            row
+            for row in original_rows
+            if row["feedback_type"] == "base_conflict"
+        )
+        ordinary_ids = {
+            str(row["id"])
+            for row in original_rows
+            if row["feedback_type"] == "inline_comment"
+        }
+        self.gateway.remote_base_head = current_base_sha
+
+        restarted_database = Database(self.db.path)
+        restarted_database.initialize()
+        restarted_lifecycle = FeedbackLifecycle(
+            database=restarted_database,
+            data_root=self.data_root,
+            github=NoActivationClient(),
+            checkouts=NoCheckoutManager(),
+            sandbox=self.sandbox,
+        )
+        restarted_executor = FakeExecutor(restarted_lifecycle)
+        restarted_publisher = FakePublisher(
+            restarted_database,
+            restarted_lifecycle,
+            self.gateway,
+        )
+        restarted_service = FeedbackService(
+            database=restarted_database,
+            lifecycle=restarted_lifecycle,
+            gateway=self.gateway,
+            evaluator=self.evaluator,
+            executor=restarted_executor,
+            publisher=restarted_publisher,
+        )
+
+        processed = restarted_service.resolve_run("run-1")
+
+        with restarted_database.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, feedback_type, github_version, state, source_sha,
+                          superseded_at, superseded_by_feedback_id
+                   FROM feedback_versions
+                   WHERE pull_request_id='pr-1'"""
+            ).fetchall()
+            operations = connection.execute(
+                """SELECT id, request_json, state
+                   FROM outbound_operations
+                   WHERE run_id='run-1'
+                     AND kind='feedback_revision_batch'
+                   ORDER BY created_at, id"""
+            ).fetchall()
+            pull_count = connection.execute(
+                "SELECT COUNT(*) FROM pull_requests WHERE run_id='run-1'"
+            ).fetchone()[0]
+        current_version = f"{pull_head_sha}:{current_base_sha}"
+        current_conflict = next(
+            row
+            for row in rows
+            if row["feedback_type"] == "base_conflict"
+            and row["github_version"] == current_version
+        )
+        stale_after = next(
+            row for row in rows if row["id"] == stale_conflict["id"]
+        )
+        completed_operation = next(
+            row
+            for row in operations
+            if row["id"] != "stale-batch" and row["state"] == "completed"
+        )
+        completed_ids = set(
+            json.loads(str(completed_operation["request_json"]))["feedback_ids"]
+        )
+
+        self.assertEqual(processed, 3)
+        self.assertEqual(len(restarted_executor.calls), 1)
+        self.assertEqual(restarted_publisher.prepared_bases, [("run-1", current_base_sha)])
+        self.assertEqual(restarted_publisher.calls, ["run-1"])
+        self.assertEqual(self.evaluator.calls, [])
+        self.assertEqual(stale_after["state"], "resolved")
+        self.assertIsNotNone(stale_after["superseded_at"])
+        self.assertEqual(
+            stale_after["superseded_by_feedback_id"],
+            current_conflict["id"],
+        )
+        self.assertEqual(
+            next(row for row in operations if row["id"] == "stale-batch")["state"],
+            "reconciled",
+        )
+        self.assertTrue(ordinary_ids.issubset(completed_ids))
+        self.assertIn(str(current_conflict["id"]), completed_ids)
+        self.assertNotIn(str(stale_conflict["id"]), completed_ids)
+        self.assertTrue(
+            all(
+                row["state"] == "resolved" and row["source_sha"] == "c" * 40
+                for row in rows
+                if row["id"] in ordinary_ids
+                or row["id"] == current_conflict["id"]
+            )
+        )
+        self.assertEqual(pull_count, 1)
+        self.assertEqual(self.gateway.post_calls, 0)
+
+    def test_confirmed_mergeability_supersedes_unfinished_conflict(self) -> None:
+        conflict_base_sha = "d" * 40
+        self.gateway.remote_base_head = conflict_base_sha
+        self.gateway.pull = replace(self.gateway.pull, mergeable=False)
+        self.assertEqual(self.service.poll_run("run-1"), 1)
+        self.gateway.pull = replace(self.gateway.pull, mergeable=True)
+
+        self.assertEqual(self.service.poll_run("run-1"), 0)
+
+        with self.db.connect() as connection:
+            conflict = connection.execute(
+                """SELECT state, superseded_at, superseded_by_feedback_id
+                   FROM feedback_versions
+                   WHERE pull_request_id='pr-1'
+                     AND feedback_type='base_conflict'"""
+            ).fetchone()
+        self.assertEqual(conflict["state"], "resolved")
+        self.assertIsNotNone(conflict["superseded_at"])
+        self.assertIsNone(conflict["superseded_by_feedback_id"])
+        self.assertEqual(len(self.executor.calls), 0)
+
+    def test_unknown_mergeability_preserves_unfinished_conflict(self) -> None:
+        conflict_base_sha = "d" * 40
+        self.gateway.remote_base_head = conflict_base_sha
+        self.gateway.pull = replace(self.gateway.pull, mergeable=False)
+        self.assertEqual(self.service.poll_run("run-1"), 1)
+        self.gateway.pull = replace(self.gateway.pull, mergeable=None)
+        self.gateway.remote_base_head = "e" * 40
+
+        self.assertEqual(self.service.poll_run("run-1"), 0)
+
+        with self.db.connect() as connection:
+            conflict = connection.execute(
+                """SELECT state, superseded_at, superseded_by_feedback_id
+                   FROM feedback_versions
+                   WHERE pull_request_id='pr-1'
+                     AND feedback_type='base_conflict'"""
+            ).fetchone()
+        self.assertEqual(conflict["state"], "pending")
+        self.assertIsNone(conflict["superseded_at"])
+        self.assertIsNone(conflict["superseded_by_feedback_id"])
+        self.assertEqual(
+            self.gateway.base_head_reads,
+            [("owner", "repo", "main")],
+        )
 
     def test_conflicting_head_base_generation_is_durable_across_restart(
         self,

@@ -14,6 +14,7 @@ from .database import Database
 from .github import FeedbackItem, FeedbackOutput, PullRequestInfo
 from .mini_swe import MINI_SWE_RUNTIME, MiniSweInference
 from .lifecycle import RunLifecycle, RunState
+from .publication import PublicationBaseChanged
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,10 @@ class FeedbackGateway(Protocol):
     def get_pull_request(
         self, owner: str, name: str, number: int
     ) -> PullRequestInfo: ...
+
+    def get_remote_branch_head(
+        self, owner: str, name: str, branch: str
+    ) -> str | None: ...
 
     def list_feedback(
         self, owner: str, name: str, pull_number: int
@@ -279,7 +284,18 @@ class FeedbackService:
         if pull_state != "open":
             self.lifecycle.close_pull_request_attempt(run_id, pull)
             return 0
-        conflict_item = _base_conflict_item(pull)
+        conflict_item: FeedbackItem | None = None
+        if pull.mergeable is False:
+            current_base_sha = self.gateway.get_remote_branch_head(
+                str(context["owner"]),
+                str(context["name"]),
+                pull.base_branch,
+            )
+            if current_base_sha is None:
+                raise RuntimeError(
+                    "conflicting pull request base branch has no current head"
+                )
+            conflict_item = _base_conflict_item(pull, current_base_sha)
         items = self.gateway.list_feedback(
             str(context["owner"]),
             str(context["name"]),
@@ -298,12 +314,15 @@ class FeedbackService:
                 (str(row["feedback_type"]), str(row["github_object_id"]))
                 for row in output_rows
             }
+            current_conflict_id: str | None = None
             for item in items:
                 if (item.feedback_type, item.object_id) in outputs:
                     continue
                 feedback_id = _stable_id(
                     f"{context['pull_id']}:{item.feedback_type}:{item.object_id}:{item.version}"
                 )
+                if item.feedback_type == "base_conflict":
+                    current_conflict_id = feedback_id
                 cursor = connection.execute(
                     """INSERT OR IGNORE INTO feedback_versions
                        (id, pull_request_id, feedback_type, github_object_id,
@@ -369,8 +388,90 @@ class FeedbackService:
                         ),
                     )
                 inserted += cursor.rowcount
+            if pull.mergeable is not None:
+                self._supersede_base_conflicts(
+                    connection,
+                    run_id=run_id,
+                    pull_request_id=str(context["pull_id"]),
+                    current_conflict_id=current_conflict_id,
+                )
             self._activate_pending_feedback(connection, run_id)
         return inserted
+
+    @staticmethod
+    def _supersede_base_conflicts(
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        pull_request_id: str,
+        current_conflict_id: str | None,
+    ) -> None:
+        rows = connection.execute(
+            """SELECT id
+               FROM feedback_versions
+               WHERE pull_request_id=?
+                 AND feedback_type='base_conflict'
+                 AND state IN ('pending', 'processing')
+                 AND (? IS NULL OR id<>?)""",
+            (
+                pull_request_id,
+                current_conflict_id,
+                current_conflict_id,
+            ),
+        ).fetchall()
+        stale_ids = {str(row["id"]) for row in rows}
+        if not stale_ids:
+            return
+        now = _utc_now()
+        for feedback_id in stale_ids:
+            connection.execute(
+                """UPDATE feedback_versions
+                   SET state='resolved',
+                       processed_at=COALESCE(processed_at, ?),
+                       superseded_at=?,
+                       superseded_by_feedback_id=?
+                   WHERE id=?
+                     AND state IN ('pending', 'processing')""",
+                (
+                    now,
+                    now,
+                    current_conflict_id,
+                    feedback_id,
+                ),
+            )
+        operations = connection.execute(
+            """SELECT id, request_json
+               FROM outbound_operations
+               WHERE run_id=?
+                 AND kind='feedback_revision_batch'
+                 AND state='pending'""",
+            (run_id,),
+        ).fetchall()
+        for operation in operations:
+            try:
+                request = json.loads(str(operation["request_json"]))
+            except (TypeError, ValueError):
+                continue
+            feedback_ids = (
+                request.get("feedback_ids")
+                if isinstance(request, dict)
+                else None
+            )
+            if not isinstance(feedback_ids, list) or stale_ids.isdisjoint(
+                str(value) for value in feedback_ids
+            ):
+                continue
+            connection.execute(
+                """UPDATE outbound_operations
+                   SET state='reconciled', external_id=?, completed_at=?,
+                       error=NULL
+                   WHERE id=? AND state='pending'""",
+                (
+                    current_conflict_id,
+                    now,
+                    operation["id"],
+                ),
+            )
 
     def resolve_run(self, run_id: str) -> int:
         processed = 0
@@ -484,6 +585,8 @@ class FeedbackService:
                             revisions,
                         ),
                     )
+                except PublicationBaseChanged:
+                    continue
                 except Exception:
                     return processed
                 if source_sha is None:
@@ -1292,23 +1395,25 @@ def _addressing_decision(
 
 def _base_conflict_item(
     pull: PullRequestInfo,
+    base_sha: str | None = None,
 ) -> FeedbackItem | None:
     if pull.mergeable is not False:
         return None
     if not re.fullmatch(r"[0-9a-f]{40}", pull.head_sha):
         raise RuntimeError("conflicting pull request has an invalid head commit SHA")
-    if not re.fullmatch(r"[0-9a-f]{40}", pull.base_sha):
+    current_base_sha = base_sha if base_sha is not None else pull.base_sha
+    if not re.fullmatch(r"[0-9a-f]{40}", current_base_sha):
         raise RuntimeError(
             "conflicting pull request has no valid current base commit SHA"
         )
     return FeedbackItem(
         feedback_type="base_conflict",
         object_id=pull.node_id,
-        version=f"{pull.head_sha}:{pull.base_sha}",
+        version=f"{pull.head_sha}:{current_base_sha}",
         author="github",
         body=(
             f"Pull request #{pull.number} at head {pull.head_sha} no longer "
-            f"merges cleanly into {pull.base_branch} at {pull.base_sha}. "
+            f"merges cleanly into {pull.base_branch} at {current_base_sha}. "
             "Resolve the base conflict on the existing branch, rerun required "
             "validation, and update this same pull request."
         ),

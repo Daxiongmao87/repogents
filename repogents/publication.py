@@ -384,6 +384,17 @@ class PublicationBlocked(RuntimeError):
     pass
 
 
+class PublicationBaseChanged(PublicationBlocked):
+    def __init__(self, expected_base_sha: str, current_base_sha: str) -> None:
+        self.expected_base_sha = expected_base_sha
+        self.current_base_sha = current_base_sha
+        super().__init__(
+            "pull-request base changed from "
+            f"{expected_base_sha} to {current_base_sha} "
+            "before conflict preparation"
+        )
+
+
 class PublicationRevisionRequired(PublicationBlocked):
     pass
 
@@ -438,9 +449,7 @@ class PublicationService:
             str(context["intended_base_branch"]),
         )
         if fetched_sha != expected_base_sha:
-            raise PublicationBlocked(
-                "intended base changed after the conflict observation"
-            )
+            raise PublicationBaseChanged(expected_base_sha, fetched_sha)
         _git(
             checkout,
             (

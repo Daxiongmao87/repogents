@@ -15,6 +15,7 @@ from repogents.github import PullRequestInfo
 from repogents.lifecycle import RunLifecycle
 from repogents.publication import (
     GitPublicationGateway,
+    PublicationBaseChanged,
     MiniSweScopeReviewer,
     PublicationService,
     ScopeDecision,
@@ -1279,6 +1280,19 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(pull["state"], "pending")
         self.assertEqual(operation["state"], "pending")
         self.assertEqual(self.gateway.create_calls, 0)
+
+    def test_prepare_base_revision_reports_changed_base_generation(self) -> None:
+        self.assertIsNotNone(self.service.publish("run-1"))
+        current_base_sha = "f" * 40
+        self.gateway.intended_base_head = current_base_sha
+
+        with self.assertRaises(PublicationBaseChanged) as caught:
+            self.service.prepare_base_revision("run-1", self.base_sha)
+
+        self.assertEqual(caught.exception.expected_base_sha, self.base_sha)
+        self.assertEqual(caught.exception.current_base_sha, current_base_sha)
+        self.assertIn(self.base_sha, str(caught.exception))
+        self.assertIn(current_base_sha, str(caught.exception))
 
     def test_resolved_base_conflict_updates_the_original_pull_request(
         self,

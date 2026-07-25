@@ -22,6 +22,7 @@ from repogents.database import (
     SCHEMA_V11,
     SCHEMA_V12,
     SCHEMA_V13,
+    SCHEMA_V14,
 )
 
 
@@ -161,7 +162,7 @@ class DatabaseTests(unittest.TestCase):
             version = connection.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
-            self.assertEqual(version, 14)
+            self.assertEqual(version, 15)
 
     def test_activity_revision_advances_only_after_durable_change(self) -> None:
         initial = self.db.activity_revision
@@ -285,7 +286,7 @@ class DatabaseTests(unittest.TestCase):
             )
         self.assertEqual(tuple(member), (300, "lead"))
         self.assertEqual(contract_version, 1)
-        self.assertEqual(versions, tuple(range(1, 15)))
+        self.assertEqual(versions, tuple(range(1, 16)))
 
     def test_concurrent_schema_v1_migration_converges_once(self) -> None:
         legacy_path = Path(self.tempdir.name) / "concurrent-legacy.sqlite3"
@@ -338,7 +339,7 @@ class DatabaseTests(unittest.TestCase):
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(team_members)")
             )
-        self.assertEqual(versions, tuple(range(1, 15)))
+        self.assertEqual(versions, tuple(range(1, 16)))
         self.assertEqual(columns.count("action_timeout_seconds"), 1)
         self.assertEqual(columns.count("atomic_role"), 1)
         with Database(legacy_path).connect() as connection:
@@ -775,7 +776,7 @@ class DatabaseTests(unittest.TestCase):
                    WHERE id='pull-1'"""
             ).fetchone()[0]
 
-        self.assertEqual(version, 14)
+        self.assertEqual(version, 15)
         self.assertEqual(issue_version["version"], 1)
         self.assertEqual(issue_version["title"], "Issue")
         self.assertEqual(issue_version["body"], "Body")
@@ -862,7 +863,7 @@ class DatabaseTests(unittest.TestCase):
                      (SELECT COUNT(*) FROM pull_requests
                        WHERE id='pull-legacy' AND run_id='run-1')""").fetchone()
 
-        self.assertEqual(schema_version, 14)
+        self.assertEqual(schema_version, 15)
         self.assertEqual(run["state"], "implementing")
         self.assertIn("legacy issue snapshot", run["reason"])
         self.assertEqual(run["validated_sha"], "b" * 40)
@@ -962,7 +963,7 @@ class DatabaseTests(unittest.TestCase):
                      AND to_state='waiting_for_feedback'"""
             ).fetchone()[0]
 
-        self.assertEqual(schema_version, 14)
+        self.assertEqual(schema_version, 15)
         self.assertEqual(run["state"], "waiting_for_feedback")
         self.assertEqual(run["last_completed_state"], "waiting_for_feedback")
         self.assertIsNone(run["reason"])
@@ -1027,7 +1028,7 @@ class DatabaseTests(unittest.TestCase):
                    FROM feedback_versions WHERE id='feedback-legacy'"""
             ).fetchone()
 
-        self.assertEqual(schema_version, 14)
+        self.assertEqual(schema_version, 15)
         self.assertTrue(
             {"review_thread_id", "review_thread_resolved"}.issubset(columns)
         )
@@ -1035,6 +1036,104 @@ class DatabaseTests(unittest.TestCase):
             tuple(feedback),
             ("feedback-legacy", "resolved", None, None),
         )
+
+    def test_schema_v15_adds_conflict_supersession_without_losing_evidence(
+        self,
+    ) -> None:
+        legacy = self.legacy_database("schema-v14-conflict.sqlite3", 10)
+        self.seed_repository_run(database=legacy)
+        now = "2026-01-01T00:02:00Z"
+        with legacy.transaction() as connection:
+            for version, statements in (
+                (11, SCHEMA_V11),
+                (12, SCHEMA_V12),
+                (13, SCHEMA_V13),
+                (14, SCHEMA_V14),
+            ):
+                for statement in statements:
+                    connection.execute(statement)
+                connection.execute(
+                    """INSERT INTO schema_version(version, applied_at)
+                       VALUES (?, ?)""",
+                    (version, now),
+                )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('pull-legacy', 'run-1', 'PR1', 9, 'pull-url',
+                           'agent/issue-3-run-1', 'main', ?, ?, ?, 'open',
+                           ?, ?)""",
+                ("a" * 40, "b" * 40, "b" * 40, now, now),
+            )
+            connection.execute(
+                """INSERT INTO feedback_versions
+                   (id, pull_request_id, feedback_type, github_object_id,
+                    github_version, author, body, path, line, state, observed_at,
+                    decision_json)
+                   VALUES ('feedback-legacy', 'pull-legacy', 'base_conflict',
+                           'PR1:head:base', 'head:base', 'repogents',
+                           'Retained conflict', NULL, NULL, 'processing', ?,
+                           '{"action":"revise","reason":"conflict","response":"fixed"}')""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO outbound_operations
+                   (id, run_id, kind, idempotency_key, request_json, state,
+                    created_at)
+                   VALUES ('operation-legacy', 'run-1',
+                           'feedback_revision_batch', 'legacy-batch',
+                           '{"feedback_ids":["feedback-legacy"]}', 'pending', ?)""",
+                (now,),
+            )
+
+        migrated = Database(legacy.path)
+        migrated.initialize()
+
+        with migrated.connect() as connection:
+            schema_version = connection.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()[0]
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(feedback_versions)")
+            }
+            feedback = connection.execute(
+                """SELECT id, state, body, decision_json, superseded_at,
+                          superseded_by_feedback_id
+                   FROM feedback_versions WHERE id='feedback-legacy'"""
+            ).fetchone()
+            operation = connection.execute(
+                """SELECT id, state, request_json
+                   FROM outbound_operations WHERE id='operation-legacy'"""
+            ).fetchone()
+            integrity = connection.execute("PRAGMA foreign_key_check").fetchall()
+
+        self.assertEqual(schema_version, 15)
+        self.assertTrue(
+            {"superseded_at", "superseded_by_feedback_id"}.issubset(columns)
+        )
+        self.assertEqual(
+            tuple(feedback),
+            (
+                "feedback-legacy",
+                "processing",
+                "Retained conflict",
+                '{"action":"revise","reason":"conflict","response":"fixed"}',
+                None,
+                None,
+            ),
+        )
+        self.assertEqual(
+            tuple(operation),
+            (
+                "operation-legacy",
+                "pending",
+                '{"feedback_ids":["feedback-legacy"]}',
+            ),
+        )
+        self.assertEqual(integrity, [])
 
     def test_schema_v10_migration_scopes_forced_run_to_repository(
         self,
