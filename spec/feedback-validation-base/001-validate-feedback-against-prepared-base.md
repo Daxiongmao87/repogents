@@ -35,4 +35,4 @@ A pull-request feedback revision can merge a newer intended-base commit than the
 - [x] `REGRESSION` - recover the exact legacy publication conflict blocker to `publishing` once, preserve its validated SHA, and prove a repeated blocker is not requeued.
 - [x] `REGRESSION` - run the focused execution, feedback, and orchestration suites.
 - [x] `REGRESSION` - run the complete project suite.
-- [ ] `LIVE` - resume Repogents issue #1 / pull request #6 and observe exact-SHA validation and same-pull publication against current `main`.
+- [x] `LIVE` - resume Repogents issue #1 / pull request #6 and observe exact-SHA validation and same-pull publication against current `main`.
