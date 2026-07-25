@@ -800,8 +800,12 @@ details > summary { cursor: pointer; }
       <section class="panel">
         <div class="panel-header"><div><h2>Agent-ready issues</h2><p class="muted">Issues shown here belong only to the selected repository.</p></div></div>
         <div class="panel-body" id="ready-issues"></div>
-        <div class="panel-header"><div><h2>All active issues</h2><p class="muted">Drag active issue buttons to set execution priority.</p></div></div>
+        <div class="panel-header"><div><h2>Runs</h2><p class="muted">Active issue runs for the selected repository.</p></div></div>
         <div class="panel-body" id="runs"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-header"><div><h2>All active issues</h2><p class="muted">Drag active issue buttons to set execution priority.</p></div></div>
+        <div class="panel-body" id="all-active-runs"></div>
       </section>
       <section class="panel" aria-labelledby="issue-log-title">
         <div class="panel-header">
@@ -1061,21 +1065,27 @@ function renderReadyIssues() {
       <span class="run-card-line muted">Updated ${esc(date(issue.updated_at))}</span>
     </article>`).join('') || `<p class="muted">${status === 'available' ? 'No agent:ready issues for this repository.' : 'No current agent:ready inventory is available.'}</p>`}`;
 }
+function runCard(run, reorderable) {
+  return `
+    <button type="button"
+      class="card run-card ${String(run.id) === selectedRunId ? 'selected' : ''}"
+      data-run-select="${esc(run.id)}" ${reorderable ? 'draggable="true"' : ''}
+      aria-pressed="${String(run.id) === selectedRunId ? 'true' : 'false'}"
+      aria-label="Select ${esc(run.repository)} issue ${esc(run.issue_number)}">
+      <span class="row"><strong>${esc(run.repository)} · Issue #${esc(run.issue_number)}: ${esc(run.issue_title)}</strong><span class="badge">${esc(run.state)}</span></span>
+      <span class="run-card-line">Last completed: ${esc(run.last_completed_state ?? 'none')}${run.pull_number ? ` · Pull request #${esc(run.pull_number)}` : ''}${run.forced ? ' · Forced work' : ''}</span>
+      ${run.reason ? `<span class="run-card-line ${run.reason_severity === 'error' ? 'error' : 'muted'}">${esc(run.reason)}${run.reason_truncated ? ' · Open Issue Log for full details.' : ''}</span>` : ''}
+      <span class="run-card-line${reorderable ? ' drag-hint' : ' muted'}">Priority ${esc(run.queue_position)}${reorderable ? ' · Drag to reorder · Alt+Arrow to move' : ''}</span>
+    </button>`;
+}
 function renderRuns() {
   renderReadyIssues();
-  const runs = document.querySelector('#runs');
-  const activeRuns = currentState.runs.filter(r => !['blocked', 'canceled', 'closed'].includes(String(r.state)));
-  runs.innerHTML = activeRuns.map(r => `
-    <button type="button"
-      class="card run-card ${String(r.id) === selectedRunId ? 'selected' : ''}"
-      data-run-select="${esc(r.id)}" draggable="true"
-      aria-pressed="${String(r.id) === selectedRunId ? 'true' : 'false'}"
-      aria-label="Select ${esc(r.repository)} issue ${esc(r.issue_number)}">
-      <span class="row"><strong>${esc(r.repository)} · Issue #${esc(r.issue_number)}: ${esc(r.issue_title)}</strong><span class="badge">${esc(r.state)}</span></span>
-      <span class="run-card-line">Last completed: ${esc(r.last_completed_state ?? 'none')}${r.pull_number ? ` · Pull request #${esc(r.pull_number)}` : ''}${r.forced ? ' · Forced work' : ''}</span>
-      ${r.reason ? `<span class="run-card-line ${r.reason_severity === 'error' ? 'error' : 'muted'}">${esc(r.reason)}${r.reason_truncated ? ' · Open Issue Log for full details.' : ''}</span>` : ''}
-      <span class="run-card-line drag-hint">Priority ${esc(r.queue_position)} · Drag to reorder · Alt+Arrow to move</span>
-    </button>`).join('') || '<p class="muted">No active issue runs.</p>';
+  const activeRuns = currentState.runs.filter(run => !['blocked', 'canceled', 'closed'].includes(String(run.state)));
+  const repositoryRuns = activeRuns.filter(run => String(run.repository_id) === selectedRepositoryId);
+  document.querySelector('#runs').innerHTML = repositoryRuns.map(run => runCard(run, false)).join('')
+    || `<p class="muted">${selectedRepositoryId ? 'No active issue runs for this repository.' : 'Select a repository to view its active issue runs.'}</p>`;
+  document.querySelector('#all-active-runs').innerHTML = activeRuns.map(run => runCard(run, true)).join('')
+    || '<p class="muted">No active issue runs.</p>';
   renderIssueLogDetails();
 }
 function renderIssueLogDetails() {
@@ -1201,6 +1211,7 @@ function selectRepository(repositoryId) {
   renderRepositoryList();
   renderRepositoryDetail();
   renderReadyIssues();
+  renderRuns();
 }
 const configurationDialog = document.querySelector('#model-configuration-dialog');
 document.querySelector('#open-model-configuration').addEventListener('click', () => {
@@ -1290,7 +1301,7 @@ document.body.addEventListener('click', event => {
   const card = event.target.closest('[data-repository]');
   if (card && !event.target.closest('a, details')) selectRepository(card.dataset.repository);
 });
-const runList = document.querySelector('#runs');
+const runList = document.querySelector('#all-active-runs');
 runList.addEventListener('dragstart', event => {
   const card = event.target.closest('[data-run-select]');
   if (!card) return;
@@ -1324,7 +1335,7 @@ runList.addEventListener('dragend', () => {
 });
 
 document.body.addEventListener('keydown', event => {
-  const run = event.target.closest('[data-run-select]');
+  const run = event.target.closest('#all-active-runs [data-run-select]');
   if (run && event.altKey && ['ArrowUp', 'ArrowDown'].includes(event.key)) {
     const sibling = event.key === 'ArrowUp' ? run.previousElementSibling : run.nextElementSibling;
     if (!sibling?.matches('[data-run-select]')) return;

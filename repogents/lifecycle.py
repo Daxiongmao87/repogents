@@ -346,7 +346,9 @@ class RunLifecycle:
             except GitHubError:
                 self._record_ready_issue_failure(repository_id)
             else:
-                self._record_ready_issue_success(repository_id, ready_issues)
+                self._record_ready_issue_success(
+                    repository_id, int(repository["ready_issue_generation"]), ready_issues
+                )
         events = self.github.list_ready_events(
             str(repository["owner"]), str(repository["name"])
         )
@@ -358,7 +360,7 @@ class RunLifecycle:
         return tuple(created)
 
     def _record_ready_issue_success(
-        self, repository_id: str, issues: list[IssueInfo]
+        self, repository_id: str, ready_issue_generation: int, issues: list[IssueInfo]
     ) -> None:
         values = [
             {
@@ -371,6 +373,34 @@ class RunLifecycle:
             for issue in issues
         ]
         with self.database.transaction() as connection:
+            eligible = connection.execute(
+                """SELECT 1 FROM repositories
+                   WHERE id=?
+                     AND enabled=1
+                     AND removed_at IS NULL
+                     AND onboarding_state='ready'
+                     AND ready_issue_generation=?""",
+                (repository_id, ready_issue_generation),
+            ).fetchone()
+            if eligible is None:
+                connection.execute(
+                    """INSERT INTO ready_issue_discovery
+                       (repository_id, status, issues_json, last_success_at,
+                        last_attempt_at, error)
+                       VALUES (?, 'unavailable', '[]', NULL,
+                               strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                               'Repository is not eligible for ready-issue discovery')
+                       ON CONFLICT(repository_id) DO UPDATE SET
+                         status=CASE
+                           WHEN ready_issue_discovery.last_success_at IS NULL
+                             THEN 'unavailable'
+                           ELSE 'stale'
+                         END,
+                         last_attempt_at=excluded.last_attempt_at,
+                         error=excluded.error""",
+                    (repository_id,),
+                )
+                return
             connection.execute(
                 """INSERT INTO ready_issue_discovery
                    (repository_id, status, issues_json, last_success_at,
@@ -1184,10 +1214,23 @@ class RunLifecycle:
             connection.execute(
                 """UPDATE repositories
                    SET enabled=?,
+                       ready_issue_generation=ready_issue_generation + 1,
                        updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                    WHERE id=?""",
                 (int(not paused), repository_id),
             )
+            if paused:
+                connection.execute(
+                    """UPDATE ready_issue_discovery
+                       SET status=CASE
+                             WHEN last_success_at IS NULL THEN 'unavailable'
+                             ELSE 'stale'
+                           END,
+                           last_attempt_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                           error='Repository is paused'
+                       WHERE repository_id=?""",
+                    (repository_id,),
+                )
         run_ids = tuple(str(row["id"]) for row in rows)
         if paused:
             for run_id in run_ids:

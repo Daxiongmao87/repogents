@@ -213,7 +213,12 @@ class GitHubClient:
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 raw = response.read()
-                payload = json.loads(raw) if raw else None
+                try:
+                    payload = json.loads(raw) if raw else None
+                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    raise GitHubError(
+                        f"GitHub {method} {path} returned an invalid JSON response"
+                    ) from error
                 return payload, {
                     key.lower(): value for key, value in response.headers.items()
                 }

@@ -918,12 +918,28 @@ class OnboardingService:
                 (repository_id,),
             ).fetchone()
             if existing is not None and existing["onboarding_state"] == "ready":
+                restoring = existing["removed_at"] is not None
                 connection.execute(
                     """UPDATE repositories
-                       SET enabled=1, removed_at=NULL, updated_at=?
+                       SET enabled=1,
+                           removed_at=NULL,
+                           ready_issue_generation=ready_issue_generation + 1,
+                           updated_at=?
                        WHERE id=?""",
                     (now, repository_id),
                 )
+                if restoring:
+                    connection.execute(
+                        """UPDATE ready_issue_discovery
+                           SET status=CASE
+                                 WHEN last_success_at IS NULL THEN 'unavailable'
+                                 ELSE 'stale'
+                               END,
+                               last_attempt_at=?,
+                               error='Repository was restored; ready issues require refresh'
+                           WHERE repository_id=?""",
+                        (now, repository_id),
+                    )
                 return repository_id
             connection.execute(
                 """INSERT INTO repositories
@@ -1006,6 +1022,15 @@ class OnboardingService:
                         _utc_now(),
                         repository_id,
                     ),
+                )
+                connection.execute(
+                    """UPDATE ready_issue_discovery
+                       SET status=CASE
+                           WHEN last_success_at IS NULL THEN 'unavailable'
+                           ELSE 'stale'
+                       END
+                       WHERE repository_id=?""",
+                    (repository_id,),
                 )
             return self._build_versions(
                 repository_id,

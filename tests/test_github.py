@@ -540,6 +540,31 @@ class GitHubAdapterTests(unittest.TestCase):
         with self.assertRaises(GitHubError):
             self.client.get_branch_head("owner", "repo", "main")
 
+    def test_invalid_json_response_is_normalized_to_github_error(self) -> None:
+        from unittest.mock import patch
+
+        from repogents.github import GitHubClient, GitHubError
+
+        class InvalidJsonResponse:
+            headers: dict[str, str] = {}
+
+            def __enter__(self) -> "InvalidJsonResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"truncated"'
+
+        client = GitHubClient(token="token", api_url="https://api.example.test")
+        with patch(
+            "repogents.github.urllib.request.urlopen",
+            return_value=InvalidJsonResponse(),
+        ):
+            with self.assertRaisesRegex(GitHubError, "invalid JSON response"):
+                client.get_repository("owner/repo")
+
 
 if __name__ == "__main__":
     unittest.main()
