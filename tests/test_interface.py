@@ -447,6 +447,10 @@ class InterfaceTests(unittest.TestCase):
             dashboard.count("#repository-filter').addEventListener('change'"),
             1,
         )
+        self.assertIn(
+            "['blocked', 'canceled', 'closed'].includes(r.state)",
+            dashboard,
+        )
 
     def test_dashboard_contains_issue_queue_and_inline_log(
         self,

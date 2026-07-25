@@ -797,9 +797,17 @@ details > summary { cursor: pointer; }
       </div>
     </section>
     <div class="secondary-sections">
-      <section class="panel">
-        <div class="panel-header"><div><h2>Issues and Runs</h2><p class="muted">Drag issue buttons to set execution priority.</p></div></div>
+      <section class="panel" aria-labelledby="repository-issues-title">
+        <div class="panel-header">
+          <div><h2 id="repository-issues-title">Issues and Runs</h2><p class="muted">Show agent:ready issues and runs for one repository.</p></div>
+          <label class="muted" for="repository-filter">Repository <select id="repository-filter" aria-label="Repository issue filter"></select></label>
+        </div>
+        <div class="panel-body" id="ready-issues"></div>
         <div class="panel-body" id="runs"></div>
+      </section>
+      <section class="panel" id="active-issues" aria-labelledby="active-issues-title">
+        <div class="panel-header"><div><h2 id="active-issues-title">All active issues</h2><p class="muted">Active runs across every repository.</p></div></div>
+        <div class="panel-body" id="active-runs"></div>
       </section>
       <section class="panel" aria-labelledby="issue-log-title">
         <div class="panel-header">
@@ -1038,12 +1046,12 @@ function renderRepositoryDetail() {
     </section>`;
 }
 function renderReadyIssues(repository) {
-  const repositoryId = String(repository.id);
+  const selectedRepository = String(repository.id);
   const discovery = (currentState.ready_issue_discovery || []).find(
-    item => String(item.repository_id) === repositoryId
+    item => String(item.repository_id) === selectedRepository
   );
   const issues = (currentState.ready_issues || []).filter(
-    issue => String(issue.repository_id) === repositoryId
+    issue => String(issue.repository_id) === selectedRepository
   );
   let message = '';
   if (!discovery || discovery.status === 'unavailable') {
@@ -1058,12 +1066,8 @@ function renderReadyIssues(repository) {
     : '';
   return `<section aria-labelledby="ready-issues-title"><h3 id="ready-issues-title">agent:ready issues</h3>${message}${cards}</section>`;
 }
-function renderRuns() {
-  const runs = document.querySelector('#runs');
-  const activeRuns = currentState.runs.filter(
-    r => !['blocked', 'canceled', 'closed'].includes(r.state)
-  );
-  runs.innerHTML = activeRuns.map(r => `
+function runCard(r) {
+  return `
     <button type="button"
       class="card run-card ${String(r.id) === selectedRunId ? 'selected' : ''}"
       data-run-select="${esc(r.id)}" draggable="true"
@@ -1073,7 +1077,35 @@ function renderRuns() {
       <span class="run-card-line">Last completed: ${esc(r.last_completed_state ?? 'none')}${r.pull_number ? ` · Pull request #${esc(r.pull_number)}` : ''}${r.forced ? ' · Forced work' : ''}</span>
       ${r.reason ? `<span class="run-card-line ${r.reason_severity === 'error' ? 'error' : 'muted'}">${esc(r.reason)}${r.reason_truncated ? ' · Open Issue Log for full details.' : ''}</span>` : ''}
       <span class="run-card-line drag-hint">Priority ${esc(r.queue_position)} · Drag to reorder · Alt+Arrow to move</span>
-    </button>`).join('') || '<p class="muted">No active issue runs.</p>';
+    </button>`;
+}
+function renderRuns() {
+  const repositoryFilter = document.querySelector('#repository-filter');
+  repositoryFilter.innerHTML = currentState.repositories.map(repository =>
+    `<option value="${esc(repository.id)}" ${String(repository.id) === selectedRepositoryId ? 'selected' : ''}>${esc(repository.identity)}</option>`
+  ).join('');
+  repositoryFilter.disabled = !currentState.repositories.length;
+
+  const selectedRepository = selectedRepositoryId;
+  const repository = currentState.repositories.find(
+    item => String(item.id) === selectedRepository
+  );
+  document.querySelector('#ready-issues').innerHTML = repository
+    ? renderReadyIssues(repository)
+    : '<p class="muted">Select a repository to view its agent:ready issues.</p>';
+
+  const repositoryRuns = currentState.runs.filter(
+    r => String(r.repository_id) === selectedRepository
+      && !['blocked', 'canceled', 'closed'].includes(r.state)
+  );
+  document.querySelector('#runs').innerHTML = repositoryRuns.map(runCard).join('')
+    || '<p class="muted">No active issue runs for this repository.</p>';
+
+  const activeRuns = currentState.runs.filter(
+    r => !['blocked', 'canceled', 'closed'].includes(r.state)
+  );
+  document.querySelector('#active-runs').innerHTML = activeRuns.map(runCard).join('')
+    || '<p class="muted">No active issue runs.</p>';
   renderIssueLogDetails();
 }
 function renderIssueLogDetails() {
@@ -1198,7 +1230,11 @@ function selectRepository(repositoryId) {
   selectedRepositoryId = String(repositoryId);
   renderRepositoryList();
   renderRepositoryDetail();
+  renderRuns();
 }
+document.querySelector('#repository-filter').addEventListener('change', event => {
+  selectRepository(event.target.value);
+});
 const configurationDialog = document.querySelector('#model-configuration-dialog');
 document.querySelector('#open-model-configuration').addEventListener('click', () => {
   populateModelConfigurationForm();
