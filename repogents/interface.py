@@ -1200,6 +1200,7 @@ function selectRepository(repositoryId) {
   selectedRepositoryId = String(repositoryId);
   renderRepositoryList();
   renderRepositoryDetail();
+  renderReadyIssues();
 }
 const configurationDialog = document.querySelector('#model-configuration-dialog');
 document.querySelector('#open-model-configuration').addEventListener('click', () => {

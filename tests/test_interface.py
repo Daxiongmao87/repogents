@@ -446,6 +446,7 @@ class InterfaceTests(unittest.TestCase):
             "All active issues",
             "Issue Log",
             "issue => String(issue.repository_id) === selectedRepositoryId",
+            "renderRepositoryDetail();\n  renderReadyIssues();",
             "!['blocked', 'canceled', 'closed'].includes(String(r.state))",
             "Role prompt",
             'draggable="true"',
