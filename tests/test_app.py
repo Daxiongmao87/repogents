@@ -427,6 +427,78 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(publication.calls, [])
         self.assertGreaterEqual(feedback.calls.count("run-1"), 1)
 
+    def test_state_reads_cached_ready_issue_discovery_without_github_calls(self) -> None:
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO repositories
+                   (id, github_node_id, owner, name, url, default_branch,
+                    onboarding_state, inputs_json, created_at, updated_at)
+                   VALUES ('repo-2', 'R2', 'owner', 'second',
+                           'https://github.com/owner/second', 'main', 'ready',
+                           '{}', '2026-01-01T00:00:00Z',
+                           '2026-01-01T00:00:00Z')"""
+            )
+            connection.execute(
+                """INSERT INTO ready_issue_discovery
+                   (repository_id, status, issues_json, last_success_at,
+                    last_attempt_at, error)
+                   VALUES ('repo-1', 'unavailable', '[]', NULL,
+                           '2026-01-02T00:00:00Z',
+                           'GitHub ready-issue discovery failed'),
+                          ('repo-2', 'available', ?,
+                           '2026-01-02T00:00:00Z',
+                           '2026-01-02T00:00:00Z', NULL)""",
+                (json.dumps([{
+                    "number": 7,
+                    "title": "Ready elsewhere",
+                    "url": "https://github.com/owner/second/issues/7",
+                    "updated_at": "2026-01-02T00:00:00Z",
+                }]),),
+            )
+
+        class UnexpectedGitHub:
+            def list_ready_issues(self, owner: str, name: str) -> tuple[object, ...]:
+                self.failures += 1
+                raise AssertionError("state must not call GitHub")
+
+            def __init__(self) -> None:
+                self.failures = 0
+
+        github = UnexpectedGitHub()
+        actions = ApplicationActions(
+            database=self.db,
+            onboarding=FakeOnboarding(),
+            lifecycle=FakeLifecycle(self.db),
+            quiet=FakeQuiet(),
+            scheduler=FakeScheduler(),
+            github=github,
+        )
+
+        first = actions.state()
+        second = actions.state()
+
+        self.assertEqual(github.failures, 0)
+        self.assertEqual(first["ready_issues"], second["ready_issues"])
+        self.assertEqual(
+            first["ready_issues"],
+            [
+                {
+                    "repository_id": "repo-2",
+                    "repository": "owner/second",
+                    "number": 7,
+                    "title": "Ready elsewhere",
+                    "url": "https://github.com/owner/second/issues/7",
+                    "updated_at": "2026-01-02T00:00:00Z",
+                }
+            ],
+        )
+        discovery = {
+            item["repository_id"]: item for item in first["ready_issue_discovery"]
+        }
+        self.assertEqual(discovery["repo-1"]["status"], "unavailable")
+        self.assertIsNone(discovery["repo-1"]["last_success_at"])
+        self.assertEqual(discovery["repo-2"]["status"], "available")
+
     def test_transient_quiet_check_preserves_active_run_for_next_tick(self) -> None:
         class FailingQuiet(FakeQuiet):
             def check_due(self, run_id: str) -> None:

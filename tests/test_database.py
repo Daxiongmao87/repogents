@@ -116,7 +116,7 @@ class DatabaseTests(unittest.TestCase):
             version = connection.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
-            self.assertEqual(version, 3)
+            self.assertEqual(version, 4)
 
     def test_schema_v1_team_timeout_is_backfilled_idempotently(self) -> None:
         legacy_path = Path(self.tempdir.name) / "legacy.sqlite3"
@@ -140,7 +140,7 @@ class DatabaseTests(unittest.TestCase):
                 )
             )
         self.assertEqual(timeout, 300)
-        self.assertEqual(versions, (1, 2, 3))
+        self.assertEqual(versions, (1, 2, 3, 4))
 
     def test_concurrent_schema_v1_migration_converges_once(self) -> None:
         legacy_path = Path(self.tempdir.name) / "concurrent-legacy.sqlite3"
@@ -193,7 +193,7 @@ class DatabaseTests(unittest.TestCase):
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(team_members)")
             )
-        self.assertEqual(versions, (1, 2, 3))
+        self.assertEqual(versions, (1, 2, 3, 4))
         self.assertEqual(columns.count("action_timeout_seconds"), 1)
         with Database(legacy_path).connect() as connection:
             acceptance_tables = {

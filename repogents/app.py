@@ -259,12 +259,17 @@ class ApplicationActions:
         lifecycle: LifecycleOperations,
         quiet: QuietOperations,
         scheduler: SchedulerControl,
+        github: GitHubClient | None = None,
     ) -> None:
         self.database = database
         self.onboarding = onboarding
         self.lifecycle = lifecycle
         self.quiet = quiet
         self.scheduler = scheduler
+        self.github = github or self
+
+    def list_ready_issues(self, owner: str, name: str) -> tuple[object, ...]:
+        return ()
 
     def state(self) -> dict[str, object]:
         with self.database.connect() as connection:
@@ -284,7 +289,7 @@ class ApplicationActions:
                      ON team_versions.id=repositories.current_team_version_id
                    ORDER BY repositories.owner COLLATE NOCASE,
                             repositories.name COLLATE NOCASE""").fetchall()
-            runs = connection.execute("""SELECT runs.id,
+            runs = connection.execute("""SELECT runs.id, runs.repository_id,
                           repositories.owner || '/' || repositories.name AS repository,
                           issues.number AS issue_number,
                           issues.title AS issue_title,
@@ -321,6 +326,11 @@ class ApplicationActions:
                      ON team_members.id=agent_assignments.team_member_id
                    ORDER BY agent_assignments.assigned_at, agent_assignments.id"""
             ).fetchall()
+            ready_issue_discoveries = connection.execute(
+                """SELECT repository_id, status, issues_json, last_success_at,
+                          last_attempt_at, error
+                   FROM ready_issue_discovery"""
+            ).fetchall()
         validation_by_run: dict[str, list[dict[str, object]]] = {}
         for row in validations:
             value = dict(row)
@@ -346,15 +356,58 @@ class ApplicationActions:
                 if acceptance is not None
                 else None
             )
+        discovery_by_repository = {
+            str(row["repository_id"]): dict(row)
+            for row in ready_issue_discoveries
+        }
         repository_values: list[dict[str, object]] = []
+        ready_issues: list[dict[str, object]] = []
+        ready_issue_discovery: list[dict[str, object]] = []
         for row in repositories:
             value = dict(row)
             value["display_inputs"] = _display_repository_inputs(
                 str(value.pop("inputs_json"))
             )
             repository_values.append(value)
+            repository_id = str(value["id"])
+            discovery = discovery_by_repository.get(repository_id)
+            if discovery is None:
+                ready_issue_discovery.append(
+                    {
+                        "repository_id": repository_id,
+                        "repository": value["identity"],
+                        "status": "unavailable",
+                        "last_success_at": None,
+                        "last_attempt_at": None,
+                        "error": "Ready-issue discovery has not run yet",
+                    }
+                )
+                continue
+            ready_issue_discovery.append(
+                {
+                    "repository_id": repository_id,
+                    "repository": value["identity"],
+                    "status": discovery["status"],
+                    "last_success_at": discovery["last_success_at"],
+                    "last_attempt_at": discovery["last_attempt_at"],
+                    "error": discovery["error"],
+                }
+            )
+            for issue in json.loads(str(discovery["issues_json"])):
+                ready_issues.append(
+                    {
+                        "repository_id": repository_id,
+                        "repository": value["identity"],
+                        "number": issue["number"],
+                        "title": issue["title"],
+                        "url": issue["url"],
+                        "updated_at": issue["updated_at"],
+                    }
+                )
         return {
             "repositories": repository_values,
+            "ready_issues": ready_issues,
+            "ready_issue_discovery": ready_issue_discovery,
             "runs": run_values,
             "notifications": self.quiet.list_notifications(),
         }
@@ -553,6 +606,7 @@ def build_runtime(
         lifecycle=lifecycle,
         quiet=quiet,
         scheduler=scheduler,
+        github=github,
     )
     return RuntimeComponents(
         database=database,

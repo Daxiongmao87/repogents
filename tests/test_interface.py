@@ -31,9 +31,20 @@ class FakeActions:
                     },
                 }
             ],
+            "ready_issues": [
+                {
+                    "repository_id": "repo-1",
+                    "repository": "owner/repo",
+                    "number": 4,
+                    "title": "Ready work",
+                    "url": "https://github.com/owner/repo/issues/4",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                }
+            ],
             "runs": [
                 {
                     "id": "run-1",
+                    "repository_id": "repo-1",
                     "repository": "owner/repo",
                     "issue_number": 3,
                     "issue_title": "Fix scrolling",
@@ -177,6 +188,9 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         state = json.loads(body)
         self.assertEqual(state["repositories"][0]["identity"], "owner/repo")
+        self.assertEqual(state["ready_issues"][0]["repository_id"], "repo-1")
+        self.assertEqual(state["ready_issues"][0]["number"], 4)
+        self.assertEqual(state["runs"][0]["repository_id"], "repo-1")
         self.assertEqual(
             state["repositories"][0]["display_inputs"],
             {
@@ -221,6 +235,15 @@ class InterfaceTests(unittest.TestCase):
         self.assertIn("Issue acceptance", dashboard)
         self.assertIn("/api/acceptance-artifacts/", dashboard)
         self.assertIn("scope", dashboard)
+        self.assertIn('id="active-issues"', dashboard)
+        self.assertIn('id="repository-filter"', dashboard)
+        self.assertIn('id="ready-issues"', dashboard)
+        self.assertIn("String(issue.repository_id) === selectedRepository", dashboard)
+        self.assertIn("String(r.repository_id) === selectedRepository", dashboard)
+        self.assertEqual(
+            dashboard.count("#repository-filter').addEventListener('change'"),
+            1,
+        )
 
     def test_acceptance_artifact_is_served_from_controller_storage(self) -> None:
         status, headers, body = self.request(

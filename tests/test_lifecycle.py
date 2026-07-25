@@ -22,6 +22,9 @@ class FakeActivationClient:
     base_sha: str = "b" * 40
     polls: int = 0
 
+    def list_ready_issues(self, owner: str, name: str) -> tuple[IssueInfo, ...]:
+        return tuple(event.issue for event in self.events)
+
     def list_ready_events(self, owner: str, name: str) -> list[ActivationEvent]:
         self.polls += 1
         return list(self.events)
@@ -341,6 +344,73 @@ class RunLifecycleTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual([row["to_state"] for row in transitions][-1], RunState.CANCELED.value)
 
+
+    def test_ready_issue_discovery_records_successful_empty_inventory(self) -> None:
+        self.github.events = []
+
+        self.assertEqual(self.lifecycle.poll_repository("repo-1"), ())
+
+        with self.db.connect() as connection:
+            discovery = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(discovery["status"], "available")
+        self.assertEqual(discovery["issues_json"], "[]")
+        self.assertIsNotNone(discovery["last_success_at"])
+        self.assertIsNone(discovery["error"])
+
+    def test_ready_issue_discovery_records_unavailable_without_cache(self) -> None:
+        from repogents.github import GitHubError
+
+        class FailingDiscoveryClient(FakeActivationClient):
+            def list_ready_issues(self, owner: str, name: str) -> tuple[IssueInfo, ...]:
+                raise GitHubError("rate limited")
+
+        lifecycle = RunLifecycle(
+            database=self.db,
+            data_root=self.data_root,
+            github=FailingDiscoveryClient([]),
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+        )
+
+        self.assertEqual(lifecycle.poll_repository("repo-1"), ())
+
+        with self.db.connect() as connection:
+            discovery = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(discovery["status"], "unavailable")
+        self.assertEqual(discovery["issues_json"], "[]")
+        self.assertIsNone(discovery["last_success_at"])
+        self.assertEqual(discovery["error"], "GitHub ready-issue discovery failed")
+
+    def test_ready_issue_discovery_retains_stale_cache_after_failure(self) -> None:
+        from repogents.github import GitHubError
+
+        self.lifecycle.poll_repository("repo-1")
+
+        class FailingDiscoveryClient(FakeActivationClient):
+            def list_ready_issues(self, owner: str, name: str) -> tuple[IssueInfo, ...]:
+                raise GitHubError("server unavailable")
+
+        lifecycle = RunLifecycle(
+            database=self.db,
+            data_root=self.data_root,
+            github=FailingDiscoveryClient([]),
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+        )
+        lifecycle.poll_repository("repo-1")
+
+        with self.db.connect() as connection:
+            discovery = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(discovery["status"], "stale")
+        self.assertIn('"number": 3', discovery["issues_json"])
+        self.assertIsNotNone(discovery["last_success_at"])
+        self.assertEqual(discovery["error"], "GitHub ready-issue discovery failed")
 
     def test_reconcile_recreates_missing_run_storage_without_new_identity(self) -> None:
         run_id = self.lifecycle.poll_repository("repo-1")[0]

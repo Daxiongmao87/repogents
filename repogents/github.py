@@ -282,6 +282,40 @@ class GitHubClient:
         activations.sort(key=lambda item: (item.applied_at, item.event_id))
         return activations
 
+    def list_ready_issues(self, owner: str, name: str) -> list[IssueInfo]:
+        payloads = self._paginate(
+            f"repos/{owner}/{name}/issues?state=open&labels=agent%3Aready"
+        )
+        issues: list[IssueInfo] = []
+        for payload in payloads:
+            if "pull_request" in payload:
+                continue
+            try:
+                number = int(payload["number"])
+                title = payload["title"]
+                url = payload["html_url"]
+                updated_at = payload["updated_at"]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not all(isinstance(value, str) and value for value in (title, url, updated_at)):
+                continue
+            node_id = payload.get("node_id", "")
+            if not isinstance(node_id, str):
+                node_id = ""
+            issues.append(
+                IssueInfo(
+                    node_id=node_id,
+                    number=number,
+                    url=url,
+                    title=title,
+                    body="",
+                    discussion=(),
+                    updated_at=updated_at,
+                )
+            )
+        issues.sort(key=lambda issue: issue.number)
+        return issues
+
     def get_branch_head(self, owner: str, name: str, branch: str) -> str:
         encoded_branch = urllib.parse.quote(branch, safe="")
         payload, _ = self._request(

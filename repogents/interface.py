@@ -286,10 +286,13 @@ button { cursor: pointer; } a { overflow-wrap: anywhere; }
 <button type="submit">Onboard</button></form>
 </section>
 <section><h2>Repositories</h2><div id="repositories"></div></section>
-<section><h2>Issues and runs</h2><div id="runs"></div></section>
+<section><h2>All active issues</h2><div id="active-issues"></div></section>
+<section><div class="row"><h2>Selected repository issues and runs</h2><label>Repository <select id="repository-filter"></select></label></div><div id="ready-issues"></div><div id="runs"></div></section>
 <section><h2>Notifications</h2><div id="notifications"></div></section>
 <script>
 let token = '';
+let selectedRepository = '';
+let currentState = {repositories: [], ready_issues: [], runs: []};
 const displayInputs = new Map();
 const error = document.querySelector('#error');
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -320,11 +323,26 @@ async function refresh() {
     const response = await fetch('/api/state', {cache:'no-store'});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const state = await response.json();
+    currentState = state;
     displayInputs.clear();
     state.repositories.forEach(r => displayInputs.set(String(r.id), r.display_inputs));
     document.querySelector('#repositories').innerHTML = state.repositories.map(r => `<article class="card"><div class="row"><strong>${githubLink(r.url, r.identity)}</strong><span class="badge">${esc(r.onboarding_state)}</span></div><p>Default: ${esc(r.default_branch)}<br>Sandbox v${esc(r.sandbox_version ?? '—')} <code>${esc(r.sandbox_version_id ?? '—')}</code><br>Team v${esc(r.team_version ?? '—')} <code>${esc(r.team_version_id ?? '—')}</code></p><details><summary>Retained inputs</summary><pre>${esc(JSON.stringify(r.display_inputs, null, 2))}</pre></details>${r.blocking_reason ? `<p class="error">${esc(r.blocking_reason)}</p>` : ''}<button data-reonboard="${esc(r.id)}">Re-onboard</button></article>`).join('') || '<p class="muted">No repositories.</p>';
-    document.querySelector('#runs').innerHTML = state.runs.map(r => `<article class="card"><div class="row"><strong>${esc(r.repository)} · ${githubLink(r.issue_url, `Issue #${r.issue_number}: ${r.issue_title}`)}</strong><span class="badge">${esc(r.state)}</span></div><p>Last completed: ${esc(r.last_completed_state ?? 'none')}</p>${r.pull_url ? `<p>${githubLink(r.pull_url, `Pull request #${r.pull_number}`)}</p>` : ''}${r.reason ? `<p class="error">${esc(r.reason)}</p>` : ''}${evidence(r)}<p>${runActions(r)}</p></article>`).join('') || '<p class="muted">No issue runs.</p>';
-    document.querySelectorAll('#runs article.card').forEach((card, index) => card.insertAdjacentHTML('beforeend', acceptanceEvidence(state.runs[index].acceptance_verification)));
+    const repositoryFilter = document.querySelector('#repository-filter');
+    if (!selectedRepository || !state.repositories.some(r => String(r.id) === selectedRepository)) selectedRepository = String(state.repositories[0]?.id ?? '');
+    repositoryFilter.innerHTML = state.repositories.map(r => `<option value="${esc(r.id)}"${String(r.id) === selectedRepository ? ' selected' : ''}>${esc(r.identity)}</option>`).join('') || '<option value="">No repositories</option>';
+    const activeRuns = state.runs.filter(r => !['canceled', 'closed'].includes(r.state));
+    document.querySelector('#active-issues').innerHTML = activeRuns.map(r => `<article class="card"><div class="row"><strong>${esc(r.repository)} · ${githubLink(r.issue_url, `Issue #${r.issue_number}: ${r.issue_title}`)}</strong><span class="badge">${esc(r.state)}</span></div></article>`).join('') || '<p class="muted">No active issues.</p>';
+    const readyIssues = (state.ready_issues || []).filter(issue => String(issue.repository_id) === selectedRepository);
+    const readyDiscovery = (state.ready_issue_discovery || []).find(item => String(item.repository_id) === selectedRepository);
+    const readyCards = readyIssues.map(issue => `<article class="card"><div class="row"><strong>${githubLink(issue.url, `Issue #${issue.number}: ${issue.title}`)}</strong><span class="badge">agent:ready</span></div><p class="muted">Updated ${esc(issue.updated_at)}</p></article>`).join('');
+    let readyMessage = '';
+    if (!readyDiscovery || readyDiscovery.status === 'unavailable') readyMessage = `<p class="error">Ready-issue discovery is unavailable${readyDiscovery?.error ? `: ${esc(readyDiscovery.error)}` : '.'}</p>`;
+    else if (readyDiscovery.status === 'stale') readyMessage = `<p class="error">Showing stale ready-issue results from ${esc(readyDiscovery.last_success_at ?? 'an earlier successful check')}${readyDiscovery.error ? `: ${esc(readyDiscovery.error)}` : '.'}</p>`;
+    else if (!readyCards) readyMessage = '<p class="muted">No agent:ready issues for this repository.</p>';
+    document.querySelector('#ready-issues').innerHTML = readyMessage + readyCards;
+    const selectedRuns = state.runs.filter(r => String(r.repository_id) === selectedRepository);
+    document.querySelector('#runs').innerHTML = selectedRuns.map(r => `<article class="card"><div class="row"><strong>${githubLink(r.issue_url, `Issue #${r.issue_number}: ${r.issue_title}`)}</strong><span class="badge">${esc(r.state)}</span></div><p>Last completed: ${esc(r.last_completed_state ?? 'none')}</p>${r.pull_url ? `<p>${githubLink(r.pull_url, `Pull request #${r.pull_number}`)}</p>` : ''}${r.reason ? `<p class="error">${esc(r.reason)}</p>` : ''}${evidence(r)}<p>${runActions(r)}</p></article>`).join('') || '<p class="muted">No issue runs for this repository.</p>';
+    document.querySelectorAll('#runs article.card').forEach((card, index) => card.insertAdjacentHTML('beforeend', acceptanceEvidence(selectedRuns[index].acceptance_verification)));
     document.querySelector('#notifications').innerHTML = state.notifications.map(n => `<article class="card ${n.read_at ? '' : 'unread'}"><strong>${esc(n.owner)}/${esc(n.name)}</strong><p>${githubLink(n.issue_url, `Issue #${n.issue_number}: ${n.issue_title}`)} · ${githubLink(n.pull_url, `PR #${n.pull_number}`)}</p><p class="muted">${esc(n.created_at)}</p>${n.read_at ? '<span class="badge">Acknowledged</span>' : `<button data-ack="${esc(n.id)}">Acknowledge</button>`}</article>`).join('') || '<p class="muted">No notifications.</p>';
     error.textContent = '';
   } catch (e) { error.textContent = e.message; }
@@ -332,6 +350,7 @@ async function refresh() {
 async function action(fn) { try { await fn(); await refresh(); } catch (e) { error.textContent = e.message; } }
 document.querySelector('#add').addEventListener('submit', event => { event.preventDefault(); action(async () => { const form = new FormData(event.target); await mutate('/api/repositories', {repository:form.get('repository'), inputs:JSON.parse(form.get('inputs'))}); event.target.reset(); event.target.elements.inputs.value='{}'; }); });
 document.querySelector('#poll').addEventListener('click', () => action(() => mutate('/api/poll', {})));
+document.querySelector('#repository-filter').addEventListener('change', event => { selectedRepository = event.target.value; refresh(); });
 document.body.addEventListener('click', event => { const b=event.target.closest('button'); if (!b) return; if (b.dataset.reonboard) action(() => { const raw=prompt('Repository inputs JSON object:', JSON.stringify(displayInputs.get(b.dataset.reonboard), null, 2)); if (raw === null) return Promise.resolve(); return mutate(`/api/repositories/${encodeURIComponent(b.dataset.reonboard)}/reonboard`, {inputs:JSON.parse(raw)}); }); if (b.dataset.cancel && confirm('Cancel this run?')) action(() => mutate(`/api/runs/${encodeURIComponent(b.dataset.cancel)}/cancel`, {})); if (b.dataset.ack) action(() => mutate(`/api/notifications/${encodeURIComponent(b.dataset.ack)}/acknowledge`, {})); });
 fetch('/', {cache:'no-store'}).then(r => { token = r.headers.get('X-Repogents-CSRF') || ''; refresh(); });
 setInterval(refresh, 10000);

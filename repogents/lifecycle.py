@@ -14,7 +14,7 @@ from typing import Protocol
 
 from .controller import RunProcessSupervisor, git_environment
 from .database import Database
-from .github import ActivationEvent
+from .github import ActivationEvent, GitHubError
 from .sandbox import RunLayout
 
 
@@ -284,13 +284,70 @@ class RunLifecycle:
         team_version_id = repository["current_team_version_id"]
         if not sandbox_version_id or not team_version_id:
             raise RuntimeError("ready repository has no stored sandbox or team version")
-        events = self.github.list_ready_events(str(repository["owner"]), str(repository["name"]))
+        owner = str(repository["owner"])
+        name = str(repository["name"])
+        try:
+            ready_issues = self.github.list_ready_issues(owner, name)
+        except GitHubError:
+            self._record_ready_issue_failure(repository_id)
+        else:
+            self._record_ready_issue_success(repository_id, ready_issues)
+        events = self.github.list_ready_events(owner, name)
         created: list[str] = []
         for event in events:
             run_id = self._activate(repository, event)
             if run_id is not None:
                 created.append(run_id)
         return tuple(created)
+
+    def _record_ready_issue_success(
+        self, repository_id: str, issues: object
+    ) -> None:
+        values = [
+            {
+                "number": issue.number,
+                "title": issue.title,
+                "url": issue.url,
+                "updated_at": issue.updated_at,
+            }
+            for issue in issues  # type: ignore[union-attr]
+        ]
+        with self.database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO ready_issue_discovery
+                   (repository_id, status, issues_json, last_success_at,
+                    last_attempt_at, error)
+                   VALUES (?, 'available', ?,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL)
+                   ON CONFLICT(repository_id) DO UPDATE SET
+                     status='available',
+                     issues_json=excluded.issues_json,
+                     last_success_at=excluded.last_success_at,
+                     last_attempt_at=excluded.last_attempt_at,
+                     error=NULL""",
+                (repository_id, json.dumps(values, sort_keys=True)),
+            )
+
+    def _record_ready_issue_failure(self, repository_id: str) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO ready_issue_discovery
+                   (repository_id, status, issues_json, last_success_at,
+                    last_attempt_at, error)
+                   VALUES (?, 'unavailable', '[]', NULL,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                           'GitHub ready-issue discovery failed')
+                   ON CONFLICT(repository_id) DO UPDATE SET
+                     status=CASE
+                       WHEN ready_issue_discovery.last_success_at IS NULL
+                         THEN 'unavailable'
+                       ELSE 'stale'
+                     END,
+                     last_attempt_at=excluded.last_attempt_at,
+                     error=excluded.error""",
+                (repository_id,),
+            )
 
     def _activate(self, repository: object, event: ActivationEvent) -> str | None:
         repository_id = str(repository["id"])  # type: ignore[index]

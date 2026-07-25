@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Generator
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_V1 = r"""
 BEGIN IMMEDIATE;
@@ -339,6 +339,20 @@ SCHEMA_V3 = (
     """,
 )
 
+SCHEMA_V4 = (
+    """
+    CREATE TABLE ready_issue_discovery (
+        repository_id TEXT PRIMARY KEY
+            REFERENCES repositories(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN ('available', 'unavailable', 'stale')),
+        issues_json TEXT NOT NULL,
+        last_success_at TEXT,
+        last_attempt_at TEXT NOT NULL,
+        error TEXT
+    )
+    """,
+)
+
 
 class Database:
     """Owns SQLite connection policy and transactional schema initialization."""
@@ -409,6 +423,14 @@ class Database:
                 connection.execute("""INSERT INTO schema_version(version, applied_at)
                        VALUES (
                            3,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )""")
+            if version < 4:
+                for statement in SCHEMA_V4:
+                    connection.execute(statement)
+                connection.execute("""INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           4,
                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                        )""")
             connection.commit()
