@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -12,15 +13,22 @@ from unittest.mock import patch
 
 from repogents.database import Database
 from repogents.controller import git_environment as controller_git_environment
-from repogents.github import ActivationEvent, IssueInfo
-from repogents.lifecycle import GitCheckoutManager, RunLifecycle, RunState, allowed_transition
+from repogents.github import ActivationEvent, GitHubError, IssueInfo
+from repogents.lifecycle import (
+    GitCheckoutManager,
+    RunLifecycle,
+    RunState,
+    allowed_transition,
+)
 
 
 @dataclass
 class FakeActivationClient:
     events: list[ActivationEvent]
+    current_issue: IssueInfo | None = None
     base_sha: str = "b" * 40
     polls: int = 0
+    issue_polls: int = 0
 
     def list_ready_issues(self, owner: str, name: str) -> tuple[IssueInfo, ...]:
         return tuple(event.issue for event in self.events)
@@ -28,6 +36,13 @@ class FakeActivationClient:
     def list_ready_events(self, owner: str, name: str) -> list[ActivationEvent]:
         self.polls += 1
         return list(self.events)
+
+    def get_issue(self, owner: str, name: str, number: int) -> IssueInfo:
+        self.issue_polls += 1
+        issue = self.current_issue or self.events[-1].issue
+        if issue.number != number:
+            raise AssertionError(f"unexpected issue number {number}")
+        return issue
 
     def get_branch_head(self, owner: str, name: str, branch: str) -> str:
         return self.base_sha
@@ -55,6 +70,18 @@ class FakeSandboxManager:
     def cancel(self, run_id: str) -> bool:
         self.canceled.append(run_id)
         return True
+
+
+class FakeProcessSupervisor:
+    def __init__(self) -> None:
+        self.paused: list[str] = []
+        self.resumed: list[str] = []
+
+    def pause(self, run_id: str) -> None:
+        self.paused.append(run_id)
+
+    def resume(self, run_id: str) -> None:
+        self.resumed.append(run_id)
 
 
 class RacingFailingSandboxManager:
@@ -116,7 +143,9 @@ class GitCheckoutManagerTests(unittest.TestCase):
         self._git("push", "origin", "main", cwd=self.admin)
         return self._git("rev-parse", "HEAD", cwd=self.admin)
 
-    def test_fetches_and_retains_exact_base_from_origin_across_source_refresh(self) -> None:
+    def test_fetches_and_retains_exact_base_from_origin_across_source_refresh(
+        self,
+    ) -> None:
         base_sha = self._push_commit("activation\n", "activation base")
         self.assertNotEqual(
             subprocess.run(
@@ -141,22 +170,32 @@ class GitCheckoutManagerTests(unittest.TestCase):
         with patch("repogents.lifecycle.git_environment", recording_environment):
             manager = GitCheckoutManager(token="configured-token")
             manager.create(self.source, base_sha, self.checkout)
-            self.assertEqual(self._git("rev-parse", "HEAD", cwd=self.checkout), base_sha)
             self.assertEqual(
-                self._git("rev-parse", f"refs/repogents/bases/{base_sha}", cwd=self.checkout),
+                self._git("rev-parse", "HEAD", cwd=self.checkout), base_sha
+            )
+            self.assertEqual(
+                self._git(
+                    "rev-parse", f"refs/repogents/bases/{base_sha}", cwd=self.checkout
+                ),
                 base_sha,
             )
 
             shutil.rmtree(self.checkout)
             self._git("clone", "--depth", "1", self.source.as_uri(), str(self.checkout))
-            self.assertNotEqual(self._git("rev-parse", "HEAD", cwd=self.checkout), base_sha)
+            self.assertNotEqual(
+                self._git("rev-parse", "HEAD", cwd=self.checkout), base_sha
+            )
             manager.create(self.source, base_sha, self.checkout)
-            self.assertEqual(self._git("rev-parse", "HEAD", cwd=self.checkout), base_sha)
+            self.assertEqual(
+                self._git("rev-parse", "HEAD", cwd=self.checkout), base_sha
+            )
 
             self._push_commit("re-onboarded\n", "later source")
             shutil.rmtree(self.source)
             self._git("clone", "--depth", "1", self.remote.as_uri(), str(self.source))
-            self.assertNotEqual(self._git("rev-parse", "HEAD", cwd=self.source), base_sha)
+            self.assertNotEqual(
+                self._git("rev-parse", "HEAD", cwd=self.source), base_sha
+            )
             self.assertNotEqual(
                 subprocess.run(
                     ["git", "cat-file", "-e", f"{base_sha}^{{commit}}"],
@@ -171,7 +210,9 @@ class GitCheckoutManagerTests(unittest.TestCase):
             manager.create(self.source, base_sha, self.checkout)
 
         self.assertEqual(self._git("rev-parse", "HEAD", cwd=self.checkout), base_sha)
-        self.assertEqual([token for token, _ in observed_environments], ["configured-token"] * 3)
+        self.assertEqual(
+            [token for token, _ in observed_environments], ["configured-token"] * 3
+        )
         for _, environment in observed_environments:
             self.assertNotIn("GH_TOKEN", environment)
             self.assertNotIn("GITHUB_TOKEN", environment)
@@ -212,13 +253,11 @@ class RunLifecycleTests(unittest.TestCase):
                    VALUES ('team-1', 'repo-1', 1, '{}', ?)""",
                 ("2026-01-01T00:00:00Z",),
             )
-            connection.execute(
-                """INSERT INTO team_members
+            connection.execute("""INSERT INTO team_members
                    (id, team_version_id, stable_key, role, responsibilities,
                     permitted_tools_json, runtime, model, instructions)
                    VALUES ('lead-1', 'team-1', 'lead', 'lead', 'Own result',
-                           '[\"read\"]', 'test', 'test', '')"""
-            )
+                           '[\"read\"]', 'test', 'test', '')""")
             connection.execute(
                 """UPDATE repositories SET current_sandbox_version_id='sandbox-1',
                                              current_team_version_id='team-1'
@@ -252,12 +291,19 @@ class RunLifecycleTests(unittest.TestCase):
     def test_transition_table_covers_expected_paths_and_rejects_invalid(self) -> None:
         self.assertTrue(allowed_transition(RunState.QUEUED, RunState.IMPLEMENTING))
         self.assertTrue(allowed_transition(RunState.VALIDATING, RunState.PUBLISHING))
-        self.assertTrue(allowed_transition(RunState.QUIET_PERIOD, RunState.RESOLVING_FEEDBACK))
-        self.assertTrue(allowed_transition(RunState.NOTIFIED, RunState.CLOSED))
+        self.assertTrue(
+            allowed_transition(
+                RunState.WAITING_FOR_FEEDBACK,
+                RunState.RESOLVING_FEEDBACK,
+            )
+        )
+        self.assertTrue(allowed_transition(RunState.BLOCKED, RunState.CLOSED))
         self.assertTrue(allowed_transition(RunState.PUBLISHING, RunState.CLOSED))
         self.assertFalse(allowed_transition(RunState.QUEUED, RunState.PUBLISHING))
         self.assertFalse(allowed_transition(RunState.CANCELED, RunState.QUEUED))
-        self.assertFalse(allowed_transition(RunState.CLOSED, RunState.RESOLVING_FEEDBACK))
+        self.assertFalse(
+            allowed_transition(RunState.CLOSED, RunState.RESOLVING_FEEDBACK)
+        )
 
     def test_repeated_poll_and_restart_create_exactly_one_run(self) -> None:
         first = self.lifecycle.poll_repository("repo-1")
@@ -275,7 +321,9 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual(second, ())
         self.assertEqual(third, ())
         with self.db.connect() as connection:
-            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 1)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 1
+            )
             run = connection.execute("SELECT * FROM runs").fetchone()
         self.assertEqual(run["sandbox_version_id"], "sandbox-1")
         self.assertEqual(run["team_version_id"], "team-1")
@@ -284,6 +332,377 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertTrue(Path(run["checkout_path"]).is_dir())
         self.assertTrue(Path(run["run_path"]).is_dir())
         self.assertEqual(len(self.checkouts.calls), 1)
+
+    def test_activation_binds_one_immutable_initial_issue_version(self) -> None:
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+
+        with self.db.connect() as connection:
+            version = connection.execute(
+                """SELECT issue_versions.*, issues.current_version_id,
+                          activation_events.issue_version_id AS activation_version_id
+                   FROM runs
+                   JOIN issues ON issues.id=runs.issue_id
+                   JOIN activation_events
+                     ON activation_events.id=runs.activation_event_id
+                   JOIN issue_versions
+                     ON issue_versions.id=issues.current_version_id
+                   WHERE runs.id=?""",
+                (run_id,),
+            ).fetchone()
+
+        self.assertEqual(version["version"], 1)
+        self.assertEqual(version["title"], "Terse issue")
+        self.assertEqual(version["body"], "Fix it")
+        self.assertEqual(
+            json.loads(version["discussion_json"]),
+            [{"author": "reviewer", "body": "context", "id": 1}],
+        )
+        self.assertEqual(version["current_version_id"], version["id"])
+        self.assertEqual(version["activation_version_id"], version["id"])
+        self.assertEqual(len(version["content_sha256"]), 64)
+
+    def test_changed_issue_wakes_blocked_run_and_supersedes_stale_proof(
+        self,
+    ) -> None:
+        processes = FakeProcessSupervisor()
+        lifecycle = RunLifecycle(
+            database=self.db,
+            data_root=self.data_root,
+            github=self.github,
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+            processes=processes,
+        )
+        run_id = lifecycle.poll_repository("repo-1")[0]
+        lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        lifecycle.transition(run_id, RunState.VALIDATING)
+        lifecycle.transition(run_id, RunState.PUBLISHING)
+        with self.db.transaction() as connection:
+            initial_version_id = connection.execute(
+                "SELECT current_version_id FROM issues WHERE number=3"
+            ).fetchone()[0]
+            connection.execute(
+                """UPDATE runs
+                   SET validated_sha=?, validated_issue_version_id=?
+                   WHERE id=?""",
+                ("c" * 40, initial_version_id, run_id),
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    validated_issue_version_id, remote_head_sha, state,
+                    created_at, updated_at)
+                   VALUES ('pull-1', ?, 'PR1', 9, 'pull-url',
+                           'agent/issue-3-run', 'main', ?, ?, ?, ?, 'open',
+                           '2026-01-01T00:01:00Z',
+                           '2026-01-01T00:01:00Z')""",
+                (
+                    run_id,
+                    "b" * 40,
+                    "c" * 40,
+                    initial_version_id,
+                    "c" * 40,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO acceptance_verifications
+                   (id, run_id, commit_sha, issue_version_id, attempt,
+                    verifier_member_id, state, claims_json,
+                    screenshot_decision_json, report_json, started_at,
+                    completed_at)
+                   VALUES ('verification-1', ?, ?, ?, 1, 'lead-1', 'blocked',
+                           '[]', '{}', '{"summary":"obsolete requirement"}',
+                           '2026-01-01T00:01:00Z',
+                           '2026-01-01T00:02:00Z')""",
+                (run_id, "c" * 40, initial_version_id),
+            )
+        lifecycle.transition(
+            run_id,
+            RunState.BLOCKED,
+            reason="publication blocked: issue acceptance verification blocked",
+        )
+        self.github.current_issue = IssueInfo(
+            node_id="I3",
+            number=3,
+            url="https://github.com/owner/repo/issues/3",
+            title="Remove obsolete dependency",
+            body="Use the direct provider. The external artifact is not a dependency.",
+            discussion=(
+                {"id": 1, "author": "reviewer", "body": "context"},
+                {
+                    "id": 2,
+                    "author": "owner",
+                    "body": "Do not require the external artifact.",
+                },
+            ),
+            updated_at="2026-01-02T00:00:00Z",
+        )
+
+        self.assertTrue(lifecycle.poll_issue_revision(run_id))
+        self.assertFalse(lifecycle.poll_issue_revision(run_id))
+
+        with self.db.connect() as connection:
+            run = connection.execute(
+                """SELECT state, reason, validated_sha,
+                          validated_issue_version_id
+                   FROM runs WHERE id=?""",
+                (run_id,),
+            ).fetchone()
+            versions = connection.execute(
+                """SELECT id, version, previous_version_id, title, body,
+                          discussion_json
+                   FROM issue_versions
+                   WHERE issue_id=(SELECT issue_id FROM runs WHERE id=?)
+                   ORDER BY version""",
+                (run_id,),
+            ).fetchall()
+            proof_state = connection.execute(
+                """SELECT state FROM acceptance_verifications
+                   WHERE id='verification-1'"""
+            ).fetchone()[0]
+            counts = connection.execute(
+                """SELECT
+                     (SELECT COUNT(*) FROM runs WHERE id=?) AS runs,
+                     (SELECT COUNT(*) FROM pull_requests WHERE run_id=?) AS pulls,
+                     (SELECT COUNT(*) FROM activation_events
+                        WHERE issue_id=(SELECT issue_id FROM runs WHERE id=?))
+                       AS activations""",
+                (run_id, run_id, run_id),
+            ).fetchone()
+
+        self.assertEqual(run["state"], RunState.IMPLEMENTING.value)
+        self.assertIn("requirements changed", run["reason"])
+        self.assertEqual(run["validated_sha"], "c" * 40)
+        self.assertEqual(run["validated_issue_version_id"], versions[0]["id"])
+        self.assertEqual(len(versions), 2)
+        self.assertEqual(versions[1]["previous_version_id"], versions[0]["id"])
+        self.assertEqual(versions[1]["title"], "Remove obsolete dependency")
+        self.assertIn("not a dependency", versions[1]["body"])
+        self.assertEqual(
+            json.loads(versions[1]["discussion_json"])[1]["body"],
+            "Do not require the external artifact.",
+        )
+        self.assertEqual(proof_state, "superseded")
+        self.assertEqual(tuple(counts), (1, 1, 1))
+        self.assertEqual(processes.paused, [run_id])
+        self.assertEqual(processes.resumed, [run_id])
+        self.assertEqual(self.sandbox.canceled, [run_id])
+        self.assertEqual(self.github.issue_polls, 2)
+
+    def test_rapid_issue_edits_fence_stale_validation_and_terminal_runs(self) -> None:
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        with self.db.connect() as connection:
+            initial_version_id = connection.execute(
+                "SELECT current_version_id FROM issues WHERE number=3"
+            ).fetchone()[0]
+
+        self.github.current_issue = IssueInfo(
+            node_id="I3",
+            number=3,
+            url="https://github.com/owner/repo/issues/3",
+            title="First revision",
+            body="Use the direct provider.",
+            discussion=(),
+            updated_at="2026-01-02T00:00:00Z",
+        )
+        self.assertTrue(self.lifecycle.poll_issue_revision(run_id))
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        self.lifecycle.transition(run_id, RunState.VALIDATING)
+        self.assertFalse(
+            self.lifecycle.record_validated_revision(
+                run_id,
+                "c" * 40,
+                initial_version_id,
+            )
+        )
+
+        self.github.current_issue = IssueInfo(
+            node_id="I3",
+            number=3,
+            url="https://github.com/owner/repo/issues/3",
+            title="Second revision",
+            body="Use the direct provider without an external artifact.",
+            discussion=(
+                {
+                    "id": 2,
+                    "author": "owner",
+                    "body": "The external artifact is optional.",
+                },
+            ),
+            updated_at="2026-01-03T00:00:00Z",
+        )
+        self.assertTrue(self.lifecycle.poll_issue_revision(run_id))
+        self.lifecycle.cancel(run_id, "fixture complete")
+        self.github.current_issue = IssueInfo(
+            node_id="I3",
+            number=3,
+            url="https://github.com/owner/repo/issues/3",
+            title="Ignored terminal revision",
+            body="A terminal run must stay terminal.",
+            discussion=(),
+            updated_at="2026-01-04T00:00:00Z",
+        )
+        self.assertFalse(self.lifecycle.poll_issue_revision(run_id))
+
+        with self.db.connect() as connection:
+            versions = connection.execute(
+                """SELECT id, version, previous_version_id, title
+                   FROM issue_versions
+                   WHERE issue_id=(SELECT issue_id FROM runs WHERE id=?)
+                   ORDER BY version""",
+                (run_id,),
+            ).fetchall()
+        self.assertEqual(
+            [(row["version"], row["title"]) for row in versions],
+            [
+                (1, "Terse issue"),
+                (2, "First revision"),
+                (3, "Second revision"),
+            ],
+        )
+        self.assertEqual(versions[0]["id"], initial_version_id)
+        self.assertEqual(versions[1]["previous_version_id"], versions[0]["id"])
+        self.assertEqual(versions[2]["previous_version_id"], versions[1]["id"])
+        self.assertEqual(
+            self.lifecycle.get_run(run_id)["state"],
+            RunState.CANCELED.value,
+        )
+
+    def test_new_issue_run_appends_after_existing_queue_entries(self) -> None:
+        first_run = self.lifecycle.poll_repository("repo-1")[0]
+        second_issue = IssueInfo(
+            node_id="I4",
+            number=4,
+            url="https://github.com/owner/repo/issues/4",
+            title="Second issue",
+            body="Fix the other thing",
+            discussion=(),
+            updated_at="2026-01-02T00:00:00Z",
+        )
+        self.github.events.append(
+            ActivationEvent(
+                event_id="event-2",
+                applied_at="2026-01-02T00:00:00Z",
+                issue=second_issue,
+            )
+        )
+
+        second_run = self.lifecycle.poll_repository("repo-1")[0]
+
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                "SELECT id, priority FROM runs ORDER BY priority"
+            ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [(first_run, 0), (second_run, 1)],
+        )
+
+    def test_pause_survives_restart_and_resumes_same_run_identity(self) -> None:
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        processes = FakeProcessSupervisor()
+        lifecycle = RunLifecycle(
+            database=self.db,
+            data_root=self.data_root,
+            github=self.github,
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+            processes=processes,
+        )
+        with self.db.connect() as connection:
+            transition_count = connection.execute(
+                "SELECT COUNT(*) FROM run_transitions WHERE run_id=?",
+                (run_id,),
+            ).fetchone()[0]
+
+        self.assertEqual(lifecycle.set_repository_paused("repo-1", True), (run_id,))
+        self.assertEqual(processes.paused, [run_id])
+        self.assertEqual(self.sandbox.canceled, [run_id])
+        self.assertEqual(lifecycle.poll_repository("repo-1"), ())
+        self.assertEqual(lifecycle.reconcile_nonterminal_runs(), ())
+
+        restarted_processes = FakeProcessSupervisor()
+        restarted = RunLifecycle(
+            database=Database(self.root / "db.sqlite3"),
+            data_root=self.data_root,
+            github=self.github,
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+            processes=restarted_processes,
+        )
+        restarted.database.initialize()
+        self.assertEqual(
+            restarted.set_repository_paused("repo-1", False),
+            (run_id,),
+        )
+
+        with self.db.connect() as connection:
+            run = connection.execute(
+                "SELECT id, state, checkout_path FROM runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+            repository_enabled = connection.execute(
+                "SELECT enabled FROM repositories WHERE id='repo-1'"
+            ).fetchone()[0]
+            run_count = connection.execute(
+                "SELECT COUNT(*) FROM runs WHERE repository_id='repo-1'"
+            ).fetchone()[0]
+            resumed_transition_count = connection.execute(
+                "SELECT COUNT(*) FROM run_transitions WHERE run_id=?",
+                (run_id,),
+            ).fetchone()[0]
+        self.assertEqual(tuple(run)[:2], (run_id, RunState.IMPLEMENTING.value))
+        self.assertTrue(Path(run["checkout_path"]).is_dir())
+        self.assertEqual(repository_enabled, 1)
+        self.assertEqual(run_count, 1)
+        self.assertEqual(resumed_transition_count, transition_count)
+        self.assertEqual(restarted_processes.resumed, [run_id])
+
+    def test_new_issue_event_is_detected_after_an_empty_poll(self) -> None:
+        event = self.github.events.pop()
+        self.assertEqual(self.lifecycle.poll_repository("repo-1"), ())
+
+        restarted = RunLifecycle(
+            database=Database(self.root / "db.sqlite3"),
+            data_root=self.data_root,
+            github=self.github,
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+        )
+        restarted.database.initialize()
+        self.github.events.append(event)
+        created = restarted.poll_repository("repo-1")
+
+        self.assertEqual(len(created), 1)
+        with self.db.connect() as connection:
+            issue = connection.execute(
+                """SELECT issues.number, issues.title
+                   FROM runs
+                   JOIN issues ON issues.id=runs.issue_id
+                   WHERE runs.id=?""",
+                (created[0],),
+            ).fetchone()
+        self.assertEqual(tuple(issue), (3, "Terse issue"))
+
+    def test_transient_event_poll_failure_does_not_skip_later_event(self) -> None:
+        with patch.object(
+            self.github,
+            "list_ready_events",
+            side_effect=[GitHubError("temporary outage"), [self.event]],
+        ):
+            with self.assertRaisesRegex(GitHubError, "temporary outage"):
+                self.lifecycle.poll_repository("repo-1")
+            with self.db.connect() as connection:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0],
+                    0,
+                )
+
+            created = self.lifecycle.poll_repository("repo-1")
+
+        self.assertEqual(len(created), 1)
 
     def test_new_activation_waits_for_prior_terminal_run(self) -> None:
         run_id = self.lifecycle.poll_repository("repo-1")[0]
@@ -315,7 +734,164 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual(self.sandbox.canceled, [run_id])
         self.assertTrue(Path(record["run_path"]).is_dir())
 
-    def test_cancel_is_durable_before_signaling_and_rejects_transition_race(self) -> None:
+    def test_legacy_unchallenged_visual_block_is_requeued_once_with_history(
+        self,
+    ) -> None:
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        self.lifecycle.transition(run_id, RunState.VALIDATING)
+        self.lifecycle.transition(run_id, RunState.PUBLISHING)
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET validated_sha=? WHERE id=?",
+                ("c" * 40, run_id),
+            )
+            connection.execute(
+                """INSERT INTO acceptance_verifications
+                   (id, run_id, commit_sha, attempt, verifier_member_id, state,
+                    claims_json, screenshot_decision_json, report_json,
+                    started_at, completed_at)
+                   VALUES ('verification-1', ?, ?, 1, 'lead-1', 'blocked',
+                           '[]', ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    "c" * 40,
+                    json.dumps({"required": True}),
+                    json.dumps(
+                        {
+                            "state": "blocked",
+                            "summary": (
+                                "The browser scenario remained on Loading Layout "
+                                "until its socket probe timed out."
+                            ),
+                            "claims": [
+                                {
+                                    "method": "browser scenario",
+                                    "result": "fail",
+                                    "observed": "Dashboard remained loading.",
+                                }
+                            ],
+                            "limitations": ["Required screenshots were not produced."],
+                        }
+                    ),
+                    "2026-01-01T01:00:00Z",
+                    "2026-01-01T01:01:00Z",
+                ),
+            )
+            connection.execute("""INSERT INTO acceptance_evidence
+                   (id, verification_id, sequence, action_json, result_json,
+                    started_at, completed_at)
+                   VALUES ('evidence-1', 'verification-1', 1,
+                           '{"action":"run"}', '{"returncode":1}',
+                           '2026-01-01T01:00:00Z', '2026-01-01T01:01:00Z')""")
+        self.lifecycle.transition(
+            run_id,
+            RunState.BLOCKED,
+            reason=(
+                "publication blocked: issue acceptance verification blocked: "
+                "browser scenario timed out"
+            ),
+        )
+
+        self.assertEqual(
+            self.lifecycle.reconcile_recoverable_blocked_runs(),
+            (run_id,),
+        )
+        self.assertEqual(
+            self.lifecycle.get_run(run_id)["state"],
+            RunState.PUBLISHING.value,
+        )
+        with self.db.connect() as connection:
+            history = connection.execute("""SELECT state, report_json
+                   FROM acceptance_verifications
+                   WHERE id='verification-1'""").fetchone()
+            evidence_count = connection.execute(
+                """SELECT COUNT(*) FROM acceptance_evidence
+                   WHERE verification_id='verification-1'"""
+            ).fetchone()[0]
+            recovery_count = connection.execute(
+                """SELECT COUNT(*) FROM run_transitions
+                   WHERE run_id=? AND from_state='blocked'
+                     AND to_state='publishing'""",
+                (run_id,),
+            ).fetchone()[0]
+        self.assertEqual(history["state"], "blocked")
+        self.assertIn("Loading Layout", history["report_json"])
+        self.assertEqual(evidence_count, 1)
+        self.assertEqual(recovery_count, 1)
+
+        self.lifecycle.transition(
+            run_id,
+            RunState.BLOCKED,
+            reason="publication blocked: corrected acceptance remained blocked",
+        )
+        self.assertEqual(
+            self.lifecycle.reconcile_recoverable_blocked_runs(),
+            (),
+        )
+        self.assertEqual(
+            self.lifecycle.get_run(run_id)["state"],
+            RunState.BLOCKED.value,
+        )
+
+    def test_classified_irreducible_acceptance_block_is_not_requeued(self) -> None:
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        self.lifecycle.transition(run_id, RunState.VALIDATING)
+        self.lifecycle.transition(run_id, RunState.PUBLISHING)
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET validated_sha=? WHERE id=?",
+                ("d" * 40, run_id),
+            )
+            connection.execute(
+                """INSERT INTO acceptance_verifications
+                   (id, run_id, commit_sha, attempt, verifier_member_id, state,
+                    claims_json, screenshot_decision_json, report_json,
+                    started_at, completed_at)
+                   VALUES ('verification-irreducible', ?, ?, 1, 'lead-1',
+                           'blocked', '[]', ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    "d" * 40,
+                    json.dumps({"required": True}),
+                    json.dumps(
+                        {
+                            "state": "blocked",
+                            "summary": "The controller-owned browser is unavailable.",
+                            "claims": [{"result": "fail"}],
+                            "limitations": ["No browser executable is available."],
+                            "blocker": {
+                                "kind": "irreducible",
+                                "reason": "No browser executable is available.",
+                            },
+                        }
+                    ),
+                    "2026-01-01T01:00:00Z",
+                    "2026-01-01T01:01:00Z",
+                ),
+            )
+        self.lifecycle.transition(
+            run_id,
+            RunState.BLOCKED,
+            reason=(
+                "publication blocked: issue acceptance verification blocked: "
+                "controller-owned browser unavailable"
+            ),
+        )
+
+        self.assertEqual(
+            self.lifecycle.reconcile_recoverable_blocked_runs(),
+            (),
+        )
+        self.assertEqual(
+            self.lifecycle.get_run(run_id)["state"],
+            RunState.BLOCKED.value,
+        )
+
+    def test_cancel_is_durable_before_signaling_and_rejects_transition_race(
+        self,
+    ) -> None:
         sandbox = RacingFailingSandboxManager()
         lifecycle = RunLifecycle(
             database=self.db,
@@ -340,10 +916,12 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertIsInstance(sandbox.transition_error, ValueError)
         with self.db.connect() as connection:
             transitions = connection.execute(
-                "SELECT to_state FROM run_transitions WHERE run_id=? ORDER BY id", (run_id,)
+                "SELECT to_state FROM run_transitions WHERE run_id=? ORDER BY id",
+                (run_id,),
             ).fetchall()
-        self.assertEqual([row["to_state"] for row in transitions][-1], RunState.CANCELED.value)
-
+        self.assertEqual(
+            [row["to_state"] for row in transitions][-1], RunState.CANCELED.value
+        )
 
     def test_ready_issue_discovery_records_successful_empty_inventory(self) -> None:
         self.github.events = []
@@ -421,7 +999,10 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual(reconciled, (run_id,))
         self.assertTrue(marker.exists())
         with self.db.connect() as connection:
-            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 1)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 1
+            )
+
     def test_transient_restart_reconciliation_preserves_run_for_next_tick(self) -> None:
         run_id = self.lifecycle.poll_repository("repo-1")[0]
         restarted = RunLifecycle(
@@ -445,7 +1026,6 @@ class RunLifecycleTests(unittest.TestCase):
                 (run_id,),
             ).fetchone()[0]
         self.assertEqual(blocked, 0)
-
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from typing import cast
 
 from repogents.acceptance import (
     AcceptanceService,
+    AcceptanceUnavailable,
     load_acceptance_artifact,
     render_acceptance_markdown,
 )
@@ -51,12 +52,52 @@ class RuntimeQueue:
         return self.runtimes.pop(0)
 
 
+class ReviewingRuntime(ScriptedRuntime):
+    def __init__(
+        self,
+        actions: Sequence[dict[str, object]],
+        reviews: Sequence[dict[str, object] | BaseException],
+    ) -> None:
+        super().__init__(actions)
+        self.reviews = list(reviews)
+        self.image_calls: list[dict[str, object]] = []
+
+    def inspect_image(
+        self,
+        *,
+        system_prompt: str,
+        prompt: str,
+        response_schema: dict[str, object],
+        image_path: Path,
+        state_directory: Path,
+    ) -> dict[str, object]:
+        del response_schema, state_directory
+        body = image_path.read_bytes()
+        self.image_calls.append(
+            {
+                "system_prompt": system_prompt,
+                "prompt": prompt,
+                "path": image_path,
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "body": body,
+            }
+        )
+        if not self.reviews:
+            raise AssertionError("unexpected screenshot review request")
+        review = self.reviews.pop(0)
+        if isinstance(review, BaseException):
+            raise review
+        return dict(review)
+
+
 class RecordingTools:
     def __init__(self, database: Database) -> None:
         self.database = database
         self.actions: list[dict[str, object]] = []
         self.write_screenshot = False
         self.checkout_writable: list[bool] = []
+        self.screenshot_bodies: list[bytes] = []
+        self.remediation_stdout: str | None = None
 
     def execute(
         self,
@@ -81,24 +122,40 @@ class RecordingTools:
                 raise AssertionError(
                     "acceptance plan was not durable before command execution"
                 )
-            if self.write_screenshot:
-                target = layout.temp / "acceptance" / "proof.png"
+            target = layout.temp / "acceptance" / "proof.png"
+            if self.screenshot_bodies:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(self.screenshot_bodies.pop(0))
+            elif self.write_screenshot:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(b"\x89PNG\r\n\x1a\nfixture-controller-screenshot")
         self.actions.append(dict(action))
         if action.get("action") == "read":
+            if action.get("path") == "client-endpoint.txt":
+                return "PORT=3000"
             return "VALUE = 2"
-        return json.dumps(
-            {
-                "returncode": 0,
-                "stdout": "VALUE=2",
-                "stderr": "",
-                "timed_out": False,
-                "log_path": str(layout.logs / "acceptance.log"),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        payload: dict[str, object] = {
+            "returncode": 0,
+            "stdout": "VALUE=2",
+            "stderr": "",
+            "timed_out": False,
+            "log_path": str(layout.logs / "acceptance.log"),
+        }
+        remediation = action.get("remediation")
+        if isinstance(remediation, dict):
+            environment = cast(dict[str, str], remediation["environment"])
+            payload["configured_environment"] = {
+                environment["name"]: environment["value"]
+            }
+            payload["stdout"] = (
+                self.remediation_stdout
+                if self.remediation_stdout is not None
+                else (
+                    "REPOGENTS_PROBE_OBSERVATION="
+                    f'{{"target":"{environment["value"]}","connected":true}}'
+                )
+            )
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 class AcceptanceServiceTests(unittest.TestCase):
@@ -146,20 +203,23 @@ class AcceptanceServiceTests(unittest.TestCase):
                 (evidence, now),
             )
             connection.execute("""INSERT INTO team_members
-                   (id, team_version_id, stable_key, role, responsibilities,
-                    permitted_tools_json, runtime, model, instructions,
-                    action_timeout_seconds)
-                   VALUES ('lead-1', 'team-1', 'lead', 'lead', 'Own result',
-                           '["read","write","run"]', 'mini-swe-agent',
-                           'openai/gpt-fixture', '', 321)""")
-            connection.execute("""INSERT INTO team_members
-                   (id, team_version_id, stable_key, role, responsibilities,
-                    permitted_tools_json, runtime, model, instructions,
-                    action_timeout_seconds)
-                   VALUES ('verifier-1', 'team-1', 'verification', 'verifier',
-                           'Independently verify issue behavior and scope',
-                           '["read","run","git_diff"]', 'mini-swe-agent',
-                           'openai/gpt-verifier', '', 432)""")
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions, action_timeout_seconds)
+                   VALUES
+                   ('lead-1', 'team-1', 'lead', 'lead',
+                    'delivery coordinator', 'Coordinate issue delivery',
+                    '["read","git_diff","git_commit"]', 'mini-swe-agent',
+                    'openai/gpt-fixture', '', 321),
+                   ('implementation-1', 'team-1', 'implementation', 'implementer',
+                    'python implementation maintainer', 'Implement source changes',
+                    '["read","write","run","git_diff"]', 'mini-swe-agent',
+                    'openai/gpt-fixture', '', 321),
+                   ('verifier-1', 'team-1', 'verification', 'verifier',
+                    'python behavior verifier',
+                    'Independently verify issue behavior and scope',
+                    '["read","run","git_diff"]', 'mini-swe-agent',
+                    'openai/gpt-verifier', '', 432)""")
             connection.execute(
                 """INSERT INTO issues
                    (id, repository_id, github_node_id, number, url, title, body,
@@ -200,6 +260,18 @@ class AcceptanceServiceTests(unittest.TestCase):
             checkouts=NoCheckoutManager(),
             sandbox=NoSandbox(),  # type: ignore[arg-type]
         )
+        issue_version_id = self.lifecycle.current_issue_version("run-1")
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE activation_events SET issue_version_id=?
+                   WHERE id='activation-1'""",
+                (issue_version_id,),
+            )
+            connection.execute(
+                """UPDATE runs SET validated_issue_version_id=?
+                   WHERE id='run-1'""",
+                (issue_version_id,),
+            )
         self.tools = RecordingTools(self.db)
 
     @staticmethod
@@ -222,6 +294,23 @@ class AcceptanceServiceTests(unittest.TestCase):
                     else "The observable contract is nonvisual command output."
                 ),
             },
+        }
+
+    @staticmethod
+    def pixel_review(
+        *,
+        verdict: str = "pass",
+        observed: str = "The expected user-visible state is unobscured.",
+    ) -> dict[str, object]:
+        return {
+            "action": "image_review",
+            "verdict": verdict,
+            "observed": observed,
+            "reason": (
+                "The pixels directly show the expected state."
+                if verdict == "pass"
+                else "The pixels do not show the expected state."
+            ),
         }
 
     def completion(
@@ -285,6 +374,176 @@ class AcceptanceServiceTests(unittest.TestCase):
             connection.execute("DELETE FROM acceptance_artifacts")
             connection.execute("DELETE FROM acceptance_evidence")
             connection.execute("DELETE FROM acceptance_verifications")
+
+    def test_verifier_prompt_requires_internal_target_evidence_integrity(self) -> None:
+        runtime = ScriptedRuntime([self.plan()])
+        service, _ = self.service([runtime], max_actions=1)
+
+        with self.assertRaisesRegex(RuntimeError, "without a final verdict"):
+            service.verify("run-1", self.commit_sha, ("app.py",))
+
+        prompt = json.loads(runtime.contexts[0])
+        constraints = "\n".join(cast(list[str], prompt["constraints"]))
+        self.assertIn("exists", constraints)
+        self.assertIn("maps to the application object under test", constraints)
+        self.assertIn("User-visible claims", constraints)
+        self.assertIn("primary evidence", constraints)
+        self.assertIn("Reconcile", constraints)
+        self.assertIn("CHROME_BIN", constraints)
+        self.assertIn(
+            "Never require production source changes solely to make an internal acceptance probe easier",
+            constraints,
+        )
+        self.assertIn("repository-defined client/server endpoint", constraints)
+        self.assertIn("probe configuration mismatch", constraints)
+        self.assertIn("correct the probe and retry", constraints)
+
+    def test_initial_blocked_verdict_requires_remediation(self) -> None:
+        blocked = self.completion(evidence=[1])
+        blocked["verdict"] = "blocked"
+        blocked["summary"] = "The first browser probe used the wrong port."
+        blocked["claim_results"][0]["result"] = "fail"  # type: ignore[index]
+        blocked["limitations"] = ["The browser probe endpoint did not match."]
+        blocked["blocker"] = {
+            "kind": "probe_configuration",
+            "reason": "The browser scenario used a source-incompatible port.",
+            "target": "3221",
+        }
+        corrected = self.completion(evidence=[4])
+        runtime = ScriptedRuntime(
+            [
+                self.plan(),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                blocked,
+                {
+                    "action": "read",
+                    "path": "client-endpoint.txt",
+                    "start": 1,
+                    "end": 20,
+                },
+                {
+                    "action": "run",
+                    "argv": ["python3", "app.py"],
+                    "remediation": {
+                        "kind": "probe_configuration",
+                        "challenge_sequence": 2,
+                        "previous_target": "3221",
+                        "corrected_target": "3000",
+                        "environment": {"name": "PORT", "value": "3000"},
+                        "source_evidence": [3],
+                    },
+                },
+                corrected,
+            ]
+        )
+        service, _ = self.service([runtime])
+
+        result = service.verify("run-1", self.commit_sha, ("app.py",))
+
+        self.assertEqual(result["state"], "passed")
+        evidence = cast(list[dict[str, object]], result["evidence"])
+        rejection_action = cast(dict[str, object], evidence[1]["action"])
+        self.assertEqual(rejection_action["action"], "verdict_rejected")
+        self.assertEqual(rejection_action["attempted_action"], "verify")
+        self.assertEqual(
+            cast(dict[str, object], rejection_action["blocker"])["target"],
+            "3221",
+        )
+        self.assertIn("remediation", str(evidence[1]["result"]))
+
+    def test_unrelated_actions_do_not_remediate_probe_blocker(self) -> None:
+        blocked = self.completion(evidence=[1])
+        blocked["verdict"] = "blocked"
+        blocked["summary"] = "The browser probe used the wrong endpoint."
+        blocked["claim_results"][0]["result"] = "fail"  # type: ignore[index]
+        blocked["limitations"] = ["The probe target did not match the client."]
+        blocked["blocker"] = {
+            "kind": "probe_configuration",
+            "reason": "The browser scenario used a source-incompatible port.",
+            "target": "3221",
+        }
+        runtime = ScriptedRuntime(
+            [
+                self.plan(),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                blocked,
+                {"action": "read", "path": "app.py", "start": 1, "end": 20},
+                {"action": "run", "argv": ["python3", "app.py"]},
+                blocked,
+            ]
+        )
+        service, _ = self.service([runtime], max_actions=6)
+
+        with self.assertRaisesRegex(RuntimeError, "without a final verdict"):
+            service.verify("run-1", self.commit_sha, ("app.py",))
+
+    def test_remediation_must_observe_the_corrected_target(self) -> None:
+        blocked = self.completion(evidence=[1])
+        blocked["verdict"] = "blocked"
+        blocked["summary"] = "The browser probe used the wrong endpoint."
+        blocked["claim_results"][0]["result"] = "fail"  # type: ignore[index]
+        blocked["limitations"] = ["The probe target did not match the client."]
+        blocked["blocker"] = {
+            "kind": "probe_configuration",
+            "reason": "The browser scenario used a source-incompatible port.",
+            "target": "3221",
+        }
+        runtime = ScriptedRuntime(
+            [
+                self.plan(),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                blocked,
+                {
+                    "action": "read",
+                    "path": "client-endpoint.txt",
+                    "start": 1,
+                    "end": 20,
+                },
+                {
+                    "action": "run",
+                    "argv": ["python3", "app.py", "3000"],
+                    "remediation": {
+                        "kind": "probe_configuration",
+                        "challenge_sequence": 2,
+                        "previous_target": "3221",
+                        "corrected_target": "3000",
+                        "environment": {"name": "PORT", "value": "3000"},
+                        "source_evidence": [3],
+                    },
+                },
+                self.completion(evidence=[4]),
+            ]
+        )
+        self.tools.remediation_stdout = "CONNECTED=true"
+        service, _ = self.service([runtime], max_actions=6)
+
+        with self.assertRaisesRegex(RuntimeError, "without a final verdict"):
+            service.verify("run-1", self.commit_sha, ("app.py",))
+
+    def test_irreducible_blocked_verdict_is_terminal_immediately(self) -> None:
+        blocked = self.completion(evidence=[1])
+        blocked["verdict"] = "blocked"
+        blocked["summary"] = "The required external service is unavailable."
+        blocked["claim_results"][0]["result"] = "fail"  # type: ignore[index]
+        blocked["limitations"] = ["The required external service is unavailable."]
+        blocked["blocker"] = {
+            "kind": "irreducible",
+            "reason": "The required external service cannot be reached.",
+        }
+        runtime = ScriptedRuntime(
+            [
+                self.plan(),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                blocked,
+            ]
+        )
+        service, _ = self.service([runtime])
+
+        result = service.verify("run-1", self.commit_sha, ("app.py",))
+
+        self.assertEqual(result["state"], "blocked")
+        evidence = cast(list[dict[str, object]], result["evidence"])
+        self.assertEqual(len(evidence), 1)
 
     def test_restart_resumes_durable_plan_and_observations_for_exact_sha(self) -> None:
         first_runtime = ScriptedRuntime(
@@ -374,12 +633,23 @@ class AcceptanceServiceTests(unittest.TestCase):
                         "python3",
                         "-c",
                         (
-                            "from pathlib import Path; "
+                            "import os; from pathlib import Path; "
                             "value=Path('app.py').read_text(); "
                             "assert value == 'VALUE = 2\\n'; "
-                            "print('VALUE=2')"
+                            "assert os.environ['PORT'] == '3000'; "
+                            "print('VALUE=2'); "
+                            "print('REPOGENTS_PROBE_OBSERVATION="
+                            '{"target":"3000","connected":true}\')'
                         ),
                     ],
+                    "remediation": {
+                        "kind": "probe_configuration",
+                        "challenge_sequence": 99,
+                        "previous_target": "3221",
+                        "corrected_target": "3000",
+                        "environment": {"name": "PORT", "value": "3000"},
+                        "source_evidence": [1],
+                    },
                 },
                 self.completion(commit_sha=candidate_sha),
             ]
@@ -405,7 +675,9 @@ class AcceptanceServiceTests(unittest.TestCase):
         self.assertIn("exit=0", proof)
         self.assertIn(candidate_sha, proof)
 
-    def test_rejects_incomplete_or_stale_pass_reports(self) -> None:
+    def test_semantically_invalid_pass_reports_are_rejected_then_corrected(
+        self,
+    ) -> None:
         invalid_reports = (
             (self.completion(evidence=[]), "evidence"),
             (self.completion(evidence=[99]), "unknown evidence"),
@@ -420,29 +692,72 @@ class AcceptanceServiceTests(unittest.TestCase):
                         self.plan(),
                         {"action": "run", "argv": ["python3", "app.py"]},
                         report,
+                        self.completion(evidence=[1]),
                     ]
                 )
                 service, _ = self.service([runtime])
-                with self.assertRaisesRegex(RuntimeError, message):
-                    service.verify("run-1", self.commit_sha, ("app.py",))
+
+                result = service.verify("run-1", self.commit_sha, ("app.py",))
+
+                self.assertEqual(result["state"], "passed")
                 with self.db.connect() as connection:
-                    states = connection.execute(
+                    attempts = connection.execute(
                         "SELECT state FROM acceptance_verifications"
                     ).fetchall()
-                self.assertEqual([row["state"] for row in states], ["verifying"])
+                    evidence = connection.execute(
+                        """SELECT sequence, action_json, result_json
+                           FROM acceptance_evidence ORDER BY sequence"""
+                    ).fetchall()
+                self.assertEqual([row["state"] for row in attempts], ["passed"])
+                self.assertEqual([row["sequence"] for row in evidence], [1, 2])
+                self.assertEqual(
+                    json.loads(evidence[1]["action_json"]),
+                    {
+                        "action": "verdict_rejected",
+                        "attempted_action": "verify",
+                    },
+                )
+                rejection = json.loads(evidence[1]["result_json"])
+                self.assertIn(message, rejection["error"])
+                self.assertIn(message, runtime.contexts[3])
 
-    def test_passing_claim_requires_successful_behavior_command(self) -> None:
+    def test_passing_claim_without_behavior_becomes_feedback_then_recovers(
+        self,
+    ) -> None:
         runtime = ScriptedRuntime(
             [
                 self.plan(),
                 {"action": "read", "path": "app.py", "start": 1, "end": 20},
                 self.completion(),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                self.completion(evidence=[3]),
             ]
         )
         service, _ = self.service([runtime])
 
-        with self.assertRaisesRegex(RuntimeError, "behavior command"):
-            service.verify("run-1", self.commit_sha, ("app.py",))
+        result = service.verify("run-1", self.commit_sha, ("app.py",))
+
+        self.assertEqual(result["state"], "passed")
+        evidence = cast(list[dict[str, object]], result["evidence"])
+        self.assertEqual(
+            [observation["sequence"] for observation in evidence],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            evidence[1]["action"],
+            {"action": "verdict_rejected", "attempted_action": "verify"},
+        )
+        self.assertFalse(evidence[1]["successful"])
+        rejection = cast(dict[str, object], evidence[1]["result"])
+        self.assertIn("behavior command", str(rejection["error"]))
+        self.assertIn("behavior command", runtime.contexts[3])
+        claims = cast(list[dict[str, object]], result["claims"])
+        self.assertEqual(claims[0]["evidence"], [3])
+        with self.db.connect() as connection:
+            attempt_count = connection.execute(
+                "SELECT COUNT(*) FROM acceptance_verifications"
+            ).fetchone()[0]
+        self.assertEqual(attempt_count, 1)
 
     def test_required_screenshot_is_copied_hashed_and_sha_bound(self) -> None:
         self.tools.write_screenshot = True
@@ -452,12 +767,13 @@ class AcceptanceServiceTests(unittest.TestCase):
             "description": "Visible result after the controller action.",
             "metadata": {"viewport": "1280x720", "scenario": "fixture output"},
         }
-        runtime = ScriptedRuntime(
+        runtime = ReviewingRuntime(
             [
                 self.plan(screenshot_required=True),
                 {"action": "run", "argv": ["python3", "app.py"]},
                 self.completion(screenshots=[screenshot]),
-            ]
+            ],
+            [self.pixel_review()],
         )
         service, _ = self.service([runtime])
 
@@ -475,6 +791,279 @@ class AcceptanceServiceTests(unittest.TestCase):
         self.assertEqual(artifact["sha256"], hashlib.sha256(body).hexdigest())
         self.assertEqual(artifact["commit_sha"], self.commit_sha)
         self.assertNotIn(str(self.layout.checkout), str(artifact["path"]))
+        metadata = cast(dict[str, object], artifact["metadata"])
+        review = cast(dict[str, object], metadata["pixel_review"])
+        self.assertEqual(review["verdict"], "pass")
+        self.assertEqual(review["sha256"], artifact["sha256"])
+        self.assertEqual(review["evidence_sequence"], 2)
+        markdown = render_acceptance_markdown(result)
+        self.assertIn("Pixel review: **pass**", markdown)
+        self.assertIn("evidence #2", markdown)
+
+    def test_temporal_screenshot_reviews_the_visible_checkpoint(self) -> None:
+        self.tools.write_screenshot = True
+        plan = self.plan(screenshot_required=True)
+        claims = cast(list[dict[str, object]], plan["claims"])
+        claims[0].update(
+            {
+                "claim": "Disabled-card state persists across reconnects.",
+                "expected": (
+                    "The card is absent after disabling and after reconnect, "
+                    "then present after enabling and a second reconnect."
+                ),
+                "method": (
+                    "Exercise both transitions and record each visible "
+                    "checkpoint in the same browser scenario."
+                ),
+            }
+        )
+        screenshot = {
+            "claim_key": "value-output",
+            "path": "/run-data/temp/acceptance/proof.png",
+            "description": (
+                "After reconnect, the Cleaner card remains absent and is "
+                "offered by the visible Enable Card control."
+            ),
+            "metadata": {
+                "viewport": "1280x720",
+                "scenario": "disabled checkpoint after reconnect",
+            },
+        }
+        runtime = ReviewingRuntime(
+            [
+                plan,
+                {"action": "run", "argv": ["python3", "app.py"]},
+                self.completion(screenshots=[screenshot]),
+            ],
+            [
+                self.pixel_review(
+                    observed=(
+                        "Cleaner is absent and the open Enable Card control "
+                        "visibly offers Cleaner."
+                    )
+                )
+            ],
+        )
+        service, _ = self.service([runtime])
+
+        result = service.verify("run-1", self.commit_sha, ("app.py",))
+
+        self.assertEqual(result["state"], "passed")
+        review_call = runtime.image_calls[0]
+        request = json.loads(str(review_call["prompt"]))
+        self.assertEqual(
+            request["review_scope"],
+            "claim_relevant_visible_checkpoint",
+        )
+        self.assertEqual(
+            request["transition_evidence"],
+            "controller_recorded_actions",
+        )
+        self.assertEqual(
+            request["submitted_description"],
+            screenshot["description"],
+        )
+        self.assertIn(
+            "still image",
+            str(review_call["system_prompt"]),
+        )
+        self.assertIn(
+            "For temporal claims",
+            runtime.contexts[2],
+        )
+        self.assertIn(
+            "controller-recorded action evidence",
+            runtime.contexts[2],
+        )
+
+    def test_auth_modal_screenshot_is_rejected_then_corrected(self) -> None:
+        auth_modal = b"\x89PNG\r\n\x1a\nauth-modal-pixels"
+        dashboard = b"\x89PNG\r\n\x1a\ndashboard-card-pixels"
+        self.tools.screenshot_bodies = [auth_modal, dashboard]
+        screenshot = {
+            "claim_key": "value-output",
+            "path": "/run-data/temp/acceptance/proof.png",
+            "description": "Visible result after the controller action.",
+            "metadata": {"viewport": "1280x720", "scenario": "fixture output"},
+        }
+        runtime = ReviewingRuntime(
+            [
+                self.plan(screenshot_required=True),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                self.completion(screenshots=[screenshot]),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                self.completion(evidence=[4], screenshots=[screenshot]),
+            ],
+            [
+                self.pixel_review(
+                    verdict="fail",
+                    observed=(
+                        "Only a blocking Secure Your Dashboard setup modal is "
+                        "visible; the claimed dashboard state is obscured."
+                    ),
+                ),
+                self.pixel_review(
+                    observed="The dashboard visibly shows the expected card state."
+                ),
+            ],
+        )
+        service, _ = self.service([runtime])
+
+        result = service.verify("run-1", self.commit_sha, ("app.py",))
+
+        self.assertEqual(result["state"], "passed")
+        evidence = cast(list[dict[str, object]], result["evidence"])
+        self.assertEqual(
+            [observation["sequence"] for observation in evidence],
+            [1, 2, 3, 4, 5],
+        )
+        self.assertEqual(
+            cast(dict[str, object], evidence[1]["action"])["action"],
+            "inspect_screenshot",
+        )
+        self.assertFalse(evidence[1]["successful"])
+        self.assertEqual(
+            evidence[2]["action"],
+            {"action": "verdict_rejected", "attempted_action": "verify"},
+        )
+        self.assertIn(
+            "Secure Your Dashboard",
+            str(cast(dict[str, object], evidence[1]["result"])["observed"]),
+        )
+        self.assertIn("Secure Your Dashboard", runtime.contexts[3])
+        self.assertTrue(evidence[4]["successful"])
+        artifacts = cast(list[dict[str, object]], result["artifacts"])
+        self.assertEqual(len(artifacts), 1)
+        body, _ = load_acceptance_artifact(self.db, str(artifacts[0]["id"]))
+        self.assertEqual(body, dashboard)
+        metadata = cast(dict[str, object], artifacts[0]["metadata"])
+        review = cast(dict[str, object], metadata["pixel_review"])
+        self.assertEqual(review["evidence_sequence"], 5)
+        self.assertEqual(review["sha256"], hashlib.sha256(dashboard).hexdigest())
+        self.assertEqual(
+            [call["body"] for call in runtime.image_calls],
+            [auth_modal, dashboard],
+        )
+        with self.db.connect() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM acceptance_artifacts"
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_unavailable_pixel_review_cannot_pass_required_screenshot(
+        self,
+    ) -> None:
+        self.tools.screenshot_bodies = [b"\x89PNG\r\n\x1a\nunreviewed-dashboard-pixels"]
+        screenshot = {
+            "claim_key": "value-output",
+            "path": "/run-data/temp/acceptance/proof.png",
+            "description": "Visible result after the controller action.",
+            "metadata": {"viewport": "1280x720", "scenario": "fixture output"},
+        }
+        blocked = self.completion()
+        blocked["verdict"] = "blocked"
+        blocked["summary"] = "Required pixel review is unavailable."
+        blocked["limitations"] = ["The configured vision model is unavailable."]
+        blocked["claim_results"][0]["result"] = "fail"  # type: ignore[index]
+        blocked["blocker"] = {
+            "kind": "irreducible",
+            "reason": "The controller-owned vision endpoint is unavailable.",
+        }
+        runtime = ReviewingRuntime(
+            [
+                self.plan(screenshot_required=True),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                self.completion(screenshots=[screenshot]),
+                blocked,
+            ],
+            [RuntimeError("vision endpoint unavailable")],
+        )
+        service, _ = self.service([runtime])
+
+        result = service.verify("run-1", self.commit_sha, ("app.py",))
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["artifacts"], [])
+        evidence = cast(list[dict[str, object]], result["evidence"])
+        self.assertFalse(evidence[1]["successful"])
+        self.assertIn(
+            "vision endpoint unavailable",
+            str(cast(dict[str, object], evidence[1]["result"])["error"]),
+        )
+        self.assertEqual(
+            evidence[2]["action"],
+            {"action": "verdict_rejected", "attempted_action": "verify"},
+        )
+
+    def test_legacy_cached_screenshot_pass_is_reverified(self) -> None:
+        self.tools.write_screenshot = True
+        screenshot = {
+            "claim_key": "value-output",
+            "path": "/run-data/temp/acceptance/proof.png",
+            "description": "Visible result after the controller action.",
+            "metadata": {"viewport": "1280x720", "scenario": "fixture output"},
+        }
+        first = ReviewingRuntime(
+            [
+                self.plan(screenshot_required=True),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                self.completion(screenshots=[screenshot]),
+            ],
+            [self.pixel_review()],
+        )
+        service, _ = self.service([first])
+        original = service.verify("run-1", self.commit_sha, ("app.py",))
+        legacy = json.loads(json.dumps(original))
+        legacy["artifacts"][0]["metadata"].pop("pixel_review")
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE acceptance_verifications SET report_json=?
+                   WHERE id=?""",
+                (json.dumps(legacy), original["id"]),
+            )
+            connection.execute(
+                """UPDATE acceptance_artifacts SET metadata_json='{}'
+                   WHERE verification_id=?""",
+                (original["id"],),
+            )
+
+        second = ReviewingRuntime(
+            [
+                self.plan(screenshot_required=True),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                self.completion(screenshots=[screenshot]),
+            ],
+            [self.pixel_review(observed="Fresh pixels prove the visible state.")],
+        )
+        service, _ = self.service([second])
+        result = service.verify("run-1", self.commit_sha, ("app.py",))
+        artifacts = cast(list[dict[str, object]], result["artifacts"])
+
+        self.assertNotEqual(result["id"], original["id"])
+        self.assertEqual(
+            cast(dict[str, object], artifacts[0]["metadata"])["pixel_review"],
+            {
+                "verdict": "pass",
+                "observed": "Fresh pixels prove the visible state.",
+                "reason": "The pixels directly show the expected state.",
+                "sha256": artifacts[0]["sha256"],
+                "evidence_sequence": 2,
+            },
+        )
+        self.assertGreater(len(second.contexts), 0)
+        with self.db.connect() as connection:
+            attempts = connection.execute(
+                """SELECT attempt, state FROM acceptance_verifications
+                   WHERE run_id='run-1' AND commit_sha=?
+                   ORDER BY attempt""",
+                (self.commit_sha,),
+            ).fetchall()
+        self.assertEqual(
+            [(row["attempt"], row["state"]) for row in attempts],
+            [(1, "passed"), (2, "passed")],
+        )
 
     def test_superseded_screenshot_cannot_satisfy_new_sha(self) -> None:
         screenshot = {
@@ -484,12 +1073,13 @@ class AcceptanceServiceTests(unittest.TestCase):
             "metadata": {"viewport": "1280x720", "scenario": "fixture output"},
         }
         self.tools.write_screenshot = True
-        first = ScriptedRuntime(
+        first = ReviewingRuntime(
             [
                 self.plan(screenshot_required=True),
                 {"action": "run", "argv": ["python3", "app.py"]},
                 self.completion(screenshots=[screenshot]),
-            ]
+            ],
+            [self.pixel_review()],
         )
         service, _ = self.service([first])
         self.assertEqual(
@@ -519,18 +1109,32 @@ class AcceptanceServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "current acceptance attempt"):
             service.verify("run-1", next_sha, ("app.py",))
 
-    def test_missing_required_screenshot_cannot_pass(self) -> None:
-        runtime = ScriptedRuntime(
+    def test_missing_required_screenshot_pass_is_rejected_then_corrected(
+        self,
+    ) -> None:
+        self.tools.write_screenshot = True
+        screenshot = {
+            "claim_key": "value-output",
+            "path": "/run-data/temp/acceptance/proof.png",
+            "description": "Visible result after the controller action.",
+            "metadata": {"viewport": "1280x720", "scenario": "fixture output"},
+        }
+        runtime = ReviewingRuntime(
             [
                 self.plan(screenshot_required=True),
                 {"action": "run", "argv": ["python3", "app.py"]},
                 self.completion(),
-            ]
+                self.completion(evidence=[1], screenshots=[screenshot]),
+            ],
+            [self.pixel_review()],
         )
         service, _ = self.service([runtime])
 
-        with self.assertRaisesRegex(RuntimeError, "required screenshot"):
-            service.verify("run-1", self.commit_sha, ("app.py",))
+        result = service.verify("run-1", self.commit_sha, ("app.py",))
+
+        self.assertEqual(result["state"], "passed")
+        self.assertEqual(len(cast(list[dict[str, object]], result["artifacts"])), 1)
+        self.assertIn("required screenshot", runtime.contexts[3])
 
     def test_missing_required_screenshot_can_block_with_evidence(self) -> None:
         blocked = self.completion()
@@ -538,6 +1142,10 @@ class AcceptanceServiceTests(unittest.TestCase):
         blocked["summary"] = "Browser capture is unavailable on the required host."
         blocked["limitations"] = ["No compatible browser capture tool is installed."]
         blocked["claim_results"][0]["result"] = "fail"  # type: ignore[index]
+        blocked["blocker"] = {
+            "kind": "irreducible",
+            "reason": "No compatible browser executable is available.",
+        }
         runtime = ScriptedRuntime(
             [
                 self.plan(screenshot_required=True),
@@ -552,6 +1160,89 @@ class AcceptanceServiceTests(unittest.TestCase):
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(result["artifacts"], [])
         self.assertIn("browser capture", str(result["summary"]).lower())
+
+    def test_same_sha_acceptance_is_not_reused_after_issue_revision(self) -> None:
+        first_runtime = ScriptedRuntime(
+            [
+                self.plan(),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                self.completion(),
+            ]
+        )
+        first_service, _ = self.service([first_runtime])
+        first = first_service.verify("run-1", self.commit_sha, ("app.py",))
+
+        with self.db.transaction() as connection:
+            initial_version_id = connection.execute(
+                """SELECT current_version_id FROM issues WHERE id='issue-1'"""
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO issue_versions
+                   (id, issue_id, version, previous_version_id,
+                    github_updated_at, content_sha256, title, body,
+                    discussion_json, observed_at)
+                   VALUES ('issue-version-2', 'issue-1', 2, ?,
+                           '2026-07-22T01:00:00Z', ?, 'Set value precisely',
+                           'Set VALUE to 2 without an external artifact.',
+                           '[{"author":"owner","body":"No artifact dependency."}]',
+                           '2026-07-22T01:00:01Z')""",
+                (initial_version_id, "2" * 64),
+            )
+            connection.execute("""UPDATE issues
+                   SET current_version_id='issue-version-2',
+                       title='Set value precisely',
+                       body='Set VALUE to 2 without an external artifact.',
+                       discussion_json=
+                         '[{"author":"owner","body":"No artifact dependency."}]',
+                       updated_at='2026-07-22T01:00:00Z'
+                   WHERE id='issue-1'""")
+
+        stale_service, stale_factory = self.service([])
+        with self.assertRaisesRegex(
+            AcceptanceUnavailable,
+            "validated issue version",
+        ):
+            stale_service.verify("run-1", self.commit_sha, ("app.py",))
+        self.assertEqual(stale_factory.calls, [])
+
+        with self.db.transaction() as connection:
+            connection.execute("""UPDATE runs
+                   SET validated_issue_version_id='issue-version-2'
+                   WHERE id='run-1'""")
+        second_runtime = ScriptedRuntime(
+            [
+                self.plan(),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                self.completion(),
+            ]
+        )
+        second_service, _ = self.service([second_runtime])
+        second = second_service.verify("run-1", self.commit_sha, ("app.py",))
+
+        with self.db.connect() as connection:
+            attempts = connection.execute(
+                """SELECT attempt, issue_version_id, state
+                   FROM acceptance_verifications
+                   WHERE run_id='run-1' AND commit_sha=?
+                   ORDER BY attempt""",
+                (self.commit_sha,),
+            ).fetchall()
+
+        self.assertEqual(first["issue_version_id"], initial_version_id)
+        self.assertEqual(second["issue_version_id"], "issue-version-2")
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(
+            [tuple(row) for row in attempts],
+            [
+                (1, initial_version_id, "superseded"),
+                (2, "issue-version-2", "passed"),
+            ],
+        )
+        revised_prompt = json.loads(second_runtime.contexts[0])
+        self.assertEqual(
+            revised_prompt["issue"]["body"],
+            "Set VALUE to 2 without an external artifact.",
+        )
 
     def test_feedback_commit_invalidates_prior_proof_without_deleting_history(
         self,

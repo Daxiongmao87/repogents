@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from repogents.database import Database
 from repogents.onboarding import RepositoryInspection
@@ -11,70 +12,304 @@ from repogents.team import EvidenceTeamFormulator, TeamService, validate_team_me
 
 
 class TeamTests(unittest.TestCase):
-    def test_team_validation_requires_exactly_one_lead_and_unique_keys(self) -> None:
-        lead = {
-            "stable_key": "lead",
-            "role": "lead",
-            "responsibilities": "Own result",
-            "permitted_tools": ["read"],
+    def test_team_validation_requires_atomic_coordinator_implementer_and_verifier(
+        self,
+    ) -> None:
+        coordinator = {
+            "stable_key": "coordination",
+            "role": "delivery coordinator",
+            "execution_class": "lead",
+            "coordinates": True,
+            "independent_verifier": False,
+            "responsibilities": "Coordinate work.",
+            "permitted_tools": ["read", "git_diff", "git_commit"],
             "runtime": "mini-swe-agent",
             "model": "configured",
             "instructions": "",
         }
-        validate_team_members([lead])
-        with self.assertRaises(ValueError):
-            validate_team_members([])
-        with self.assertRaises(ValueError):
-            validate_team_members([lead, dict(lead, stable_key="other-lead")])
-        with self.assertRaises(ValueError):
-            validate_team_members([lead, dict(lead, role="verifier")])
+        implementer = {
+            "stable_key": "implementation",
+            "role": "Python application maintainer",
+            "execution_class": "implementer",
+            "coordinates": False,
+            "independent_verifier": False,
+            "responsibilities": "Implement Python application changes.",
+            "permitted_tools": ["read", "write", "run", "git_diff"],
+            "runtime": "mini-swe-agent",
+            "model": "configured",
+            "instructions": "",
+        }
+        verifier = {
+            "stable_key": "verification",
+            "role": "behavior verifier",
+            "execution_class": "verifier",
+            "coordinates": False,
+            "independent_verifier": True,
+            "responsibilities": "Verify behavior independently.",
+            "permitted_tools": ["read", "run"],
+            "runtime": "mini-swe-agent",
+            "model": "configured",
+            "instructions": "",
+        }
+        validate_team_members([coordinator, implementer, verifier])
+        with self.assertRaisesRegex(ValueError, "coordinating member"):
+            validate_team_members([implementer, verifier])
+        with self.assertRaisesRegex(ValueError, "coordinating member"):
+            validate_team_members(
+                [
+                    coordinator,
+                    dict(
+                        coordinator,
+                        stable_key="other-coordinator",
+                        role="release coordinator",
+                    ),
+                    implementer,
+                    verifier,
+                ]
+            )
+        with self.assertRaisesRegex(ValueError, "independent verifier"):
+            validate_team_members([coordinator, implementer])
+        with self.assertRaisesRegex(ValueError, "implementation member"):
+            validate_team_members([coordinator, verifier])
+        with self.assertRaisesRegex(ValueError, "identities"):
+            validate_team_members(
+                [
+                    coordinator,
+                    dict(implementer, stable_key="coordination"),
+                    verifier,
+                ]
+            )
+        with self.assertRaisesRegex(ValueError, "coordinating member.*write"):
+            validate_team_members(
+                [
+                    dict(
+                        coordinator,
+                        permitted_tools=["read", "write"],
+                    ),
+                    implementer,
+                    verifier,
+                ]
+            )
+        with self.assertRaisesRegex(ValueError, "verifier.*write"):
+            validate_team_members(
+                [
+                    coordinator,
+                    implementer,
+                    dict(verifier, permitted_tools=["read", "write", "run"]),
+                ]
+            )
         with self.assertRaisesRegex(ValueError, "action timeout"):
-            validate_team_members([dict(lead, action_timeout_seconds=0)])
+            validate_team_members(
+                [
+                    dict(coordinator, action_timeout_seconds=0),
+                    implementer,
+                    verifier,
+                ]
+            )
+        with self.assertRaisesRegex(ValueError, "stable key"):
+            validate_team_members(
+                [
+                    coordinator,
+                    dict(implementer, stable_key="Invalid Key"),
+                    verifier,
+                ]
+            )
+        with self.assertRaisesRegex(ValueError, "model"):
+            validate_team_members([coordinator, dict(implementer, model=""), verifier])
 
-    def test_formulation_varies_from_repository_evidence(self) -> None:
-        formulator = EvidenceTeamFormulator(
-            runtime="mini-swe-agent",
-            model="configured",
-            action_timeout_seconds=601,
+    @patch("repogents.team.MiniSweInference")
+    def test_configured_agent_designs_atomic_team_from_repository_evidence(
+        self,
+        inference_type: object,
+    ) -> None:
+        inference = inference_type.return_value
+        inference.infer.return_value = {
+            "members": [
+                {
+                    "stable_key": "coordination",
+                    "role": "delivery coordinator",
+                    "coordinates": True,
+                    "independent_verifier": False,
+                    "responsibilities": (
+                        "Coordinate assignments and integrate completed work."
+                    ),
+                    "permitted_tools": ["read", "git_diff", "git_commit"],
+                },
+                {
+                    "stable_key": "battle-engine",
+                    "role": "turn-based battle engine developer",
+                    "coordinates": False,
+                    "independent_verifier": False,
+                    "responsibilities": (
+                        "Implement turn-based battle engine behavior."
+                    ),
+                    "permitted_tools": ["read", "write", "run", "git_diff"],
+                },
+                {
+                    "stable_key": "schema-verification",
+                    "role": "battle schema compatibility verifier",
+                    "coordinates": False,
+                    "independent_verifier": True,
+                    "responsibilities": (
+                        "Independently verify battle schema compatibility."
+                    ),
+                    "permitted_tools": ["read", "run", "git_diff"],
+                },
+            ]
+        }
+        observed_classes: list[str] = []
+
+        def resolve(execution_class: str) -> str:
+            observed_classes.append(execution_class)
+            return f"openai/{execution_class}"
+
+        with tempfile.TemporaryDirectory() as state_root:
+            formulator = EvidenceTeamFormulator(
+                runtime="mini-swe-agent",
+                model="openai/team-architect",
+                model_resolver=resolve,
+                state_root=Path(state_root),
+                action_timeout_seconds=601,
+            )
+            inspection = RepositoryInspection(
+                languages=("python",),
+                manifests=("pyproject.toml",),
+                lockfiles=(),
+                instruction_files=("README.md",),
+                validation_commands=(("python3", "-m", "pytest"),),
+                file_count=20,
+                summary="small Python battle simulator",
+                instructions=(("README.md", "Battle schemas are public."),),
+                source_files=("src/martite/battle.py", "tests/test_battle.py"),
+            )
+
+            members = formulator.formulate(inspection)
+
+        self.assertEqual(
+            [member["stable_key"] for member in members],
+            ["coordination", "battle-engine", "schema-verification"],
         )
-        small = RepositoryInspection(
+        self.assertEqual(
+            [member["role"] for member in members],
+            [
+                "delivery coordinator",
+                "turn-based battle engine developer",
+                "battle schema compatibility verifier",
+            ],
+        )
+        self.assertEqual(
+            [member["execution_class"] for member in members],
+            ["lead", "implementer", "verifier"],
+        )
+        self.assertEqual(
+            [member["model"] for member in members],
+            ["openai/lead", "openai/implementer", "openai/verifier"],
+        )
+        self.assertEqual(
+            observed_classes,
+            ["lead", "implementer", "verifier"],
+        )
+        self.assertTrue(
+            all(member["runtime"] == "mini-swe-agent" for member in members)
+        )
+        self.assertTrue(
+            all(member["action_timeout_seconds"] == 601 for member in members)
+        )
+
+        request = inference.infer.call_args.kwargs
+        packet = json.loads(request["prompt"])
+        self.assertEqual(packet["repository"]["file_count"], 20)
+        self.assertIn(
+            "src/martite/battle.py",
+            packet["repository"]["source_files"],
+        )
+        self.assertIn("design", packet["task"].lower())
+        self.assertIn("atomic", packet["task"].lower())
+        self.assertIn(
+            "must not implement or verify",
+            packet["task"].lower(),
+        )
+        self.assertIn("role names", packet["task"].lower())
+
+    @patch("repogents.team.MiniSweInference")
+    def test_invalid_or_failed_agent_design_has_no_fallback_team(
+        self,
+        inference_type: object,
+    ) -> None:
+        inference = inference_type.return_value
+        inference.infer.return_value = {
+            "members": [
+                {
+                    "stable_key": "verification",
+                    "role": "repository behavior verifier",
+                    "coordinates": False,
+                    "independent_verifier": True,
+                    "responsibilities": "Verify repository behavior.",
+                    "permitted_tools": ["read", "run"],
+                }
+            ]
+        }
+        inspection = RepositoryInspection(
             languages=("python",),
             manifests=("pyproject.toml",),
             lockfiles=(),
-            instruction_files=("README.md",),
-            validation_commands=(("python3", "-m", "pytest"),),
-            file_count=20,
-            summary="small Python project",
+            instruction_files=(),
+            validation_commands=(("python3", "-m", "unittest"),),
+            file_count=10,
+            summary="small repository",
         )
-        complex_repository = RepositoryInspection(
-            languages=("javascript", "python"),
-            manifests=("package.json", "pyproject.toml"),
-            lockfiles=("package-lock.json",),
-            instruction_files=("AGENTS.md", "README.md"),
-            validation_commands=(("npm", "test"), ("python3", "-m", "pytest")),
-            file_count=2000,
-            summary="multi-language project",
-        )
-        small_members = formulator.formulate(small)
-        complex_members = formulator.formulate(complex_repository)
-        self.assertEqual(
-            [member["role"] for member in small_members],
-            ["lead", "verifier"],
-        )
-        self.assertEqual(
-            [member["role"] for member in complex_members],
-            ["lead", "implementer", "verifier"],
-        )
-        self.assertNotEqual(small_members, complex_members)
-        self.assertTrue(
-            all(member["action_timeout_seconds"] == 601 for member in complex_members)
-        )
-        for members in (small_members, complex_members):
-            verifier = next(
-                member for member in members if member["role"] == "verifier"
+        with tempfile.TemporaryDirectory() as state_root:
+            formulator = EvidenceTeamFormulator(
+                runtime="mini-swe-agent",
+                model="openai/team-architect",
+                state_root=Path(state_root),
             )
-            self.assertEqual(verifier["permitted_tools"], ["read", "run", "git_diff"])
-            self.assertNotIn("write", verifier["permitted_tools"])
+            with self.assertRaisesRegex(ValueError, "coordinating member"):
+                formulator.formulate(inspection)
+
+            inference.infer.side_effect = RuntimeError("model unavailable")
+            with self.assertRaisesRegex(RuntimeError, "model unavailable"):
+                formulator.formulate(inspection)
+
+    def test_team_validation_rejects_unsupported_controller_tool(self) -> None:
+        coordinator = {
+            "stable_key": "coordination",
+            "role": "delivery coordinator",
+            "execution_class": "lead",
+            "coordinates": True,
+            "independent_verifier": False,
+            "responsibilities": "Coordinate work.",
+            "permitted_tools": ["read", "network"],
+            "runtime": "mini-swe-agent",
+            "model": "configured",
+            "instructions": "",
+        }
+        implementer = {
+            "stable_key": "implementation",
+            "role": "Python maintainer",
+            "execution_class": "implementer",
+            "coordinates": False,
+            "independent_verifier": False,
+            "responsibilities": "Implement Python changes.",
+            "permitted_tools": ["read", "write", "run"],
+            "runtime": "mini-swe-agent",
+            "model": "configured",
+            "instructions": "",
+        }
+        verifier = {
+            "stable_key": "verification",
+            "role": "behavior verifier",
+            "execution_class": "verifier",
+            "coordinates": False,
+            "independent_verifier": True,
+            "responsibilities": "Verify repository behavior.",
+            "permitted_tools": ["read", "run"],
+            "runtime": "mini-swe-agent",
+            "model": "configured",
+            "instructions": "",
+        }
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            validate_team_members([coordinator, implementer, verifier])
 
 
 class TeamServiceTests(unittest.TestCase):
@@ -99,23 +334,60 @@ class TeamServiceTests(unittest.TestCase):
             )
             connection.execute(
                 """INSERT INTO team_versions
-                   (id, repository_id, version, evidence_json, created_at)
-                   VALUES ('team-1', 'repo-1', 1, ?, ?)""",
+                   (id, repository_id, version, evidence_json,
+                    design_contract_version, created_at)
+                   VALUES ('team-1', 'repo-1', 1, ?, 2, ?)""",
                 (json.dumps({"languages": ["python"]}), "2026-01-01T00:00:00Z"),
             )
             members = (
-                ("member-lead", "lead", "lead"),
-                ("member-verifier", "verify", "verifier"),
+                (
+                    "member-lead",
+                    "lead",
+                    "lead",
+                    "delivery coordinator",
+                    "Coordinate and integrate work",
+                    '["read","git_diff","git_commit"]',
+                ),
+                (
+                    "member-build",
+                    "build",
+                    "implementer",
+                    "Python application maintainer",
+                    "Implement repository changes",
+                    '["read","write","run","git_diff"]',
+                ),
+                (
+                    "member-verifier",
+                    "verify",
+                    "verifier",
+                    "behavior verifier",
+                    "Independently verify behavior",
+                    '["read","run"]',
+                ),
             )
-            for member_id, stable_key, role in members:
+            for (
+                member_id,
+                stable_key,
+                role,
+                atomic_role,
+                responsibility,
+                tools,
+            ) in members:
                 connection.execute(
                     """INSERT INTO team_members
-                       (id, team_version_id, stable_key, role, responsibilities,
-                        permitted_tools_json, runtime, model, instructions,
-                        action_timeout_seconds)
-                       VALUES (?, 'team-1', ?, ?, ?, '["read"]', 'mini-swe-agent',
+                       (id, team_version_id, stable_key, role, atomic_role,
+                        responsibilities, permitted_tools_json, runtime, model,
+                        instructions, action_timeout_seconds)
+                       VALUES (?, 'team-1', ?, ?, ?, ?, ?, 'mini-swe-agent',
                                'configured', '', 301)""",
-                    (member_id, stable_key, role, role),
+                    (
+                        member_id,
+                        stable_key,
+                        role,
+                        atomic_role,
+                        responsibility,
+                        tools,
+                    ),
                 )
             connection.execute(
                 """INSERT INTO issues
@@ -145,22 +417,35 @@ class TeamServiceTests(unittest.TestCase):
         team = self.service.load("team-1")
         self.assertEqual(team.version, 1)
         self.assertEqual(
-            [member.stable_key for member in team.members], ["lead", "verify"]
+            [member.stable_key for member in team.members],
+            ["lead", "build", "verify"],
         )
         self.assertTrue(
             all(member.action_timeout_seconds == 301 for member in team.members)
         )
+        self.assertEqual(
+            [member.role for member in team.members],
+            [
+                "delivery coordinator",
+                "Python application maintainer",
+                "behavior verifier",
+            ],
+        )
+        self.assertEqual(
+            [member.execution_class for member in team.members],
+            ["lead", "implementer", "verifier"],
+        )
         assignments = self.service.assign(
             "run-1",
-            ("lead", "verify"),
-            "Lead implements; verifier independently checks repository-required behavior.",
+            ("lead", "build", "verify"),
+            "The coordinator assigns implementation and independent verification.",
         )
         self.assertEqual(
             [assignment.member.stable_key for assignment in assignments],
-            ["lead", "verify"],
+            ["lead", "build", "verify"],
         )
         reloaded = self.service.assignments_for_run("run-1")
-        self.assertEqual(len(reloaded), 2)
+        self.assertEqual(len(reloaded), 3)
         self.assertTrue(all(assignment.reasoning for assignment in reloaded))
 
     def test_existing_run_keeps_prior_team_after_repository_version_changes(
@@ -169,30 +454,58 @@ class TeamServiceTests(unittest.TestCase):
         with self.db.transaction() as connection:
             connection.execute(
                 """INSERT INTO team_versions
-                   (id, repository_id, version, evidence_json, created_at)
-                   VALUES ('team-2', 'repo-1', 2, '{}', ?)""",
+                   (id, repository_id, version, evidence_json,
+                    design_contract_version, created_at)
+                   VALUES ('team-2', 'repo-1', 2, '{}', 2, ?)""",
                 ("2026-01-02T00:00:00Z",),
             )
-            connection.execute("""INSERT INTO team_members
-                   (id, team_version_id, stable_key, role, responsibilities,
-                    permitted_tools_json, runtime, model, instructions,
-                    action_timeout_seconds)
-                   VALUES ('member-new-lead', 'team-2', 'new-lead', 'lead',
-                           'Own later runs', '["read"]', 'mini-swe-agent', 'configured',
-                           '', 777)""")
+            connection.executemany(
+                """INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions, action_timeout_seconds)
+                   VALUES (?, 'team-2', ?, ?, ?, ?, ?, 'mini-swe-agent',
+                           'configured', '', 777)""",
+                (
+                    (
+                        "member-new-lead",
+                        "new-lead",
+                        "lead",
+                        "release coordinator",
+                        "Coordinate later runs",
+                        '["read","git_diff","git_commit"]',
+                    ),
+                    (
+                        "member-new-build",
+                        "new-build",
+                        "implementer",
+                        "release implementation maintainer",
+                        "Implement later changes",
+                        '["read","write","run","git_diff"]',
+                    ),
+                    (
+                        "member-new-verify",
+                        "new-verify",
+                        "verifier",
+                        "release behavior verifier",
+                        "Verify later changes",
+                        '["read","run"]',
+                    ),
+                ),
+            )
             connection.execute(
                 "UPDATE repositories SET current_team_version_id='team-2' WHERE id='repo-1'"
             )
 
         assignments = TeamService(Database(self.db.path)).assign(
             "run-1",
-            ("lead", "verify"),
+            ("lead", "build", "verify"),
             "The active run continues with the team version captured at activation.",
         )
 
         self.assertEqual(
             [assignment.member.stable_key for assignment in assignments],
-            ["lead", "verify"],
+            ["lead", "build", "verify"],
         )
         with self.db.connect() as connection:
             run = connection.execute(
@@ -214,18 +527,43 @@ class TeamServiceTests(unittest.TestCase):
             777,
         )
 
+    def test_legacy_team_contract_remains_loadable_for_active_run(self) -> None:
+        with self.db.transaction() as connection:
+            connection.execute("""UPDATE team_versions
+                   SET design_contract_version=1
+                   WHERE id='team-1'""")
+            connection.execute("DELETE FROM team_members WHERE id='member-build'")
+            connection.execute("""UPDATE team_members
+                   SET permitted_tools_json='["read","write","run","git_diff"]'
+                   WHERE id='member-lead'""")
+
+        team = self.service.load("team-1")
+
+        self.assertEqual(
+            [member.stable_key for member in team.members],
+            ["lead", "verify"],
+        )
+        self.assertIn("write", team.members[0].permitted_tools)
+
     def test_rejects_obsolete_omp_runtime_in_stored_member(self) -> None:
         """Stored team member with runtime='omp' must not be used for execution."""
         with self.db.transaction() as connection:
-            connection.execute("""INSERT INTO team_members
-                   (id, team_version_id, stable_key, role, responsibilities,
-                    permitted_tools_json, runtime, model, instructions,
-                    action_timeout_seconds)
-                   VALUES ('legacy-lead', 'team-1', 'legacy', 'verifier', 'Legacy check',
-                           '["read"]', 'omp', 'openai/legacy', '', 300)""")
+            connection.execute("""UPDATE team_members
+                   SET runtime='omp', model='openai/legacy'
+                   WHERE id='member-verifier'""")
         team = self.service.load("team-1")
-        legacy_member = next(m for m in team.members if m.stable_key == "legacy")
+        legacy_member = next(m for m in team.members if m.stable_key == "verify")
         self.assertEqual(legacy_member.runtime, "omp")
+
+    def test_rejects_assignment_without_stored_verifier(self) -> None:
+        with self.assertRaisesRegex(ValueError, "independent verifier"):
+            self.service.assign(
+                "run-1",
+                ("lead", "build"),
+                "Implementation without independent review",
+            )
+        self.assertEqual(self.service.assignments_for_run("run-1"), ())
+
 
     def test_rejects_assignment_outside_runs_stored_team(self) -> None:
         with self.assertRaises(ValueError):

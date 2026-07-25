@@ -4,12 +4,11 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from .controller import RunProcessSupervisor, require_explicit_model, run_file_backed
-
 
 MINI_SWE_RUNTIME = "mini-swe-agent"
 
@@ -41,14 +40,33 @@ _PROVIDER_CREDENTIAL_KEYS = {
     "xai": ("XAI_API_KEY",),
     "zai": ("ZAI_API_KEY",),
 }
+_MULTI_VALUE_CREDENTIAL_PROVIDERS = {"aws"}
+
 
 FileBackedRunner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def model_api_key_variables(model: str) -> tuple[str, ...]:
+    explicit_model = require_explicit_model(model)
+    provider = explicit_model.split("/", 1)[0].lower()
+    return _PROVIDER_CREDENTIAL_KEYS.get(provider, ())
+
+
+def model_managed_api_key_variable(model: str) -> str | None:
+    explicit_model = require_explicit_model(model)
+    provider = explicit_model.split("/", 1)[0].lower()
+    if provider in _MULTI_VALUE_CREDENTIAL_PROVIDERS:
+        return None
+    variables = _PROVIDER_CREDENTIAL_KEYS.get(provider, ())
+    return variables[0] if variables else None
 
 
 def mini_swe_environment(
     model: str,
     config_directory: Path,
     source: Mapping[str, str] | None = None,
+    *,
+    api_key: str | None = None,
 ) -> dict[str, str]:
     """Build the credential-minimal environment for one mini-SWE worker."""
 
@@ -59,11 +77,21 @@ def mini_swe_environment(
         for key, value in values.items()
         if key in _MINI_SWE_BASE_ENVIRONMENT_KEYS
     }
-    provider = explicit_model.split("/", 1)[0].lower()
-    for key in _PROVIDER_CREDENTIAL_KEYS.get(provider, ()):
-        value = values.get(key)
-        if value:
-            environment[key] = value
+    credential_keys = model_api_key_variables(explicit_model)
+    if api_key is not None:
+        if not api_key:
+            raise ValueError("configured model API key cannot be blank")
+        credential_key = model_managed_api_key_variable(explicit_model)
+        if credential_key is None:
+            raise ValueError(
+                f"model provider does not support a managed API key: {explicit_model}"
+            )
+        environment[credential_key] = api_key
+    else:
+        for key in credential_keys:
+            value = values.get(key)
+            if value:
+                environment[key] = value
 
     directory = Path(config_directory).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -80,6 +108,7 @@ class MiniSweInference:
         model: str | None = None,
         *,
         base_url: str | None = None,
+        api_key: str | None = None,
         timeout: float = 600,
         runner: FileBackedRunner | None = None,
         supervisor: RunProcessSupervisor | None = None,
@@ -90,10 +119,15 @@ class MiniSweInference:
         if runner is None:
             self.model = require_explicit_model(model)
         else:
-            self.model = model.strip() if isinstance(model, str) and model.strip() else None
+            self.model = (
+                model.strip() if isinstance(model, str) and model.strip() else None
+            )
         if base_url is not None and not base_url.strip():
             raise ValueError("mini-SWE model base URL cannot be blank")
         self.base_url = base_url
+        if api_key is not None and not api_key:
+            raise ValueError("mini-SWE model API key cannot be blank")
+        self.api_key = api_key
         self.timeout = timeout
         self.runner = runner or run_file_backed
         self.supervisor = supervisor
@@ -106,11 +140,18 @@ class MiniSweInference:
         prompt: str,
         response_schema: Mapping[str, object],
         state_directory: Path,
+        image_paths: Sequence[Path] = (),
     ) -> dict[str, object]:
         model = require_explicit_model(self.model)
         state = Path(state_directory).expanduser().resolve()
         state.mkdir(parents=True, exist_ok=True, mode=0o700)
         state.chmod(0o700)
+        images: list[str] = []
+        for image_path in image_paths:
+            image = Path(image_path).expanduser().resolve(strict=True)
+            if not image.is_file():
+                raise ValueError("mini-SWE inference image must be a file")
+            images.append(str(image))
         request = json.dumps(
             {
                 "model": model,
@@ -120,6 +161,7 @@ class MiniSweInference:
                 "response_schema": dict(response_schema),
                 "state_directory": str(state),
                 "timeout": self.timeout,
+                "image_paths": images,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -130,15 +172,17 @@ class MiniSweInference:
             request,
             state,
             self.timeout,
-            environment=mini_swe_environment(model, state / "config"),
+            environment=mini_swe_environment(
+                model,
+                state / "config",
+                api_key=self.api_key,
+            ),
             supervisor=self.supervisor,
             run_id=self.run_id,
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
-            raise RuntimeError(
-                f"mini-SWE worker exited {result.returncode}: {detail}"
-            )
+            raise RuntimeError(f"mini-SWE worker exited {result.returncode}: {detail}")
         value = _single_json_object(result.stdout)
         if not isinstance(value, dict):
             raise ValueError("mini-SWE worker decision must be a JSON object")

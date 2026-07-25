@@ -10,13 +10,13 @@ This MVP is the smallest locally operated product that proves the complete repos
 4. implement and validate the requested change in an isolated checkout;
 5. publish an unmerged pull request containing the tested revision;
 6. resolve later pull-request feedback autonomously; and
-7. notify the user after 30 continuous feedback-free minutes.
+7. monitor each open pull request for feedback until GitHub reports it merged or externally closed.
 
 The MVP must make that complete path usable and restart-safe. It need not support multiple users, multiple hosts, distributed execution, high availability, or automatic merging.
 
 ## Product Outcome
 
-One user can maintain a repository inventory, delegate a GitHub issue with `agent:ready`, have the repository's stored agent team implement and test it in the repository's stored sandbox, receive an unmerged pull request, have pull-request feedback resolved autonomously, and receive a notification after 30 quiet minutes.
+One user can maintain a repository inventory, delegate a GitHub issue with `agent:ready`, have the repository's stored agent team implement and test it in the repository's stored sandbox, receive an unmerged pull request, and have pull-request feedback resolved autonomously for as long as that pull request remains open.
 
 ## Operating Scope
 
@@ -35,10 +35,10 @@ The sandbox protects unrelated host resources from accidental or defective repos
 
 The application uses local durable storage consisting of:
 
-- one SQLite database for identities, configuration, state transitions, external-object identifiers, deadlines, and notifications; and
+- one SQLite database for identities, configuration, state transitions, external-object identifiers, and durable feedback state; and
 - application-owned filesystem directories for sandbox environments, isolated checkouts, caches, logs, and generated run artifacts.
 
-The database is the source of truth for repository, run, publication, feedback, and notification state. State required for restart recovery must be committed before the application performs the next external side effect.
+The database is the source of truth for repository, run, publication, and feedback state. State required for restart recovery must be committed before the application performs the next external side effect.
 
 The application stores at least:
 
@@ -50,18 +50,16 @@ The application stores at least:
 - issue branch names, pull-request identities, and tested commit SHAs;
 - validation commands and results;
 - feedback versions and processing state;
-- quiet-period generations and deadlines; and
-- durable user notifications.
+- pull-request status and feedback-processing state.
 
 Database constraints must prevent:
 
 - more than one run for the same activating label event;
 - more than one nonterminal run for the same repository issue;
 - duplicate storage or processing of the same feedback version;
-- more than one pull-request association for the same run; and
-- more than one notification for the same quiet-period generation.
+- more than one pull-request association for the same run.
 
-The inventory, sandbox state, team composition, active runs, feedback state, quiet-period state, and notifications persist across application restarts.
+The inventory, sandbox state, team composition, active runs, pull-request state, and feedback state persist across application restarts.
 
 ## 2. Repository Onboarding and Inventory
 
@@ -280,6 +278,8 @@ The activating event identity is unique. Repeated polling and application restar
 
 A repository issue may have at most one nonterminal run. Removing `agent:ready` does not implicitly cancel an existing run. A new label event may create a new run only after the previous run becomes terminal.
 
+When an application-created pull request is externally closed without merge, that close observation becomes a stable activation event if the linked GitHub issue is still open. The application closes the prior run and creates exactly one fresh queued run using the repository's current stored sandbox and team versions, default branch, and fetched base SHA. Repeated polling and application restarts cannot duplicate the replacement run. If the pull request was merged or the issue is closed, no replacement is created.
+
 After restart, the application loads and reconciles the existing nonterminal run instead of creating another one.
 
 ### 5.2 Run states
@@ -292,15 +292,13 @@ The application exposes these issue-run states:
 - `publishing`;
 - `waiting_for_feedback`;
 - `resolving_feedback`;
-- `quiet_period`;
-- `notified`;
 - `blocked`;
 - `canceled`; and
 - `closed`.
 
 `blocked`, `canceled`, and `closed` record a reason. `canceled` and `closed` are terminal. A blocked run performs no autonomous work and may be canceled; recoverable internal failures do not enter `blocked`.
 
-A run may be `waiting_for_feedback`, `quiet_period`, or `notified` without retaining an agent process. New feedback for an open pull request returns the same run to `resolving_feedback`.
+A run may remain `waiting_for_feedback` without retaining an agent process. New feedback for an open pull request returns the same run to `resolving_feedback`; a merged or externally closed pull request moves that attempt to `closed`. A closed-unmerged attempt is replaced only under the open-issue rule in §5.1.
 
 ### 5.3 Failure handling
 
@@ -457,35 +455,23 @@ After a source-changing revision:
 
 Review handling does not reprovision the sandbox or reformulate the team.
 
-Feedback is processed in durable order. After resolving the current pending set, the application immediately polls again before starting a quiet period so feedback arriving during implementation is not missed.
+Feedback is processed in durable order. After resolving the current pending set, the application immediately polls again so feedback arriving during implementation is not missed, then continues polling the open pull request on every scheduler interval.
 
-## 9. Quiet-Period Notification
+## 9. Continuous Pull-Request Monitoring
 
-Each quiet period is a durable generation associated with the pull request.
+Every open application-created pull request remains under feedback monitoring until GitHub reports it merged or externally closed.
 
-The first quiet period starts only after the initial tested pull request is published and its remote head is confirmed.
+The first monitoring state starts only after the initial tested pull request is published and its remote head is confirmed. For every later feedback cycle:
 
-For every later feedback cycle:
-
-1. New feedback cancels the current quiet-period deadline.
-2. The application resolves all feedback through the current durable watermark.
+1. The application stores newly observed feedback before assigning it.
+2. It resolves all feedback through the current durable watermark.
 3. It publishes every required tested revision and response.
 4. It polls again for feedback that arrived during resolution.
-5. If no feedback remains pending, it stores a new quiet-period generation with a deadline 30 minutes after the final required publication.
+5. If no feedback remains pending, the same run returns to `waiting_for_feedback`.
 
-At the first successful poll at or after the deadline, the application checks GitHub again. If:
+Elapsed time does not complete the run, create a deadline, or stop polling. GitHub or application outages delay observation; they never cause the application to infer that feedback handling is complete.
 
-- no newer unprocessed feedback exists;
-- no feedback remains pending or in progress; and
-- the pull request remains open,
-
-then the application creates exactly one notification for that quiet-period generation and marks the run `notified`.
-
-If the application or GitHub is unavailable at the deadline, notification waits until the application can successfully verify the pull request. It does not infer quiet time while unable to poll.
-
-If a user or other external actor closes or merges the pull request, the application marks the run `closed`, stops its quiet period, and does not send a quiet-period notification for that interrupted generation. The application itself never merges or closes the pull request.
-
-Feedback arriving after a notification returns the same open run to `resolving_feedback` and may produce another quiet-period generation and notification.
+If a user or other external actor merges the pull request, the application marks the run `closed`. If the pull request is closed without merge, the application marks that attempt `closed`, checks the linked GitHub issue, and starts one fresh run when the issue remains open. The application itself never merges or closes a pull request.
 
 ## 10. Minimal Local Interface
 
@@ -499,18 +485,8 @@ The application provides one local interface that allows the user to:
 - view each issue's current state and blocking reason;
 - cancel a blocked or active run as applicable;
 - open issue links on GitHub;
-- open pull-request links on GitHub; and
-- receive and acknowledge quiet-period notifications.
+- open pull-request links on GitHub.
 
-A quiet-period notification is stored durably and displayed in the interface with:
-
-- repository identity;
-- issue identity and link;
-- pull-request identity and link;
-- notification time; and
-- read or unread state.
-
-A Linux desktop notification may also be emitted, but the persistent in-application notification is the acceptance source of truth.
 
 No application accounts, organizations, tenant management, onboarding wizard, or administrative console are required.
 
@@ -573,11 +549,10 @@ One inventoried repository demonstrates the complete live path:
 13. The stored team evaluates and resolves it according to its actual content.
 14. Any required source revision is validated against its own commit SHA and pushed to the same pull request.
 15. Any required response is posted once and is not reprocessed as feedback.
-16. The application is restarted during the quiet period.
-17. No further feedback arrives for 30 continuous verified minutes.
-18. Exactly one persistent notification is created for that quiet-period generation.
-19. The notification identifies and links the repository, issue, and pull request.
-20. The application does not merge or close the pull request.
+16. The application is restarted while the pull request remains open.
+17. After restart, the same open pull request continues to be polled without a quiet deadline.
+18. Later real feedback is stored and resolved on the same run without duplication.
+19. The application does not merge or close the pull request.
 
 ## 12. Explicit Non-Requirements
 

@@ -61,7 +61,13 @@ class PublicationGateway(Protocol):
     ) -> str: ...
 
     def push_branch(
-        self, checkout: Path, owner: str, name: str, branch: str, sha: str
+        self,
+        checkout: Path,
+        owner: str,
+        name: str,
+        branch: str,
+        sha: str,
+        expected_remote_sha: str | None,
     ) -> None: ...
 
     def find_pull_request(
@@ -156,10 +162,25 @@ class GitPublicationGateway:
         return head
 
     def push_branch(
-        self, checkout: Path, owner: str, name: str, branch: str, sha: str
+        self,
+        checkout: Path,
+        owner: str,
+        name: str,
+        branch: str,
+        sha: str,
+        expected_remote_sha: str | None,
     ) -> None:
         if not re.fullmatch(r"[0-9a-f]{40}", sha):
             raise ValueError("push SHA is invalid")
+        if expected_remote_sha is not None and not re.fullmatch(
+            r"[0-9a-f]{40}",
+            expected_remote_sha,
+        ):
+            raise ValueError("expected remote SHA is invalid")
+        lease = (
+            f"--force-with-lease=refs/heads/{branch}:"
+            + (expected_remote_sha or "")
+        )
         with git_environment(self.token) as environment:
             result = subprocess.run(
                 [
@@ -168,6 +189,7 @@ class GitPublicationGateway:
                     "core.hooksPath=/dev/null",
                     "push",
                     "--porcelain",
+                    lease,
                     f"https://github.com/{owner}/{name}.git",
                     f"{sha}:refs/heads/{branch}",
                 ],
@@ -229,6 +251,10 @@ class MiniSweScopeReviewer:
         *,
         model: str | None = None,
         base_url: str | None = None,
+        api_key: str | None = None,
+        connection_resolver: (
+            Callable[[str], tuple[str | None, str | None]] | None
+        ) = None,
         state_root: Path | None = None,
         processes: RunProcessSupervisor | None = None,
         timeout: float = 600,
@@ -237,6 +263,8 @@ class MiniSweScopeReviewer:
             raise ValueError("scope reviewer timeout must be positive")
         self.model = model
         self.base_url = base_url
+        self.api_key = api_key
+        self.connection_resolver = connection_resolver
         self.state_root = (
             Path(state_root).expanduser().resolve()
             if state_root is not None
@@ -258,18 +286,18 @@ class MiniSweScopeReviewer:
         changed_files: tuple[str, ...],
     ) -> ScopeDecision:
         model = self.model
-        stored_lead = issue.get("stored_lead")
-        if stored_lead is not None:
-            if not isinstance(stored_lead, dict):
-                raise RuntimeError("stored scope-review lead configuration is invalid")
-            if stored_lead.get("runtime") != MINI_SWE_RUNTIME:
+        stored_verifier = issue.get("stored_verifier")
+        if stored_verifier is not None:
+            if not isinstance(stored_verifier, dict):
+                raise RuntimeError("stored verifier configuration is invalid")
+            if stored_verifier.get("runtime") != MINI_SWE_RUNTIME:
                 raise RuntimeError(
-                    "unsupported stored scope-review runtime: "
-                    f"{stored_lead.get('runtime')}"
+                    "unsupported stored verifier runtime: "
+                    f"{stored_verifier.get('runtime')}"
                 )
-            stored_model = stored_lead.get("model")
+            stored_model = stored_verifier.get("model")
             if not isinstance(stored_model, str) or not stored_model:
-                raise RuntimeError("stored scope-review model is invalid")
+                raise RuntimeError("stored verifier model is invalid")
             if model is None:
                 model = stored_model
         if not model:
@@ -277,12 +305,11 @@ class MiniSweScopeReviewer:
         prompt = json.dumps(
             {
                 "task": (
-                    "Decide whether the complete committed "
-                    "base-to-validated-head diff is required by the issue, "
-                    "complies with the immutable stored repository evidence and "
-                    "instructions, and excludes plans, logs, caches, credentials, "
-                    "licensed artifacts, generated environment state, and "
-                    "unrelated work."
+                    "Independently review the complete committed "
+                    "base-to-validated-head diff before publication. Approve only "
+                    "when it correctly and fully implements the issue, has adequate "
+                    "validation, complies with immutable stored repository evidence "
+                    "and instructions, and excludes unrelated or forbidden artifacts."
                 ),
                 "decision_rules": [
                     (
@@ -319,10 +346,15 @@ class MiniSweScopeReviewer:
             if run_id
             else uuid.uuid5(uuid.NAMESPACE_URL, prompt).hex
         )
+        base_url = self.base_url
+        api_key = self.api_key
+        if self.connection_resolver is not None:
+            base_url, api_key = self.connection_resolver(model)
         inference = self._build_inference(
             MiniSweInference(
                 model=model,
-                base_url=self.base_url,
+                base_url=base_url,
+                api_key=api_key,
                 timeout=self.timeout,
                 supervisor=self.processes,
                 run_id=run_id,
@@ -350,6 +382,17 @@ class MiniSweScopeReviewer:
 
 class PublicationBlocked(RuntimeError):
     pass
+
+
+class PublicationBaseChanged(PublicationBlocked):
+    def __init__(self, expected_base_sha: str, current_base_sha: str) -> None:
+        self.expected_base_sha = expected_base_sha
+        self.current_base_sha = current_base_sha
+        super().__init__(
+            "pull-request base changed from "
+            f"{expected_base_sha} to {current_base_sha} "
+            "before conflict preparation"
+        )
 
 
 class PublicationRevisionRequired(PublicationBlocked):
@@ -380,6 +423,43 @@ class PublicationService:
         self.acceptance = acceptance
         self.scanner = SecretScanner()
 
+    def prepare_base_revision(
+        self,
+        run_id: str,
+        expected_base_sha: str,
+    ) -> str:
+        if not re.fullmatch(r"[0-9a-f]{40}", expected_base_sha):
+            raise ValueError("expected pull-request base SHA is invalid")
+        context = self._context(run_id)
+        with self.database.connect() as connection:
+            pull = connection.execute(
+                """SELECT state FROM pull_requests
+                   WHERE run_id=?""",
+                (run_id,),
+            ).fetchone()
+        if pull is None or pull["state"] != "open":
+            raise PublicationBlocked(
+                "base conflict revision requires the existing open pull request"
+            )
+        checkout = Path(str(context["checkout_path"]))
+        fetched_sha = self.gateway.fetch_intended_base_head(
+            checkout,
+            str(context["owner"]),
+            str(context["name"]),
+            str(context["intended_base_branch"]),
+        )
+        if fetched_sha != expected_base_sha:
+            raise PublicationBaseChanged(expected_base_sha, fetched_sha)
+        _git(
+            checkout,
+            (
+                "update-ref",
+                f"refs/repogents/pull-bases/{fetched_sha}",
+                fetched_sha,
+            ),
+        )
+        return fetched_sha
+
     def publish(self, run_id: str) -> PullRequestInfo | None:
         try:
             context = self._context(run_id)
@@ -387,6 +467,11 @@ class PublicationService:
                 raise PublicationBlocked(
                     f"run cannot publish from state {context['state']}"
                 )
+            self._require_publishing(
+                run_id,
+                validated_sha=str(context.get("validated_sha") or ""),
+                issue_version_id=str(context.get("validated_issue_version_id") or ""),
+            )
             validated_sha = str(context.get("validated_sha") or "")
             checkout = Path(str(context["checkout_path"]))
             issue = self._scope_review_issue(context, validated_sha)
@@ -421,6 +506,13 @@ class PublicationService:
                 raise PublicationBlocked(
                     "issue acceptance verification did not produce a passing report"
                 )
+            if acceptance.get("issue_version_id") != context.get(
+                "validated_issue_version_id"
+            ):
+                raise PublicationBlocked(
+                    "issue acceptance proof does not match the validated issue version"
+                )
+            self._require_feedback_resolved(run_id, validated_sha)
             proof_body = self._pull_body(context, validated_sha, acceptance)
             branch = f"agent/issue-{context['issue_number']}-{run_id}"
             pull_row = self._stage_pull_request(context, branch, validated_sha)
@@ -430,6 +522,11 @@ class PublicationService:
                 branch,
                 validated_sha,
                 proof_body,
+            )
+            self._require_publishing(
+                run_id,
+                validated_sha=validated_sha,
+                issue_version_id=str(context["validated_issue_version_id"]),
             )
             self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
             return pull
@@ -490,6 +587,7 @@ class PublicationService:
             raise RuntimeError("stored issue discussion is invalid")
         return {
             "run_id": context["id"],
+            "issue_version_id": context["validated_issue_version_id"],
             "number": context["issue_number"],
             "url": context["issue_url"],
             "title": context["issue_title"],
@@ -501,11 +599,11 @@ class PublicationService:
             "sandbox_version_id": context["sandbox_version_id"],
             "team_version_id": context["team_version_id"],
             "repository_evidence": sandbox_evidence,
-            "stored_lead": {
-                "runtime": context["lead_runtime"],
-                "model": context["lead_model"],
+            "stored_verifier": {
+                "runtime": context["verifier_runtime"],
+                "model": context["verifier_model"],
+                "instructions": context["verifier_instructions"],
             },
-            "lead_instructions": context["lead_instructions"],
         }
 
     def _preflight(
@@ -543,34 +641,72 @@ class PublicationService:
             raise PublicationBlocked(
                 "current intended-base head does not descend from the stored activation base"
             )
-        merge = _git(
-            checkout,
-            ("merge-tree", base_sha, current_base_sha, validated_sha),
+        includes_current_base = (
+            _git_result(
+                checkout,
+                (
+                    "merge-base",
+                    "--is-ancestor",
+                    current_base_sha,
+                    validated_sha,
+                ),
+            ).returncode
+            == 0
         )
-        if "<<<<<<< .our" in merge:
-            raise PublicationBlocked(
-                "validated commit has a merge conflict with the current intended-base head"
+        if not includes_current_base:
+            merge = _git(
+                checkout,
+                ("merge-tree", base_sha, current_base_sha, validated_sha),
             )
+            if "<<<<<<< .our" in merge:
+                raise PublicationBlocked(
+                    "validated commit has a merge conflict with the current "
+                    "intended-base head"
+                )
+        comparison_base_sha = current_base_sha if includes_current_base else base_sha
         status = _git(checkout, ("status", "--porcelain", "--untracked-files=no"))
         if status.strip():
             raise PublicationBlocked("tracked checkout state changed after validation")
         with self.database.connect() as connection:
             commands = connection.execute(
                 """SELECT validation_commands.command_json,
-                          validation_results.exit_status
+                          validation_results.verdict,
+                          validation_baselines.base_sha AS baseline_base_sha,
+                          validation_baselines.command_json
+                              AS baseline_command_json
                    FROM validation_commands
                    LEFT JOIN validation_results
                      ON validation_results.run_id=?
                     AND validation_results.commit_sha=?
-                    AND validation_results.command_json=validation_commands.command_json
+                    AND validation_results.validation_command_id=
+                        validation_commands.id
+                   LEFT JOIN validation_baselines
+                     ON validation_baselines.run_id=?
+                    AND validation_baselines.validation_command_id=
+                        validation_commands.id
                    WHERE validation_commands.sandbox_version_id=?
                      AND validation_commands.required=1
                    ORDER BY validation_commands.position""",
-                (context["id"], validated_sha, context["sandbox_version_id"]),
+                (
+                    context["id"],
+                    validated_sha,
+                    context["id"],
+                    context["sandbox_version_id"],
+                ),
             ).fetchall()
-        if not commands or any(row["exit_status"] != 0 for row in commands):
+        if not commands or any(
+            row["baseline_base_sha"] != context["base_sha"]
+            or row["baseline_command_json"] != row["command_json"]
+            for row in commands
+        ):
             raise PublicationBlocked(
-                "every required validation command must pass for the exact published SHA"
+                "every required validation command must have matching "
+                "exact-base baseline evidence"
+            )
+        if not commands or any(row["verdict"] != "pass" for row in commands):
+            raise PublicationBlocked(
+                "every required validation command must have a passing policy "
+                "verdict for the exact published SHA"
             )
         changed_output = _git(
             checkout,
@@ -578,7 +714,7 @@ class PublicationService:
                 "diff",
                 "--name-only",
                 "--diff-filter=ACMRTD",
-                base_sha,
+                comparison_base_sha,
                 validated_sha,
                 "--",
             ),
@@ -592,7 +728,10 @@ class PublicationService:
                 "forbidden application, credential, or environment artifact in commit: "
                 + ", ".join(forbidden)
             )
-        diff = _git(checkout, ("diff", "--binary", base_sha, validated_sha, "--"))
+        diff = _git(
+            checkout,
+            ("diff", "--binary", comparison_base_sha, validated_sha, "--"),
+        )
         findings = self.scanner.scan(diff, self.known_secret_values(str(context["id"])))
         if findings:
             raise PublicationRevisionRequired(
@@ -609,13 +748,21 @@ class PublicationService:
         pull_id = _stable_id(f"{context['id']}:pull-request")
         now = _utc_now()
         with self.database.transaction() as connection:
+            self._require_publishing(
+                str(context["id"]),
+                validated_sha=validated_sha,
+                issue_version_id=str(context["validated_issue_version_id"]),
+                connection=connection,
+            )
             connection.execute(
                 """INSERT INTO pull_requests
                    (id, run_id, url, branch_name, intended_base_branch,
-                    base_sha, validated_head_sha, state, created_at, updated_at)
-                   VALUES (?, ?, '', ?, ?, ?, ?, 'pending', ?, ?)
+                    base_sha, validated_head_sha, validated_issue_version_id,
+                    state, created_at, updated_at)
+                   VALUES (?, ?, '', ?, ?, ?, ?, ?, 'pending', ?, ?)
                    ON CONFLICT(run_id) DO UPDATE SET
                      validated_head_sha=excluded.validated_head_sha,
+                     validated_issue_version_id=excluded.validated_issue_version_id,
                      updated_at=excluded.updated_at""",
                 (
                     pull_id,
@@ -624,6 +771,7 @@ class PublicationService:
                     context["intended_base_branch"],
                     context["base_sha"],
                     validated_sha,
+                    context["validated_issue_version_id"],
                     now,
                     now,
                 ),
@@ -661,8 +809,19 @@ class PublicationService:
             with self.lifecycle.external_effect(str(context["id"])) as active:
                 if not active:
                     raise PublicationBlocked("run was canceled at publication boundary")
-                self._require_publishing(str(context["id"]))
-                self.gateway.push_branch(checkout, owner, name, branch, validated_sha)
+                self._require_publishing(
+                    str(context["id"]),
+                    validated_sha=validated_sha,
+                    issue_version_id=str(context["validated_issue_version_id"]),
+                )
+                self.gateway.push_branch(
+                    checkout,
+                    owner,
+                    name,
+                    branch,
+                    validated_sha,
+                    None if previous is None else str(previous),
+                )
             confirmed = self._confirm_remote(owner, name, branch, validated_sha)
             if not confirmed:
                 raise PublicationBlocked(
@@ -673,6 +832,8 @@ class PublicationService:
             self._require_publishing(
                 str(context["id"]),
                 connection=connection,
+                validated_sha=validated_sha,
+                issue_version_id=str(context["validated_issue_version_id"]),
             )
             connection.execute(
                 """UPDATE pull_requests SET validated_head_sha=?, remote_head_sha=?, updated_at=?
@@ -701,7 +862,11 @@ class PublicationService:
             with self.lifecycle.external_effect(str(context["id"])) as active:
                 if not active:
                     raise PublicationBlocked("run was canceled at publication boundary")
-                self._require_publishing(str(context["id"]))
+                self._require_publishing(
+                    str(context["id"]),
+                    validated_sha=validated_sha,
+                    issue_version_id=str(context["validated_issue_version_id"]),
+                )
                 title = f"Resolve #{context['issue_number']}: {' '.join(str(context['issue_title']).split())}"
                 body = proof_body
                 pull = self.gateway.create_pull_request(
@@ -746,7 +911,11 @@ class PublicationService:
                         raise PublicationBlocked(
                             "run was canceled at pull-request proof boundary"
                         )
-                    self._require_publishing(str(context["id"]))
+                    self._require_publishing(
+                        str(context["id"]),
+                        validated_sha=validated_sha,
+                        issue_version_id=str(context["validated_issue_version_id"]),
+                    )
                     self.gateway.update_pull_request_body(
                         owner,
                         name,
@@ -763,6 +932,8 @@ class PublicationService:
             self._require_publishing(
                 str(context["id"]),
                 connection=connection,
+                validated_sha=validated_sha,
+                issue_version_id=str(context["validated_issue_version_id"]),
             )
             connection.execute(
                 """UPDATE pull_requests
@@ -795,6 +966,8 @@ class PublicationService:
         proof = render_acceptance_markdown(acceptance)
         body = (
             f"Automated implementation for {context['issue_url']}.\n\n"
+            f"Closes #{context['issue_number']}\n\n"
+            f"Validated issue revision: `{context['validated_issue_version_id']}`.\n\n"
             f"{proof}\n\n"
             "This pull request is intentionally unmerged."
         )
@@ -872,52 +1045,103 @@ class PublicationService:
                 (state, external_id, now, now, operation_id),
             )
 
+    def _require_feedback_resolved(
+        self,
+        run_id: str,
+        validated_sha: str,
+    ) -> None:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT feedback_versions.decision_json,
+                          feedback_versions.source_sha
+                   FROM feedback_versions
+                   JOIN pull_requests
+                     ON pull_requests.id=feedback_versions.pull_request_id
+                   WHERE pull_requests.run_id=?
+                     AND feedback_versions.state IN ('pending', 'processing')""",
+                (run_id,),
+            ).fetchall()
+        for row in rows:
+            value = row["decision_json"]
+            if not value:
+                raise PublicationRevisionRequired(
+                    "unresolved pull-request feedback exists at publication boundary"
+                )
+            try:
+                action = json.loads(str(value)).get("action")
+            except (json.JSONDecodeError, AttributeError):
+                action = None
+            if action != "revise" or row["source_sha"] != validated_sha:
+                raise PublicationRevisionRequired(
+                    "unresolved pull-request feedback exists at publication boundary"
+                )
+
     def _require_publishing(
         self,
         run_id: str,
         *,
+        validated_sha: str | None = None,
+        issue_version_id: str | None = None,
         connection: sqlite3.Connection | None = None,
     ) -> None:
+        query = """SELECT runs.state, runs.validated_sha,
+                          runs.validated_issue_version_id,
+                          issues.current_version_id
+                   FROM runs
+                   JOIN issues ON issues.id=runs.issue_id
+                   WHERE runs.id=?"""
         if connection is None:
             with self.database.connect() as active_connection:
-                row = active_connection.execute(
-                    "SELECT state FROM runs WHERE id=?",
-                    (run_id,),
-                ).fetchone()
+                row = active_connection.execute(query, (run_id,)).fetchone()
         else:
-            row = connection.execute(
-                "SELECT state FROM runs WHERE id=?",
-                (run_id,),
-            ).fetchone()
+            row = connection.execute(query, (run_id,)).fetchone()
         if row is None:
             raise KeyError(run_id)
         if row["state"] != RunState.PUBLISHING.value:
             raise PublicationBlocked(
                 f"run reached durable {row['state']} state at publication boundary"
             )
+        if (
+            row["validated_issue_version_id"] is None
+            or row["validated_issue_version_id"] != row["current_version_id"]
+            or (
+                issue_version_id is not None
+                and row["validated_issue_version_id"] != issue_version_id
+            )
+        ):
+            raise PublicationBlocked(
+                "validated issue version is stale at publication boundary"
+            )
+        if validated_sha is not None and row["validated_sha"] != validated_sha:
+            raise PublicationBlocked("validated commit changed at publication boundary")
 
     def _context(self, run_id: str) -> dict[str, object]:
         with self.database.connect() as connection:
             row = connection.execute(
                 """SELECT runs.*, repositories.owner, repositories.name,
-                          issues.number AS issue_number, issues.title AS issue_title,
-                          issues.body AS issue_body, issues.discussion_json,
+                          issues.number AS issue_number,
+                          issue_versions.title AS issue_title,
+                          issue_versions.body AS issue_body,
+                          issue_versions.discussion_json,
                           issues.url AS issue_url,
+                          issues.current_version_id,
                           sandbox_versions.evidence_json AS sandbox_evidence_json,
                           team_versions.evidence_json AS team_evidence_json,
-                          team_members.runtime AS lead_runtime,
-                          team_members.model AS lead_model,
-                          team_members.instructions AS lead_instructions
+                          team_members.runtime AS verifier_runtime,
+                          team_members.model AS verifier_model,
+                          team_members.instructions AS verifier_instructions
                    FROM runs
                    JOIN repositories ON repositories.id=runs.repository_id
                    JOIN issues ON issues.id=runs.issue_id
+                   LEFT JOIN issue_versions
+                     ON issue_versions.id=runs.validated_issue_version_id
                    JOIN sandbox_versions
                      ON sandbox_versions.id=runs.sandbox_version_id
                    JOIN team_versions
                      ON team_versions.id=runs.team_version_id
                    JOIN team_members
                      ON team_members.team_version_id=runs.team_version_id
-                    AND team_members.role='lead'
+                    AND team_members.role='verifier'
                    WHERE runs.id=?""",
                 (run_id,),
             ).fetchone()

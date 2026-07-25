@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import subprocess
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .controller import RunProcessSupervisor
 from .database import Database
 from .github import FeedbackItem, FeedbackOutput, PullRequestInfo
 from .mini_swe import MINI_SWE_RUNTIME, MiniSweInference
 from .lifecycle import RunLifecycle, RunState
+from .publication import PublicationBaseChanged
 
 
 @dataclass(frozen=True)
@@ -35,9 +37,15 @@ class FeedbackGateway(Protocol):
         self, owner: str, name: str, number: int
     ) -> PullRequestInfo: ...
 
+    def get_remote_branch_head(
+        self, owner: str, name: str, branch: str
+    ) -> str | None: ...
+
     def list_feedback(
         self, owner: str, name: str, pull_number: int
     ) -> list[FeedbackItem]: ...
+
+    def application_login(self) -> str: ...
 
     def find_response(
         self,
@@ -57,6 +65,7 @@ class FeedbackGateway(Protocol):
         feedback: FeedbackItem,
         body: str,
     ) -> FeedbackOutput: ...
+    def resolve_review_thread(self, thread_id: str) -> None: ...
 
 
 class FeedbackEvaluator(Protocol):
@@ -64,15 +73,14 @@ class FeedbackEvaluator(Protocol):
 
 
 class SourceExecutor(Protocol):
-    def execute(self, run_id: str, *, additional_context: str | None = None) -> str | None: ...
+    def execute(
+        self, run_id: str, *, additional_context: str | None = None
+    ) -> str | None: ...
 
 
 class RevisionPublisher(Protocol):
     def publish(self, run_id: str) -> object | None: ...
-
-
-class QuietStarter(Protocol):
-    def start(self, run_id: str) -> None: ...
+    def prepare_base_revision(self, run_id: str, expected_base_sha: str) -> str: ...
 
 
 class MiniSweFeedbackEvaluator:
@@ -96,6 +104,10 @@ class MiniSweFeedbackEvaluator:
         *,
         model: str | None = None,
         base_url: str | None = None,
+        api_key: str | None = None,
+        connection_resolver: (
+            Callable[[str], tuple[str | None, str | None]] | None
+        ) = None,
         state_root: Path | None = None,
         processes: RunProcessSupervisor | None = None,
         timeout: float = 600,
@@ -104,6 +116,8 @@ class MiniSweFeedbackEvaluator:
             raise ValueError("feedback evaluator timeout must be positive")
         self.model = model
         self.base_url = base_url
+        self.api_key = api_key
+        self.connection_resolver = connection_resolver
         self.state_root = (
             Path(state_root).expanduser().resolve()
             if state_root is not None
@@ -123,9 +137,7 @@ class MiniSweFeedbackEvaluator:
         stored_lead = context.get("stored_lead")
         if stored_lead is not None:
             if not isinstance(stored_lead, dict):
-                raise RuntimeError(
-                    "stored feedback lead configuration is invalid"
-                )
+                raise RuntimeError("stored feedback lead configuration is invalid")
             if stored_lead.get("runtime") != MINI_SWE_RUNTIME:
                 raise RuntimeError(
                     "unsupported stored feedback runtime: "
@@ -137,9 +149,7 @@ class MiniSweFeedbackEvaluator:
             if model is None:
                 model = stored_model
         if not model:
-            raise RuntimeError(
-                "feedback evaluator requires an explicit stored model"
-            )
+            raise RuntimeError("feedback evaluator requires an explicit stored model")
         prompt = json.dumps(
             {
                 "task": (
@@ -149,14 +159,48 @@ class MiniSweFeedbackEvaluator:
                 ),
                 "context": context,
                 "actions": {
-                    "revise": "valid in-scope source change required",
+                    "revise": "concrete valid in-scope source change required",
                     "answer": (
-                        "relevant question or explanation without source change"
+                        "actual concrete question or requested explanation "
+                        "without source change"
                     ),
                     "decline": (
-                        "incorrect, contradictory, or out-of-scope request"
+                        "concrete incorrect, contradictory, or out-of-scope request"
                     ),
                     "ignore": "no response or source action is warranted",
+                },
+                "routing": {
+                    "eligible": [
+                        (
+                            "a general comment explicitly addressed to "
+                            "context.application_login"
+                        ),
+                        (
+                            "a concrete pull-request question, requested change, "
+                            "contradiction, or substantive review finding, even "
+                            "when it begins with another account mention"
+                        ),
+                        (
+                            "an unresolved inline review finding, which does not "
+                            "require an @ mention"
+                        ),
+                    ],
+                    "ignore": [
+                        (
+                            "a recognized standalone external-integration command "
+                            "whose leading @login addresses another account, "
+                            "including @login review and @login address that feedback"
+                        ),
+                        (
+                            "a generic review wrapper, acknowledgment, status "
+                            "remark, or input with no concrete question, request, "
+                            "contradiction, or finding"
+                        ),
+                    ],
+                    "response": (
+                        "Never invent a review or status summary for non-actionable "
+                        "input. Return ignore with an empty response instead."
+                    ),
                 },
                 "response_schema": {
                     "action": "revise|answer|decline|ignore",
@@ -172,10 +216,15 @@ class MiniSweFeedbackEvaluator:
             if run_id
             else uuid.uuid5(uuid.NAMESPACE_URL, prompt).hex
         )
+        base_url = self.base_url
+        api_key = self.api_key
+        if self.connection_resolver is not None:
+            base_url, api_key = self.connection_resolver(model)
         inference = self._build_inference(
             MiniSweInference(
                 model=model,
-                base_url=self.base_url,
+                base_url=base_url,
+                api_key=api_key,
                 timeout=self.timeout,
                 supervisor=self.processes,
                 run_id=run_id,
@@ -209,7 +258,6 @@ class FeedbackService:
         evaluator: FeedbackEvaluator,
         executor: SourceExecutor,
         publisher: RevisionPublisher,
-        quiet: QuietStarter,
     ) -> None:
         self.database = database
         self.lifecycle = lifecycle
@@ -217,7 +265,6 @@ class FeedbackService:
         self.evaluator = evaluator
         self.executor = executor
         self.publisher = publisher
-        self.quiet = quiet
 
     def poll_run(self, run_id: str) -> int:
         context = self._pull_context(run_id)
@@ -234,33 +281,28 @@ class FeedbackService:
                    WHERE id=?""",
                 (pull_state, pull.head_sha, pull.updated_at, context["pull_id"]),
             )
-            if pull_state != "open":
-                connection.execute(
-                    """UPDATE quiet_periods
-                       SET state='canceled', canceled_at=?
-                       WHERE run_id=? AND state='active'""",
-                    (_utc_now(), run_id),
-                )
         if pull_state != "open":
-            state = RunState(str(self.lifecycle.get_run(run_id)["state"]))
-            if state in {
-                RunState.PUBLISHING,
-                RunState.WAITING_FOR_FEEDBACK,
-                RunState.RESOLVING_FEEDBACK,
-                RunState.QUIET_PERIOD,
-                RunState.NOTIFIED,
-            }:
-                self.lifecycle.transition(
-                    run_id,
-                    RunState.CLOSED,
-                    reason="pull request was merged or closed by an external actor",
-                )
+            self.lifecycle.close_pull_request_attempt(run_id, pull)
             return 0
+        conflict_item: FeedbackItem | None = None
+        if pull.mergeable is False:
+            current_base_sha = self.gateway.get_remote_branch_head(
+                str(context["owner"]),
+                str(context["name"]),
+                pull.base_branch,
+            )
+            if current_base_sha is None:
+                raise RuntimeError(
+                    "conflicting pull request base branch has no current head"
+                )
+            conflict_item = _base_conflict_item(pull, current_base_sha)
         items = self.gateway.list_feedback(
             str(context["owner"]),
             str(context["name"]),
             _required_int(context["pull_number"], "pull number"),
         )
+        if conflict_item is not None:
+            items.insert(0, conflict_item)
         inserted = 0
         with self.database.transaction() as connection:
             output_rows = connection.execute(
@@ -272,17 +314,22 @@ class FeedbackService:
                 (str(row["feedback_type"]), str(row["github_object_id"]))
                 for row in output_rows
             }
+            current_conflict_id: str | None = None
             for item in items:
                 if (item.feedback_type, item.object_id) in outputs:
                     continue
                 feedback_id = _stable_id(
                     f"{context['pull_id']}:{item.feedback_type}:{item.object_id}:{item.version}"
                 )
+                if item.feedback_type == "base_conflict":
+                    current_conflict_id = feedback_id
                 cursor = connection.execute(
                     """INSERT OR IGNORE INTO feedback_versions
                        (id, pull_request_id, feedback_type, github_object_id,
-                        github_version, author, body, path, line, url, state, observed_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                        github_version, author, body, path, line, url,
+                        review_thread_id, review_thread_resolved, state,
+                        observed_at, decision_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
                     (
                         feedback_id,
                         context["pull_id"],
@@ -294,11 +341,137 @@ class FeedbackService:
                         item.path,
                         item.line,
                         item.url,
+                        item.review_thread_id,
+                        (
+                            int(item.review_thread_resolved)
+                            if item.review_thread_resolved is not None
+                            else None
+                        ),
                         _utc_now(),
+                        (
+                            _json(
+                                asdict(
+                                    FeedbackDecision(
+                                        action="revise",
+                                        reason=(
+                                            "The current open pull request is "
+                                            "not mergeable into its base."
+                                        ),
+                                        response=(
+                                            "Resolved the current base conflict, "
+                                            "revalidated the result, and updated "
+                                            "this pull request."
+                                        ),
+                                    )
+                                )
+                            )
+                            if item.feedback_type == "base_conflict"
+                            else None
+                        ),
                     ),
                 )
+                if item.review_thread_id is not None:
+                    connection.execute(
+                        """UPDATE feedback_versions
+                           SET review_thread_id=?, review_thread_resolved=?
+                           WHERE pull_request_id=?
+                             AND feedback_type=?
+                             AND github_object_id=?
+                             AND github_version=?""",
+                        (
+                            item.review_thread_id,
+                            int(bool(item.review_thread_resolved)),
+                            context["pull_id"],
+                            item.feedback_type,
+                            item.object_id,
+                            item.version,
+                        ),
+                    )
                 inserted += cursor.rowcount
+            if pull.mergeable is not None:
+                self._supersede_base_conflicts(
+                    connection,
+                    run_id=run_id,
+                    pull_request_id=str(context["pull_id"]),
+                    current_conflict_id=current_conflict_id,
+                )
+            self._activate_pending_feedback(connection, run_id)
         return inserted
+
+    @staticmethod
+    def _supersede_base_conflicts(
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        pull_request_id: str,
+        current_conflict_id: str | None,
+    ) -> None:
+        rows = connection.execute(
+            """SELECT id
+               FROM feedback_versions
+               WHERE pull_request_id=?
+                 AND feedback_type='base_conflict'
+                 AND state IN ('pending', 'processing')
+                 AND (? IS NULL OR id<>?)""",
+            (
+                pull_request_id,
+                current_conflict_id,
+                current_conflict_id,
+            ),
+        ).fetchall()
+        stale_ids = {str(row["id"]) for row in rows}
+        if not stale_ids:
+            return
+        now = _utc_now()
+        for feedback_id in stale_ids:
+            connection.execute(
+                """UPDATE feedback_versions
+                   SET state='resolved',
+                       processed_at=COALESCE(processed_at, ?),
+                       superseded_at=?,
+                       superseded_by_feedback_id=?
+                   WHERE id=?
+                     AND state IN ('pending', 'processing')""",
+                (
+                    now,
+                    now,
+                    current_conflict_id,
+                    feedback_id,
+                ),
+            )
+        operations = connection.execute(
+            """SELECT id, request_json
+               FROM outbound_operations
+               WHERE run_id=?
+                 AND kind='feedback_revision_batch'
+                 AND state='pending'""",
+            (run_id,),
+        ).fetchall()
+        for operation in operations:
+            try:
+                request = json.loads(str(operation["request_json"]))
+            except (TypeError, ValueError):
+                continue
+            feedback_ids = (
+                request.get("feedback_ids")
+                if isinstance(request, dict)
+                else None
+            )
+            if not isinstance(feedback_ids, list) or stale_ids.isdisjoint(
+                str(value) for value in feedback_ids
+            ):
+                continue
+            connection.execute(
+                """UPDATE outbound_operations
+                   SET state='reconciled', external_id=?, completed_at=?,
+                       error=NULL
+                   WHERE id=? AND state='pending'""",
+                (
+                    current_conflict_id,
+                    now,
+                    operation["id"],
+                ),
+            )
 
     def resolve_run(self, run_id: str) -> int:
         processed = 0
@@ -307,95 +480,342 @@ class FeedbackService:
             self.poll_run(run_id)
             if self._pull_context(run_id)["pull_state"] != "open":
                 return processed
-            if self.lifecycle.get_run(run_id)["state"] in {
-                RunState.CANCELED.value,
-                RunState.CLOSED.value,
-            }:
-                return processed
             pending = self._pending(run_id)
             if not pending:
+                if self._has_review_thread_work(run_id):
+                    if not self._ensure_resolving(run_id):
+                        return processed
+                    try:
+                        self._resolve_review_threads(run_id)
+                    except Exception:
+                        return processed
+                    if self._has_review_thread_work(run_id):
+                        return processed
                 self._finish_feedback_cycle(run_id)
                 return processed
-            for row in pending:
-                run = self.lifecycle.get_run(run_id)
-                if str(run["state"]) == RunState.PUBLISHING.value:
-                    source_sha = row.get("source_sha")
-                    decision_json = row.get("decision_json")
-                    if not source_sha and decision_json:
-                        decision = FeedbackDecision(**json.loads(str(decision_json)))
-                        if decision.action == "revise" and run.get("validated_sha"):
-                            source_sha = str(run["validated_sha"])
-                            with self.database.transaction() as connection:
-                                connection.execute(
-                                    "UPDATE feedback_versions SET source_sha=? WHERE id=?",
-                                    (source_sha, row["id"]),
-                                )
-                            row["source_sha"] = source_sha
-                    if source_sha and self.publisher.publish(run_id) is None:
+            if not self._ensure_resolving(run_id):
+                return processed
+
+            try:
+                for row in pending:
+                    self._decision(run_id, row)
+                    if not self._ensure_resolving(run_id):
                         return processed
-                if not self._ensure_resolving(run_id):
-                    return processed
-                try:
-                    decision = self._decision(run_id, row)
-                    if self.lifecycle.get_run(run_id)["state"] != RunState.RESOLVING_FEEDBACK.value:
-                        return processed
-                    source_sha = row.get("source_sha")
-                    if decision.action == "revise" and not source_sha:
-                        feedback_context = json.dumps(
-                            {
-                                "feedback": self._feedback_payload(row),
-                                "decision": asdict(decision),
-                                "instruction": "Implement this valid in-scope feedback on the existing pull-request checkout, then rerun affected repository validation.",
-                            },
-                            sort_keys=True,
-                        )
-                        source_sha = self.executor.execute(
-                            run_id, additional_context=feedback_context
-                        )
-                        if source_sha is None:
-                            return processed
-                        with self.database.transaction() as connection:
-                            connection.execute(
-                                "UPDATE feedback_versions SET source_sha=? WHERE id=?",
-                                (source_sha, row["id"]),
-                            )
-                        if self.publisher.publish(run_id) is None:
-                            return processed
+            except Exception:
+                return processed
+
+            pending = self._pending(run_id)
+            if any(row.get("decision_json") is None for row in pending):
+                continue
+
+            revisions: list[dict[str, object]] = []
+            try:
+                for row in pending:
+                    decision = self._stored_decision(row)
+                    if decision.action == "revise":
+                        revisions.append(row)
+                        continue
                     if decision.response:
-                        if not self._ensure_resolving(run_id):
-                            return processed
                         self._respond(run_id, row, decision.response)
-                    if self.lifecycle.get_run(run_id)["state"] != RunState.RESOLVING_FEEDBACK.value:
-                        return processed
                     final_state = {
-                        "revise": "resolved",
                         "answer": "answered",
                         "decline": "declined",
                         "ignore": "resolved",
                     }[decision.action]
-                    with self.database.transaction() as connection:
-                        connection.execute(
-                            """UPDATE feedback_versions
-                               SET state=?, processed_at=? WHERE id=?""",
-                            (final_state, _utc_now(), row["id"]),
-                        )
+                    self._complete_feedback((row,), final_state)
                     processed += 1
+            except Exception:
+                return processed
+
+            self.poll_run(run_id)
+            if self._pull_context(run_id)["pull_state"] != "open":
+                return processed
+            pending = self._pending(run_id)
+            if not pending:
+                continue
+            if any(row.get("decision_json") is None for row in pending):
+                continue
+            revisions = [
+                row
+                for row in pending
+                if self._stored_decision(row).action == "revise"
+            ]
+            if len(revisions) != len(pending):
+                continue
+
+            self._recover_revision_batch(run_id, revisions)
+            source_shas = {
+                str(row["source_sha"])
+                for row in revisions
+                if row.get("source_sha")
+            }
+            all_bound = len(source_shas) == 1 and all(
+                row.get("source_sha") for row in revisions
+            )
+            if all_bound and self._published_revision_sha(run_id) in source_shas:
+                self._complete_feedback(tuple(revisions), "resolved")
+                processed += len(revisions)
+                continue
+
+            if not all_bound:
+                state = RunState(str(self.lifecycle.get_run(run_id)["state"]))
+                if state == RunState.PUBLISHING:
+                    self.lifecycle.transition(
+                        run_id,
+                        RunState.IMPLEMENTING,
+                        reason=(
+                            "new pull-request feedback arrived before publication"
+                        ),
+                    )
+                elif state not in {
+                    RunState.RESOLVING_FEEDBACK,
+                    RunState.IMPLEMENTING,
+                    RunState.VALIDATING,
+                }:
+                    return processed
+                try:
+                    batch_operation_id = self._stage_revision_batch(
+                        run_id,
+                        revisions,
+                    )
+                    source_sha = self.executor.execute(
+                        run_id,
+                        additional_context=self._revision_context(
+                            run_id,
+                            revisions,
+                        ),
+                    )
+                except PublicationBaseChanged:
+                    continue
                 except Exception:
                     return processed
-            # The next loop is an immediate GitHub repoll before quiet time.
+                if source_sha is None:
+                    return processed
+                with self.database.transaction() as connection:
+                    for row in revisions:
+                        connection.execute(
+                            "UPDATE feedback_versions SET source_sha=? WHERE id=?",
+                            (source_sha, row["id"]),
+                        )
+                    connection.execute(
+                        """UPDATE outbound_operations
+                           SET state='completed', external_id=?, completed_at=?,
+                               error=NULL
+                           WHERE id=?""",
+                        (source_sha, _utc_now(), batch_operation_id),
+                    )
+
+                self.poll_run(run_id)
+                if self._pull_context(run_id)["pull_state"] != "open":
+                    return processed
+                latest = self._pending(run_id)
+                revision_ids = {str(row["id"]) for row in revisions}
+                if any(
+                    str(row["id"]) not in revision_ids
+                    or row.get("decision_json") is None
+                    for row in latest
+                ):
+                    continue
+
+            if self.publisher.publish(run_id) is None:
+                return processed
+            self._complete_feedback(tuple(revisions), "resolved")
+            processed += len(revisions)
         return processed
 
-    def _decision(
-        self, run_id: str, row: dict[str, object]
-    ) -> FeedbackDecision:
+    @staticmethod
+    def _stored_decision(row: dict[str, object]) -> FeedbackDecision:
+        value = row.get("decision_json")
+        if not value:
+            raise RuntimeError("feedback decision is not durable")
+        return FeedbackDecision(**json.loads(str(value)))
+
+    def _complete_feedback(
+        self,
+        rows: tuple[dict[str, object], ...],
+        state: str,
+    ) -> None:
+        now = _utc_now()
+        with self.database.transaction() as connection:
+            for row in rows:
+                connection.execute(
+                    """UPDATE feedback_versions
+                       SET state=?, processed_at=? WHERE id=?""",
+                    (state, now, row["id"]),
+                )
+
+    def _stage_revision_batch(
+        self,
+        run_id: str,
+        rows: list[dict[str, object]],
+    ) -> str:
+        feedback_ids = sorted(str(row["id"]) for row in rows)
+        idempotency_key = (
+            f"{run_id}:feedback-revision-batch:" + ",".join(feedback_ids)
+        )
+        operation_id = _stable_id(idempotency_key)
+        with self.database.transaction() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO outbound_operations
+                   (id, run_id, kind, idempotency_key, request_json, state,
+                    created_at)
+                   VALUES (?, ?, 'feedback_revision_batch', ?, ?, 'pending', ?)""",
+                (
+                    operation_id,
+                    run_id,
+                    idempotency_key,
+                    _json({"feedback_ids": feedback_ids}),
+                    _utc_now(),
+                ),
+            )
+        return operation_id
+
+    def _recover_revision_batch(
+        self,
+        run_id: str,
+        rows: list[dict[str, object]],
+    ) -> None:
+        run = self.lifecycle.get_run(run_id)
+        if (
+            run["state"] != RunState.PUBLISHING.value
+            or not run.get("validated_sha")
+        ):
+            return
+        with self.database.connect() as connection:
+            operation = connection.execute(
+                """SELECT id, request_json FROM outbound_operations
+                   WHERE run_id=? AND kind='feedback_revision_batch'
+                     AND state='pending'
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT 1""",
+                (run_id,),
+            ).fetchone()
+        if operation is None:
+            return
+        request = json.loads(str(operation["request_json"]))
+        feedback_ids = request.get("feedback_ids")
+        if not isinstance(feedback_ids, list) or not all(
+            isinstance(value, str) for value in feedback_ids
+        ):
+            raise RuntimeError("durable feedback revision batch is invalid")
+        by_id = {str(row["id"]): row for row in rows}
+        matched = [by_id[value] for value in feedback_ids if value in by_id]
+        if not matched:
+            return
+        source_sha = str(run["validated_sha"])
+        now = _utc_now()
+        with self.database.transaction() as connection:
+            for row in matched:
+                connection.execute(
+                    """UPDATE feedback_versions
+                       SET source_sha=? WHERE id=? AND source_sha IS NULL""",
+                    (source_sha, row["id"]),
+                )
+                row["source_sha"] = source_sha
+            connection.execute(
+                """UPDATE outbound_operations
+                   SET state='completed', external_id=?, completed_at=?,
+                       error=NULL
+                   WHERE id=?""",
+                (source_sha, now, operation["id"]),
+            )
+
+    def _published_revision_sha(self, run_id: str) -> str | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT remote_head_sha FROM pull_requests WHERE run_id=?""",
+                (run_id,),
+            ).fetchone()
+        if row is None or row["remote_head_sha"] is None:
+            return None
+        return str(row["remote_head_sha"])
+
+    def _revision_context(
+        self,
+        run_id: str,
+        rows: list[dict[str, object]],
+    ) -> str:
+        batch: list[dict[str, object]] = []
+        for row in rows:
+            decision = self._stored_decision(row)
+            instruction = (
+                "Implement this valid in-scope feedback on the existing "
+                "pull-request checkout, then rerun affected repository validation."
+            )
+            if row["feedback_type"] == "base_conflict":
+                current_base_sha = _conflict_base_sha(row)
+                if not row.get("source_sha"):
+                    prepared_sha = self.publisher.prepare_base_revision(
+                        run_id,
+                        current_base_sha,
+                    )
+                    if prepared_sha != current_base_sha:
+                        raise RuntimeError(
+                            "prepared pull-request base does not match "
+                            "the observed conflict generation"
+                        )
+                instruction = (
+                    "The controller fetched the conflicting base commit "
+                    f"{current_base_sha} into this checkout. Merge that exact "
+                    "commit into the current issue commit, resolve every conflict "
+                    "while preserving issue scope, commit the result, and rerun "
+                    "required validation. Keep the existing branch and pull request."
+                )
+            batch.append(
+                {
+                    "feedback": self._feedback_payload(row),
+                    "decision": asdict(decision),
+                    "instruction": instruction,
+                }
+            )
+        return json.dumps(
+            {
+                "instruction": (
+                    "Implement every revision in this feedback batch as one "
+                    "candidate, internally review it, then validate it once."
+                ),
+                "feedback_batch": batch,
+            },
+            sort_keys=True,
+        )
+
+    def _decision(self, run_id: str, row: dict[str, object]) -> FeedbackDecision:
         existing = row.get("decision_json")
         if existing:
+            if row.get("state") == "pending":
+                with self.database.transaction() as connection:
+                    connection.execute(
+                        "UPDATE feedback_versions SET state='processing' WHERE id=?",
+                        (row["id"],),
+                    )
+                row["state"] = "processing"
             value = json.loads(str(existing))
             return FeedbackDecision(**value)
-        context = self._evaluation_context(run_id, row)
-        decision = self.evaluator.evaluate(context)
+
+        application_login: str | None = None
+        if (
+            row.get("feedback_type") == "inline_comment"
+            and bool(row.get("review_thread_resolved"))
+        ):
+            decision = FeedbackDecision(
+                action="ignore",
+                reason="The GitHub review thread is already resolved.",
+                response="",
+            )
+        else:
+            if row.get("feedback_type") == "comment":
+                application_login = self.gateway.application_login()
+            decision = _addressing_decision(row, application_login)
+        if decision is None:
+            context = self._evaluation_context(
+                run_id,
+                row,
+                application_login=application_login,
+            )
+            decision = self.evaluator.evaluate(context)
+
         self.poll_run(run_id)
-        if self.lifecycle.get_run(run_id)["state"] != RunState.RESOLVING_FEEDBACK.value:
+        if not self._ensure_resolving(run_id):
             raise RuntimeError("run stopped during feedback evaluation")
         with self.database.transaction() as connection:
             connection.execute(
@@ -457,10 +877,24 @@ class FeedbackService:
             author=str(row["author"]),
             body=str(row["body"]),
             path=str(row["path"]) if row.get("path") is not None else None,
-            line=_required_int(row["line"], "feedback line") if row.get("line") is not None else None,
+            line=(
+                _required_int(row["line"], "feedback line")
+                if row.get("line") is not None
+                else None
+            ),
             url=str(row.get("url") or ""),
             created_at=str(row["observed_at"]),
             updated_at=str(row["github_version"]),
+            review_thread_id=(
+                str(row["review_thread_id"])
+                if row.get("review_thread_id") is not None
+                else None
+            ),
+            review_thread_resolved=(
+                bool(row["review_thread_resolved"])
+                if row.get("review_thread_resolved") is not None
+                else None
+            ),
         )
 
     def _respond(
@@ -484,7 +918,7 @@ class FeedbackService:
         )
         if output is None:
             with self.lifecycle.external_effect(run_id) as active:
-                if not active or self.lifecycle.get_run(run_id)["state"] != RunState.RESOLVING_FEEDBACK.value:
+                if not active or not self._ensure_resolving(run_id):
                     raise RuntimeError("run stopped before feedback response")
                 output = self.gateway.post_response(
                     str(context["owner"]),
@@ -568,34 +1002,253 @@ class FeedbackService:
             ).fetchone()
         return operation_id, str(row["attempted_at"])
 
+    def _has_review_thread_work(self, run_id: str) -> bool:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT
+                       EXISTS (
+                           SELECT 1
+                           FROM feedback_versions
+                           JOIN pull_requests
+                             ON pull_requests.id=feedback_versions.pull_request_id
+                           WHERE pull_requests.run_id=?
+                             AND feedback_versions.state IN (
+                                 'resolved', 'answered', 'declined'
+                             )
+                             AND feedback_versions.review_thread_id IS NOT NULL
+                             AND feedback_versions.review_thread_resolved=0
+                       ),
+                       EXISTS (
+                           SELECT 1
+                           FROM outbound_operations
+                           WHERE run_id=?
+                             AND kind='resolve_review_thread'
+                             AND state IN ('pending', 'attempted')
+                       )""",
+                (run_id, run_id),
+            ).fetchone()
+        return bool(row[0]) or bool(row[1])
+
+    def _resolve_review_threads(self, run_id: str) -> None:
+        self._stage_review_thread_operations(run_id)
+        with self.database.connect() as connection:
+            operations = connection.execute(
+                """SELECT id, request_json
+                   FROM outbound_operations
+                   WHERE run_id=?
+                     AND kind='resolve_review_thread'
+                     AND state IN ('pending', 'attempted')
+                   ORDER BY created_at, id""",
+                (run_id,),
+            ).fetchall()
+        for operation in operations:
+            request = json.loads(str(operation["request_json"]))
+            thread_id = (
+                request.get("thread_id")
+                if isinstance(request, dict)
+                else None
+            )
+            if not isinstance(thread_id, str) or not thread_id:
+                raise RuntimeError(
+                    "pending review-thread resolution has an invalid thread ID"
+                )
+            with self.database.connect() as connection:
+                unresolved = connection.execute(
+                    """SELECT 1
+                       FROM feedback_versions
+                       JOIN pull_requests
+                         ON pull_requests.id=feedback_versions.pull_request_id
+                       WHERE pull_requests.run_id=?
+                         AND feedback_versions.review_thread_id=?
+                         AND feedback_versions.state IN (
+                             'resolved', 'answered', 'declined'
+                         )
+                         AND feedback_versions.review_thread_resolved=0
+                       LIMIT 1""",
+                    (run_id, thread_id),
+                ).fetchone()
+            if unresolved is None:
+                with self.database.transaction() as connection:
+                    connection.execute(
+                        """UPDATE outbound_operations
+                           SET state='completed', external_id=?,
+                               completed_at=?, error=NULL
+                           WHERE id=?""",
+                        (thread_id, _utc_now(), operation["id"]),
+                    )
+                continue
+            try:
+                with self.database.transaction() as connection:
+                    connection.execute(
+                        """UPDATE outbound_operations
+                           SET attempted_at=?, error=NULL WHERE id=?""",
+                        (_utc_now(), operation["id"]),
+                    )
+                with self.lifecycle.external_effect(run_id) as active:
+                    if not active or not self._ensure_resolving(run_id):
+                        raise RuntimeError(
+                            "run stopped before review-thread resolution"
+                        )
+                    self.gateway.resolve_review_thread(thread_id)
+                with self.database.transaction() as connection:
+                    now = _utc_now()
+                    connection.execute(
+                        """UPDATE feedback_versions
+                           SET review_thread_resolved=1
+                           WHERE pull_request_id IN (
+                               SELECT id FROM pull_requests WHERE run_id=?
+                           )
+                             AND review_thread_id=?""",
+                        (run_id, thread_id),
+                    )
+                    connection.execute(
+                        """UPDATE outbound_operations
+                           SET state='completed', external_id=?,
+                               completed_at=?, error=NULL
+                           WHERE id=?""",
+                        (thread_id, now, operation["id"]),
+                    )
+            except Exception as error:
+                with self.database.transaction() as connection:
+                    connection.execute(
+                        """UPDATE outbound_operations
+                           SET error=? WHERE id=?""",
+                        (str(error) or error.__class__.__name__, operation["id"]),
+                    )
+                raise
+
+    def _stage_review_thread_operations(self, run_id: str) -> None:
+        with self.database.transaction() as connection:
+            threads = connection.execute(
+                """SELECT DISTINCT feedback_versions.review_thread_id
+                   FROM feedback_versions
+                   JOIN pull_requests
+                     ON pull_requests.id=feedback_versions.pull_request_id
+                   WHERE pull_requests.run_id=?
+                     AND feedback_versions.state IN (
+                         'resolved', 'answered', 'declined'
+                     )
+                     AND feedback_versions.review_thread_id IS NOT NULL
+                     AND feedback_versions.review_thread_resolved=0
+                   ORDER BY feedback_versions.review_thread_id""",
+                (run_id,),
+            ).fetchall()
+            for row in threads:
+                thread_id = str(row["review_thread_id"])
+                existing = connection.execute(
+                    """SELECT id
+                       FROM outbound_operations
+                       WHERE run_id=?
+                         AND kind='resolve_review_thread'
+                         AND state IN ('pending', 'attempted')
+                         AND json_extract(request_json, '$.thread_id')=?
+                       LIMIT 1""",
+                    (run_id, thread_id),
+                ).fetchone()
+                if existing is not None:
+                    continue
+                generation = int(
+                    connection.execute(
+                        """SELECT COUNT(*)
+                           FROM outbound_operations
+                           WHERE run_id=?
+                             AND kind='resolve_review_thread'
+                             AND json_extract(
+                                 request_json,
+                                 '$.thread_id'
+                             )=?""",
+                        (run_id, thread_id),
+                    ).fetchone()[0]
+                ) + 1
+                idempotency_key = (
+                    f"{run_id}:resolve-review-thread:{thread_id}:{generation}"
+                )
+                connection.execute(
+                    """INSERT INTO outbound_operations
+                       (id, run_id, kind, idempotency_key, request_json, state,
+                        created_at)
+                       VALUES (?, ?, 'resolve_review_thread', ?, ?, 'pending', ?)""",
+                    (
+                        _stable_id(idempotency_key),
+                        run_id,
+                        idempotency_key,
+                        _json({"thread_id": thread_id}),
+                        _utc_now(),
+                    ),
+                )
+
+    def _activate_pending_feedback(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+    ) -> None:
+        row = connection.execute(
+            """SELECT runs.state,
+                      repositories.enabled AS repository_enabled,
+                      repositories.removed_at AS repository_removed_at,
+                      EXISTS (
+                          SELECT 1
+                          FROM feedback_versions
+                          JOIN pull_requests
+                            ON pull_requests.id=feedback_versions.pull_request_id
+                          WHERE pull_requests.run_id=runs.id
+                            AND feedback_versions.state IN ('pending', 'processing')
+                      ) AS has_pending
+               FROM runs
+               JOIN repositories ON repositories.id=runs.repository_id
+               WHERE runs.id=?""",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        state = RunState(str(row["state"]))
+        if (
+            not bool(row["has_pending"])
+            or not bool(row["repository_enabled"])
+            or row["repository_removed_at"] is not None
+            or state != RunState.WAITING_FOR_FEEDBACK
+        ):
+            return
+        now = _utc_now()
+        connection.execute(
+            """UPDATE runs
+               SET state='resolving_feedback', last_completed_state=?,
+                   reason=NULL, updated_at=?
+               WHERE id=?""",
+            (state.value, now, run_id),
+        )
+        connection.execute(
+            """INSERT INTO run_transitions
+               (run_id, from_state, to_state, occurred_at)
+               VALUES (?, ?, 'resolving_feedback', ?)""",
+            (run_id, state.value, now),
+        )
+
     def _ensure_resolving(self, run_id: str) -> bool:
         run = self.lifecycle.get_run(run_id)
         state = RunState(str(run["state"]))
-        if state == RunState.BLOCKED:
-            return False
         if state in {
-            RunState.WAITING_FOR_FEEDBACK,
-            RunState.QUIET_PERIOD,
-            RunState.NOTIFIED,
+            RunState.BLOCKED,
+            RunState.CANCELED,
+            RunState.CLOSED,
         }:
-            with self.database.transaction() as connection:
-                connection.execute(
-                    """UPDATE quiet_periods
-                       SET state='canceled', canceled_at=?
-                       WHERE run_id=? AND state='active'""",
-                    (_utc_now(), run_id),
-                )
+            return False
+        if state == RunState.WAITING_FOR_FEEDBACK:
             self.lifecycle.transition(run_id, RunState.RESOLVING_FEEDBACK)
             return True
-        return state == RunState.RESOLVING_FEEDBACK
+        return state in {
+            RunState.RESOLVING_FEEDBACK,
+            RunState.IMPLEMENTING,
+            RunState.VALIDATING,
+            RunState.PUBLISHING,
+        }
 
     def _finish_feedback_cycle(self, run_id: str) -> None:
+        if self._pending(run_id) or self._has_review_thread_work(run_id):
+            return
         state = RunState(str(self.lifecycle.get_run(run_id)["state"]))
         if state == RunState.RESOLVING_FEEDBACK:
             self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
-            state = RunState.WAITING_FOR_FEEDBACK
-        if state == RunState.WAITING_FOR_FEEDBACK:
-            self.quiet.start(run_id)
 
     def _pending(self, run_id: str) -> list[dict[str, object]]:
         with self.database.connect() as connection:
@@ -628,7 +1281,11 @@ class FeedbackService:
         return dict(row)
 
     def _evaluation_context(
-        self, run_id: str, feedback: dict[str, object]
+        self,
+        run_id: str,
+        feedback: dict[str, object],
+        *,
+        application_login: str | None = None,
     ) -> dict[str, object]:
         with self.database.connect() as connection:
             row = connection.execute(
@@ -672,6 +1329,7 @@ class FeedbackService:
         )
         return {
             "run_id": run_id,
+            "application_login": application_login,
             "issue": {
                 "title": row["title"],
                 "body": row["body"],
@@ -702,6 +1360,77 @@ class FeedbackService:
             "line": row.get("line"),
             "url": row.get("url"),
         }
+
+
+def _addressing_decision(
+    row: dict[str, object],
+    application_login: str | None,
+) -> FeedbackDecision | None:
+    if row.get("feedback_type") != "comment":
+        return None
+    match = re.fullmatch(
+        (
+            r"\s*@(?P<login>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))"
+            r"(?:\s*[:,]\s*|\s+)"
+            r"(?:review|address\s+that\s+feedback)\s*[.!]?\s*"
+        ),
+        str(row.get("body") or ""),
+        flags=re.IGNORECASE,
+    )
+    if (
+        match is None
+        or match.group("login").casefold() == str(application_login).casefold()
+    ):
+        return None
+    return FeedbackDecision(
+        action="ignore",
+        reason=(
+            "The recognized external-integration command is addressed to "
+            f"@{match.group('login')}, not the authenticated Repogents account "
+            f"@{application_login}."
+        ),
+        response="",
+    )
+
+
+def _base_conflict_item(
+    pull: PullRequestInfo,
+    base_sha: str | None = None,
+) -> FeedbackItem | None:
+    if pull.mergeable is not False:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{40}", pull.head_sha):
+        raise RuntimeError("conflicting pull request has an invalid head commit SHA")
+    current_base_sha = base_sha if base_sha is not None else pull.base_sha
+    if not re.fullmatch(r"[0-9a-f]{40}", current_base_sha):
+        raise RuntimeError(
+            "conflicting pull request has no valid current base commit SHA"
+        )
+    return FeedbackItem(
+        feedback_type="base_conflict",
+        object_id=pull.node_id,
+        version=f"{pull.head_sha}:{current_base_sha}",
+        author="github",
+        body=(
+            f"Pull request #{pull.number} at head {pull.head_sha} no longer "
+            f"merges cleanly into {pull.base_branch} at {current_base_sha}. "
+            "Resolve the base conflict on the existing branch, rerun required "
+            "validation, and update this same pull request."
+        ),
+        path=None,
+        line=None,
+        url=pull.url,
+        created_at=pull.updated_at,
+        updated_at=pull.updated_at,
+    )
+
+
+def _conflict_base_sha(row: dict[str, object]) -> str:
+    version = str(row.get("github_version") or "")
+    _, separator, base_sha = version.partition(":")
+    if not separator or not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+        raise RuntimeError("stored base-conflict feedback has an invalid generation")
+    return base_sha
 
 
 def _committed_diff(checkout: Path, base_sha: str, validated_sha: str) -> str:

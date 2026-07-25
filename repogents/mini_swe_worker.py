@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import importlib
 import json
@@ -11,7 +12,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-
 DefaultAgent: Any = None
 LitellmModel: Any = None
 Submitted: Any = None
@@ -20,6 +20,11 @@ FormatError: Any = None
 _COMPLETION_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 _REASONING_EFFORTS = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024
+_MULTIMODAL_REGEX = (
+    r"(?s)<MSWEA_MULTIMODAL_CONTENT><CONTENT_TYPE>(.+?)</CONTENT_TYPE>"
+    r"(.+?)</MSWEA_MULTIMODAL_CONTENT>"
 )
 
 
@@ -34,9 +39,7 @@ class ControllerDecisionEnvironment:
         try:
             command = action.get("command")
             if not isinstance(command, str):
-                raise ValueError(
-                    "mini-SWE decision action requires a command string"
-                )
+                raise ValueError("mini-SWE decision action requires a command string")
             lines = command.lstrip().splitlines(keepends=True)
             if not lines or lines[0].strip() != _COMPLETION_MARKER:
                 raise ValueError(
@@ -45,9 +48,7 @@ class ControllerDecisionEnvironment:
             submission = "".join(lines[1:]).strip()
             decision = _single_json_object(submission)
             if not isinstance(decision, dict):
-                raise TypeError(
-                    "mini-SWE submission must contain one JSON object"
-                )
+                raise TypeError("mini-SWE submission must contain one JSON object")
             _validate_schema(decision, self.response_schema)
         except (TypeError, ValueError) as error:
             if FormatError is None:
@@ -107,7 +108,9 @@ class ControllerDecisionEnvironment:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if len(arguments) not in {1, 2}:
-        raise ValueError("mini-SWE worker expects a request path and optional response path")
+        raise ValueError(
+            "mini-SWE worker expects a request path and optional response path"
+        )
     request_path = Path(arguments[0].removeprefix("@")).expanduser().resolve()
     response_path = (
         Path(arguments[1]).expanduser().resolve() if len(arguments) == 2 else None
@@ -143,14 +146,48 @@ def _model_configuration(selector: str) -> tuple[str, str | None]:
     return selector, None
 
 
+def _multimodal_task(prompt: str, image_paths: object) -> tuple[str, bool]:
+    if not isinstance(image_paths, list) or any(
+        not isinstance(value, str) or not value.strip() for value in image_paths
+    ):
+        raise TypeError("mini-SWE worker image paths must be a string list")
+    if not image_paths:
+        return prompt, False
+    parts = [prompt.rstrip()]
+    for value in image_paths:
+        path = Path(value).expanduser().resolve(strict=True)
+        if not path.is_file():
+            raise ValueError("mini-SWE worker image path must be a file")
+        body = path.read_bytes()
+        if not body or len(body) > _MAX_IMAGE_BYTES:
+            raise ValueError("mini-SWE worker image size is invalid")
+        if body.startswith(b"\x89PNG\r\n\x1a\n"):
+            media_type = "image/png"
+        elif body.startswith(b"\xff\xd8\xff"):
+            media_type = "image/jpeg"
+        elif len(body) >= 12 and body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+            media_type = "image/webp"
+        else:
+            raise ValueError("mini-SWE worker image type is unsupported")
+        encoded = base64.b64encode(body).decode("ascii")
+        parts.append(
+            "<MSWEA_MULTIMODAL_CONTENT><CONTENT_TYPE>image_url</CONTENT_TYPE>"
+            f"data:{media_type};base64,{encoded}"
+            "</MSWEA_MULTIMODAL_CONTENT>"
+        )
+    return "\n".join(parts), True
+
+
 def _run_request(
     request: Mapping[str, object],
 ) -> tuple[dict[str, object], dict[str, object]]:
-    model, reasoning_effort = _model_configuration(
-        _required_string(request, "model")
-    )
+    model, reasoning_effort = _model_configuration(_required_string(request, "model"))
     system_prompt = _required_string(request, "system_prompt")
     prompt = _required_string(request, "prompt", allow_empty=True)
+    task, has_images = _multimodal_task(
+        prompt,
+        request.get("image_paths", []),
+    )
     state_directory = Path(_required_string(request, "state_directory")).resolve()
     state_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     state_directory.chmod(0o700)
@@ -185,7 +222,9 @@ def _run_request(
         model_name=model,
         model_kwargs=model_kwargs,
         cost_tracking="ignore_errors",
+        multimodal_regex=_MULTIMODAL_REGEX if has_images else "",
     )
+    _abort_permanent_model_errors(model_adapter)
     environment = ControllerDecisionEnvironment(response_schema)
     protocol = (
         system_prompt.rstrip()
@@ -207,7 +246,7 @@ def _run_request(
         max_consecutive_format_errors=2,
         output_path=None,
     )
-    outcome = agent.run(task=prompt)
+    outcome = agent.run(task=task)
     submission = outcome.get("submission") if isinstance(outcome, dict) else None
     if not isinstance(submission, str) or not submission.strip():
         raise ValueError("mini-SWE agent did not submit one decision")
@@ -236,6 +275,15 @@ def _load_harness() -> None:
             Submitted = module.Submitted
         if FormatError is None:
             FormatError = module.FormatError
+
+
+def _abort_permanent_model_errors(model_adapter: object) -> None:
+    module = importlib.import_module("litellm")
+    bad_request_error = module.exceptions.BadRequestError
+    existing = list(getattr(model_adapter, "abort_exceptions", ()))
+    if bad_request_error not in existing:
+        existing.append(bad_request_error)
+    model_adapter.abort_exceptions = existing
 
 
 def _write_trajectory(
@@ -273,8 +321,7 @@ def _write_trajectory(
     )
     temporary = destination.with_suffix(".tmp")
     temporary.write_text(
-        json.dumps(trajectory, ensure_ascii=False, indent=2, sort_keys=True)
-        + "\n",
+        json.dumps(trajectory, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     temporary.chmod(0o600)
@@ -354,16 +401,14 @@ def _validate_schema(
     if isinstance(value, str):
         minimum_length = schema.get("minLength")
         if isinstance(minimum_length, int) and len(value) < minimum_length:
-            raise ValueError(
-                f"{path} requires at least {minimum_length} characters"
-            )
+            raise ValueError(f"{path} requires at least {minimum_length} characters")
 
 
 def _has_json_type(value: object, expected: str) -> bool:
     checks = {
         "array": lambda item: isinstance(item, list),
         "boolean": lambda item: isinstance(item, bool),
-        "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+        "integer": lambda item: (isinstance(item, int) and not isinstance(item, bool)),
         "null": lambda item: item is None,
         "number": lambda item: isinstance(item, (int, float))
         and not isinstance(item, bool),

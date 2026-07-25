@@ -5,14 +5,23 @@ import subprocess
 import tempfile
 import threading
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Callable
 from unittest import mock
 
 from repogents.database import Database
-from repogents.feedback import FeedbackDecision, FeedbackService, MiniSweFeedbackEvaluator
+from repogents.execution import ExecutionService, ScriptedRuntime
+from repogents.feedback import (
+    FeedbackDecision,
+    FeedbackService,
+    MiniSweFeedbackEvaluator,
+)
 from repogents.github import FeedbackItem, FeedbackOutput, PullRequestInfo
 from repogents.lifecycle import RunLifecycle, RunState
+from repogents.team import TeamService
+from repogents.publication import PublicationBaseChanged
 from repogents.sandbox import SandboxManager
 
 
@@ -22,6 +31,20 @@ class NoActivationClient:
 
     def get_branch_head(self, owner: str, name: str, branch: str) -> str:
         return "a" * 40
+
+    issue_state = "open"
+
+    def get_issue(self, owner: str, name: str, number: int) -> object:
+        return SimpleNamespace(
+            node_id="I1",
+            number=number,
+            url=f"https://github.com/{owner}/{name}/issues/{number}",
+            title="Issue",
+            body="Body",
+            discussion=(),
+            updated_at="2026-01-01T00:08:00Z",
+            state=self.issue_state,
+        )
 
 
 class NoCheckoutManager:
@@ -38,10 +61,7 @@ class FeedbackLifecycle(RunLifecycle):
         reason: str | None = None,
     ) -> None:
         run = self.get_run(run_id)
-        if (
-            run["state"] == RunState.PUBLISHING.value
-            and target == RunState.CLOSED
-        ):
+        if run["state"] == RunState.PUBLISHING.value and target == RunState.CLOSED:
             if not (reason or "").strip():
                 raise ValueError("closed transition requires a reason")
             now = "2026-01-01T00:07:00Z"
@@ -63,7 +83,6 @@ class FeedbackLifecycle(RunLifecycle):
         super().transition(run_id, target, reason=reason)
 
 
-
 class FakeFeedbackGateway:
     def __init__(self) -> None:
         self.items: list[FeedbackItem] = []
@@ -71,6 +90,7 @@ class FakeFeedbackGateway:
         self.post_calls = 0
         self.polls = 0
         self.status_calls = 0
+        self.application_author = "configured-user"
         self.pull = PullRequestInfo(
             node_id="PR1",
             number=11,
@@ -80,18 +100,38 @@ class FakeFeedbackGateway:
             head_branch="agent/issue-3-run-1",
             head_sha="b" * 40,
             base_branch="main",
+            base_sha="a" * 40,
+            mergeable=True,
             updated_at="2026-01-01T00:00:00Z",
         )
         self.crash_after_post = False
         self.inject_after_first_poll: FeedbackItem | None = None
+        self.resolve_thread_calls: list[str] = []
+        self.resolve_thread_head_shas: list[str] = []
+        self.resolve_thread_output_counts: list[int] = []
+        self.fail_before_thread_resolution = False
+        self.crash_after_thread_resolution = False
+        self.remote_base_head: str | None = None
+        self.base_head_reads: list[tuple[str, str, str]] = []
 
-    def get_pull_request(
-        self, owner: str, name: str, number: int
-    ) -> PullRequestInfo:
+    def get_pull_request(self, owner: str, name: str, number: int) -> PullRequestInfo:
         self.status_calls += 1
         return self.pull
 
-    def list_feedback(self, owner: str, name: str, pull_number: int) -> list[FeedbackItem]:
+    def get_remote_branch_head(
+        self, owner: str, name: str, branch: str
+    ) -> str | None:
+        self.base_head_reads.append((owner, name, branch))
+        if self.remote_base_head is not None:
+            return self.remote_base_head
+        return self.pull.base_sha
+
+    def application_login(self) -> str:
+        return self.application_author
+
+    def list_feedback(
+        self, owner: str, name: str, pull_number: int
+    ) -> list[FeedbackItem]:
         self.polls += 1
         values = list(self.items)
         if self.polls >= 2 and self.inject_after_first_poll is not None:
@@ -126,7 +166,11 @@ class FakeFeedbackGateway:
     ) -> FeedbackOutput:
         self.post_calls += 1
         output = FeedbackOutput(
-            feedback_type="inline_comment" if feedback.feedback_type == "inline_comment" else "comment",
+            feedback_type=(
+                "inline_comment"
+                if feedback.feedback_type == "inline_comment"
+                else "comment"
+            ),
             object_id=f"output-{self.post_calls}",
             target_object_id=feedback.object_id,
             body=body,
@@ -138,6 +182,25 @@ class FakeFeedbackGateway:
             self.crash_after_post = False
             raise RuntimeError("connection dropped after response was accepted")
         return output
+    def resolve_review_thread(self, thread_id: str) -> None:
+        self.resolve_thread_calls.append(thread_id)
+        self.resolve_thread_head_shas.append(self.pull.head_sha)
+        self.resolve_thread_output_counts.append(len(self.outputs))
+        if self.fail_before_thread_resolution:
+            self.fail_before_thread_resolution = False
+            raise RuntimeError("connection dropped before thread was resolved")
+        self.items = [
+            (
+                replace(item, review_thread_resolved=True)
+                if item.review_thread_id == thread_id
+                else item
+            )
+            for item in self.items
+        ]
+        if self.crash_after_thread_resolution:
+            self.crash_after_thread_resolution = False
+            raise RuntimeError("connection dropped after thread was resolved")
+
 
 
 class FakeEvaluator:
@@ -148,21 +211,40 @@ class FakeEvaluator:
         body = str(context["feedback"]["body"])
         self.calls.append(body)
         if "change" in body.lower():
-            return FeedbackDecision("revise", "valid in-scope change", "Implemented and validated the requested change.")
+            return FeedbackDecision(
+                "revise",
+                "valid in-scope change",
+                "Implemented and validated the requested change.",
+            )
         if "?" in body:
-            return FeedbackDecision("answer", "relevant question", "The behavior follows the repository contract.")
+            return FeedbackDecision(
+                "answer",
+                "relevant question",
+                "The behavior follows the repository contract.",
+            )
         if "wrong" in body.lower():
-            return FeedbackDecision("decline", "request contradicts issue scope", "Declined because it contradicts the issue scope.")
-        return FeedbackDecision("answer", "relevant feedback", "Acknowledged and resolved.")
+            return FeedbackDecision(
+                "decline",
+                "request contradicts issue scope",
+                "Declined because it contradicts the issue scope.",
+            )
+        return FeedbackDecision(
+            "answer", "relevant feedback", "Acknowledged and resolved."
+        )
 
 
 class FakeExecutor:
     def __init__(self, lifecycle: RunLifecycle) -> None:
         self.lifecycle = lifecycle
         self.calls: list[tuple[str, str | None]] = []
+        self.after_execute: Callable[[], None] | None = None
 
     def execute(self, run_id: str, *, additional_context: str | None = None) -> str:
         self.calls.append((run_id, additional_context))
+        if self.after_execute is not None:
+            callback = self.after_execute
+            self.after_execute = None
+            callback()
         self.lifecycle.transition(run_id, RunState.VALIDATING)
         with self.lifecycle.database.transaction() as connection:
             connection.execute(
@@ -185,6 +267,17 @@ class FakePublisher:
         self.calls: list[str] = []
         self.source_shas_at_call: list[str | None] = []
         self.fail_once = False
+        self.prepared_bases: list[tuple[str, str]] = []
+        self.base_change_once: str | None = None
+
+    def prepare_base_revision(self, run_id: str, expected_base_sha: str) -> str:
+        self.prepared_bases.append((run_id, expected_base_sha))
+        if self.base_change_once is not None:
+            actual_base_sha = self.base_change_once
+            self.base_change_once = None
+            self.gateway.remote_base_head = actual_base_sha
+            raise PublicationBaseChanged(expected_base_sha, actual_base_sha)
+        return expected_base_sha
 
     def publish(self, run_id: str) -> object | None:
         self.calls.append(run_id)
@@ -203,36 +296,35 @@ class FakePublisher:
             self.fail_once = False
             return None
         with self.database.transaction() as connection:
+            validated_sha = str(
+                connection.execute(
+                    "SELECT validated_sha FROM runs WHERE id=?", (run_id,)
+                ).fetchone()["validated_sha"]
+            )
             connection.execute(
                 """UPDATE pull_requests SET validated_head_sha=?, remote_head_sha=?, updated_at=?
                    WHERE run_id=?""",
-                ("c" * 40, "c" * 40, "2026-01-01T00:06:00Z", run_id),
+                (
+                    validated_sha,
+                    validated_sha,
+                    "2026-01-01T00:06:00Z",
+                    run_id,
+                ),
             )
         self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
         self.gateway.pull = replace(
             self.gateway.pull,
-            head_sha="c" * 40,
+            head_sha=validated_sha,
+            mergeable=True,
             updated_at="2026-01-01T00:06:00Z",
         )
         return object()
 
 
-class FakeQuietStarter:
-    def __init__(self, lifecycle: RunLifecycle) -> None:
-        self.lifecycle = lifecycle
-        self.calls: list[str] = []
-
-    def start(self, run_id: str) -> None:
-        self.calls.append(run_id)
-        state = self.lifecycle.get_run(run_id)["state"]
-        if state == "resolving_feedback":
-            self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
-        if self.lifecycle.get_run(run_id)["state"] == "waiting_for_feedback":
-            self.lifecycle.transition(run_id, RunState.QUIET_PERIOD)
-
-
 class MiniSweFeedbackEvaluatorTests(unittest.TestCase):
-    def test_passes_stored_model_base_url_state_directory_supervisor_and_run_id(self) -> None:
+    def test_passes_stored_model_base_url_state_directory_supervisor_and_run_id(
+        self,
+    ) -> None:
         observed: dict[str, object] = {}
         state_root = Path("/model-state/feedback")
 
@@ -241,7 +333,14 @@ class MiniSweFeedbackEvaluatorTests(unittest.TestCase):
 
         supervisor = FakeSupervisor()
 
-        def fake_infer(self, *, system_prompt: str, prompt: str, response_schema: dict, state_directory: Path) -> dict:
+        def fake_infer(
+            self,
+            *,
+            system_prompt: str,
+            prompt: str,
+            response_schema: dict,
+            state_directory: Path,
+        ) -> dict:
             observed["model"] = self.model
             observed["base_url"] = self.base_url
             observed["timeout"] = self.timeout
@@ -293,7 +392,15 @@ class MiniSweFeedbackEvaluatorTests(unittest.TestCase):
         self.assertIn("feedback", str(observed["state_directory"]))
         prompt_data = json.loads(observed["prompt"])
         self.assertIn("response_schema", prompt_data)
-        self.assertEqual(prompt_data["response_schema"]["action"], "revise|answer|decline|ignore")
+        self.assertEqual(
+            prompt_data["response_schema"]["action"], "revise|answer|decline|ignore"
+        )
+        routing = json.dumps(prompt_data["routing"])
+        self.assertIn("context.application_login", routing)
+        self.assertIn("leading @login", routing)
+        self.assertIn("concrete pull-request", routing)
+        self.assertIn("begins with another account mention", routing)
+        self.assertIn("Never invent a review or status summary", routing)
         self.assertTrue(
             "Return exactly one JSON object" in observed["system_prompt"]
             or "Return one JSON" in observed["system_prompt"]
@@ -303,7 +410,14 @@ class MiniSweFeedbackEvaluatorTests(unittest.TestCase):
         observed: dict[str, object] = {}
         large_feedback = {"body": "x" * 100_000}
 
-        def fake_infer(self, *, system_prompt: str, prompt: str, response_schema: dict, state_directory: Path) -> dict:
+        def fake_infer(
+            self,
+            *,
+            system_prompt: str,
+            prompt: str,
+            response_schema: dict,
+            state_directory: Path,
+        ) -> dict:
             observed["system_prompt"] = system_prompt
             observed["prompt"] = prompt
             return {"action": "answer", "reason": "ok", "response": "Handled."}
@@ -343,7 +457,9 @@ class MiniSweFeedbackEvaluatorTests(unittest.TestCase):
             )
         self.assertIn("omp", str(raised.exception))
 
-    def test_requires_explicit_model_when_no_constructor_or_stored_override(self) -> None:
+    def test_requires_explicit_model_when_no_constructor_or_stored_override(
+        self,
+    ) -> None:
         evaluator = MiniSweFeedbackEvaluator()
         with self.assertRaises(RuntimeError) as raised:
             evaluator.evaluate({"feedback": {"body": "Hello"}})
@@ -353,7 +469,14 @@ class MiniSweFeedbackEvaluatorTests(unittest.TestCase):
         state_root = Path("/model-state/feedback")
         observed_dirs: list[Path] = []
 
-        def fake_infer(self, *, system_prompt: str, prompt: str, response_schema: dict, state_directory: Path) -> dict:
+        def fake_infer(
+            self,
+            *,
+            system_prompt: str,
+            prompt: str,
+            response_schema: dict,
+            state_directory: Path,
+        ) -> dict:
             observed_dirs.append(state_directory)
             return {"action": "ignore", "reason": "n/a", "response": ""}
 
@@ -401,7 +524,9 @@ class FeedbackTests(unittest.TestCase):
         now = "2026-01-01T00:00:00Z"
         sandbox_root = self.data_root / "repositories" / "repo-1" / "sandbox" / "1"
         sandbox_root.mkdir(parents=True)
-        checkout = self.data_root / "repositories" / "repo-1" / "runs" / "run-1" / "checkout"
+        checkout = (
+            self.data_root / "repositories" / "repo-1" / "runs" / "run-1" / "checkout"
+        )
         checkout.mkdir(parents=True)
         with self.db.transaction() as connection:
             connection.execute(
@@ -423,13 +548,15 @@ class FeedbackTests(unittest.TestCase):
                    VALUES ('team-1', 'repo-1', 1, '{}', ?)""",
                 (now,),
             )
-            connection.execute(
-                """INSERT INTO team_members
+            connection.execute("""UPDATE repositories
+                   SET current_sandbox_version_id='sandbox-1',
+                       current_team_version_id='team-1'
+                   WHERE id='repo-1'""")
+            connection.execute("""INSERT INTO team_members
                    (id, team_version_id, stable_key, role, responsibilities,
                     permitted_tools_json, runtime, model, instructions)
                    VALUES ('lead-1', 'team-1', 'lead', 'lead', 'Own', '[]',
-                           'mini-swe-agent', 'openai/gpt-stored', '')"""
-            )
+                           'mini-swe-agent', 'openai/gpt-stored', '')""")
             connection.execute(
                 """INSERT INTO issues
                    (id, repository_id, github_node_id, number, url, title, body,
@@ -475,7 +602,6 @@ class FeedbackTests(unittest.TestCase):
         self.evaluator = FakeEvaluator()
         self.executor = FakeExecutor(self.lifecycle)
         self.publisher = FakePublisher(self.db, self.lifecycle, self.gateway)
-        self.quiet = FakeQuietStarter(self.lifecycle)
         self.service = FeedbackService(
             database=self.db,
             lifecycle=self.lifecycle,
@@ -483,7 +609,6 @@ class FeedbackTests(unittest.TestCase):
             evaluator=self.evaluator,
             executor=self.executor,
             publisher=self.publisher,
-            quiet=self.quiet,
         )
         self._seed_commit_history()
 
@@ -561,6 +686,8 @@ class FeedbackTests(unittest.TestCase):
         body: str,
         *,
         author: str = "reviewer",
+        review_thread_id: str | None = None,
+        review_thread_resolved: bool | None = None,
     ) -> FeedbackItem:
         return FeedbackItem(
             feedback_type=feedback_type,
@@ -573,6 +700,1236 @@ class FeedbackTests(unittest.TestCase):
             url=f"url-{object_id}",
             created_at="2026-01-01T00:01:00Z",
             updated_at=version,
+            review_thread_id=review_thread_id,
+            review_thread_resolved=review_thread_resolved,
+        )
+
+    def test_command_addressed_to_other_account_is_ignored_without_work(
+        self,
+    ) -> None:
+        self.gateway.items = [
+            self.item(
+                "comment",
+                "codex-command",
+                "v1",
+                "@codex review",
+                author="configured-user",
+            ),
+            self.item(
+                "comment",
+                "codex-address-command",
+                "v1",
+                "@codex address that feedback",
+                author="configured-user",
+            ),
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 2)
+
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                """SELECT state, decision_json FROM feedback_versions
+                   ORDER BY github_object_id"""
+            ).fetchall()
+            operation_count = connection.execute(
+                "SELECT COUNT(*) FROM outbound_operations"
+            ).fetchone()[0]
+        decisions = [json.loads(str(row["decision_json"])) for row in rows]
+        self.assertEqual([row["state"] for row in rows], ["resolved", "resolved"])
+        self.assertEqual(
+            [decision["action"] for decision in decisions],
+            ["ignore", "ignore"],
+        )
+        self.assertEqual(
+            [decision["response"] for decision in decisions],
+            ["", ""],
+        )
+        self.assertEqual(self.evaluator.calls, [])
+        self.assertEqual(self.executor.calls, [])
+        self.assertEqual(self.publisher.calls, [])
+        self.assertEqual(self.gateway.post_calls, 0)
+        self.assertEqual(operation_count, 0)
+
+    def test_configured_addressee_and_incidental_mention_remain_evaluable(
+        self,
+    ) -> None:
+        self.gateway.items = [
+            self.item(
+                "comment",
+                "addressed-question",
+                "v1",
+                "@configured-user why is this correct?",
+            ),
+            self.item(
+                "comment",
+                "incidental-mention",
+                "v1",
+                "Why does the note from @alice matter?",
+            ),
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 2)
+
+        self.assertEqual(
+            self.evaluator.calls,
+            [
+                "@configured-user why is this correct?",
+                "Why does the note from @alice matter?",
+            ],
+        )
+        self.assertEqual(self.gateway.post_calls, 2)
+
+    def test_actionable_feedback_with_other_leading_addressee_is_evaluated(
+        self,
+    ) -> None:
+        body = "@alice, please change the null handling."
+        self.gateway.items = [
+            self.item(
+                "comment",
+                "other-addressee-actionable",
+                "v1",
+                body,
+            )
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 1)
+
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT state, decision_json FROM feedback_versions"
+            ).fetchone()
+        decision = json.loads(str(row["decision_json"]))
+        self.assertEqual(row["state"], "resolved")
+        self.assertEqual(decision["action"], "revise")
+        self.assertEqual(self.evaluator.calls, [body])
+        self.assertEqual(len(self.executor.calls), 1)
+        self.assertEqual(self.publisher.calls, ["run-1"])
+
+    def test_resolved_inline_thread_is_ignored_without_work(self) -> None:
+        self.gateway.items = [
+            self.item(
+                "inline_comment",
+                "resolved-inline",
+                "v1",
+                "Change this implementation.",
+                review_thread_id="THREAD-resolved",
+                review_thread_resolved=True,
+            )
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 1)
+
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT state, decision_json FROM feedback_versions"
+            ).fetchone()
+            operation_count = connection.execute(
+                "SELECT COUNT(*) FROM outbound_operations"
+            ).fetchone()[0]
+        decision = json.loads(str(row["decision_json"]))
+        self.assertEqual(row["state"], "resolved")
+        self.assertEqual(decision["action"], "ignore")
+        self.assertEqual(decision["response"], "")
+        self.assertEqual(self.evaluator.calls, [])
+        self.assertEqual(self.executor.calls, [])
+        self.assertEqual(self.publisher.calls, [])
+        self.assertEqual(self.gateway.resolve_thread_calls, [])
+        self.assertEqual(self.gateway.post_calls, 0)
+        self.assertEqual(operation_count, 0)
+
+    def test_unknown_mergeability_does_not_create_conflict_feedback(
+        self,
+    ) -> None:
+        self.gateway.pull = replace(
+            self.gateway.pull,
+            base_sha="d" * 40,
+            mergeable=None,
+        )
+
+        self.assertEqual(self.service.poll_run("run-1"), 0)
+
+        with self.db.connect() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM feedback_versions"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+        self.assertEqual(
+            self.lifecycle.get_run("run-1")["state"],
+            RunState.WAITING_FOR_FEEDBACK.value,
+        )
+
+    def test_idle_open_pull_does_not_churn_waiting_state(self) -> None:
+        with self.db.connect() as connection:
+            before = connection.execute(
+                "SELECT updated_at FROM runs WHERE id='run-1'"
+            ).fetchone()[0]
+            transitions_before = connection.execute(
+                "SELECT COUNT(*) FROM run_transitions WHERE run_id='run-1'"
+            ).fetchone()[0]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 0)
+
+        with self.db.connect() as connection:
+            after = connection.execute(
+                "SELECT updated_at FROM runs WHERE id='run-1'"
+            ).fetchone()[0]
+            transitions_after = connection.execute(
+                "SELECT COUNT(*) FROM run_transitions WHERE run_id='run-1'"
+            ).fetchone()[0]
+            quiet_count = connection.execute(
+                "SELECT COUNT(*) FROM quiet_periods"
+            ).fetchone()[0]
+            notification_count = connection.execute(
+                "SELECT COUNT(*) FROM notifications"
+            ).fetchone()[0]
+        self.assertEqual(
+            self.lifecycle.get_run("run-1")["state"],
+            RunState.WAITING_FOR_FEEDBACK.value,
+        )
+        self.assertEqual(after, before)
+        self.assertEqual(transitions_after, transitions_before)
+        self.assertEqual(quiet_count, 0)
+        self.assertEqual(notification_count, 0)
+
+    def test_later_feedback_after_idle_poll_uses_same_run(self) -> None:
+        self.assertEqual(self.service.poll_run("run-1"), 0)
+        self.gateway.items = [
+            self.item(
+                "comment",
+                "later-feedback",
+                "v1",
+                "Why does this remain active?",
+            )
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 1)
+
+        with self.db.connect() as connection:
+            run_count = connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+            pull_count = connection.execute(
+                "SELECT COUNT(*) FROM pull_requests WHERE run_id='run-1'"
+            ).fetchone()[0]
+            feedback_state = connection.execute("""SELECT state FROM feedback_versions
+                   WHERE github_object_id='later-feedback'""").fetchone()[0]
+            quiet_count = connection.execute(
+                "SELECT COUNT(*) FROM quiet_periods"
+            ).fetchone()[0]
+        self.assertEqual(run_count, 1)
+        self.assertEqual(pull_count, 1)
+        self.assertEqual(feedback_state, "answered")
+        self.assertEqual(
+            self.lifecycle.get_run("run-1")["state"],
+            RunState.WAITING_FOR_FEEDBACK.value,
+        )
+        self.assertEqual(quiet_count, 0)
+
+    def test_review_thread_resolution_reconciles_after_accepted_mutation_crash(
+        self,
+    ) -> None:
+        self.gateway.items = [
+            self.item(
+                "inline_comment",
+                "thread-feedback",
+                "v1",
+                "Please change this behavior.",
+                review_thread_id="THREAD-1",
+                review_thread_resolved=False,
+            )
+        ]
+        self.gateway.crash_after_thread_resolution = True
+
+        self.assertEqual(self.service.resolve_run("run-1"), 1)
+
+        with self.db.connect() as connection:
+            first = connection.execute(
+                """SELECT runs.state, feedback_versions.state AS feedback_state,
+                          feedback_versions.review_thread_resolved,
+                          outbound_operations.state AS operation_state
+                   FROM runs
+                   JOIN pull_requests ON pull_requests.run_id=runs.id
+                   JOIN feedback_versions
+                     ON feedback_versions.pull_request_id=pull_requests.id
+                   JOIN outbound_operations
+                     ON outbound_operations.run_id=runs.id
+                    AND outbound_operations.kind='resolve_review_thread'
+                   WHERE runs.id='run-1'"""
+            ).fetchone()
+        self.assertEqual(
+            tuple(first),
+            ("resolving_feedback", "resolved", 0, "pending"),
+        )
+        self.assertEqual(self.gateway.resolve_thread_calls, ["THREAD-1"])
+        self.assertEqual(self.gateway.resolve_thread_head_shas, ["c" * 40])
+
+        restarted_database = Database(self.root / "db.sqlite3")
+        restarted_database.initialize()
+        restarted_lifecycle = FeedbackLifecycle(
+            database=restarted_database,
+            data_root=self.data_root,
+            github=NoActivationClient(),
+            checkouts=NoCheckoutManager(),
+            sandbox=self.sandbox,
+        )
+        restarted = FeedbackService(
+            database=restarted_database,
+            lifecycle=restarted_lifecycle,
+            gateway=self.gateway,
+            evaluator=self.evaluator,
+            executor=FakeExecutor(restarted_lifecycle),
+            publisher=FakePublisher(
+                restarted_database,
+                restarted_lifecycle,
+                self.gateway,
+            ),
+        )
+
+        self.assertEqual(restarted.resolve_run("run-1"), 0)
+
+        with restarted_database.connect() as connection:
+            final = connection.execute(
+                """SELECT runs.state, feedback_versions.review_thread_resolved,
+                          outbound_operations.state
+                   FROM runs
+                   JOIN pull_requests ON pull_requests.run_id=runs.id
+                   JOIN feedback_versions
+                     ON feedback_versions.pull_request_id=pull_requests.id
+                   JOIN outbound_operations
+                     ON outbound_operations.run_id=runs.id
+                    AND outbound_operations.kind='resolve_review_thread'
+                   WHERE runs.id='run-1'"""
+            ).fetchone()
+        self.assertEqual(tuple(final), ("waiting_for_feedback", 1, "completed"))
+        self.assertEqual(self.gateway.resolve_thread_calls, ["THREAD-1"])
+
+    def test_one_thread_resolution_waits_for_all_local_responses(self) -> None:
+        self.gateway.items = [
+            self.item(
+                "inline_comment",
+                "thread-question",
+                "v1",
+                "Why does this behave this way?",
+                review_thread_id="THREAD-SHARED",
+                review_thread_resolved=False,
+            ),
+            self.item(
+                "inline_comment",
+                "thread-decline",
+                "v1",
+                "This is wrong",
+                review_thread_id="THREAD-SHARED",
+                review_thread_resolved=False,
+            ),
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 2)
+
+        with self.db.connect() as connection:
+            states = tuple(
+                row[0]
+                for row in connection.execute(
+                    """SELECT state FROM feedback_versions
+                       ORDER BY github_object_id"""
+                )
+            )
+            operations = connection.execute(
+                """SELECT COUNT(*), MIN(state)
+                   FROM outbound_operations
+                   WHERE kind='resolve_review_thread'"""
+            ).fetchone()
+        self.assertEqual(states, ("declined", "answered"))
+        self.assertEqual(tuple(operations), (1, "completed"))
+        self.assertEqual(self.gateway.post_calls, 2)
+        self.assertEqual(self.gateway.resolve_thread_calls, ["THREAD-SHARED"])
+        self.assertEqual(self.gateway.resolve_thread_output_counts, [2])
+        self.assertEqual(self.executor.calls, [])
+        self.assertEqual(self.publisher.calls, [])
+
+    def test_review_thread_resolution_retries_after_pre_mutation_crash(
+        self,
+    ) -> None:
+        self.gateway.items = [
+            self.item(
+                "inline_comment",
+                "pre-mutation-crash",
+                "v1",
+                "Please change this behavior.",
+                review_thread_id="THREAD-RETRY",
+                review_thread_resolved=False,
+            )
+        ]
+        self.gateway.fail_before_thread_resolution = True
+
+        self.assertEqual(self.service.resolve_run("run-1"), 1)
+        self.assertEqual(self.gateway.resolve_thread_calls, ["THREAD-RETRY"])
+        self.assertEqual(self.lifecycle.get_run("run-1")["state"], "resolving_feedback")
+        self.assertEqual(len(self.executor.calls), 1)
+        self.assertEqual(self.publisher.calls, ["run-1"])
+
+        restarted_database = Database(self.root / "db.sqlite3")
+        restarted_database.initialize()
+        restarted_lifecycle = FeedbackLifecycle(
+            database=restarted_database,
+            data_root=self.data_root,
+            github=NoActivationClient(),
+            checkouts=NoCheckoutManager(),
+            sandbox=self.sandbox,
+        )
+        restarted_executor = FakeExecutor(restarted_lifecycle)
+        restarted_publisher = FakePublisher(
+            restarted_database,
+            restarted_lifecycle,
+            self.gateway,
+        )
+        restarted = FeedbackService(
+            database=restarted_database,
+            lifecycle=restarted_lifecycle,
+            gateway=self.gateway,
+            evaluator=self.evaluator,
+            executor=restarted_executor,
+            publisher=restarted_publisher,
+        )
+
+        self.assertEqual(restarted.resolve_run("run-1"), 0)
+
+        with restarted_database.connect() as connection:
+            operation = connection.execute(
+                """SELECT COUNT(*), MIN(state)
+                   FROM outbound_operations
+                   WHERE kind='resolve_review_thread'"""
+            ).fetchone()
+        self.assertEqual(tuple(operation), (1, "completed"))
+        self.assertEqual(
+            self.gateway.resolve_thread_calls,
+            ["THREAD-RETRY", "THREAD-RETRY"],
+        )
+        self.assertEqual(restarted_executor.calls, [])
+        self.assertEqual(restarted_publisher.calls, [])
+        self.assertEqual(
+            restarted_lifecycle.get_run("run-1")["state"],
+            "waiting_for_feedback",
+        )
+
+    def test_historical_completed_feedback_is_matched_to_thread_in_place(
+        self,
+    ) -> None:
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO feedback_versions
+                   (id, pull_request_id, feedback_type, github_object_id,
+                    github_version, author, body, path, line, url, state,
+                    observed_at, processed_at)
+                   VALUES ('historical-feedback', 'pr-1', 'inline_comment',
+                           'historical-comment', 'v1', 'reviewer',
+                           'Already handled', 'app.py', 10, 'comment-url',
+                           'resolved', '2026-01-01T00:01:00Z',
+                           '2026-01-01T00:02:00Z')"""
+            )
+        self.gateway.items = [
+            self.item(
+                "inline_comment",
+                "historical-comment",
+                "v1",
+                "Already handled",
+                review_thread_id="THREAD-HISTORICAL",
+                review_thread_resolved=False,
+            )
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 0)
+
+        with self.db.connect() as connection:
+            feedback = connection.execute(
+                """SELECT id, review_thread_id, review_thread_resolved
+                   FROM feedback_versions
+                   WHERE github_object_id='historical-comment'"""
+            ).fetchall()
+            operation_state = connection.execute(
+                """SELECT state FROM outbound_operations
+                   WHERE kind='resolve_review_thread'"""
+            ).fetchone()[0]
+        self.assertEqual(
+            [tuple(row) for row in feedback],
+            [("historical-feedback", "THREAD-HISTORICAL", 1)],
+        )
+        self.assertEqual(operation_state, "completed")
+        self.assertEqual(self.gateway.resolve_thread_calls, ["THREAD-HISTORICAL"])
+        self.assertEqual(self.executor.calls, [])
+        self.assertEqual(self.publisher.calls, [])
+        self.assertEqual(self.gateway.post_calls, 0)
+
+    def test_closed_unmerged_pull_restarts_open_issue_exactly_once(self) -> None:
+        self.gateway.pull = replace(
+            self.gateway.pull,
+            state="closed",
+            merged=False,
+            updated_at="2026-01-01T00:08:00Z",
+        )
+
+        self.assertEqual(self.service.poll_run("run-1"), 0)
+        restarted_database = Database(self.root / "db.sqlite3")
+        restarted_database.initialize()
+        restarted_lifecycle = FeedbackLifecycle(
+            database=restarted_database,
+            data_root=self.data_root,
+            github=NoActivationClient(),
+            checkouts=NoCheckoutManager(),
+            sandbox=self.sandbox,
+        )
+        restarted = FeedbackService(
+            database=restarted_database,
+            lifecycle=restarted_lifecycle,
+            gateway=self.gateway,
+            evaluator=self.evaluator,
+            executor=FakeExecutor(restarted_lifecycle),
+            publisher=FakePublisher(
+                restarted_database,
+                restarted_lifecycle,
+                self.gateway,
+            ),
+        )
+        self.assertEqual(restarted.poll_run("run-1"), 0)
+        self.assertEqual(self.service.poll_run("run-1"), 0)
+
+        with self.db.connect() as connection:
+            runs = connection.execute(
+                """SELECT id, state, reason, sandbox_version_id, team_version_id,
+                          intended_base_branch, base_sha
+                   FROM runs ORDER BY created_at, id"""
+            ).fetchall()
+            activations = connection.execute("""SELECT github_event_id, kind
+                   FROM activation_events ORDER BY applied_at, id""").fetchall()
+            prior = connection.execute("""SELECT state FROM pull_requests
+                   WHERE run_id='run-1'""").fetchone()
+
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[0]["state"], RunState.CLOSED.value)
+        self.assertIn("closed without merge", runs[0]["reason"])
+        self.assertEqual(runs[1]["state"], RunState.QUEUED.value)
+        self.assertEqual(runs[1]["sandbox_version_id"], "sandbox-1")
+        self.assertEqual(runs[1]["team_version_id"], "team-1")
+        self.assertEqual(runs[1]["intended_base_branch"], "main")
+        self.assertEqual(runs[1]["base_sha"], "a" * 40)
+        self.assertEqual(prior["state"], "closed")
+        self.assertEqual(len(activations), 2)
+        self.assertEqual(activations[1]["kind"], "closed_pr_restart")
+        self.assertIn("PR1", activations[1]["github_event_id"])
+
+    def test_closed_unmerged_pull_does_not_restart_closed_issue(self) -> None:
+        self.lifecycle.github.issue_state = "closed"
+        self.gateway.pull = replace(
+            self.gateway.pull,
+            state="closed",
+            merged=False,
+            updated_at="2026-01-01T00:08:00Z",
+        )
+
+        self.assertEqual(self.service.poll_run("run-1"), 0)
+
+        with self.db.connect() as connection:
+            runs = connection.execute(
+                "SELECT state, reason FROM runs ORDER BY created_at, id"
+            ).fetchall()
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["state"], RunState.CLOSED.value)
+        self.assertIn("issue is closed", runs[0]["reason"])
+
+    def test_polling_feedback_activates_resolution_without_agent_work(
+        self,
+    ) -> None:
+        self.gateway.items = [
+            self.item(
+                "inline_comment",
+                "comment-during-monitoring",
+                "v1",
+                "Please change this behavior",
+            )
+        ]
+
+        self.assertEqual(self.service.poll_run("run-1"), 1)
+        self.assertEqual(self.service.poll_run("run-1"), 0)
+
+        with self.db.connect() as connection:
+            feedback_count = connection.execute(
+                "SELECT COUNT(*) FROM feedback_versions"
+            ).fetchone()[0]
+            quiet_count = connection.execute(
+                "SELECT COUNT(*) FROM quiet_periods"
+            ).fetchone()[0]
+            notification_count = connection.execute(
+                "SELECT COUNT(*) FROM notifications"
+            ).fetchone()[0]
+        self.assertEqual(
+            self.lifecycle.get_run("run-1")["state"],
+            RunState.RESOLVING_FEEDBACK.value,
+        )
+        self.assertEqual(feedback_count, 1)
+        self.assertEqual(quiet_count, 0)
+        self.assertEqual(notification_count, 0)
+        self.assertEqual(self.evaluator.calls, [])
+        self.assertEqual(self.executor.calls, [])
+
+    def test_base_advance_during_preparation_retries_only_latest_generation(
+        self,
+    ) -> None:
+        observed_base_sha = "d" * 40
+        latest_base_sha = "e" * 40
+        pull_head_sha = self.gateway.pull.head_sha
+        self.gateway.remote_base_head = observed_base_sha
+        self.gateway.pull = replace(
+            self.gateway.pull,
+            base_sha="a" * 40,
+            mergeable=False,
+        )
+        self.publisher.base_change_once = latest_base_sha
+
+        processed = self.service.resolve_run("run-1")
+
+        with self.db.connect() as connection:
+            conflicts = connection.execute(
+                """SELECT id, github_version, state, source_sha, superseded_at,
+                          superseded_by_feedback_id
+                   FROM feedback_versions
+                   WHERE pull_request_id='pr-1'
+                     AND feedback_type='base_conflict'"""
+            ).fetchall()
+            operations = connection.execute(
+                """SELECT state FROM outbound_operations
+                   WHERE run_id='run-1'
+                     AND kind='feedback_revision_batch'
+                   ORDER BY created_at, id"""
+            ).fetchall()
+        by_version = {str(row["github_version"]): row for row in conflicts}
+        observed_version = f"{pull_head_sha}:{observed_base_sha}"
+        latest_version = f"{pull_head_sha}:{latest_base_sha}"
+        observed = by_version[observed_version]
+        latest = by_version[latest_version]
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(
+            self.publisher.prepared_bases,
+            [
+                ("run-1", observed_base_sha),
+                ("run-1", latest_base_sha),
+            ],
+        )
+        self.assertEqual(len(self.executor.calls), 1)
+        context = str(self.executor.calls[0][1])
+        self.assertIn(latest_base_sha, context)
+        self.assertNotIn(observed_base_sha, context)
+        self.assertEqual(observed["state"], "resolved")
+        self.assertIsNotNone(observed["superseded_at"])
+        self.assertEqual(
+            observed["superseded_by_feedback_id"],
+            latest["id"],
+        )
+        self.assertIsNone(observed["source_sha"])
+        self.assertEqual(latest["state"], "resolved")
+        self.assertEqual(latest["source_sha"], "c" * 40)
+        self.assertIsNone(latest["superseded_at"])
+        self.assertEqual(
+            sorted(str(row["state"]) for row in operations),
+            ["completed", "reconciled"],
+        )
+        self.assertEqual(self.gateway.post_calls, 0)
+        self.assertEqual(self.publisher.calls, ["run-1"])
+
+    def test_restart_supersedes_stale_mixed_batch_and_reuses_other_feedback(
+        self,
+    ) -> None:
+        stale_base_sha = "d" * 40
+        current_base_sha = "e" * 40
+        pull_head_sha = self.gateway.pull.head_sha
+        self.gateway.remote_base_head = stale_base_sha
+        self.gateway.pull = replace(
+            self.gateway.pull,
+            base_sha="a" * 40,
+            mergeable=False,
+        )
+        self.gateway.items = [
+            self.item("inline_comment", "finding-1", "v1", "Change the first path"),
+            self.item("inline_comment", "finding-2", "v1", "Change the second path"),
+        ]
+        self.assertEqual(self.service.poll_run("run-1"), 3)
+        decision_json = json.dumps(
+            asdict(
+                FeedbackDecision(
+                    "revise",
+                    "valid in-scope change",
+                    "Implemented and validated the requested change.",
+                )
+            ),
+            sort_keys=True,
+        )
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE feedback_versions
+                   SET state='processing',
+                       decision_json=COALESCE(decision_json, ?)
+                   WHERE pull_request_id='pr-1'""",
+                (decision_json,),
+            )
+            original_rows = connection.execute(
+                """SELECT id, feedback_type, github_version
+                   FROM feedback_versions
+                   WHERE pull_request_id='pr-1'
+                   ORDER BY id"""
+            ).fetchall()
+            original_ids = [str(row["id"]) for row in original_rows]
+            connection.execute(
+                """INSERT INTO outbound_operations
+                   (id, run_id, kind, idempotency_key, request_json, state,
+                    created_at)
+                   VALUES ('stale-batch', 'run-1', 'feedback_revision_batch',
+                           'stale-batch-key', ?, 'pending',
+                           '2026-01-01T00:02:00Z')""",
+                (json.dumps({"feedback_ids": original_ids}),),
+            )
+        stale_conflict = next(
+            row
+            for row in original_rows
+            if row["feedback_type"] == "base_conflict"
+        )
+        ordinary_ids = {
+            str(row["id"])
+            for row in original_rows
+            if row["feedback_type"] == "inline_comment"
+        }
+        self.gateway.remote_base_head = current_base_sha
+
+        restarted_database = Database(self.db.path)
+        restarted_database.initialize()
+        restarted_lifecycle = FeedbackLifecycle(
+            database=restarted_database,
+            data_root=self.data_root,
+            github=NoActivationClient(),
+            checkouts=NoCheckoutManager(),
+            sandbox=self.sandbox,
+        )
+        restarted_executor = FakeExecutor(restarted_lifecycle)
+        restarted_publisher = FakePublisher(
+            restarted_database,
+            restarted_lifecycle,
+            self.gateway,
+        )
+        restarted_service = FeedbackService(
+            database=restarted_database,
+            lifecycle=restarted_lifecycle,
+            gateway=self.gateway,
+            evaluator=self.evaluator,
+            executor=restarted_executor,
+            publisher=restarted_publisher,
+        )
+
+        processed = restarted_service.resolve_run("run-1")
+
+        with restarted_database.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, feedback_type, github_version, state, source_sha,
+                          superseded_at, superseded_by_feedback_id
+                   FROM feedback_versions
+                   WHERE pull_request_id='pr-1'"""
+            ).fetchall()
+            operations = connection.execute(
+                """SELECT id, request_json, state
+                   FROM outbound_operations
+                   WHERE run_id='run-1'
+                     AND kind='feedback_revision_batch'
+                   ORDER BY created_at, id"""
+            ).fetchall()
+            pull_count = connection.execute(
+                "SELECT COUNT(*) FROM pull_requests WHERE run_id='run-1'"
+            ).fetchone()[0]
+        current_version = f"{pull_head_sha}:{current_base_sha}"
+        current_conflict = next(
+            row
+            for row in rows
+            if row["feedback_type"] == "base_conflict"
+            and row["github_version"] == current_version
+        )
+        stale_after = next(
+            row for row in rows if row["id"] == stale_conflict["id"]
+        )
+        completed_operation = next(
+            row
+            for row in operations
+            if row["id"] != "stale-batch" and row["state"] == "completed"
+        )
+        completed_ids = set(
+            json.loads(str(completed_operation["request_json"]))["feedback_ids"]
+        )
+
+        self.assertEqual(processed, 3)
+        self.assertEqual(len(restarted_executor.calls), 1)
+        self.assertEqual(restarted_publisher.prepared_bases, [("run-1", current_base_sha)])
+        self.assertEqual(restarted_publisher.calls, ["run-1"])
+        self.assertEqual(self.evaluator.calls, [])
+        self.assertEqual(stale_after["state"], "resolved")
+        self.assertIsNotNone(stale_after["superseded_at"])
+        self.assertEqual(
+            stale_after["superseded_by_feedback_id"],
+            current_conflict["id"],
+        )
+        self.assertEqual(
+            next(row for row in operations if row["id"] == "stale-batch")["state"],
+            "reconciled",
+        )
+        self.assertTrue(ordinary_ids.issubset(completed_ids))
+        self.assertIn(str(current_conflict["id"]), completed_ids)
+        self.assertNotIn(str(stale_conflict["id"]), completed_ids)
+        self.assertTrue(
+            all(
+                row["state"] == "resolved" and row["source_sha"] == "c" * 40
+                for row in rows
+                if row["id"] in ordinary_ids
+                or row["id"] == current_conflict["id"]
+            )
+        )
+        self.assertEqual(pull_count, 1)
+        self.assertEqual(self.gateway.post_calls, 0)
+
+    def test_confirmed_mergeability_supersedes_unfinished_conflict(self) -> None:
+        conflict_base_sha = "d" * 40
+        self.gateway.remote_base_head = conflict_base_sha
+        self.gateway.pull = replace(self.gateway.pull, mergeable=False)
+        self.assertEqual(self.service.poll_run("run-1"), 1)
+        self.gateway.pull = replace(self.gateway.pull, mergeable=True)
+
+        self.assertEqual(self.service.poll_run("run-1"), 0)
+
+        with self.db.connect() as connection:
+            conflict = connection.execute(
+                """SELECT state, superseded_at, superseded_by_feedback_id
+                   FROM feedback_versions
+                   WHERE pull_request_id='pr-1'
+                     AND feedback_type='base_conflict'"""
+            ).fetchone()
+        self.assertEqual(conflict["state"], "resolved")
+        self.assertIsNotNone(conflict["superseded_at"])
+        self.assertIsNone(conflict["superseded_by_feedback_id"])
+        self.assertEqual(len(self.executor.calls), 0)
+
+    def test_unknown_mergeability_preserves_unfinished_conflict(self) -> None:
+        conflict_base_sha = "d" * 40
+        self.gateway.remote_base_head = conflict_base_sha
+        self.gateway.pull = replace(self.gateway.pull, mergeable=False)
+        self.assertEqual(self.service.poll_run("run-1"), 1)
+        self.gateway.pull = replace(self.gateway.pull, mergeable=None)
+        self.gateway.remote_base_head = "e" * 40
+
+        self.assertEqual(self.service.poll_run("run-1"), 0)
+
+        with self.db.connect() as connection:
+            conflict = connection.execute(
+                """SELECT state, superseded_at, superseded_by_feedback_id
+                   FROM feedback_versions
+                   WHERE pull_request_id='pr-1'
+                     AND feedback_type='base_conflict'"""
+            ).fetchone()
+        self.assertEqual(conflict["state"], "pending")
+        self.assertIsNone(conflict["superseded_at"])
+        self.assertIsNone(conflict["superseded_by_feedback_id"])
+        self.assertEqual(
+            self.gateway.base_head_reads,
+            [("owner", "repo", "main")],
+        )
+
+    def test_conflicting_head_base_generation_is_durable_across_restart(
+        self,
+    ) -> None:
+        base_sha = "d" * 40
+        self.gateway.pull = replace(
+            self.gateway.pull,
+            base_sha=base_sha,
+            mergeable=False,
+        )
+
+        self.assertEqual(self.service.poll_run("run-1"), 1)
+        restarted = FeedbackService(
+            database=Database(self.root / "db.sqlite3"),
+            lifecycle=self.lifecycle,
+            gateway=self.gateway,
+            evaluator=self.evaluator,
+            executor=self.executor,
+            publisher=self.publisher,
+        )
+        self.assertEqual(restarted.poll_run("run-1"), 0)
+
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                """SELECT feedback_type, github_object_id, github_version,
+                          state, decision_json
+                   FROM feedback_versions"""
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["feedback_type"], "base_conflict")
+        self.assertEqual(rows[0]["github_object_id"], "PR1")
+        self.assertEqual(
+            rows[0]["github_version"],
+            f"{self.gateway.pull.head_sha}:{base_sha}",
+        )
+        self.assertEqual(rows[0]["state"], "pending")
+        self.assertEqual(
+            json.loads(rows[0]["decision_json"])["action"],
+            "revise",
+        )
+
+    def test_merged_run_and_conflicting_run_are_polled_independently(
+        self,
+    ) -> None:
+        now = "2026-01-01T00:00:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO issues
+                   (id, repository_id, github_node_id, number, url, title,
+                    body, discussion_json, updated_at)
+                   VALUES ('issue-2', 'repo-1', 'I2', 4, 'issue-2-url',
+                           'Second issue', 'Second body', '[]', ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO activation_events
+                   (id, repository_id, issue_id, github_event_id, applied_at)
+                   VALUES ('activation-2', 'repo-1', 'issue-2', 'event-2', ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO runs
+                   (id, repository_id, issue_id, activation_event_id,
+                    sandbox_version_id, team_version_id,
+                    intended_base_branch, base_sha, state,
+                    last_completed_state, validated_sha, checkout_path,
+                    run_path, created_at, updated_at)
+                   VALUES ('run-2', 'repo-1', 'issue-2', 'activation-2',
+                           'sandbox-1', 'team-1', 'main', ?,
+                           'waiting_for_feedback', 'publishing', ?, ?, ?, ?, ?)""",
+                (
+                    "a" * 40,
+                    "e" * 40,
+                    str(self.root / "run-2" / "checkout"),
+                    str(self.root / "run-2"),
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('pr-2', 'run-2', 'PR2', 12, 'pr-2-url',
+                           'agent/issue-4-run-2', 'main', ?, ?, ?,
+                           'open', ?, ?)""",
+                ("a" * 40, "e" * 40, "e" * 40, now, now),
+            )
+
+        class MultiRunGateway(FakeFeedbackGateway):
+            def __init__(self) -> None:
+                super().__init__()
+                self.pulls = {
+                    11: replace(
+                        self.pull,
+                        state="closed",
+                        merged=True,
+                        mergeable=True,
+                    ),
+                    12: replace(
+                        self.pull,
+                        node_id="PR2",
+                        number=12,
+                        url="pr-2-url",
+                        head_branch="agent/issue-4-run-2",
+                        head_sha="e" * 40,
+                        base_sha="d" * 40,
+                        mergeable=False,
+                    ),
+                }
+
+            def get_pull_request(
+                self,
+                owner: str,
+                name: str,
+                number: int,
+            ) -> PullRequestInfo:
+                del owner, name
+                self.status_calls += 1
+                return self.pulls[number]
+
+        gateway = MultiRunGateway()
+        publisher = FakePublisher(self.db, self.lifecycle, gateway)
+        service = FeedbackService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            gateway=gateway,
+            evaluator=self.evaluator,
+            executor=self.executor,
+            publisher=publisher,
+        )
+
+        self.assertEqual(service.poll_run("run-1"), 0)
+        self.assertEqual(service.poll_run("run-2"), 1)
+
+        self.assertEqual(
+            self.lifecycle.get_run("run-1")["state"],
+            RunState.CLOSED.value,
+        )
+        self.assertEqual(
+            self.lifecycle.get_run("run-2")["state"],
+            RunState.RESOLVING_FEEDBACK.value,
+        )
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                """SELECT pull_requests.run_id,
+                          feedback_versions.feedback_type
+                   FROM feedback_versions
+                   JOIN pull_requests
+                     ON pull_requests.id=feedback_versions.pull_request_id"""
+            ).fetchall()
+        self.assertEqual(
+            [(row["run_id"], row["feedback_type"]) for row in rows],
+            [("run-2", "base_conflict")],
+        )
+
+    def test_conflict_revision_reuses_existing_run_checkout_branch_and_pull(
+        self,
+    ) -> None:
+        base_sha = "d" * 40
+        self.gateway.pull = replace(
+            self.gateway.pull,
+            base_sha=base_sha,
+            mergeable=False,
+        )
+
+        self.assertEqual(self.service.resolve_run("run-1"), 1)
+
+        self.assertEqual(
+            self.publisher.prepared_bases,
+            [("run-1", base_sha)],
+        )
+        self.assertEqual(len(self.executor.calls), 1)
+        self.assertIn(base_sha, str(self.executor.calls[0][1]))
+        self.assertEqual(self.evaluator.calls, [])
+        self.assertEqual(self.publisher.calls, ["run-1"])
+        with self.db.connect() as connection:
+            pull_count = connection.execute(
+                "SELECT COUNT(*) FROM pull_requests WHERE run_id='run-1'"
+            ).fetchone()[0]
+            branch = connection.execute(
+                "SELECT branch_name FROM pull_requests WHERE run_id='run-1'"
+            ).fetchone()[0]
+        self.assertEqual(pull_count, 1)
+        self.assertEqual(branch, "agent/issue-3-run-1")
+
+    def test_conflict_revision_runs_real_validation_before_updating_same_pull(
+        self,
+    ) -> None:
+        checkout, base_sha, prior_validated_sha = self._seed_commit_history()
+
+        def git(*arguments: str) -> str:
+            return subprocess.run(
+                ["git", *arguments],
+                cwd=checkout,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+
+        git("branch", "-M", "agent/issue-3-run-1")
+        git("checkout", "-b", "fixture-current-base", base_sha)
+        (checkout / "app.py").write_text(
+            "line 10 changed on current base\n", encoding="utf-8"
+        )
+        git("add", "app.py")
+        git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=f@example.com",
+            "commit",
+            "-m",
+            "advance fixture base",
+        )
+        current_base_sha = git("rev-parse", "HEAD")
+        git("checkout", "agent/issue-3-run-1")
+
+        baseline_log = self.root / "baseline.log"
+        baseline_log.write_text("fixture baseline passed\n", encoding="utf-8")
+        policy = {
+            "persistent_root": str(
+                self.data_root / "repositories" / "repo-1" / "sandbox" / "1"
+            ),
+            "allowed_host_paths": [],
+            "allowed_services": [],
+            "secret_bindings": [],
+        }
+        command = [
+            "python3",
+            "-c",
+            "compile(open('app.py', encoding='utf-8').read(), 'app.py', 'exec')",
+        ]
+        now = "2026-01-01T00:00:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE sandbox_versions SET policy_json=?
+                   WHERE id='sandbox-1'""",
+                (json.dumps(policy),),
+            )
+            connection.execute(
+                """INSERT INTO validation_commands
+                   (id, sandbox_version_id, position, command_json, source, required)
+                   VALUES ('validation-command-1', 'sandbox-1', 0, ?, 'fixture', 1)""",
+                (json.dumps(command),),
+            )
+            connection.execute(
+                """INSERT INTO validation_baselines
+                   (id, run_id, validation_command_id, command_json, base_sha,
+                    mode, started_at, completed_at, exit_status, log_path,
+                    findings_json)
+                   VALUES ('baseline-1', 'run-1', 'validation-command-1', ?, ?,
+                           'strict', ?, ?, 0, ?, '[]')""",
+                (
+                    json.dumps(command),
+                    base_sha,
+                    now,
+                    now,
+                    str(baseline_log),
+                ),
+            )
+            connection.execute("""UPDATE team_members
+                   SET permitted_tools_json='["read","git_diff","git_commit"]',
+                       model='test/lead'
+                   WHERE id='lead-1'""")
+            connection.execute("""INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions)
+                   VALUES ('implementation-1', 'team-1', 'implementation',
+                           'implementer', 'conflict resolver',
+                           'Resolve source conflicts',
+                           '["read","write","run","git_diff"]',
+                           'mini-swe-agent', 'test/implementation', '')""")
+            connection.execute("""INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions)
+                   VALUES ('verification-1', 'team-1', 'verification',
+                           'verifier', 'behavior verifier',
+                           'Independently review the conflict resolution',
+                           '["read","run","git_diff"]',
+                           'mini-swe-agent', 'test/verification', '')""")
+            connection.executemany(
+                """INSERT INTO agent_assignments
+                   (id, run_id, team_member_id, reasoning, assigned_at)
+                   VALUES (?, 'run-1', ?, 'Resolve the current base conflict', ?)""",
+                (
+                    ("lead-assignment", "lead-1", now),
+                    ("implementation-assignment", "implementation-1", now),
+                ),
+            )
+
+        implementation = ScriptedRuntime(
+            [
+                {
+                    "action": "run",
+                    "argv": [
+                        "git",
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=f@example.com",
+                        "merge",
+                        "--no-edit",
+                        current_base_sha,
+                    ],
+                },
+                {
+                    "action": "write",
+                    "path": "app.py",
+                    "content": "value = 'resolved from feature and current base'\n",
+                },
+                {
+                    "action": "finish",
+                    "summary": "resolved the current base conflict",
+                },
+            ]
+        )
+        lead = ScriptedRuntime(
+            [{"action": "finish", "summary": "integrated conflict resolution"}]
+        )
+        verification = ScriptedRuntime(
+            [{"action": "finish", "summary": "conflict resolution approved"}]
+        )
+        executor = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=(
+                lambda _runtime, model, _timeout: (
+                    lead
+                    if model == "test/lead"
+                    else verification
+                    if model == "test/verification"
+                    else implementation
+                )
+            ),
+            max_actions=10,
+            max_revision_cycles=1,
+        )
+        publisher = FakePublisher(self.db, self.lifecycle, self.gateway)
+        service = FeedbackService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            gateway=self.gateway,
+            evaluator=self.evaluator,
+            executor=executor,
+            publisher=publisher,
+        )
+        self.gateway.pull = replace(
+            self.gateway.pull,
+            head_sha=prior_validated_sha,
+            base_sha=current_base_sha,
+            mergeable=False,
+        )
+
+        processed = service.resolve_run("run-1")
+        self.assertEqual(processed, 1)
+
+        with self.db.connect() as connection:
+            run = connection.execute(
+                "SELECT state, validated_sha FROM runs WHERE id='run-1'"
+            ).fetchone()
+            validation = connection.execute(
+                """SELECT commit_sha, exit_status, verdict, log_path
+                   FROM validation_results
+                   WHERE run_id='run-1' AND commit_sha=?""",
+                (run["validated_sha"],),
+            ).fetchone()
+            pull = connection.execute(
+                """SELECT github_node_id, branch_name, remote_head_sha
+                   FROM pull_requests WHERE run_id='run-1'"""
+            ).fetchone()
+            pull_count = connection.execute(
+                "SELECT COUNT(*) FROM pull_requests WHERE run_id='run-1'"
+            ).fetchone()[0]
+        self.assertNotEqual(run["validated_sha"], prior_validated_sha)
+        self.assertEqual(run["state"], RunState.WAITING_FOR_FEEDBACK.value)
+        self.assertIsNotNone(validation)
+        self.assertEqual(validation["commit_sha"], run["validated_sha"])
+        self.assertEqual(validation["exit_status"], 0)
+        self.assertEqual(validation["verdict"], "pass")
+        self.assertTrue(Path(validation["log_path"]).is_file())
+        self.assertEqual(publisher.prepared_bases, [("run-1", current_base_sha)])
+        self.assertEqual(publisher.calls, ["run-1"])
+        self.assertEqual(pull_count, 1)
+        self.assertEqual(pull["github_node_id"], "PR1")
+        self.assertEqual(pull["branch_name"], "agent/issue-3-run-1")
+        self.assertEqual(pull["remote_head_sha"], run["validated_sha"])
+        git(
+            "merge-base",
+            "--is-ancestor",
+            current_base_sha,
+            str(run["validated_sha"]),
         )
 
     def test_evaluation_context_uses_the_runs_stored_lead_configuration(self) -> None:
@@ -664,8 +2021,7 @@ class FeedbackTests(unittest.TestCase):
         self.gateway.items = [invalid, deleted, binary]
         self.assertEqual(self.service.poll_run("run-1"), 3)
         rows = {
-            str(row["github_object_id"]): row
-            for row in self.service._pending("run-1")
+            str(row["github_object_id"]): row for row in self.service._pending("run-1")
         }
 
         contexts = {
@@ -690,7 +2046,9 @@ class FeedbackTests(unittest.TestCase):
             json.dumps(contexts["invalid-path"]["addressed_source"]),
         )
 
-    def test_ingests_mixed_and_edited_feedback_once_but_filters_recorded_outputs(self) -> None:
+    def test_ingests_mixed_and_edited_feedback_once_but_filters_recorded_outputs(
+        self,
+    ) -> None:
         with self.db.transaction() as connection:
             connection.execute(
                 """INSERT INTO outbound_operations
@@ -710,8 +2068,20 @@ class FeedbackTests(unittest.TestCase):
             self.item("inline_comment", "inline-1", "v1", "Inline body"),
             self.item("comment", "comment-1", "v1", "First version"),
             self.item("comment", "comment-1", "v2", "Edited version"),
-            self.item("comment", "app-output", "v1", "Application response", author="configured-user"),
-            self.item("comment", "manual-same-author", "v1", "Manual feedback", author="configured-user"),
+            self.item(
+                "comment",
+                "app-output",
+                "v1",
+                "Application response",
+                author="configured-user",
+            ),
+            self.item(
+                "comment",
+                "manual-same-author",
+                "v1",
+                "Manual feedback",
+                author="configured-user",
+            ),
         ]
         self.assertEqual(self.service.poll_run("run-1"), 5)
         self.assertEqual(self.service.poll_run("run-1"), 0)
@@ -722,33 +2092,49 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(len(rows), 5)
         self.assertNotIn("app-output", [row["github_object_id"] for row in rows])
         self.assertEqual(
-            [row["github_version"] for row in rows if row["github_object_id"] == "comment-1"],
+            [
+                row["github_version"]
+                for row in rows
+                if row["github_object_id"] == "comment-1"
+            ],
             ["v1", "v2"],
         )
 
     def test_answer_is_posted_once_and_never_reingested(self) -> None:
-        self.gateway.items = [self.item("comment", "question-1", "v1", "Why is this correct?")]
+        self.gateway.items = [
+            self.item("comment", "question-1", "v1", "Why is this correct?")
+        ]
         self.assertEqual(self.service.resolve_run("run-1"), 1)
         self.assertEqual(self.gateway.post_calls, 1)
         self.gateway.items.append(
-            self.item("comment", "output-1", "2026-01-01T00:05:00Z", self.gateway.outputs[0].body)
+            self.item(
+                "comment",
+                "output-1",
+                "2026-01-01T00:05:00Z",
+                self.gateway.outputs[0].body,
+            )
         )
         self.assertEqual(self.service.poll_run("run-1"), 0)
         with self.db.connect() as connection:
             row = connection.execute("SELECT state FROM feedback_versions").fetchone()
-            outputs = connection.execute("SELECT COUNT(*) FROM application_outputs").fetchone()[0]
+            outputs = connection.execute(
+                "SELECT COUNT(*) FROM application_outputs"
+            ).fetchone()[0]
         self.assertEqual(row["state"], "answered")
         self.assertEqual(outputs, 1)
         self.assertEqual(self.executor.calls, [])
-        self.assertEqual(self.quiet.calls, ["run-1"])
+        self.assertEqual(
+            self.lifecycle.get_run("run-1")["state"],
+            RunState.WAITING_FOR_FEEDBACK.value,
+        )
 
-    def test_response_loss_reconciles_on_next_attempt_without_duplicate_post(self) -> None:
+    def test_response_loss_reconciles_on_next_attempt_without_duplicate_post(
+        self,
+    ) -> None:
         self.gateway.items = [self.item("comment", "question-1", "v1", "Why?")]
         self.gateway.crash_after_post = True
         self.assertEqual(self.service.resolve_run("run-1"), 0)
-        self.assertEqual(
-            self.lifecycle.get_run("run-1")["state"], "resolving_feedback"
-        )
+        self.assertEqual(self.lifecycle.get_run("run-1")["state"], "resolving_feedback")
         output = self.gateway.outputs[0]
         self.gateway.items.append(
             self.item(
@@ -806,14 +2192,19 @@ class FeedbackTests(unittest.TestCase):
             feedback_count = connection.execute(
                 "SELECT COUNT(*) FROM feedback_versions"
             ).fetchone()[0]
-        self.assertEqual(dict(pull), {
-            "state": "closed",
-            "remote_head_sha": "d" * 40,
-            "updated_at": "2026-01-01T00:07:00Z",
-        })
+        self.assertEqual(
+            dict(pull),
+            {
+                "state": "closed",
+                "remote_head_sha": "d" * 40,
+                "updated_at": "2026-01-01T00:07:00Z",
+            },
+        )
         self.assertEqual(feedback_count, 0)
 
-    def test_cancellation_during_feedback_inference_prevents_later_effects(self) -> None:
+    def test_cancellation_during_feedback_inference_prevents_later_effects(
+        self,
+    ) -> None:
         started = threading.Event()
         release = threading.Event()
 
@@ -904,23 +2295,103 @@ class FeedbackTests(unittest.TestCase):
             ("pending", None, None),
         )
 
-    def test_source_change_is_implemented_validated_and_published_to_same_pull_request(self) -> None:
-        self.gateway.items = [self.item("inline_comment", "inline-1", "v1", "Please change this behavior")]
-        self.assertEqual(self.service.resolve_run("run-1"), 1)
+    def test_known_revision_feedback_is_combined_before_one_publication(self) -> None:
+        self.gateway.items = [
+            self.item(
+                "inline_comment",
+                "inline-1",
+                "v1",
+                "Please change this behavior",
+            ),
+            self.item(
+                "comment",
+                "comment-2",
+                "v1",
+                "Please change the related fallback",
+            ),
+        ]
+
+        self.assertEqual(self.service.resolve_run("run-1"), 2)
+
         self.assertEqual(len(self.executor.calls), 1)
-        self.assertIn("Please change", self.executor.calls[0][1])
+        revision_context = str(self.executor.calls[0][1])
+        self.assertIn("Please change this behavior", revision_context)
+        self.assertIn("Please change the related fallback", revision_context)
         self.assertEqual(self.publisher.calls, ["run-1"])
-        self.assertEqual(self.gateway.post_calls, 1)
+        self.assertEqual(self.gateway.post_calls, 0)
         with self.db.connect() as connection:
-            feedback = connection.execute("SELECT state, source_sha FROM feedback_versions").fetchone()
-            pull_count = connection.execute("SELECT COUNT(*) FROM pull_requests").fetchone()[0]
-            pull = connection.execute("SELECT remote_head_sha FROM pull_requests").fetchone()
-        self.assertEqual(feedback["state"], "resolved")
-        self.assertEqual(feedback["source_sha"], "c" * 40)
+            feedback = connection.execute(
+                """SELECT state, source_sha FROM feedback_versions
+                   ORDER BY github_object_id"""
+            ).fetchall()
+            pull_count = connection.execute(
+                "SELECT COUNT(*) FROM pull_requests"
+            ).fetchone()[0]
+            pull = connection.execute(
+                "SELECT remote_head_sha FROM pull_requests"
+            ).fetchone()
+        self.assertEqual(
+            [(row["state"], row["source_sha"]) for row in feedback],
+            [("resolved", "c" * 40), ("resolved", "c" * 40)],
+        )
         self.assertEqual(pull_count, 1)
         self.assertEqual(pull["remote_head_sha"], "c" * 40)
 
-    def test_external_close_during_publication_stops_before_reconciliation(self) -> None:
+    def test_feedback_arriving_before_publication_prevents_intermediate_push(
+        self,
+    ) -> None:
+        first = self.item(
+            "inline_comment",
+            "first-revision",
+            "v1",
+            "Please change the first behavior",
+        )
+        second = self.item(
+            "inline_comment",
+            "second-revision",
+            "v1",
+            "Please change the second behavior",
+        )
+        self.gateway.items = [first]
+
+        def inject_second() -> None:
+            self.gateway.items.append(second)
+            self.service.poll_run("run-1")
+            decision = FeedbackDecision(
+                "revise",
+                "valid in-scope change",
+                "Implemented and validated the requested change.",
+            )
+            with self.db.transaction() as connection:
+                connection.execute(
+                    """UPDATE feedback_versions
+                       SET state='processing', decision_json=?
+                       WHERE github_object_id='second-revision'""",
+                    (json.dumps(asdict(decision), sort_keys=True),),
+                )
+
+        self.executor.after_execute = inject_second
+
+        self.assertEqual(self.service.resolve_run("run-1"), 2)
+
+        self.assertEqual(len(self.executor.calls), 2)
+        self.assertIn("Please change the first behavior", self.executor.calls[0][1])
+        self.assertIn("Please change the first behavior", self.executor.calls[1][1])
+        self.assertIn("Please change the second behavior", self.executor.calls[1][1])
+        self.assertEqual(self.publisher.calls, ["run-1"])
+        self.assertEqual(self.gateway.post_calls, 0)
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                "SELECT state, source_sha FROM feedback_versions ORDER BY github_object_id"
+            ).fetchall()
+        self.assertEqual(
+            [(row["state"], row["source_sha"]) for row in rows],
+            [("resolved", "c" * 40), ("resolved", "c" * 40)],
+        )
+
+    def test_external_close_during_publication_stops_before_reconciliation(
+        self,
+    ) -> None:
         self.gateway.items = [
             self.item(
                 "inline_comment",
@@ -966,7 +2437,9 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(self.publisher.calls, [])
         self.assertEqual(self.gateway.post_calls, 0)
 
-    def test_crash_after_validation_checkpoints_sha_before_publication_without_reexecution(self) -> None:
+    def test_crash_after_validation_checkpoints_sha_before_publication_without_reexecution(
+        self,
+    ) -> None:
         self.gateway.items = [
             self.item(
                 "inline_comment",
@@ -992,6 +2465,21 @@ class FeedbackTests(unittest.TestCase):
                    SET state='publishing', validated_sha=?, updated_at=?
                    WHERE id='run-1'""",
                 ("c" * 40, "2026-01-01T00:05:00Z"),
+            )
+            feedback_id = connection.execute(
+                "SELECT id FROM feedback_versions"
+            ).fetchone()["id"]
+            connection.execute(
+                """INSERT INTO outbound_operations
+                   (id, run_id, kind, idempotency_key, request_json, state,
+                    created_at)
+                   VALUES ('revision-batch-1', 'run-1',
+                           'feedback_revision_batch', 'revision-batch-1', ?,
+                           'pending', ?)""",
+                (
+                    json.dumps({"feedback_ids": [feedback_id]}, sort_keys=True),
+                    "2026-01-01T00:04:00Z",
+                ),
             )
 
         self.assertEqual(self.service.resolve_run("run-1"), 1)
@@ -1029,16 +2517,21 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(self.service.resolve_run("run-1"), 1)
         self.assertEqual(self.publisher.calls, ["run-1", "run-1"])
         self.assertEqual(len(self.executor.calls), 1)
-        self.assertEqual(self.gateway.post_calls, 1)
+        self.assertEqual(self.gateway.post_calls, 0)
 
-    def test_immediate_repoll_processes_feedback_arriving_during_resolution(self) -> None:
+    def test_immediate_repoll_processes_feedback_arriving_during_resolution(
+        self,
+    ) -> None:
         first = self.item("comment", "first", "v1", "First question?")
         second = self.item("comment", "second", "v1", "Second question?")
         self.gateway.items = [first]
         self.gateway.inject_after_first_poll = second
         self.assertEqual(self.service.resolve_run("run-1"), 2)
         self.assertEqual(self.gateway.post_calls, 2)
-        self.assertEqual(self.quiet.calls, ["run-1"])
+        self.assertEqual(
+            self.lifecycle.get_run("run-1")["state"],
+            RunState.WAITING_FOR_FEEDBACK.value,
+        )
 
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
-
 _BASE_ENVIRONMENT_KEYS = {
     "HOME",
     "LANG",
@@ -38,14 +37,29 @@ _PROVIDER_ENVIRONMENT_KEYS = {
         "CLAUDE_CODE_USE_FOUNDRY",
         "FOUNDRY_BASE_URL",
     },
-    "aws": {"AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"},
+    "aws": {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_PROFILE",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    },
     "azure": {"AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"},
     "cerebras": {"CEREBRAS_API_KEY"},
     "cursor": {"CURSOR_ACCESS_TOKEN"},
     "deepseek": {"DEEPSEEK_API_KEY"},
-    "gemini": {"GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_LOCATION", "GOOGLE_CLOUD_PROJECT"},
+    "gemini": {
+        "GEMINI_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_CLOUD_PROJECT",
+    },
     "github-copilot": {"COPILOT_GITHUB_TOKEN"},
-    "google": {"GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_LOCATION", "GOOGLE_CLOUD_PROJECT"},
+    "google": {
+        "GEMINI_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_CLOUD_PROJECT",
+    },
     "groq": {"GROQ_API_KEY"},
     "kilo": {"KILO_API_KEY"},
     "minimax": {"MINIMAX_API_KEY"},
@@ -147,6 +161,10 @@ def git_environment(
         yield environment
 
 
+class RunPaused(RuntimeError):
+    """A controller-owned run process was interrupted by repository pause."""
+
+
 class RunProcessSupervisor:
     """Tracks and terminates controller processes owned by a run."""
 
@@ -154,6 +172,7 @@ class RunProcessSupervisor:
         self._lock = threading.Lock()
         self._processes: dict[str, set[subprocess.Popen[str]]] = {}
         self._canceled: set[str] = set()
+        self._paused: set[str] = set()
 
     def run(
         self,
@@ -169,6 +188,8 @@ class RunProcessSupervisor:
                 return subprocess.CompletedProcess(
                     list(argv), -signal.SIGTERM, "", "run canceled"
                 )
+            if run_id in self._paused:
+                raise RunPaused(run_id)
             process = subprocess.Popen(
                 list(argv),
                 cwd=cwd,
@@ -181,14 +202,23 @@ class RunProcessSupervisor:
             )
             self._processes.setdefault(run_id, set()).add(process)
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self._terminate(process)
+                process.communicate()
+                with self._lock:
+                    paused = run_id in self._paused
+                if paused:
+                    raise RunPaused(run_id)
+                raise
+            with self._lock:
+                paused = run_id in self._paused
+            if paused:
+                raise RunPaused(run_id)
             return subprocess.CompletedProcess(
                 list(argv), process.returncode, stdout, stderr
             )
-        except subprocess.TimeoutExpired:
-            self._terminate(process)
-            process.communicate()
-            raise
         finally:
             with self._lock:
                 active = self._processes.get(run_id)
@@ -203,6 +233,17 @@ class RunProcessSupervisor:
             active = tuple(self._processes.get(run_id, ()))
         for process in active:
             self._terminate(process)
+
+    def pause(self, run_id: str) -> None:
+        with self._lock:
+            self._paused.add(run_id)
+            active = tuple(self._processes.get(run_id, ()))
+        for process in active:
+            self._terminate(process)
+
+    def resume(self, run_id: str) -> None:
+        with self._lock:
+            self._paused.discard(run_id)
 
     def active(self, run_id: str) -> tuple[int, ...]:
         with self._lock:

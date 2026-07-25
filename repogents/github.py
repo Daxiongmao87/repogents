@@ -12,6 +12,50 @@ from typing import Any
 _GITHUB_HOST = "github.com"
 _IDENTITY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
+_REVIEW_THREADS_QUERY = """
+query RepogentsReviewThreads(
+  $owner: String!
+  $name: String!
+  $number: Int!
+  $after: String
+) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        nodes {
+          id
+          isResolved
+          comments(first: 100) {
+            nodes { databaseId }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+_REVIEW_THREAD_COMMENTS_QUERY = """
+query RepogentsReviewThreadComments($threadId: ID!, $after: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $after) {
+        nodes { databaseId }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+_RESOLVE_REVIEW_THREAD_MUTATION = """
+mutation RepogentsResolveReviewThread($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread { id isResolved }
+  }
+}
+"""
+
 
 @dataclass(frozen=True)
 class RepositoryInfo:
@@ -37,6 +81,7 @@ class IssueInfo:
     body: str
     discussion: tuple[dict[str, object], ...]
     updated_at: str
+    state: str = "open"
 
 
 @dataclass(frozen=True)
@@ -57,6 +102,8 @@ class PullRequestInfo:
     head_sha: str
     base_branch: str
     updated_at: str
+    base_sha: str = ""
+    mergeable: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +118,8 @@ class FeedbackItem:
     url: str
     created_at: str
     updated_at: str
+    review_thread_id: str | None = None
+    review_thread_resolved: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -182,6 +231,147 @@ class GitHubClient:
                 f"GitHub {method} {path} failed: {error.reason}"
             ) from error
 
+    def _graphql(
+        self,
+        query: str,
+        variables: dict[str, object],
+    ) -> dict[str, Any]:
+        payload, _ = self._request(
+            "POST",
+            "graphql",
+            body={"query": query, "variables": variables},
+        )
+        if not isinstance(payload, dict):
+            raise GitHubError("GitHub GraphQL response was not an object")
+        errors = payload.get("errors")
+        if errors:
+            raise GitHubError(f"GitHub GraphQL request failed: {errors}")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise GitHubError("GitHub GraphQL response omitted data")
+        return data
+
+    def _review_thread_states(
+        self,
+        owner: str,
+        name: str,
+        pull_number: int,
+    ) -> dict[str, tuple[str, bool]]:
+        states: dict[str, tuple[str, bool]] = {}
+        after: str | None = None
+        while True:
+            data = self._graphql(
+                _REVIEW_THREADS_QUERY,
+                {
+                    "owner": owner,
+                    "name": name,
+                    "number": pull_number,
+                    "after": after,
+                },
+            )
+            try:
+                threads = data["repository"]["pullRequest"]["reviewThreads"]
+            except (KeyError, TypeError) as error:
+                raise GitHubError(
+                    "GitHub review-thread response omitted the pull request"
+                ) from error
+            if not isinstance(threads, dict):
+                raise GitHubError(
+                    "GitHub review-thread response was not a connection"
+                )
+            nodes = threads.get("nodes")
+            page_info = threads.get("pageInfo")
+            if not isinstance(nodes, list) or not isinstance(page_info, dict):
+                raise GitHubError(
+                    "GitHub review-thread connection omitted pagination fields"
+                )
+            for node in nodes:
+                if not isinstance(node, dict):
+                    raise GitHubError("GitHub review-thread node was invalid")
+                thread_id = str(node.get("id") or "")
+                resolved = node.get("isResolved")
+                comments = node.get("comments")
+                if (
+                    not thread_id
+                    or not isinstance(resolved, bool)
+                    or not isinstance(comments, dict)
+                ):
+                    raise GitHubError(
+                        "GitHub review-thread node omitted required fields"
+                    )
+                self._record_thread_comments(
+                    states,
+                    thread_id,
+                    resolved,
+                    comments,
+                )
+                comment_page = comments.get("pageInfo")
+                while isinstance(comment_page, dict) and bool(
+                    comment_page.get("hasNextPage")
+                ):
+                    comment_after = comment_page.get("endCursor")
+                    if not isinstance(comment_after, str) or not comment_after:
+                        raise GitHubError(
+                            "GitHub review-thread comment cursor was missing"
+                        )
+                    comment_data = self._graphql(
+                        _REVIEW_THREAD_COMMENTS_QUERY,
+                        {"threadId": thread_id, "after": comment_after},
+                    )
+                    comment_node = comment_data.get("node")
+                    if not isinstance(comment_node, dict):
+                        raise GitHubError(
+                            "GitHub review-thread comment page omitted its thread"
+                        )
+                    comments = comment_node.get("comments")
+                    if not isinstance(comments, dict):
+                        raise GitHubError(
+                            "GitHub review-thread comment page was invalid"
+                        )
+                    self._record_thread_comments(
+                        states,
+                        thread_id,
+                        resolved,
+                        comments,
+                    )
+                    comment_page = comments.get("pageInfo")
+            if not bool(page_info.get("hasNextPage")):
+                return states
+            next_after = page_info.get("endCursor")
+            if not isinstance(next_after, str) or not next_after:
+                raise GitHubError("GitHub review-thread cursor was missing")
+            after = next_after
+
+    @staticmethod
+    def _record_thread_comments(
+        states: dict[str, tuple[str, bool]],
+        thread_id: str,
+        resolved: bool,
+        comments: dict[str, Any],
+    ) -> None:
+        nodes = comments.get("nodes")
+        page_info = comments.get("pageInfo")
+        if not isinstance(nodes, list) or not isinstance(page_info, dict):
+            raise GitHubError(
+                "GitHub review-thread comments omitted pagination fields"
+            )
+        for node in nodes:
+            if not isinstance(node, dict):
+                raise GitHubError("GitHub review-thread comment was invalid")
+            database_id = node.get("databaseId")
+            if not isinstance(database_id, int) or isinstance(database_id, bool):
+                raise GitHubError(
+                    "GitHub review-thread comment omitted its database ID"
+                )
+            object_id = str(database_id)
+            prior = states.get(object_id)
+            current = (thread_id, resolved)
+            if prior is not None and prior != current:
+                raise GitHubError(
+                    "GitHub inline comment appeared in multiple review threads"
+                )
+            states[object_id] = current
+
     def get_repository(self, identity: str) -> RepositoryInfo:
         owner, name = parse_repository_identity(identity)
         payload, _ = self._request("GET", f"repos/{owner}/{name}")
@@ -247,6 +437,7 @@ class GitHubClient:
                 body=str(payload.get("body") or ""),
                 discussion=discussion,
                 updated_at=str(payload["updated_at"]),
+                state=str(payload["state"]).lower(),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise GitHubError(
@@ -406,6 +597,11 @@ class GitHubClient:
     def _pull_request(payload: object) -> PullRequestInfo:
         if not isinstance(payload, dict):
             raise GitHubError("GitHub pull-request response was not an object")
+        mergeable = payload.get("mergeable")
+        if mergeable is not None and not isinstance(mergeable, bool):
+            raise GitHubError(
+                "GitHub pull-request mergeable result was not boolean or null"
+            )
         try:
             return PullRequestInfo(
                 node_id=str(payload["node_id"]),
@@ -417,6 +613,8 @@ class GitHubClient:
                 head_sha=str(payload["head"]["sha"]),
                 base_branch=str(payload["base"]["ref"]),
                 updated_at=str(payload["updated_at"]),
+                base_sha=str(payload["base"].get("sha", "")),
+                mergeable=mergeable,
             )
         except (KeyError, TypeError, ValueError) as error:
             raise GitHubError(
@@ -426,6 +624,7 @@ class GitHubClient:
     def list_feedback(
         self, owner: str, name: str, pull_number: int
     ) -> list[FeedbackItem]:
+        thread_states = self._review_thread_states(owner, name, pull_number)
         reviews = self._paginate(f"repos/{owner}/{name}/pulls/{pull_number}/reviews")
         inline_comments = self._paginate(
             f"repos/{owner}/{name}/pulls/{pull_number}/comments"
@@ -455,6 +654,16 @@ class GitHubClient:
                     updated_at=version,
                 )
             )
+        missing_thread_ids = [
+            str(comment.get("id") or "")
+            for comment in inline_comments
+            if str(comment.get("id") or "") not in thread_states
+        ]
+        if missing_thread_ids:
+            raise GitHubError(
+                "GitHub review-thread response omitted inline comments: "
+                + ", ".join(missing_thread_ids)
+            )
         for comment in inline_comments:
             values.append(
                 FeedbackItem(
@@ -474,6 +683,8 @@ class GitHubClient:
                     updated_at=str(
                         comment.get("updated_at") or comment.get("created_at") or ""
                     ),
+                    review_thread_id=thread_states[str(comment["id"])][0],
+                    review_thread_resolved=thread_states[str(comment["id"])][1],
                 )
             )
         for comment in comments:
@@ -504,6 +715,28 @@ class GitHubClient:
             )
         )
         return values
+
+    def resolve_review_thread(self, thread_id: str) -> None:
+        if not thread_id.strip():
+            raise ValueError("review thread ID must be nonempty")
+        data = self._graphql(
+            _RESOLVE_REVIEW_THREAD_MUTATION,
+            {"threadId": thread_id},
+        )
+        mutation = data.get("resolveReviewThread")
+        thread = (
+            mutation.get("thread")
+            if isinstance(mutation, dict)
+            else None
+        )
+        if (
+            not isinstance(thread, dict)
+            or thread.get("id") != thread_id
+            or thread.get("isResolved") is not True
+        ):
+            raise GitHubError(
+                "GitHub did not confirm review-thread resolution"
+            )
 
     def post_response(
         self,
@@ -547,6 +780,9 @@ class GitHubClient:
             )
         self._application_author = login.strip()
         return self._application_author
+
+    def application_login(self) -> str:
+        return self._application_login()
 
     def find_response(
         self,

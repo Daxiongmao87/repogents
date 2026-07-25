@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -11,7 +13,7 @@ from pathlib import Path
 from repogents.database import Database
 from repogents.execution import ExecutionService, ScriptedRuntime
 from repogents.lifecycle import RunLifecycle, RunState
-from repogents.sandbox import SandboxManager
+from repogents.sandbox import RunLayout, SandboxManager
 from repogents.team import TeamService
 
 
@@ -35,7 +37,9 @@ class RuleAwareRuntime:
     def next_action(self, context: str, state_directory: Path) -> dict[str, object]:
         self.calls += 1
         if self.calls == 1:
-            target = "allowed.py" if "Do not modify locked.py" in context else "locked.py"
+            target = (
+                "allowed.py" if "Do not modify locked.py" in context else "locked.py"
+            )
             return {
                 "action": "replace",
                 "path": target,
@@ -60,9 +64,13 @@ class ExecutionTests(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
         self.root = Path(self.tempdir.name)
         self.data_root = self.root / "data"
-        self.checkout = self.data_root / "repositories" / "repo-1" / "runs" / "run-1" / "checkout"
+        self.checkout = (
+            self.data_root / "repositories" / "repo-1" / "runs" / "run-1" / "checkout"
+        )
         self.checkout.mkdir(parents=True)
-        (self.checkout / "value.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+        (self.checkout / "value.py").write_text(
+            "def value():\n    return 1\n", encoding="utf-8"
+        )
         (self.checkout / "test_value.py").write_text(
             "import unittest\nfrom value import value\n\n"
             "class ValueTest(unittest.TestCase):\n"
@@ -72,7 +80,15 @@ class ExecutionTests(unittest.TestCase):
         )
         self._git("init", "-q", "-b", "main")
         self._git("add", "-A")
-        self._git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "-qm", "base")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-qm",
+            "base",
+        )
         self.base_sha = self._git("rev-parse", "HEAD").strip()
         self.sandbox_root = self.data_root / "repositories" / "repo-1" / "sandbox" / "1"
         self.sandbox_root.mkdir(parents=True)
@@ -101,7 +117,9 @@ class ExecutionTests(unittest.TestCase):
                 (
                     str(self.sandbox_root),
                     json.dumps(policy),
-                    json.dumps({"instruction_files": [], "summary": "small Python fixture"}),
+                    json.dumps(
+                        {"instruction_files": [], "summary": "small Python fixture"}
+                    ),
                     now,
                 ),
             )
@@ -109,7 +127,20 @@ class ExecutionTests(unittest.TestCase):
                 """INSERT INTO validation_commands
                    (id, sandbox_version_id, position, command_json, source, required)
                    VALUES ('validation-command-1', 'sandbox-1', 0, ?, 'fixture', 1)""",
-                (json.dumps(["python3", "-m", "unittest", "discover", "-s", ".", "-p", "test_*.py"]),),
+                (
+                    json.dumps(
+                        [
+                            "python3",
+                            "-m",
+                            "unittest",
+                            "discover",
+                            "-s",
+                            ".",
+                            "-p",
+                            "test_*.py",
+                        ]
+                    ),
+                ),
             )
             connection.execute(
                 """INSERT INTO team_versions
@@ -117,14 +148,23 @@ class ExecutionTests(unittest.TestCase):
                    VALUES ('team-1', 'repo-1', 1, '{}', ?)""",
                 (now,),
             )
-            connection.execute(
-                """INSERT INTO team_members
-                   (id, team_version_id, stable_key, role, responsibilities,
-                    permitted_tools_json, runtime, model, instructions)
-                   VALUES ('lead-1', 'team-1', 'lead', 'lead', 'Own result',
-                           '[\"read\",\"write\",\"run\",\"git_diff\",\"git_commit\"]',
-                           'mini-swe-agent', 'test/stored', '')"""
-            )
+            connection.execute("""INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions)
+                   VALUES
+                   ('lead-1', 'team-1', 'lead', 'lead',
+                    'delivery coordinator', 'Coordinate and integrate the result',
+                    '["read","git_diff","git_commit"]',
+                    'mini-swe-agent', 'test/lead', ''),
+                   ('implementation-1', 'team-1', 'implementation', 'implementer',
+                    'python implementation maintainer', 'Implement the source change',
+                    '["read","write","run","git_diff"]',
+                    'mini-swe-agent', 'test/implementation', ''),
+                   ('verification-1', 'team-1', 'verification', 'verifier',
+                    'python behavior verifier', 'Independently verify behavior',
+                    '["read","run","git_diff"]',
+                    'mini-swe-agent', 'test/verification', '')""")
             connection.execute(
                 """INSERT INTO issues
                    (id, repository_id, github_node_id, number, url, title, body,
@@ -148,12 +188,14 @@ class ExecutionTests(unittest.TestCase):
                            'sandbox-1', 'team-1', 'main', ?, 'queued', ?, ?, ?, ?)""",
                 (self.base_sha, str(self.checkout), str(run_root), now, now),
             )
-            connection.execute(
+            connection.executemany(
                 """INSERT INTO agent_assignments
                    (id, run_id, team_member_id, reasoning, assigned_at)
-                   VALUES ('fixture-assignment', 'run-1', 'lead-1',
-                           'Explicit fixture lead assignment', ?)""",
-                (now,),
+                   VALUES (?, 'run-1', ?, 'Explicit fixture assignment', ?)""",
+                (
+                    ("fixture-lead-assignment", "lead-1", now),
+                    ("fixture-implementation-assignment", "implementation-1", now),
+                ),
             )
             connection.execute(
                 """UPDATE repositories SET current_sandbox_version_id='sandbox-1',
@@ -180,22 +222,476 @@ class ExecutionTests(unittest.TestCase):
         )
         return result.stdout
 
-    def service(self, actions: list[dict[str, object]]) -> tuple[ExecutionService, ScriptedRuntime]:
-        runtime = ScriptedRuntime(actions)
+    def service(
+        self,
+        actions: list[dict[str, object]],
+    ) -> tuple[ExecutionService, ScriptedRuntime]:
+        implementation_runtime = ScriptedRuntime(actions)
+        lead_runtime = ScriptedRuntime(
+            [
+                {"action": "finish", "summary": "integrated member work"}
+                for _ in range(10)
+            ]
+        )
+        verifier_runtime = ScriptedRuntime(
+            [
+                {"action": "finish", "summary": "candidate independently approved"}
+                for _ in range(10)
+            ]
+        )
+
+        def runtime_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            if stored_model == "test/lead":
+                return lead_runtime
+            if stored_model == "test/verification":
+                return verifier_runtime
+            return implementation_runtime
+
         return (
             ExecutionService(
                 database=self.db,
                 lifecycle=self.lifecycle,
                 teams=TeamService(self.db),
                 sandbox=self.sandbox,
-                runtime_factory=lambda _stored_runtime, _stored_model, _stored_timeout: runtime,
+                runtime_factory=runtime_factory,
                 max_actions=20,
                 max_revision_cycles=3,
             ),
-            runtime,
+            implementation_runtime,
         )
 
-    def test_agent_edits_only_isolated_checkout_and_validates_exact_commit(self) -> None:
+    def test_durable_action_history_write_signals_activity(self) -> None:
+        service, _ = self.service([])
+        layout = RunLayout.create(self.data_root, "repo-1", "run-1")
+        revision = self.db.activity_revision
+
+        service._store_transcript(layout, ["Lead inspected src/app.py"])
+
+        self.assertEqual(
+            json.loads(
+                (layout.agent_state / "action-history.json").read_text(encoding="utf-8")
+            ),
+            ["Lead inspected src/app.py"],
+        )
+        self.assertGreater(
+            self.db.wait_for_activity_change(revision, timeout=0),
+            revision,
+        )
+
+    def _amend_base(self, files: dict[str, str]) -> None:
+        for relative, content in files.items():
+            path = self.checkout / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        self._git("add", "-A")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "--amend",
+            "-qm",
+            "base",
+        )
+        self.base_sha = self._git("rev-parse", "HEAD").strip()
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET base_sha=? WHERE id='run-1'",
+                (self.base_sha,),
+            )
+
+    def _set_validation_command(self, command: list[str]) -> None:
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE validation_commands
+                   SET command_json=?
+                   WHERE id='validation-command-1'""",
+                (json.dumps(command),),
+            )
+
+    def _seed_default_delta_baseline(self) -> None:
+        with self.db.transaction() as connection:
+            command_json = connection.execute("""SELECT command_json
+                   FROM validation_commands
+                   WHERE id='validation-command-1'""").fetchone()[0]
+            connection.execute(
+                """INSERT INTO validation_baselines
+                   (id, run_id, validation_command_id, command_json,
+                    base_sha, mode, started_at, completed_at, exit_status,
+                    log_path, findings_json)
+                   VALUES ('baseline-1', 'run-1', 'validation-command-1', ?,
+                           ?, 'delta', '2026-01-01T00:00:00Z',
+                           '2026-01-01T00:00:01Z', 1,
+                           '/logs/baseline.json', ?)""",
+                (
+                    command_json,
+                    self.base_sha,
+                    json.dumps(["unittest|fail|" "test_value (test_value.ValueTest)"]),
+                ),
+            )
+
+    def test_exact_base_validation_is_persisted_before_the_first_agent_action(
+        self,
+    ) -> None:
+        test = self
+
+        class BaselineAwareRuntime:
+            contexts: list[str] = []
+
+            def next_action(
+                self,
+                context: str,
+                state_directory: Path,
+            ) -> dict[str, object]:
+                del state_directory
+                self.contexts.append(context)
+                with test.db.connect() as connection:
+                    test.assertEqual(
+                        connection.execute("""SELECT COUNT(*)
+                               FROM validation_baselines
+                               WHERE run_id='run-1'""").fetchone()[0],
+                        1,
+                    )
+                return {"action": "block", "reason": "fixture observation complete"}
+
+        with self.db.transaction() as connection:
+            connection.execute("""DELETE FROM agent_assignments
+                   WHERE run_id='run-1' AND team_member_id='implementation-1'""")
+        runtime = BaselineAwareRuntime()
+        service = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=lambda _runtime, _model, _timeout: runtime,
+        )
+
+        self.assertIsNone(service.execute("run-1"))
+
+        with self.db.connect() as connection:
+            baseline = connection.execute(
+                """SELECT base_sha, mode, exit_status, findings_json
+                   FROM validation_baselines
+                   WHERE run_id='run-1'"""
+            ).fetchone()
+        self.assertEqual(baseline["base_sha"], self.base_sha)
+        self.assertEqual(baseline["mode"], "delta")
+        self.assertEqual(baseline["exit_status"], 1)
+        self.assertTrue(json.loads(baseline["findings_json"]))
+        self.assertEqual(len(runtime.contexts), 1)
+
+    def test_reduced_baseline_debt_passes_with_nonzero_exit_status(self) -> None:
+        self._amend_base(
+            {
+                "test_value.py": (
+                    "import unittest\n"
+                    "from value import value\n\n"
+                    "class ValueTest(unittest.TestCase):\n"
+                    "    def test_at_least_two(self):\n"
+                    "        self.assertGreaterEqual(value(), 2)\n\n"
+                    "    def test_three(self):\n"
+                    "        self.assertEqual(value(), 3)\n"
+                )
+            }
+        )
+        service, _ = self.service(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 2",
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "reduced existing failures"},
+            ]
+        )
+
+        validated_sha = service.execute("run-1")
+
+        self.assertIsNotNone(validated_sha)
+        self.assertEqual(self.lifecycle.get_run("run-1")["state"], "publishing")
+        with self.db.connect() as connection:
+            result = connection.execute(
+                """SELECT exit_status, verdict, comparison_json
+                   FROM validation_results
+                   WHERE commit_sha=?""",
+                (validated_sha,),
+            ).fetchone()
+        comparison = json.loads(result["comparison_json"])
+        self.assertEqual((result["exit_status"], result["verdict"]), (1, "pass"))
+        self.assertEqual(
+            (
+                comparison["new_count"],
+                comparison["resolved_count"],
+                comparison["unchanged_count"],
+            ),
+            (0, 1, 1),
+        )
+
+    def test_lower_finding_count_with_a_new_finding_fails(self) -> None:
+        baseline = (
+            "src/a.py:10:2: error: alpha [RULE_A]\n"
+            "src/b.py:20:3: error: beta [RULE_B]\n"
+            "src/c.py:30:4: error: gamma [RULE_C]\n"
+        )
+        candidate = (
+            "src/a.py:110:12: error: alpha [RULE_A]\n"
+            "src/d.py:40:5: error: new debt [RULE_D]\n"
+        )
+        self._amend_base({"diagnostics.txt": baseline})
+        self._set_validation_command(
+            [
+                "python3",
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    "print(Path('diagnostics.txt').read_text()); sys.exit(1)"
+                ),
+            ]
+        )
+        service, _ = self.service(
+            [
+                {
+                    "action": "replace",
+                    "path": "diagnostics.txt",
+                    "old": baseline,
+                    "new": candidate,
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "net reduction with new debt"},
+            ]
+        )
+        service.max_revision_cycles = 1
+
+        self.assertIsNone(service.execute("run-1"))
+
+        self.assertEqual(self.lifecycle.get_run("run-1")["state"], "implementing")
+        with self.db.connect() as connection:
+            result = connection.execute("""SELECT verdict, comparison_json
+                   FROM validation_results
+                   ORDER BY started_at DESC
+                   LIMIT 1""").fetchone()
+        comparison = json.loads(result["comparison_json"])
+        self.assertEqual(result["verdict"], "fail")
+        self.assertEqual(
+            (
+                comparison["new_count"],
+                comparison["resolved_count"],
+                comparison["unchanged_count"],
+            ),
+            (1, 2, 1),
+        )
+
+    def test_validation_policy_change_cannot_erase_baseline_debt(self) -> None:
+        self._amend_base({".eslintignore": "# baseline\n"})
+        self._set_validation_command(
+            [
+                "python3",
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    "ignored=Path('.eslintignore').read_text(); "
+                    "finding='src/a.py:10:2: error: alpha [RULE_A]'; "
+                    "print('' if 'src/a.py' in ignored else finding); "
+                    "sys.exit(0 if 'src/a.py' in ignored else 1)"
+                ),
+            ]
+        )
+        service, _ = self.service(
+            [
+                {
+                    "action": "replace",
+                    "path": ".eslintignore",
+                    "old": "# baseline",
+                    "new": "src/a.py",
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "suppressed baseline finding"},
+            ]
+        )
+        service.max_revision_cycles = 1
+
+        self.assertIsNone(service.execute("run-1"))
+
+        with self.db.connect() as connection:
+            result = connection.execute("""SELECT verdict, comparison_json
+                   FROM validation_results
+                   ORDER BY started_at DESC
+                   LIMIT 1""").fetchone()
+        comparison = json.loads(result["comparison_json"])
+        self.assertEqual(result["verdict"], "fail")
+        self.assertEqual(comparison["contract_changed"], [".eslintignore"])
+        self.assertTrue(comparison["weakening_detected"])
+
+    def test_non_suppressing_policy_file_change_remains_eligible(self) -> None:
+        finding = "src/a.py:10:2: error: alpha [RULE_A]\n"
+        self._amend_base(
+            {
+                "diagnostics.txt": finding,
+                "pyproject.toml": 'version = "1.0"\n',
+            }
+        )
+        self._set_validation_command(
+            [
+                "python3",
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    "print(Path('diagnostics.txt').read_text()); sys.exit(1)"
+                ),
+            ]
+        )
+        service, _ = self.service(
+            [
+                {
+                    "action": "replace",
+                    "path": "pyproject.toml",
+                    "old": 'version = "1.0"',
+                    "new": 'version = "1.1"',
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "updated project metadata"},
+            ]
+        )
+
+        validated_sha = service.execute("run-1")
+
+        self.assertIsNotNone(validated_sha)
+        with self.db.connect() as connection:
+            result = connection.execute(
+                """SELECT verdict, comparison_json
+                   FROM validation_results
+                   WHERE commit_sha=?""",
+                (validated_sha,),
+            ).fetchone()
+        comparison = json.loads(result["comparison_json"])
+        self.assertEqual(result["verdict"], "pass")
+        self.assertEqual(comparison["contract_changed"], ["pyproject.toml"])
+        self.assertEqual(comparison["weakening_detected"], [])
+
+    def test_source_only_suppression_cannot_erase_baseline_finding(
+        self,
+    ) -> None:
+        self._amend_base({"src/a.py": "value = 1\n"})
+        self._set_validation_command(
+            [
+                "python3",
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    "source=Path('src/a.py').read_text(); "
+                    "finding='src/a.py:10:2: error: alpha [RULE_A]'; "
+                    "print('' if 'noqa' in source else finding); "
+                    "sys.exit(0 if 'noqa' in source else 1)"
+                ),
+            ]
+        )
+        service, _ = self.service(
+            [
+                {
+                    "action": "replace",
+                    "path": "src/a.py",
+                    "old": "value = 1",
+                    "new": "# noqa: RULE_A\nvalue = 1",
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "suppressed baseline finding"},
+            ]
+        )
+        service.max_revision_cycles = 1
+
+        self.assertIsNone(service.execute("run-1"))
+
+        with self.db.connect() as connection:
+            result = connection.execute("""SELECT verdict, comparison_json
+                   FROM validation_results
+                   ORDER BY started_at DESC
+                   LIMIT 1""").fetchone()
+        comparison = json.loads(result["comparison_json"])
+        self.assertEqual(result["verdict"], "fail")
+        self.assertEqual(comparison["contract_changed"], ["src/a.py"])
+        self.assertTrue(comparison["weakening_detected"])
+
+    def test_narrow_suppression_with_source_change_remains_reviewable(
+        self,
+    ) -> None:
+        self._amend_base({"src/a.py": "value = 1\n"})
+        self._set_validation_command(
+            [
+                "python3",
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    "source=Path('src/a.py').read_text(); "
+                    "finding='src/a.py:10:2: error: alpha [RULE_A]'; "
+                    "print('' if 'value = 2' in source else finding); "
+                    "sys.exit(0 if 'value = 2' in source else 1)"
+                ),
+            ]
+        )
+        service, _ = self.service(
+            [
+                {
+                    "action": "replace",
+                    "path": "src/a.py",
+                    "old": "value = 1",
+                    "new": "value = 2  # noqa: RULE_A",
+                    "count": 1,
+                },
+                {
+                    "action": "finish",
+                    "summary": "changed behavior with narrow suppression",
+                },
+            ]
+        )
+
+        validated_sha = service.execute("run-1")
+
+        self.assertIsNotNone(validated_sha)
+        with self.db.connect() as connection:
+            result = connection.execute(
+                """SELECT verdict, comparison_json
+                   FROM validation_results
+                   WHERE commit_sha=?""",
+                (validated_sha,),
+            ).fetchone()
+        comparison = json.loads(result["comparison_json"])
+        self.assertEqual(result["verdict"], "pass")
+        self.assertEqual(comparison["contract_changed"], ["src/a.py"])
+        self.assertEqual(comparison["weakening_detected"], [])
+
+    def test_unparseable_failed_baseline_blocks_before_agent_action(self) -> None:
+        self._set_validation_command(
+            ["python3", "-c", "print('command failed'); raise SystemExit(1)"]
+        )
+        service, runtime = self.service(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 2",
+                    "count": 1,
+                }
+            ]
+        )
+
+        self.assertIsNone(service.execute("run-1"))
+
+        run = self.lifecycle.get_run("run-1")
+        self.assertEqual(run["state"], "blocked")
+        self.assertIn("baseline", run["reason"])
+        self.assertEqual(runtime.contexts, [])
+
+    def test_agent_edits_only_isolated_checkout_and_validates_exact_commit(
+        self,
+    ) -> None:
         service, runtime = self.service(
             [
                 {"action": "read", "path": "value.py"},
@@ -206,7 +702,10 @@ class ExecutionTests(unittest.TestCase):
                     "new": "return 2",
                     "count": 1,
                 },
-                {"action": "run", "argv": ["python3", "-m", "unittest", "test_value.py"]},
+                {
+                    "action": "run",
+                    "argv": ["python3", "-m", "unittest", "test_value.py"],
+                },
                 {"action": "finish", "summary": "value now returns two"},
             ]
         )
@@ -215,15 +714,91 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(run["state"], "publishing")
         self.assertEqual(run["validated_sha"], validated_sha)
         self.assertEqual(self._git("rev-parse", "HEAD").strip(), validated_sha)
-        self.assertEqual((self.checkout / "value.py").read_text(encoding="utf-8"), "def value():\n    return 2\n")
+        self.assertEqual(
+            (self.checkout / "value.py").read_text(encoding="utf-8"),
+            "def value():\n    return 2\n",
+        )
         with self.db.connect() as connection:
-            validations = connection.execute("SELECT * FROM validation_results").fetchall()
-            assignments = connection.execute("SELECT * FROM agent_assignments").fetchall()
+            validations = connection.execute(
+                "SELECT * FROM validation_results"
+            ).fetchall()
+            assignments = connection.execute(
+                "SELECT * FROM agent_assignments"
+            ).fetchall()
         self.assertEqual(len(validations), 1)
         self.assertEqual(validations[0]["commit_sha"], validated_sha)
         self.assertEqual(validations[0]["exit_status"], 0)
-        self.assertEqual(len(assignments), 1)
+        self.assertEqual(len(assignments), 3)
         self.assertTrue(runtime.contexts)
+
+    def test_pause_interrupts_sandbox_action_then_same_run_resumes(self) -> None:
+        service, runtime = self.service(
+            [
+                {
+                    "action": "run",
+                    "argv": [
+                        "python3",
+                        "-c",
+                        "import time; time.sleep(60)",
+                    ],
+                },
+                {
+                    "action": "write",
+                    "path": "later.txt",
+                    "content": "started only after resume\n",
+                },
+                {
+                    "action": "finish",
+                    "summary": "continued the same persisted run",
+                },
+            ]
+        )
+        results: list[str | None] = []
+        worker = threading.Thread(
+            target=lambda: results.append(service.execute("run-1"))
+        )
+        worker.start()
+        deadline = time.monotonic() + 10
+        while (
+            not runtime.contexts or not self.sandbox.is_active("run-1")
+        ) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(runtime.contexts)
+        self.assertTrue(self.sandbox.is_active("run-1"))
+        state_at_pause = self.lifecycle.get_run("run-1")["state"]
+
+        paused_runs = self.lifecycle.set_repository_paused("repo-1", True)
+        worker.join(10)
+
+        self.assertEqual(paused_runs, ("run-1",))
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results, [None])
+        self.assertEqual(self.lifecycle.get_run("run-1")["state"], state_at_pause)
+        self.assertNotIn(
+            self.lifecycle.get_run("run-1")["state"],
+            {
+                RunState.BLOCKED.value,
+                RunState.CANCELED.value,
+                RunState.CLOSED.value,
+            },
+        )
+        self.assertFalse((self.checkout / "later.txt").exists())
+
+        self.assertEqual(
+            self.lifecycle.set_repository_paused("repo-1", False),
+            ("run-1",),
+        )
+        validated_sha = service.execute("run-1")
+
+        self.assertIsNotNone(validated_sha)
+        self.assertEqual(
+            self.lifecycle.get_run("run-1")["state"],
+            RunState.PUBLISHING.value,
+        )
+        self.assertEqual(
+            (self.checkout / "later.txt").read_text(encoding="utf-8"),
+            "started only after resume\n",
+        )
 
     def test_inspection_note_survives_action_quantum_and_guides_edit(self) -> None:
         first_runtime = ScriptedRuntime(
@@ -262,18 +837,30 @@ class ExecutionTests(unittest.TestCase):
                 {"action": "finish", "summary": "implemented stored note"},
             ]
         )
+        lead_runtime = ScriptedRuntime(
+            [{"action": "finish", "summary": "integrated stored implementation"}]
+        )
+        verifier_runtime = ScriptedRuntime(
+            [{"action": "finish", "summary": "stored note candidate approved"}]
+        )
         restarted = ExecutionService(
             database=Database(self.db.path),
             lifecycle=self.lifecycle,
             teams=TeamService(Database(self.db.path)),
             sandbox=self.sandbox,
-            runtime_factory=lambda _runtime, _model, _timeout: second_runtime,
+            runtime_factory=lambda _runtime, model, _timeout: (
+                lead_runtime
+                if model == "test/lead"
+                else verifier_runtime
+                if model == "test/verification"
+                else second_runtime
+            ),
             max_actions=10,
         )
 
         self.assertIsNotNone(restarted.execute("run-1"))
         self.assertIn(
-            "Lead note: value.py returns one; replace it with two next.",
+            "Member implementation note: value.py returns one; replace it with two next.",
             second_runtime.contexts[0],
         )
 
@@ -328,13 +915,12 @@ class ExecutionTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "a coordination note already records an exact next action"
-                in context
+                "a coordination note already records an exact next action" in context
                 for context in runtime.contexts
             )
         )
         self.assertIn(
-            "Lead note: value.py now returns two; finish next.",
+            "Member implementation note: value.py now returns two; finish next.",
             runtime.contexts[-1],
         )
 
@@ -351,14 +937,22 @@ class ExecutionTests(unittest.TestCase):
                    VALUES ('team-2', 'repo-1', 2, '{}', ?)""",
                 ("2026-01-02T00:00:00Z",),
             )
-            connection.execute(
-                """INSERT INTO team_members
-                   (id, team_version_id, stable_key, role, responsibilities,
-                    permitted_tools_json, runtime, model, instructions,
-                    action_timeout_seconds)
-                   VALUES ('lead-2', 'team-2', 'lead', 'lead', 'Own later runs',
-                           '["read"]', 'mini-swe-agent', 'openai/new-model', '', 777)"""
-            )
+            connection.execute("""INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions, action_timeout_seconds)
+                   VALUES
+                   ('lead-2', 'team-2', 'lead', 'lead', 'release coordinator',
+                    'Coordinate later runs', '["read","git_diff","git_commit"]',
+                    'mini-swe-agent', 'openai/new-model', '', 777),
+                   ('implementation-2', 'team-2', 'implementation', 'implementer',
+                    'release implementation maintainer', 'Implement later runs',
+                    '["read","write","run","git_diff"]',
+                    'mini-swe-agent', 'openai/new-model', '', 777),
+                   ('verification-2', 'team-2', 'verification', 'verifier',
+                    'release behavior verifier', 'Verify later runs',
+                    '["read","run","git_diff"]',
+                    'mini-swe-agent', 'openai/new-model', '', 777)""")
             connection.execute(
                 """UPDATE repositories SET current_team_version_id='team-2'
                    WHERE id='repo-1'"""
@@ -375,6 +969,12 @@ class ExecutionTests(unittest.TestCase):
                 {"action": "finish", "summary": "used stored model"},
             ]
         )
+        lead_runtime = ScriptedRuntime(
+            [{"action": "finish", "summary": "integrated stored model work"}]
+        )
+        verifier_runtime = ScriptedRuntime(
+            [{"action": "finish", "summary": "stored model candidate approved"}]
+        )
         requested: list[tuple[str, str, float]] = []
 
         def runtime_factory(
@@ -382,9 +982,11 @@ class ExecutionTests(unittest.TestCase):
             stored_model: str,
             stored_timeout: float,
         ) -> ScriptedRuntime:
-            requested.append(
-                (stored_runtime, stored_model, stored_timeout)
-            )
+            requested.append((stored_runtime, stored_model, stored_timeout))
+            if stored_model == "openai/stored-model":
+                return lead_runtime
+            if stored_model == "test/verification":
+                return verifier_runtime
             return runtime
 
         restarted_database = Database(self.db.path)
@@ -400,7 +1002,11 @@ class ExecutionTests(unittest.TestCase):
         self.assertIsNotNone(service.execute("run-1"))
         self.assertEqual(
             requested,
-            [("mini-swe-agent", "openai/stored-model", 321)],
+            [
+                ("mini-swe-agent", "openai/stored-model", 321),
+                ("mini-swe-agent", "test/implementation", 300),
+                ("mini-swe-agent", "test/verification", 300),
+            ],
         )
         self.assertTrue(runtime.contexts)
 
@@ -421,7 +1027,6 @@ class ExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported stored model runtime"):
             service.execute("run-1")
         factory.assert_not_called()
-
 
     def test_cancellation_during_inference_prevents_later_effects(self) -> None:
         lifecycle = self.lifecycle
@@ -458,11 +1063,15 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(self._git("rev-parse", "HEAD").strip(), self.base_sha)
         with self.db.connect() as connection:
             self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM validation_results").fetchone()[0],
+                connection.execute(
+                    "SELECT COUNT(*) FROM validation_results"
+                ).fetchone()[0],
                 0,
             )
 
-    def test_command_scoped_secret_is_authorized_redacted_and_not_persisted(self) -> None:
+    def test_command_scoped_secret_is_authorized_redacted_and_not_persisted(
+        self,
+    ) -> None:
         command = [
             "python3",
             "-c",
@@ -497,8 +1106,7 @@ class ExecutionTests(unittest.TestCase):
                 {
                     "action": "note",
                     "summary": (
-                        f"Observed {fixture_secret}; edit next. "
-                        + ("x" * 5_000)
+                        f"Observed {fixture_secret}; edit next. " + ("x" * 5_000)
                     ),
                 },
                 {
@@ -543,7 +1151,9 @@ class ExecutionTests(unittest.TestCase):
         history_path = self.checkout.parent / "agent-state" / "action-history.json"
         stored_history = json.loads(history_path.read_text(encoding="utf-8"))
         note_entry = next(
-            entry for entry in stored_history if entry.startswith("Lead note:")
+            entry
+            for entry in stored_history
+            if entry.startswith("Member implementation note:")
         )
         self.assertLessEqual(len(note_entry), 2_020)
         restarted_runtime = ScriptedRuntime(
@@ -558,15 +1168,24 @@ class ExecutionTests(unittest.TestCase):
                 {"action": "finish", "summary": "secret stayed scoped"},
             ]
         )
+        lead_runtime = ScriptedRuntime(
+            [{"action": "finish", "summary": "integrated scoped secret work"}]
+        )
+        verifier_runtime = ScriptedRuntime(
+            [{"action": "finish", "summary": "scoped secret candidate approved"}]
+        )
         restarted_database = Database(self.db.path)
         restarted = ExecutionService(
             database=restarted_database,
             lifecycle=self.lifecycle,
             teams=TeamService(restarted_database),
             sandbox=self.sandbox,
-            runtime_factory=(
-                lambda _stored_runtime, _stored_model, _stored_timeout:
-                restarted_runtime
+            runtime_factory=lambda _stored_runtime, model, _stored_timeout: (
+                lead_runtime
+                if model == "test/lead"
+                else verifier_runtime
+                if model == "test/verification"
+                else restarted_runtime
             ),
             secret_resolver=resolve,
             max_actions=10,
@@ -591,9 +1210,7 @@ class ExecutionTests(unittest.TestCase):
                 *restarted_runtime.contexts,
                 *(
                     path.read_text(encoding="utf-8")
-                    for path in (self.checkout.parent / "logs").glob(
-                        "command-*.json"
-                    )
+                    for path in (self.checkout.parent / "logs").glob("command-*.json")
                 ),
             ]
         )
@@ -601,7 +1218,9 @@ class ExecutionTests(unittest.TestCase):
         self.assertNotIn(fixture_secret, observed)
         self.assertNotIn(json.dumps(fixture_secret)[1:-1], observed)
 
-    def test_resolved_command_secret_returns_to_agent_for_automatic_correction(self) -> None:
+    def test_resolved_command_secret_returns_to_agent_for_automatic_correction(
+        self,
+    ) -> None:
         command = [
             "python3",
             "-c",
@@ -640,12 +1259,30 @@ class ExecutionTests(unittest.TestCase):
                 {"action": "finish", "summary": "removed the secret"},
             ]
         )
+        lead_runtime = ScriptedRuntime(
+            [
+                {"action": "finish", "summary": "reviewed corrected secret handling"},
+                {"action": "finish", "summary": "integrated corrected secret handling"},
+            ]
+        )
+        verifier_runtime = ScriptedRuntime(
+            [
+                {"action": "finish", "summary": "first candidate reviewed"},
+                {"action": "finish", "summary": "secret-free candidate approved"},
+            ]
+        )
         service = ExecutionService(
             database=self.db,
             lifecycle=self.lifecycle,
             teams=TeamService(self.db),
             sandbox=self.sandbox,
-            runtime_factory=lambda _stored_runtime, _stored_model, _stored_timeout: runtime,
+            runtime_factory=lambda _stored_runtime, model, _stored_timeout: (
+                lead_runtime
+                if model == "test/lead"
+                else verifier_runtime
+                if model == "test/verification"
+                else runtime
+            ),
             secret_resolver=lambda reference: {
                 "secret://fixture": "fixture-canary-value"
             }[reference],
@@ -712,9 +1349,7 @@ class ExecutionTests(unittest.TestCase):
         ]
         fixture_secret = 'assignment-"secret"\\line\nvalue'
         with self.db.transaction() as connection:
-            connection.execute(
-                "DELETE FROM agent_assignments WHERE run_id='run-1'"
-            )
+            connection.execute("DELETE FROM agent_assignments WHERE run_id='run-1'")
             row = connection.execute(
                 "SELECT policy_json FROM sandbox_versions WHERE id='sandbox-1'"
             ).fetchone()
@@ -735,9 +1370,9 @@ class ExecutionTests(unittest.TestCase):
                 {"action": "run", "argv": command},
                 {
                     "action": "assign",
-                    "members": ["lead"],
+                    "members": ["lead", "verification"],
                     "reason": (
-                        f"Observed {fixture_secret}; lead-only issue. "
+                        f"Observed {fixture_secret}; lead-only implementation. "
                         + ("x" * 5_000)
                     ),
                 },
@@ -756,7 +1391,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertIsNone(service.execute("run-1"))
 
         assignments = TeamService(self.db).assignments_for_run("run-1")
-        self.assertEqual(len(assignments), 1)
+        self.assertEqual(len(assignments), 2)
         self.assertLessEqual(len(assignments[0].reasoning), 2_000)
         history = (
             self.checkout.parent / "agent-state" / "action-history.json"
@@ -766,14 +1401,18 @@ class ExecutionTests(unittest.TestCase):
         self.assertNotIn(fixture_secret, observed)
         self.assertNotIn(json.dumps(fixture_secret)[1:-1], observed)
 
-    def test_stored_lead_explicitly_selects_lead_only_for_small_issue(self) -> None:
+    def test_stored_lead_selects_atomic_implementer_for_small_issue(self) -> None:
         with self.db.transaction() as connection:
-            connection.execute(
-                "DELETE FROM agent_assignments WHERE run_id='run-1'"
-            )
-        reason = "The one-line source change and its focused test need only the lead."
+            connection.execute("DELETE FROM agent_assignments WHERE run_id='run-1'")
+        reason = "The one-line source change needs the stored implementation member."
         assigning = ScriptedRuntime(
-            [{"action": "assign", "members": ["lead"], "reason": reason}]
+            [
+                {
+                    "action": "assign",
+                    "members": ["lead", "implementation", "verification"],
+                    "reason": reason,
+                }
+            ]
         )
         first = ExecutionService(
             database=self.db,
@@ -788,7 +1427,7 @@ class ExecutionTests(unittest.TestCase):
         assignments = TeamService(self.db).assignments_for_run("run-1")
         self.assertEqual(
             [assignment.member.stable_key for assignment in assignments],
-            ["lead"],
+            ["lead", "implementation", "verification"],
         )
         self.assertEqual(assignments[0].reasoning, reason)
         service, _runtime = self.service(
@@ -813,21 +1452,14 @@ class ExecutionTests(unittest.TestCase):
             connection.execute(
                 "UPDATE team_members SET model='test/lead' WHERE id='lead-1'"
             )
-            connection.execute(
-                """INSERT INTO team_members
-                   (id, team_version_id, stable_key, role, responsibilities,
-                    permitted_tools_json, runtime, model, instructions)
-                   VALUES
-                   ('implementation-1', 'team-1', 'implementation', 'implementer',
-                    'Implement the bounded source change', '[\"read\",\"write\",\"run\"]',
-                    'mini-swe-agent', 'test/implementation', 'Follow implementation instructions'),
-                   ('verification-1', 'team-1', 'verification', 'verifier',
-                    'Independently verify behavior', '[\"read\",\"run\"]',
-                    'mini-swe-agent', 'test/verification', 'Follow verification instructions')"""
-            )
-        assignment_reason = (
-            "Implementation changes the function; verification independently runs its test."
-        )
+            connection.execute("""UPDATE team_members
+                   SET instructions=CASE stable_key
+                     WHEN 'implementation' THEN 'Follow implementation instructions'
+                     WHEN 'verification' THEN 'Follow verification instructions'
+                     ELSE instructions
+                   END
+                   WHERE team_version_id='team-1'""")
+        assignment_reason = "Implementation changes the function; verification independently runs its test."
         assigning_lead = ScriptedRuntime(
             [
                 {
@@ -874,6 +1506,7 @@ class ExecutionTests(unittest.TestCase):
                 {"action": "finish", "summary": "implemented return value"},
             ]
         )
+
         class FailOnceRuntime(ScriptedRuntime):
             def __init__(self, actions: list[dict[str, object]]) -> None:
                 super().__init__(actions)
@@ -909,9 +1542,7 @@ class ExecutionTests(unittest.TestCase):
             stored_model: str,
             stored_timeout: float,
         ):
-            runtime_requests.append(
-                (stored_runtime, stored_model, stored_timeout)
-            )
+            runtime_requests.append((stored_runtime, stored_model, stored_timeout))
             return runtimes[stored_model]
 
         restarted = ExecutionService(
@@ -942,10 +1573,11 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(
             runtime_requests,
             [
+                ("mini-swe-agent", "test/lead", 300),
                 ("mini-swe-agent", "test/implementation", 300),
                 ("mini-swe-agent", "test/verification", 300),
-                ("mini-swe-agent", "test/verification", 300),
                 ("mini-swe-agent", "test/lead", 300),
+                ("mini-swe-agent", "test/verification", 300),
             ],
         )
         self.assertIn('"stable_key": "implementation"', implementation.contexts[0])
@@ -957,8 +1589,8 @@ class ExecutionTests(unittest.TestCase):
             lead.contexts[0],
         )
         self.assertIn(
-            "Member verification finished: verified return value",
-            lead.contexts[0],
+            "Lead finished: integrated member work",
+            verification.contexts[0],
         )
 
     def test_action_history_is_bounded_for_model_context(self) -> None:
@@ -1022,12 +1654,24 @@ class ExecutionTests(unittest.TestCase):
         second_runtime = ScriptedRuntime(
             [{"action": "finish", "summary": "continued after execution quantum"}]
         )
+        lead_runtime = ScriptedRuntime(
+            [{"action": "finish", "summary": "integrated continued work"}]
+        )
+        verifier_runtime = ScriptedRuntime(
+            [{"action": "finish", "summary": "continued candidate approved"}]
+        )
         restarted = ExecutionService(
             database=self.db,
             lifecycle=self.lifecycle,
             teams=TeamService(self.db),
             sandbox=self.sandbox,
-            runtime_factory=lambda _stored_runtime, _stored_model, _stored_timeout: second_runtime,
+            runtime_factory=lambda _stored_runtime, model, _stored_timeout: (
+                lead_runtime
+                if model == "test/lead"
+                else verifier_runtime
+                if model == "test/verification"
+                else second_runtime
+            ),
             max_actions=1,
             max_revision_cycles=3,
         )
@@ -1112,12 +1756,10 @@ class ExecutionTests(unittest.TestCase):
 
     def test_source_revision_reason_reaches_agent_context(self) -> None:
         with self.db.transaction() as connection:
-            connection.execute(
-                """UPDATE runs
+            connection.execute("""UPDATE runs
                    SET state='implementing',
                        reason='scope review rejected: Docker cache optimization is unrelated'
-                   WHERE id='run-1'"""
-            )
+                   WHERE id='run-1'""")
         service, runtime = self.service(
             [
                 {
@@ -1154,16 +1796,17 @@ class ExecutionTests(unittest.TestCase):
             any("repository tool failed" in context for context in runtime.contexts)
         )
 
-    def test_restart_from_validating_resumes_dirty_checkout_without_reasking_agent(self) -> None:
+    def test_restart_from_validating_resumes_dirty_checkout_without_reasking_agent(
+        self,
+    ) -> None:
+        self._seed_default_delta_baseline()
         (self.checkout / "value.py").write_text(
             "def value():\n    return 2\n", encoding="utf-8"
         )
         with self.db.transaction() as connection:
-            connection.execute(
-                """UPDATE runs
+            connection.execute("""UPDATE runs
                    SET state='validating', last_completed_state='implementing'
-                   WHERE id='run-1'"""
-            )
+                   WHERE id='run-1'""")
         service, runtime = self.service([])
         validated_sha = service.execute("run-1")
         self.assertIsNotNone(validated_sha)
@@ -1174,14 +1817,41 @@ class ExecutionTests(unittest.TestCase):
             result = connection.execute(
                 "SELECT commit_sha, exit_status FROM validation_results"
             ).fetchone()
-        self.assertEqual((result["commit_sha"], result["exit_status"]), (validated_sha, 0))
+        self.assertEqual(
+            (result["commit_sha"], result["exit_status"]), (validated_sha, 0)
+        )
 
-    def test_failed_validation_returns_to_agent_then_records_new_passing_sha(self) -> None:
+    def test_failed_validation_returns_to_agent_then_records_new_passing_sha(
+        self,
+    ) -> None:
+        self._amend_base(
+            {
+                "test_value.py": (
+                    "import unittest\n"
+                    "from value import value\n\n"
+                    "class ValueTest(unittest.TestCase):\n"
+                    "    def test_value(self):\n"
+                    "        self.assertIn(value(), (1, 2))\n"
+                )
+            }
+        )
         service, _ = self.service(
             [
-                {"action": "replace", "path": "value.py", "old": "return 1", "new": "return 3", "count": 1},
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 3",
+                    "count": 1,
+                },
                 {"action": "finish", "summary": "first attempt"},
-                {"action": "replace", "path": "value.py", "old": "return 3", "new": "return 2", "count": 1},
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 3",
+                    "new": "return 2",
+                    "count": 1,
+                },
                 {"action": "finish", "summary": "corrected after validation"},
             ]
         )
@@ -1193,13 +1863,136 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual([row["exit_status"] for row in rows], [1, 0])
         self.assertEqual(rows[-1]["commit_sha"], passing_sha)
         self.assertNotEqual(rows[0]["commit_sha"], rows[1]["commit_sha"])
+        self.assertEqual(
+            self._git(
+                "rev-list",
+                "--count",
+                f"{self.base_sha}..{passing_sha}",
+            ).strip(),
+            "1",
+        )
+        self.assertEqual(
+            self._git("show", "-s", "--format=%s", passing_sha).strip(),
+            "Resolve issue #3: Return two",
+        )
+
+    def test_feedback_revision_replaces_current_controller_commit(self) -> None:
+        service, _ = self.service(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 2",
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "initial implementation"},
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "def value():\n    return 2\n",
+                    "new": (
+                        "def value():\n"
+                        "    # Preserve the requested value after feedback.\n"
+                        "    return 2\n"
+                    ),
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "feedback revision"},
+            ]
+        )
+
+        initial_sha = service.execute("run-1")
+        self.assertIsNotNone(initial_sha)
+        self.lifecycle.transition("run-1", RunState.WAITING_FOR_FEEDBACK)
+        self.lifecycle.transition("run-1", RunState.RESOLVING_FEEDBACK)
+
+        revised_sha = service.execute(
+            "run-1",
+            additional_context="Apply the accepted pull-request feedback.",
+        )
+
+        self.assertIsNotNone(revised_sha)
+        self.assertNotEqual(revised_sha, initial_sha)
+        self.assertEqual(
+            self._git(
+                "rev-list",
+                "--count",
+                f"{self.base_sha}..{revised_sha}",
+            ).strip(),
+            "1",
+        )
+        self.assertEqual(
+            self._git("rev-parse", f"{revised_sha}^").strip(),
+            self.base_sha,
+        )
+        with self.db.connect() as connection:
+            validation_shas = {
+                str(row["commit_sha"])
+                for row in connection.execute(
+                    "SELECT commit_sha FROM validation_results WHERE run_id='run-1'"
+                ).fetchall()
+            }
+        self.assertEqual(validation_shas, {initial_sha, revised_sha})
+
+    def test_first_controller_commit_preserves_non_controller_head(self) -> None:
+        self._seed_default_delta_baseline()
+        (self.checkout / "maintainer-note.txt").write_text(
+            "preserve this commit\n",
+            encoding="utf-8",
+        )
+        self._git("add", "-A")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-qm",
+            "maintainer preparation",
+        )
+        maintainer_sha = self._git("rev-parse", "HEAD").strip()
+        service, _ = self.service(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 2",
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "implementation"},
+            ]
+        )
+
+        validated_sha = service.execute("run-1")
+
+        self.assertIsNotNone(validated_sha)
+        self.assertEqual(
+            self._git("rev-parse", f"{validated_sha}^").strip(),
+            maintainer_sha,
+        )
+        self.assertEqual(
+            self._git(
+                "rev-list",
+                "--count",
+                f"{self.base_sha}..{validated_sha}",
+            ).strip(),
+            "2",
+        )
 
     def test_missing_validation_commands_block_without_autonomous_resume(self) -> None:
         with self.db.transaction() as connection:
             connection.execute("DELETE FROM validation_commands")
         service, _ = self.service(
             [
-                {"action": "replace", "path": "value.py", "old": "return 1", "new": "return 2", "count": 1},
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 2",
+                    "count": 1,
+                },
                 {"action": "finish", "summary": "implementation complete"},
             ]
         )
@@ -1209,6 +2002,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertIn("validation commands", run["reason"])
 
     def test_validation_mutation_cannot_pass_and_returns_to_agent(self) -> None:
+        self._seed_default_delta_baseline()
         mutating_command = [
             "python3",
             "-c",
@@ -1221,23 +2015,30 @@ class ExecutionTests(unittest.TestCase):
             )
         service, _ = self.service(
             [
-                {"action": "replace", "path": "value.py", "old": "return 1", "new": "return 2", "count": 1},
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 2",
+                    "count": 1,
+                },
                 {"action": "finish", "summary": "implementation complete"},
             ]
         )
         service.max_revision_cycles = 1
         self.assertIsNone(service.execute("run-1"))
         run = self.lifecycle.get_run("run-1")
-        self.assertEqual(run["state"], "implementing")
+        self.assertEqual(run["state"], "blocked")
         self.assertIsNone(run["validated_sha"])
-        self.assertEqual(self._git("status", "--porcelain", "--untracked-files=no"), "")
-        self.assertEqual((self.checkout / "value.py").read_text(encoding="utf-8"), "def value():\n    return 2\n")
-        history = json.loads(
-            (self.checkout.parent / "agent-state" / "action-history.json").read_text(
-                encoding="utf-8"
-            )
+        self.assertIn("baseline command changed", run["reason"])
+        self.assertEqual(
+            self._git("status", "--porcelain", "--untracked-files=no"),
+            "",
         )
-        self.assertTrue(any("Validation for commit" in entry for entry in history))
+        self.assertEqual(
+            (self.checkout / "value.py").read_text(encoding="utf-8"),
+            "def value():\n    return 1\n",
+        )
 
     def test_path_escape_error_is_returned_to_agent_for_safe_correction(self) -> None:
         service, runtime = self.service(
@@ -1291,17 +2092,104 @@ class ExecutionTests(unittest.TestCase):
             runtime.contexts[1],
         )
 
+    def test_verifier_rejection_revises_before_commit_and_validation(self) -> None:
+        implementation = ScriptedRuntime(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 2  # unreviewed",
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "implemented first candidate"},
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 2  # unreviewed",
+                    "new": "return 2",
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "implemented verifier correction"},
+            ]
+        )
+        verification = ScriptedRuntime(
+            [
+                {
+                    "action": "block",
+                    "reason": "Remove the unreviewed marker before approval",
+                },
+                {"action": "finish", "summary": "corrected candidate approved"},
+            ]
+        )
+        lead = ScriptedRuntime(
+            [
+                {"action": "finish", "summary": "integrated first candidate"},
+                {"action": "finish", "summary": "integrated reviewed candidate"},
+            ]
+        )
+        runtimes = {
+            "test/lead": lead,
+            "test/implementation": implementation,
+            "test/verification": verification,
+        }
+        service = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=(lambda _runtime, model, _timeout: runtimes[model]),
+            max_actions=10,
+        )
+
+        validated_sha = service.execute("run-1")
+
+        self.assertIsNotNone(validated_sha)
+        self.assertEqual(self.lifecycle.get_run("run-1")["state"], "publishing")
+        self.assertEqual(len(verification.contexts), 2)
+        self.assertIn(
+            "Remove the unreviewed marker before approval",
+            implementation.contexts[2],
+        )
+        self.assertEqual(
+            (self.checkout / "value.py").read_text(encoding="utf-8"),
+            "def value():\n    return 2\n",
+        )
+        with self.db.connect() as connection:
+            assignment_count = connection.execute(
+                """SELECT COUNT(*) FROM agent_assignments
+                   WHERE run_id='run-1' AND team_member_id='verification-1'"""
+            ).fetchone()[0]
+            blocked = connection.execute(
+                """SELECT COUNT(*) FROM run_transitions
+                   WHERE run_id='run-1' AND to_state='blocked'"""
+            ).fetchone()[0]
+            validation_count = connection.execute(
+                "SELECT COUNT(*) FROM validation_results WHERE run_id='run-1'"
+            ).fetchone()[0]
+        self.assertEqual(assignment_count, 1)
+        self.assertEqual(blocked, 0)
+        self.assertEqual(validation_count, 1)
+
     def test_model_block_action_records_irreducible_reason(self) -> None:
-        service, _ = self.service(
+        with self.db.transaction() as connection:
+            connection.execute("""DELETE FROM agent_assignments
+                   WHERE run_id='run-1' AND team_member_id='implementation-1'""")
+        runtime = ScriptedRuntime(
             [{"action": "block", "reason": "Required licensed SDK is not available"}]
+        )
+        service = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=lambda _runtime, _model, _timeout: runtime,
+            max_actions=10,
         )
         self.assertIsNone(service.execute("run-1"))
         run = self.lifecycle.get_run("run-1")
         self.assertEqual(run["state"], "blocked")
         self.assertIn("licensed SDK", run["reason"])
-
-
-
 
 
 class MiniSweExecutionIntegrationTests(unittest.TestCase):
@@ -1328,38 +2216,32 @@ class MiniSweExecutionIntegrationTests(unittest.TestCase):
                    VALUES ('team-1', 'repo-1', 1, '{}', ?)""",
                 (now,),
             )
-            connection.execute(
-                """INSERT INTO team_members
+            connection.execute("""INSERT INTO team_members
                    (id, team_version_id, stable_key, role, responsibilities,
                     permitted_tools_json, runtime, model, instructions,
                     action_timeout_seconds)
                    VALUES ('lead-1', 'team-1', 'lead', 'lead', 'Own result',
                            '[\"read\",\"write\",\"run\"]',
-                           'mini-swe-agent', 'openai/gpt-4', '', 321)"""
-            )
+                           'mini-swe-agent', 'openai/gpt-4', '', 321)""")
 
     def test_stored_runtime_model_timeout_survives_database_reopen(self) -> None:
         reopened = Database(self.db.path)
         reopened.initialize()
         with reopened.connect() as connection:
-            row = connection.execute(
-                """SELECT runtime, model, action_timeout_seconds
-                   FROM team_members WHERE id='lead-1'"""
-            ).fetchone()
+            row = connection.execute("""SELECT runtime, model, action_timeout_seconds
+                   FROM team_members WHERE id='lead-1'""").fetchone()
         self.assertEqual(row["runtime"], "mini-swe-agent")
         self.assertEqual(row["model"], "openai/gpt-4")
         self.assertEqual(row["action_timeout_seconds"], 321)
 
     def test_obsolete_omp_runtime_rejected_without_fallback(self) -> None:
         with self.db.transaction() as connection:
-            connection.execute(
-                """INSERT INTO team_members
+            connection.execute("""INSERT INTO team_members
                    (id, team_version_id, stable_key, role, responsibilities,
                     permitted_tools_json, runtime, model, instructions,
                     action_timeout_seconds)
                    VALUES ('legacy-1', 'team-1', 'legacy', 'verifier', 'Legacy member',
-                           '[\"read\"]', 'omp', 'openai/legacy', '', 300)"""
-            )
+                           '[\"read\"]', 'omp', 'openai/legacy', '', 300)""")
         reopened = Database(self.db.path)
         reopened.initialize()
         with reopened.connect() as connection:
@@ -1377,12 +2259,24 @@ class MiniSweRejectionTests(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
         self.root = Path(self.tempdir.name)
         self.data_root = self.root / "data"
-        self.checkout = self.data_root / "repositories" / "repo-1" / "runs" / "run-1" / "checkout"
+        self.checkout = (
+            self.data_root / "repositories" / "repo-1" / "runs" / "run-1" / "checkout"
+        )
         self.checkout.mkdir(parents=True)
-        (self.checkout / "value.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+        (self.checkout / "value.py").write_text(
+            "def value():\n    return 1\n", encoding="utf-8"
+        )
         self._git("init", "-q", "-b", "main")
         self._git("add", "-A")
-        self._git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "-qm", "base")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-qm",
+            "base",
+        )
         self.base_sha = self._git("rev-parse", "HEAD").strip()
         self.sandbox_root = self.data_root / "repositories" / "repo-1" / "sandbox" / "1"
         self.sandbox_root.mkdir(parents=True)
@@ -1411,7 +2305,9 @@ class MiniSweRejectionTests(unittest.TestCase):
                 (
                     str(self.sandbox_root),
                     json.dumps(policy),
-                    json.dumps({"instruction_files": [], "summary": "small Python fixture"}),
+                    json.dumps(
+                        {"instruction_files": [], "summary": "small Python fixture"}
+                    ),
                     now,
                 ),
             )
@@ -1419,7 +2315,20 @@ class MiniSweRejectionTests(unittest.TestCase):
                 """INSERT INTO validation_commands
                    (id, sandbox_version_id, position, command_json, source, required)
                    VALUES ('validation-command-1', 'sandbox-1', 0, ?, 'fixture', 1)""",
-                (json.dumps(["python3", "-m", "unittest", "discover", "-s", ".", "-p", "test_*.py"]),),
+                (
+                    json.dumps(
+                        [
+                            "python3",
+                            "-m",
+                            "unittest",
+                            "discover",
+                            "-s",
+                            ".",
+                            "-p",
+                            "test_*.py",
+                        ]
+                    ),
+                ),
             )
             connection.execute(
                 """INSERT INTO team_versions
@@ -1427,14 +2336,22 @@ class MiniSweRejectionTests(unittest.TestCase):
                    VALUES ('team-1', 'repo-1', 1, '{}', ?)""",
                 (now,),
             )
-            connection.execute(
-                """INSERT INTO team_members
-                   (id, team_version_id, stable_key, role, responsibilities,
-                    permitted_tools_json, runtime, model, instructions)
-                   VALUES ('lead-1', 'team-1', 'lead', 'lead', 'Own result',
-                           '[\"read\",\"write\",\"run\",\"git_diff\",\"git_commit\"]',
-                           'omp', 'test/stored', '')"""
-            )
+            connection.execute("""INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions)
+                   VALUES
+                   ('lead-1', 'team-1', 'lead', 'lead', 'delivery coordinator',
+                    'Coordinate result', '["read","git_diff","git_commit"]',
+                    'omp', 'test/stored', ''),
+                   ('implementation-1', 'team-1', 'implementation', 'implementer',
+                    'python implementation maintainer', 'Implement changes',
+                    '["read","write","run","git_diff"]',
+                    'mini-swe-agent', 'test/stored', ''),
+                   ('verification-1', 'team-1', 'verification', 'verifier',
+                    'python behavior verifier', 'Verify behavior',
+                    '["read","run","git_diff"]',
+                    'mini-swe-agent', 'test/stored', '')""")
             connection.execute(
                 """INSERT INTO issues
                    (id, repository_id, github_node_id, number, url, title, body,
@@ -1492,6 +2409,7 @@ class MiniSweRejectionTests(unittest.TestCase):
 
     def test_obsolete_omp_stored_runtime_rejected_at_execution(self) -> None:
         """Stored team member with runtime='omp' must be rejected without fallback."""
+
         def factory(runtime: str, model: str, timeout: float) -> object:
             self.fail(
                 f"obsolete runtime reached factory instead of being rejected: "

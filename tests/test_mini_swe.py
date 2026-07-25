@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import io
 import json
@@ -17,7 +18,6 @@ from repogents.mini_swe import (
     MiniSweInference,
     mini_swe_environment,
 )
-
 
 _ACTION_SCHEMA = {
     "type": "object",
@@ -92,9 +92,37 @@ class MiniSweConfigurationTests(unittest.TestCase):
                         },
                     )
                     self.assertTrue(config_directory.is_dir())
-                    self.assertTrue(
-                        config_directory.is_relative_to(application_state)
-                    )
+                    self.assertTrue(config_directory.is_relative_to(application_state))
+
+    def test_environment_preserves_multi_value_and_alternative_credentials(
+        self,
+    ) -> None:
+        source = {
+            "PATH": "/controller/bin",
+            "AWS_ACCESS_KEY_ID": "access-id",
+            "AWS_SECRET_ACCESS_KEY": "secret-access-key",  # pragma: allowlist secret
+            "AWS_SESSION_TOKEN": "session-token",  # pragma: allowlist secret
+            "ANTHROPIC_OAUTH_TOKEN": "oauth-token",  # pragma: allowlist secret
+            "OPENAI_API_KEY": "unrelated-openai-key",  # pragma: allowlist secret
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            aws = mini_swe_environment("aws/bedrock-model", root / "aws", source)
+            anthropic = mini_swe_environment(
+                "anthropic/claude-test",
+                root / "anthropic",
+                source,
+            )
+
+        self.assertEqual(aws["AWS_ACCESS_KEY_ID"], "access-id")
+        self.assertEqual(aws["AWS_SECRET_ACCESS_KEY"], "secret-access-key")
+        self.assertEqual(aws["AWS_SESSION_TOKEN"], "session-token")
+        self.assertNotIn("ANTHROPIC_OAUTH_TOKEN", aws)
+        self.assertNotIn("OPENAI_API_KEY", aws)
+        self.assertEqual(anthropic["ANTHROPIC_OAUTH_TOKEN"], "oauth-token")
+        self.assertNotIn("ANTHROPIC_API_KEY", anthropic)
+        self.assertNotIn("AWS_ACCESS_KEY_ID", anthropic)
 
 
 class _RecordingFileBackedRunner:
@@ -195,6 +223,71 @@ class MiniSweInferenceBoundaryTests(unittest.TestCase):
         config_directory = Path(environment["MSWEA_GLOBAL_CONFIG_DIR"])
         self.assertTrue(config_directory.is_relative_to(state_directory))
 
+    def test_explicit_dashboard_key_replaces_ambient_key_without_entering_request(
+        self,
+    ) -> None:
+        decision = {"action": "finish", "reason": "complete"}
+        runner = _RecordingFileBackedRunner(json.dumps(decision))
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_directory = Path(directory) / "state"
+            with patch.dict(
+                os.environ,
+                {
+                    "PATH": "/controller/bin",
+                    "OPENAI_API_KEY": "ambient-key",  # pragma: allowlist secret
+                },
+                clear=True,
+            ):
+                inference = MiniSweInference(
+                    "openai/gpt-explicit",
+                    api_key="dashboard-key",  # pragma: allowlist secret
+                    runner=runner,
+                )
+                inference.infer(
+                    system_prompt="Return one controller decision.",
+                    prompt="Choose an action.",
+                    response_schema=_ACTION_SCHEMA,
+                    state_directory=state_directory,
+                )
+
+        call = runner.calls[0]
+        self.assertEqual(
+            call["environment"]["OPENAI_API_KEY"],
+            "dashboard-key",
+        )
+        self.assertNotIn("dashboard-key", str(call["request"]))
+        self.assertNotIn("dashboard-key", str(call["argv"]))
+
+    def test_inference_passes_resolved_images_only_in_file_request(
+        self,
+    ) -> None:
+        decision = {"action": "finish", "reason": "image reviewed"}
+        runner = _RecordingFileBackedRunner(json.dumps(decision))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "capture.png"
+            image.write_bytes(b"\x89PNG\r\n\x1a\nimage-pixels")
+            state_directory = root / "state"
+            inference = MiniSweInference(
+                "openai/gpt-explicit",
+                runner=runner,
+            )
+            result = inference.infer(
+                system_prompt="Review one image.",
+                prompt="Does the image show the expected state?",
+                response_schema=_ACTION_SCHEMA,
+                state_directory=state_directory,
+                image_paths=(image,),
+            )
+
+        self.assertEqual(result, decision)
+        call = runner.calls[0]
+        request = json.loads(str(call["request"]))
+        self.assertEqual(request["image_paths"], [str(image.resolve())])
+        self.assertNotIn(str(image), call["argv"])
+
     def test_timeout_from_inference_is_propagated_by_file_backed_runner(
         self,
     ) -> None:
@@ -233,6 +326,8 @@ class MiniSweWorkerTests(unittest.TestCase):
         observed: dict[str, Any] = {}
 
         class FakeLiteLLM:
+            abort_exceptions = [TimeoutError]
+
             def __init__(self, **kwargs) -> None:
                 observed["model_arguments"] = kwargs
 
@@ -259,9 +354,7 @@ class MiniSweWorkerTests(unittest.TestCase):
             def run(self, task: str = "", **kwargs):
                 observed["task"] = task
                 try:
-                    observed["environment"].execute(
-                        {"command": "git status"}
-                    )
+                    observed["environment"].execute({"command": "git status"})
                 except Exception:
                     observed["repository_action_rejected"] = True
                 else:
@@ -315,6 +408,11 @@ class MiniSweWorkerTests(unittest.TestCase):
             trajectory = trajectories[0]
 
         model_arguments = observed["model_arguments"]
+        self.assertIn(TimeoutError, observed["model"].abort_exceptions)
+        self.assertIn(
+            "BadRequestError",
+            {error.__name__ for error in observed["model"].abort_exceptions},
+        )
         self.assertEqual(
             model_arguments["model_name"],
             "openai/codex/gpt-5.6-terra",
@@ -338,6 +436,73 @@ class MiniSweWorkerTests(unittest.TestCase):
         self.assertNotIn("raw_response", serialized)
         self.assertNotIn("provider-response-id", serialized)
         self.assertNotIn(provider_secret, serialized)
+
+    def test_worker_expands_images_without_persisting_pixel_bytes(
+        self,
+    ) -> None:
+        decision = {"action": "finish", "reason": "pixels reviewed"}
+        observed: dict[str, Any] = {}
+        image_body = b"\x89PNG\r\n\x1a\nprivate-image-pixels"
+
+        class FakeLiteLLM:
+            def __init__(self, **kwargs) -> None:
+                observed["model_arguments"] = kwargs
+
+        class FakeDefaultAgent:
+            def __init__(self, model, environment, **kwargs) -> None:
+                del model, environment, kwargs
+                self.n_calls = 1
+
+            def run(self, task: str = "", **kwargs):
+                del kwargs
+                observed["task"] = task
+                return {"submission": json.dumps(decision)}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_directory = root / "state"
+            image = root / "capture.png"
+            image.write_bytes(image_body)
+            request_path = root / "request.json"
+            response_path = root / "response.json"
+            request_path.write_text(
+                json.dumps(
+                    {
+                        "model": "openai/codex/gpt-5.6-terra",
+                        "base_url": "https://models.example.test/v1",
+                        "system_prompt": "Review one screenshot.",
+                        "prompt": "Judge only visible pixels.",
+                        "response_schema": _ACTION_SCHEMA,
+                        "state_directory": str(state_directory),
+                        "image_paths": [str(image)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(mini_swe_worker, "LitellmModel", FakeLiteLLM),
+                patch.object(
+                    mini_swe_worker,
+                    "DefaultAgent",
+                    FakeDefaultAgent,
+                ),
+            ):
+                mini_swe_worker.main([str(request_path), str(response_path)])
+            response_value = json.loads(response_path.read_text(encoding="utf-8"))
+
+            trajectories = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in state_directory.rglob("*.json")
+                if "trajectory-" in path.name
+            ]
+
+        encoded = base64.b64encode(image_body).decode("ascii")
+        self.assertIn(f"data:image/png;base64,{encoded}", observed["task"])
+        self.assertTrue(observed["model_arguments"]["multimodal_regex"])
+        self.assertEqual(response_value, decision)
+        self.assertEqual(len(trajectories), 1)
+        self.assertNotIn(encoded, json.dumps(trajectories[0], sort_keys=True))
 
     def test_worker_stdout_contains_only_the_final_decision(self) -> None:
         decision = {"action": "finish", "reason": "clean channel"}
@@ -491,9 +656,7 @@ class MiniSweWorkerTests(unittest.TestCase):
                     FakeSubmitted,
                 ),
             ):
-                mini_swe_worker.main(
-                    [str(request_path), str(response_path)]
-                )
+                mini_swe_worker.main([str(request_path), str(response_path)])
             result = json.loads(response_path.read_text(encoding="utf-8"))
 
         self.assertEqual(result, decision)
@@ -516,6 +679,7 @@ class MiniSweWorkerTests(unittest.TestCase):
 
         for label, submission in invalid_submissions.items():
             with self.subTest(label=label):
+
                 class FakeLiteLLM:
                     def __init__(self, **kwargs) -> None:
                         pass
@@ -564,6 +728,67 @@ class MiniSweWorkerTests(unittest.TestCase):
                                 [str(request_path), str(response_path)]
                             )
                     self.assertFalse(response_path.exists())
+
+    def test_permanent_model_errors_abort_while_transient_errors_retry(self) -> None:
+        import litellm
+        from minisweagent.models.litellm_model import (
+            LitellmModel as HarnessLitellmModel,
+        )
+        from tenacity import (
+            Retrying,
+            retry_if_not_exception_type,
+            stop_after_attempt,
+            wait_none,
+        )
+
+        adapter = HarnessLitellmModel(
+            model_name="openai/test-model",
+            model_kwargs={},
+            cost_tracking="ignore_errors",
+        )
+        mini_swe_worker._abort_permanent_model_errors(adapter)
+
+        def immediate_retry(*, logger, abort_exceptions):
+            del logger
+            return Retrying(
+                reraise=True,
+                stop=stop_after_attempt(2),
+                wait=wait_none(),
+                retry=retry_if_not_exception_type(tuple(abort_exceptions)),
+            )
+
+        permanent_calls = 0
+
+        def raise_permanent(*args, **kwargs):
+            nonlocal permanent_calls
+            permanent_calls += 1
+            raise litellm.exceptions.BadRequestError(
+                "model not found",
+                "test-model",
+                "openai",
+            )
+
+        transient_calls = 0
+
+        def raise_transient(*args, **kwargs):
+            nonlocal transient_calls
+            transient_calls += 1
+            raise ConnectionError("temporary provider outage")
+
+        messages = [{"role": "user", "content": "test"}]
+        with patch(
+            "minisweagent.models.litellm_model.retry",
+            side_effect=immediate_retry,
+        ):
+            with patch.object(adapter, "_query", side_effect=raise_permanent):
+                with self.assertRaises(litellm.exceptions.BadRequestError):
+                    adapter.query(messages)
+            with patch.object(adapter, "_query", side_effect=raise_transient):
+                with self.assertRaises(ConnectionError):
+                    adapter.query(messages)
+
+        self.assertEqual(permanent_calls, 1)
+        self.assertEqual(transient_calls, 2)
 
 
 if __name__ == "__main__":

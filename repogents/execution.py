@@ -19,8 +19,37 @@ from .sandbox import (
     redact_text,
 )
 from .team import Assignment, StoredTeam, TeamMember, TeamService
+from .validation import compare_findings, extract_findings
 
 _ACTION_HISTORY_LIMIT = 2_000
+_PROBE_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RESERVED_PROBE_ENVIRONMENT = frozenset(
+    {
+        "CARGO_HOME",
+        "CHROME_BIN",
+        "GOCACHE",
+        "GOMODCACHE",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "NODE_PATH",
+        "PATH",
+        "PIP_CACHE_DIR",
+        "PIP_TARGET",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPATH",
+        "PYTHONPYCACHEPREFIX",
+        "TMPDIR",
+        "VIRTUAL_ENV",
+        "XDG_CACHE_HOME",
+        "npm_config_cache",
+        "npm_config_prefix",
+    }
+)
+_SENSITIVE_PROBE_ENVIRONMENT = re.compile(
+    r"(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE|ACCESS_KEY|API_KEY)",
+    re.IGNORECASE,
+)
 _ACTION_FIELD_ORDER = (
     "action",
     "path",
@@ -47,6 +76,224 @@ _ACTION_STRING_LIMITS = {
     "new": 256,
     "content": 256,
 }
+
+_VALIDATION_POLICY_NAMES = frozenset(
+    {
+        ".eslintignore",
+        ".gitignore",
+        ".prettierignore",
+        ".stylelintignore",
+        "Cargo.lock",
+        "Cargo.toml",
+        "Gemfile",
+        "Gemfile.lock",
+        "Makefile",
+        "eslint.config.js",
+        "eslint.config.mjs",
+        "eslint.config.cjs",
+        "go.mod",
+        "go.sum",
+        "mypy.ini",
+        "package-lock.json",
+        "package.json",
+        "pnpm-lock.yaml",
+        "pyproject.toml",
+        "pytest.ini",
+        "ruff.toml",
+        "setup.cfg",
+        "tox.ini",
+        "yarn.lock",
+    }
+)
+
+
+def _is_validation_policy_path(value: str) -> bool:
+    name = Path(value).name
+    return (
+        name in _VALIDATION_POLICY_NAMES
+        or name.startswith((".eslintrc", ".prettierrc", "tsconfig."))
+        or name.startswith(("jest.config.", "vitest.config."))
+    )
+
+
+_DIRECT_VALIDATION_IGNORE_NAMES = frozenset(
+    {".eslintignore", ".prettierignore", ".stylelintignore"}
+)
+_SUPPRESSION_KEY = re.compile(
+    r"\b(ignore|ignores|ignorepatterns|exclude|excludedfiles|omit|"
+    r"extend-ignore|per-file-ignores)\b\s*[:=]",
+    re.IGNORECASE,
+)
+_DISABLED_SETTING = re.compile(
+    r"[:=]\s*(?:[\"'](?:off|warn)[\"']|0)\s*[,}]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _validation_weakening_reasons(
+    path: str,
+    diff: str,
+    baseline_findings: tuple[str, ...],
+) -> tuple[str, ...]:
+    name = Path(path).name.lower()
+    additions = tuple(
+        line[1:].strip()
+        for line in diff.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    meaningful = tuple(
+        line for line in additions if line and not line.startswith(("#", "//"))
+    )
+    if name in _DIRECT_VALIDATION_IGNORE_NAMES and meaningful:
+        return (f"{path}: added validation exclusion",)
+    if name == ".gitignore" and any(
+        _ignore_matches_finding(line, baseline_findings)
+        for line in meaningful
+        if not line.startswith("!")
+    ):
+        return (f"{path}: ignored a baseline finding path",)
+    if any(_line_adds_suppression(line) for line in meaningful):
+        return (f"{path}: added validation suppression or exclusion",)
+    if "deleted file mode" in diff and _is_validation_config_path(name):
+        return (f"{path}: removed validation configuration",)
+    return ()
+
+
+def _line_adds_suppression(line: str) -> bool:
+    lowered = line.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "eslint-disable",
+            "@ts-ignore",
+            "# noqa",
+            "|| true",
+            "--max-warnings=-1",
+        )
+    ):
+        return True
+    if _DISABLED_SETTING.search(line):
+        return True
+    if re.search(
+        r"\b(skiplibcheck|strict|noemitonerror)\b\s*[:=]\s*false\b",
+        lowered,
+    ):
+        return True
+    match = _SUPPRESSION_KEY.search(line)
+    if match is None:
+        return False
+    value = line[match.end() :].strip().rstrip(",")
+    return value.lower() not in {"", "[]", "{}", "false", "none", "null"}
+
+
+def _ignore_matches_finding(
+    entry: str,
+    baseline_findings: tuple[str, ...],
+) -> bool:
+    pattern = entry.strip().lstrip("/")
+    if not pattern:
+        return False
+    finding_paths = (
+        finding.partition("|")[0] for finding in baseline_findings if "|" in finding
+    )
+    return any(
+        candidate == pattern
+        or candidate.startswith(pattern.rstrip("/") + "/")
+        or Path(candidate).match(pattern)
+        for candidate in finding_paths
+    )
+
+
+def _is_validation_config_path(name: str) -> bool:
+    return name in {
+        "mypy.ini",
+        "pyproject.toml",
+        "pytest.ini",
+        "ruff.toml",
+        "setup.cfg",
+        "tox.ini",
+    } or name.startswith(
+        (
+            ".eslintrc",
+            ".prettierrc",
+            "eslint.config.",
+            "jest.config.",
+            "tsconfig.",
+            "vitest.config.",
+        )
+    )
+
+
+_SOURCE_SUPPRESSION_MARKER = re.compile(
+    r"(eslint-disable|@ts-(?:ignore|expect-error|nocheck)|"
+    r"#\s*(?:noqa|type:\s*ignore|pyright:\s*ignore)|"
+    r"rubocop:\s*disable|//\s*nolint\b|noinspection)",
+    re.IGNORECASE,
+)
+
+
+def _source_suppression_analysis(
+    path: str,
+    diff: str,
+) -> tuple[bool, tuple[str, ...]]:
+    additions = tuple(
+        line[1:]
+        for line in diff.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    marker_lines = tuple(
+        line for line in additions if _SOURCE_SUPPRESSION_MARKER.search(line)
+    )
+    if not marker_lines:
+        return False, ()
+    if any(_is_broad_source_suppression(line) for line in marker_lines):
+        return True, (f"{path}: added broad source suppression",)
+
+    deletions = {
+        line[1:].strip()
+        for line in diff.splitlines()
+        if line.startswith("-") and not line.startswith("---")
+    }
+    substantive = False
+    for line in additions:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _SOURCE_SUPPRESSION_MARKER.search(line):
+            remainder = _without_source_suppression(line)
+            if remainder and remainder not in deletions:
+                substantive = True
+            continue
+        if stripped.startswith(("#", "//", "/*", "*")):
+            continue
+        if stripped not in deletions:
+            substantive = True
+    if not substantive:
+        return True, (f"{path}: added suppression without source behavior",)
+    return True, ()
+
+
+def _is_broad_source_suppression(line: str) -> bool:
+    lowered = line.lower()
+    return (
+        "@ts-nocheck" in lowered
+        or "flake8: noqa" in lowered
+        or "ruff: noqa" in lowered
+        or "mypy: ignore-errors" in lowered
+        or re.search(
+            r"eslint-disable(?!-(?:next-line|line))",
+            lowered,
+        )
+        is not None
+    )
+
+
+def _without_source_suppression(line: str) -> str:
+    marker = _SOURCE_SUPPRESSION_MARKER.search(line)
+    if marker is None:
+        return line.strip()
+    prefix = line[: marker.start()].rstrip()
+    return "" if prefix.strip() in {"#", "//", "/*", "*"} else prefix.strip()
 
 
 def _bounded_redacted_text(
@@ -191,7 +438,7 @@ class MiniSweModelRuntime:
 {"action":"assign","members":["lead","member-key"],"reason":"why these stored members are needed"}
 {"action":"note","summary":"concise findings and exact next action"}
 {"action":"finish","summary":"implemented behavior and why it satisfies the issue"}
-{"action":"block","reason":"specific irreducible missing or contradictory prerequisite"}
+{"action":"block","reason":"specific irreducible missing or contradictory prerequisite"} (lead only; non-leads finish with blocker evidence for the lead)
 Read before editing. Do not reread evidence already present in action history unless its result was incomplete or the source changed. Once inspection supports a decision, persist one concise note with the findings and exact next action, then execute that action instead of continuing to inspect. After a note, the next decision must execute the stated action; the controller rejects another note until a repository write or replacement succeeds. Assignment is available only before issue work begins. A note neither finishes nor blocks the work. Keep changes strictly in issue scope. Do not create or retain plans, specification ledgers, coordination files, agent instructions, or other process artifacts in the repository; change only product source, repository-required tests, and directly required configuration. Never publish, merge, close, push, expose credentials, or invent missing external resources."""
     _RESPONSE_SCHEMA: dict[str, object] = {
         "type": "object",
@@ -239,6 +486,7 @@ Read before editing. Do not reread evidence already present in action history un
         *,
         model: str,
         base_url: str | None = None,
+        api_key: str | None = None,
         timeout: float = 600,
         supervisor: RunProcessSupervisor | None = None,
         run_id: str | None = None,
@@ -249,6 +497,7 @@ Read before editing. Do not reread evidence already present in action history un
             raise ValueError("stored-agent model timeout must be positive")
         self.model = model
         self.base_url = base_url
+        self.api_key = api_key
         self.timeout = timeout
         self.supervisor = supervisor
         self.run_id = run_id
@@ -263,6 +512,7 @@ Read before editing. Do not reread evidence already present in action history un
         inference = MiniSweInference(
             self.model,
             base_url=self.base_url,
+            api_key=self.api_key,
             timeout=self.timeout,
             supervisor=self.supervisor,
             run_id=self.run_id,
@@ -272,6 +522,31 @@ Read before editing. Do not reread evidence already present in action history un
             prompt=context,
             response_schema=self.response_schema,
             state_directory=state_directory,
+        )
+
+    def inspect_image(
+        self,
+        *,
+        system_prompt: str,
+        prompt: str,
+        response_schema: dict[str, object],
+        image_path: Path,
+        state_directory: Path,
+    ) -> dict[str, object]:
+        inference = MiniSweInference(
+            self.model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            timeout=self.timeout,
+            supervisor=self.supervisor,
+            run_id=self.run_id,
+        )
+        return inference.infer(
+            system_prompt=system_prompt,
+            prompt=prompt,
+            response_schema=response_schema,
+            state_directory=state_directory,
+            image_paths=(image_path,),
         )
 
 
@@ -291,6 +566,43 @@ def _default_runtime_factory(
         model=model,
         timeout=action_timeout_seconds,
     )
+
+
+def _probe_runtime_environment(
+    action: dict[str, object],
+) -> dict[str, str] | None:
+    remediation = action.get("remediation")
+    if remediation is None:
+        return None
+    if not isinstance(remediation, dict):
+        raise ValueError("run action remediation must be an object")
+    environment = remediation.get("environment")
+    corrected_target = remediation.get("corrected_target")
+    environment_name = (
+        environment.get("name") if isinstance(environment, dict) else None
+    )
+    environment_value = (
+        environment.get("value") if isinstance(environment, dict) else None
+    )
+    if (
+        remediation.get("kind") != "probe_configuration"
+        or not isinstance(environment_name, str)
+        or not environment_name
+        or len(environment_name) > 128
+        or not _PROBE_ENVIRONMENT_NAME.fullmatch(environment_name)
+        or environment_name in _RESERVED_PROBE_ENVIRONMENT
+        or environment_name.startswith(("LD_", "DYLD_", "GIT_", "SSH_"))
+        or _SENSITIVE_PROBE_ENVIRONMENT.search(environment_name)
+        or not isinstance(environment_value, str)
+        or not environment_value
+        or len(environment_value) > 2_048
+        or "\x00" in environment_value
+        or environment_value != corrected_target
+    ):
+        raise ValueError(
+            "probe remediation requires a safe corrected environment binding"
+        )
+    return {environment_name: environment_value}
 
 
 class AgentToolExecutor:
@@ -337,24 +649,39 @@ class AgentToolExecutor:
             ):
                 raise ValueError("run action timeout must be a number")
             timeout = min(max(float(timeout_value), 1), 300)
+            runtime_environment = _probe_runtime_environment(action)
+            command = tuple(argv)
+            if runtime_environment is not None:
+                environment_name, environment_value = next(
+                    iter(runtime_environment.items())
+                )
+                command = (
+                    "/usr/bin/env",
+                    "--",
+                    f"{environment_name}={environment_value}",
+                    *command,
+                )
             result = self.sandbox.run(
                 policy,
                 layout,
-                tuple(argv),
+                command,
                 timeout=timeout,
                 secrets=secrets,
                 checkout_writable=checkout_writable,
             )
             if result.canceled:
                 raise _RunCanceled(layout.run_id)
+            payload: dict[str, object] = {
+                "returncode": result.returncode,
+                "stdout": result.stdout[-32_000:],
+                "stderr": result.stderr[-32_000:],
+                "timed_out": result.timed_out,
+                "log_path": str(result.log_path),
+            }
+            if runtime_environment is not None:
+                payload["configured_environment"] = runtime_environment
             return json.dumps(
-                {
-                    "returncode": result.returncode,
-                    "stdout": result.stdout[-32_000:],
-                    "stderr": result.stderr[-32_000:],
-                    "timed_out": result.timed_out,
-                    "log_path": str(result.log_path),
-                },
+                payload,
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -397,6 +724,10 @@ class MissingValidationCommands(RuntimeError):
     pass
 
 
+class BaselineUnavailable(RuntimeError):
+    pass
+
+
 class RevisionRequired(RuntimeError):
     """A safe, source-fixable revision that must return to the stored agent."""
 
@@ -436,7 +767,10 @@ class ExecutionService:
     def execute(
         self, run_id: str, *, additional_context: str | None = None
     ) -> str | None:
-        run, issue, sandbox_row = self._load_context(run_id)
+        if self._is_canceled(run_id):
+            return None
+        issue_version_id = self.lifecycle.current_issue_version(run_id)
+        run, issue, sandbox_row = self._load_context(run_id, issue_version_id)
         current = RunState(str(run["state"]))
         resume_validation = current == RunState.VALIDATING
         if current == RunState.QUEUED:
@@ -448,7 +782,7 @@ class ExecutionService:
         }:
             raise ValueError(f"run cannot execute from state {current.value}")
         team = self.teams.load(str(run["team_version_id"]))
-        lead = next(member for member in team.members if member.role == "lead")
+        lead = next(member for member in team.members if member.coordinates)
         layout = RunLayout.create(
             Path(str(run["run_path"])).parents[3],
             str(run["repository_id"]),
@@ -457,11 +791,45 @@ class ExecutionService:
         policy = _sandbox_policy(sandbox_row)
         secret_bindings = _secret_bindings(sandbox_row)
         resolved_secret_values: set[str] = set()
+        try:
+            self._ensure_validation_baselines(
+                run,
+                str(run["sandbox_version_id"]),
+                policy,
+                layout,
+                secret_bindings,
+                resolved_secret_values,
+            )
+        except _RunCanceled:
+            return None
+        except (MissingValidationCommands, BaselineUnavailable) as error:
+            if not self._is_canceled(run_id):
+                self.lifecycle.transition(
+                    run_id,
+                    RunState.BLOCKED,
+                    reason=str(error),
+                )
+            return None
         base_context = self._base_prompt(
             run, issue, sandbox_row, team, additional_context
         )
         transcript = self._load_transcript(layout)
         assignments = self.teams.assignments_for_run(run_id)
+        if assignments and not any(
+            assignment.member.independent_verifier for assignment in assignments
+        ):
+            verifier = next(
+                member for member in team.members if member.independent_verifier
+            )
+            self.teams.assign(
+                run_id,
+                tuple(
+                    assignment.member.stable_key for assignment in assignments
+                )
+                + (verifier.stable_key,),
+                "Complete the existing assignment with mandatory independent review.",
+            )
+            assignments = self.teams.assignments_for_run(run_id)
         if not assignments:
             self._agent_cycle(
                 self._runtime(lead, run_id),
@@ -475,37 +843,69 @@ class ExecutionService:
                 allow_assignment=True,
             )
             return None
-        if not resume_validation:
-            for assignment in assignments:
-                member = assignment.member
-                if member.role == "lead" or self._member_finished(transcript, member):
-                    continue
-                outcome, yielded = self._agent_cycle(
-                    self._runtime(member, run_id),
-                    member,
-                    policy,
-                    layout,
-                    self._member_prompt(base_context, assignment),
-                    transcript,
-                    secret_bindings,
-                    resolved_secret_values,
-                )
-                if yielded or outcome is None:
-                    return None
         runtime = self._runtime(lead, run_id)
         for cycle in range(self.max_revision_cycles):
             if not (resume_validation and cycle == 0):
-                outcome, yielded = self._agent_cycle(
-                    runtime,
-                    lead,
-                    policy,
-                    layout,
-                    base_context,
-                    transcript,
-                    secret_bindings,
-                    resolved_secret_values,
+                for assignment in assignments:
+                    member = assignment.member
+                    if (
+                        member.coordinates
+                        or member.independent_verifier
+                        or self._member_finished(transcript, member)
+                    ):
+                        continue
+                    member_outcome, yielded = self._agent_cycle(
+                        self._runtime(member, run_id),
+                        member,
+                        policy,
+                        layout,
+                        self._member_prompt(base_context, assignment),
+                        transcript,
+                        secret_bindings,
+                        resolved_secret_values,
+                    )
+                    if yielded or member_outcome is None:
+                        return None
+                if not self._member_finished(transcript, lead):
+                    outcome, yielded = self._agent_cycle(
+                        runtime,
+                        lead,
+                        policy,
+                        layout,
+                        base_context,
+                        transcript,
+                        secret_bindings,
+                        resolved_secret_values,
+                    )
+                    if yielded or outcome is None:
+                        return None
+                verifier_assignment = next(
+                    assignment
+                    for assignment in assignments
+                    if assignment.member.independent_verifier
                 )
-                if yielded or outcome is None:
+                try:
+                    verifier_outcome, yielded = self._agent_cycle(
+                        self._runtime(verifier_assignment.member, run_id),
+                        verifier_assignment.member,
+                        policy,
+                        layout,
+                        self._member_prompt(base_context, verifier_assignment),
+                        transcript,
+                        secret_bindings,
+                        resolved_secret_values,
+                    )
+                except RevisionRequired as error:
+                    transcript.append(
+                        "Revision requested for assigned members: independent "
+                        "review rejected the candidate:\n"
+                        + redact_text(str(error), resolved_secret_values)
+                    )
+                    self._store_transcript(layout, transcript)
+                    if cycle + 1 >= self.max_revision_cycles:
+                        return None
+                    continue
+                if yielded or verifier_outcome is None:
                     return None
             try:
                 self._ensure_not_canceled(run_id)
@@ -522,8 +922,8 @@ class ExecutionService:
                 if self._is_canceled(run_id):
                     return None
                 transcript.append(
-                    "Commit preparation found a source-fixable problem. "
-                    "Revise the implementation:\n"
+                    "Revision requested for assigned members: commit preparation "
+                    "found a source-fixable problem:\n"
                     + redact_text(str(error), resolved_secret_values)
                 )
                 self._store_transcript(layout, transcript)
@@ -547,7 +947,7 @@ class ExecutionService:
                 )
             except _RunCanceled:
                 return None
-            except MissingValidationCommands as error:
+            except (MissingValidationCommands, BaselineUnavailable) as error:
                 if self._is_canceled(run_id):
                     return None
                 self.lifecycle.transition(run_id, RunState.BLOCKED, reason=str(error))
@@ -560,22 +960,20 @@ class ExecutionService:
                 return None
             if passed:
                 self._ensure_not_canceled(run_id)
-                with self.database.transaction() as connection:
-                    connection.execute(
-                        "UPDATE runs SET validated_sha=?, updated_at=? WHERE id=?",
-                        (commit_sha, _utc_now(), run_id),
-                    )
-                if self._is_canceled(run_id):
+                if not self.lifecycle.record_validated_revision(
+                    run_id,
+                    commit_sha,
+                    issue_version_id,
+                ):
                     return None
                 self._clear_transcript(layout)
-                self.lifecycle.transition(run_id, RunState.PUBLISHING)
                 return commit_sha
             if self._is_canceled(run_id):
                 return None
             transcript.append(
-                "Validation for commit "
+                "Revision requested for assigned members: validation for commit "
                 + commit_sha
-                + " failed. Revise the implementation:\n"
+                + " failed:\n"
                 + validation_feedback
             )
             self._store_transcript(layout, transcript)
@@ -660,13 +1058,15 @@ class ExecutionService:
                     if not isinstance(summary, str) or not summary.strip():
                         raise ValueError("note action requires a nonempty summary")
                     label = (
-                        "Lead"
-                        if member.role == "lead"
-                        else f"Member {member.stable_key}"
+                        "Lead" if member.coordinates else f"Member {member.stable_key}"
                     )
                     safe_summary = _bounded_redacted_text(
                         summary,
                         resolved_secret_values,
+                        limit=max(
+                            0,
+                            _ACTION_HISTORY_LIMIT - len(label) - len(" note: "),
+                        ),
                     )
                     transcript.append(f"{label} note: {safe_summary}")
                     self._store_transcript(layout, transcript)
@@ -680,13 +1080,15 @@ class ExecutionService:
                     if not isinstance(summary, str) or not summary.strip():
                         raise ValueError("finish action requires a nonempty summary")
                     label = (
-                        "Lead"
-                        if member.role == "lead"
-                        else f"Member {member.stable_key}"
+                        "Lead" if member.coordinates else f"Member {member.stable_key}"
                     )
                     safe_summary = _bounded_redacted_text(
                         summary,
                         resolved_secret_values,
+                        limit=max(
+                            0,
+                            _ACTION_HISTORY_LIMIT - len(label) - len(" finished: "),
+                        ),
                     )
                     transcript.append(f"{label} finished: {safe_summary}")
                     self._store_transcript(layout, transcript)
@@ -700,6 +1102,15 @@ class ExecutionService:
                         reason,
                         resolved_secret_values,
                     )
+                    if member.independent_verifier:
+                        raise RevisionRequired(safe_reason)
+                    if not member.coordinates:
+                        handoff = "reported blocker for lead decision: " + safe_reason
+                        transcript.append(
+                            f"Member {member.stable_key} finished: {handoff}"
+                        )
+                        self._store_transcript(layout, transcript)
+                        return handoff, False
                     self.lifecycle.transition(
                         layout.run_id,
                         RunState.BLOCKED,
@@ -782,9 +1193,39 @@ class ExecutionService:
             encoding="utf-8",
         )
         temporary.replace(path)
+        self.database.notify_activity_change()
 
     def _clear_transcript(self, layout: RunLayout) -> None:
         self._transcript_path(layout).unlink(missing_ok=True)
+
+    def _head_is_controller_issue_commit(
+        self,
+        run: dict[str, object],
+        message: str,
+        policy: SandboxPolicy,
+        layout: RunLayout,
+    ) -> bool:
+        metadata = self._git(
+            policy,
+            layout,
+            ("show", "-s", "--format=%H%x09%ce%x09%s", "HEAD"),
+            allow_failure=True,
+        )
+        if metadata.returncode != 0:
+            raise RuntimeError(
+                metadata.stderr.strip()
+                or metadata.stdout.strip()
+                or "cannot inspect current commit"
+            )
+        fields = metadata.stdout.rstrip("\r\n").split("\t", 2)
+        if len(fields) != 3:
+            raise RuntimeError("current commit metadata is invalid")
+        commit_sha, committer_email, subject = fields
+        return (
+            commit_sha != str(run["base_sha"])
+            and committer_email == "repogents@localhost"
+            and subject == message
+        )
 
     def _commit(
         self,
@@ -820,19 +1261,27 @@ class ExecutionService:
         if staged.returncode == 1:
             title = " ".join(str(issue["title"]).split())[:120]
             message = f"Resolve issue #{issue['number']}: {title}"
+            commit_arguments = [
+                "-c",
+                "user.name=Repogents",
+                "-c",
+                "user.email=repogents@localhost",
+                "commit",
+                "--quiet",
+            ]
+            if self._head_is_controller_issue_commit(
+                run,
+                message,
+                policy,
+                layout,
+            ):
+                commit_arguments.extend(("--amend", "--no-edit"))
+            else:
+                commit_arguments.extend(("-m", message))
             commit = self._git(
                 policy,
                 layout,
-                (
-                    "-c",
-                    "user.name=Repogents",
-                    "-c",
-                    "user.email=repogents@localhost",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    message,
-                ),
+                tuple(commit_arguments),
                 allow_failure=True,
             )
             if commit.returncode != 0:
@@ -843,6 +1292,213 @@ class ExecutionService:
         if head == str(run["base_sha"]):
             raise RevisionRequired("agent produced no committed issue change")
         return head
+
+    def _ensure_validation_baselines(
+        self,
+        run: dict[str, object],
+        sandbox_version_id: str,
+        policy: SandboxPolicy,
+        layout: RunLayout,
+        secret_bindings: tuple[SecretBinding, ...],
+        resolved_secret_values: set[str],
+    ) -> None:
+        run_id = str(run["id"])
+        base_sha = str(run["base_sha"])
+        self._ensure_not_canceled(run_id)
+        with self.database.connect() as connection:
+            commands = connection.execute(
+                """SELECT id, command_json
+                   FROM validation_commands
+                   WHERE sandbox_version_id=? AND required=1
+                   ORDER BY position""",
+                (sandbox_version_id,),
+            ).fetchall()
+            baselines = connection.execute(
+                """SELECT validation_command_id, base_sha, command_json
+                   FROM validation_baselines
+                   WHERE run_id=?""",
+                (run_id,),
+            ).fetchall()
+        if not commands:
+            raise MissingValidationCommands(
+                "repository validation commands could not be derived; "
+                "explicit input is required"
+            )
+        baseline_by_command = {
+            str(row["validation_command_id"]): (
+                str(row["base_sha"]),
+                str(row["command_json"]),
+            )
+            for row in baselines
+        }
+        required_ids = {str(row["id"]) for row in commands}
+        command_by_id = {str(row["id"]): str(row["command_json"]) for row in commands}
+        for command_id, (
+            stored_base_sha,
+            stored_command,
+        ) in baseline_by_command.items():
+            if command_id not in required_ids:
+                continue
+            if stored_base_sha != base_sha:
+                raise BaselineUnavailable(
+                    "stored validation baseline does not match the run base SHA"
+                )
+            if stored_command != command_by_id[command_id]:
+                raise BaselineUnavailable("stored validation baseline command changed")
+        if required_ids.issubset(baseline_by_command):
+            return
+
+        head = self._git(
+            policy,
+            layout,
+            ("rev-parse", "HEAD"),
+            allow_failure=True,
+        )
+        status = self._git(
+            policy,
+            layout,
+            ("status", "--porcelain", "--untracked-files=no"),
+            allow_failure=True,
+        )
+        if (
+            head.returncode != 0
+            or head.stdout.strip() != base_sha
+            or status.returncode != 0
+            or bool(status.stdout.strip())
+        ):
+            raise BaselineUnavailable(
+                "validation baseline is missing and the checkout is no longer "
+                "the clean exact run base"
+            )
+
+        for row in commands:
+            command_id = str(row["id"])
+            if command_id in baseline_by_command:
+                continue
+            command = json.loads(str(row["command_json"]))
+            if not isinstance(command, list) or not all(
+                isinstance(value, str) for value in command
+            ):
+                raise RuntimeError("stored validation command is invalid")
+            self._ensure_not_canceled(run_id)
+            secrets = self._command_secrets(
+                tuple(command),
+                secret_bindings,
+                resolved_secret_values,
+            )
+            result = self.sandbox.run(
+                policy,
+                layout,
+                tuple(command),
+                timeout=600,
+                secrets=secrets,
+            )
+            if result.canceled:
+                raise _RunCanceled(run_id)
+            self._ensure_not_canceled(run_id)
+            checked_head = self._git(
+                policy,
+                layout,
+                ("rev-parse", "HEAD"),
+                allow_failure=True,
+            )
+            checked_status = self._git(
+                policy,
+                layout,
+                ("status", "--porcelain", "--untracked-files=no"),
+                allow_failure=True,
+            )
+            if (
+                checked_head.returncode != 0
+                or checked_head.stdout.strip() != base_sha
+                or checked_status.returncode != 0
+                or bool(checked_status.stdout.strip())
+            ):
+                self._git(
+                    policy,
+                    layout,
+                    ("reset", "--hard", base_sha),
+                    allow_failure=False,
+                )
+                raise BaselineUnavailable(
+                    "validation baseline command changed the exact base checkout"
+                )
+            stdout = redact_text(result.stdout, resolved_secret_values)
+            stderr = redact_text(result.stderr, resolved_secret_values)
+            findings = extract_findings(stdout, stderr)
+            if result.returncode != 0 and not findings:
+                raise BaselineUnavailable(
+                    "validation baseline failed without usable normalized findings: "
+                    + " ".join(command)
+                )
+            mode = "strict" if result.returncode == 0 else "delta"
+            with self.database.transaction() as connection:
+                connection.execute(
+                    """INSERT OR IGNORE INTO validation_baselines
+                       (id, run_id, validation_command_id, command_json,
+                        base_sha, mode, started_at, completed_at, exit_status,
+                        log_path, findings_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        _stable_id(f"{run_id}:{command_id}:baseline"),
+                        run_id,
+                        command_id,
+                        str(row["command_json"]),
+                        base_sha,
+                        mode,
+                        result.started_at,
+                        result.completed_at,
+                        result.returncode,
+                        str(result.log_path),
+                        _json(findings),
+                    ),
+                )
+
+    def _validation_contract_changes(
+        self,
+        policy: SandboxPolicy,
+        layout: RunLayout,
+        base_sha: str,
+        commit_sha: str,
+        baseline_findings: tuple[str, ...],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        changed = self._git(
+            policy,
+            layout,
+            ("diff", "--name-only", base_sha, commit_sha, "--"),
+        )
+        changed_paths = tuple(path for path in changed.stdout.splitlines() if path)
+        contract_paths: list[str] = []
+        weakening: list[str] = []
+        for path in changed_paths:
+            path_diff = self._git(
+                policy,
+                layout,
+                (
+                    "diff",
+                    "--unified=0",
+                    base_sha,
+                    commit_sha,
+                    "--",
+                    path,
+                ),
+            )
+            policy_path = _is_validation_policy_path(path)
+            source_marker, source_weakening = _source_suppression_analysis(
+                path, path_diff.stdout
+            )
+            if policy_path or source_marker:
+                contract_paths.append(path)
+            if policy_path:
+                weakening.extend(
+                    _validation_weakening_reasons(
+                        path,
+                        path_diff.stdout,
+                        baseline_findings,
+                    )
+                )
+            weakening.extend(source_weakening)
+        return tuple(contract_paths), tuple(weakening)
 
     def _validate(
         self,
@@ -857,60 +1513,163 @@ class ExecutionService:
         self._ensure_not_canceled(run_id)
         with self.database.connect() as connection:
             rows = connection.execute(
-                """SELECT command_json FROM validation_commands
-                   WHERE sandbox_version_id=? AND required=1 ORDER BY position""",
-                (sandbox_version_id,),
+                """SELECT validation_commands.id AS validation_command_id,
+                          validation_commands.command_json AS command_json,
+                          validation_baselines.command_json
+                              AS baseline_command_json,
+                          validation_baselines.base_sha AS baseline_base_sha,
+                          validation_baselines.mode,
+                          validation_baselines.findings_json,
+                          runs.base_sha AS run_base_sha
+                   FROM validation_commands
+                   JOIN runs ON runs.id=?
+                   LEFT JOIN validation_baselines
+                     ON validation_baselines.run_id=runs.id
+                    AND validation_baselines.validation_command_id=
+                        validation_commands.id
+                   WHERE validation_commands.sandbox_version_id=?
+                     AND validation_commands.required=1
+                   ORDER BY validation_commands.position""",
+                (run_id, sandbox_version_id),
             ).fetchall()
         if not rows:
             raise MissingValidationCommands(
-                "repository validation commands could not be derived; explicit input is required"
+                "repository validation commands could not be derived; "
+                "explicit input is required"
             )
+        if any(row["mode"] is None for row in rows):
+            raise BaselineUnavailable(
+                "required validation baseline evidence is missing"
+            )
+        base_sha = str(rows[0]["run_base_sha"])
+        if any(str(row["baseline_base_sha"]) != base_sha for row in rows):
+            raise BaselineUnavailable("required validation baseline evidence is stale")
+        if any(
+            str(row["baseline_command_json"]) != str(row["command_json"])
+            for row in rows
+        ):
+            raise BaselineUnavailable("stored validation baseline command changed")
+        baseline_by_command: dict[str, tuple[str, ...]] = {}
+        for row in rows:
+            baseline_value = json.loads(str(row["findings_json"]))
+            if not isinstance(baseline_value, list) or not all(
+                isinstance(value, str) for value in baseline_value
+            ):
+                raise BaselineUnavailable(
+                    "stored validation baseline findings are invalid"
+                )
+            baseline_by_command[str(row["validation_command_id"])] = tuple(
+                baseline_value
+            )
+        all_baseline_findings = tuple(
+            finding for findings in baseline_by_command.values() for finding in findings
+        )
+        contract_changes, weakening_detected = self._validation_contract_changes(
+            policy,
+            layout,
+            base_sha,
+            commit_sha,
+            all_baseline_findings,
+        )
         failures: list[str] = []
         for row in rows:
-            command = json.loads(row["command_json"])
+            command = json.loads(str(row["command_json"]))
             if not isinstance(command, list) or not all(
                 isinstance(value, str) for value in command
             ):
                 raise RuntimeError("stored validation command is invalid")
+            baseline_findings = baseline_by_command[str(row["validation_command_id"])]
             self._ensure_not_canceled(run_id)
             secrets = self._command_secrets(
-                tuple(command), secret_bindings, resolved_secret_values
+                tuple(command),
+                secret_bindings,
+                resolved_secret_values,
             )
             self._ensure_not_canceled(run_id)
             result = self.sandbox.run(
-                policy, layout, tuple(command), timeout=600, secrets=secrets
+                policy,
+                layout,
+                tuple(command),
+                timeout=600,
+                secrets=secrets,
             )
             if result.canceled:
                 raise _RunCanceled(run_id)
             self._ensure_not_canceled(run_id)
+            stdout = redact_text(result.stdout, resolved_secret_values)
+            stderr = redact_text(result.stderr, resolved_secret_values)
+            candidate_findings = extract_findings(stdout, stderr)
+            delta = compare_findings(
+                baseline_findings,
+                candidate_findings,
+            )
+            mode = str(row["mode"])
+            output_usable = result.returncode == 0 or bool(candidate_findings)
+            if mode == "strict":
+                policy_passed = result.returncode == 0
+            elif mode == "delta":
+                policy_passed = output_usable and delta.passed
+            else:
+                raise BaselineUnavailable(
+                    f"stored validation baseline mode is invalid: {mode}"
+                )
+            passed = policy_passed and not weakening_detected
+            comparison = {
+                "mode": mode,
+                "baseline_count": len(baseline_findings),
+                "candidate_count": len(candidate_findings),
+                "new_count": len(delta.new),
+                "resolved_count": len(delta.resolved),
+                "unchanged_count": len(delta.unchanged),
+                "new_findings": list(delta.new),
+                "contract_changed": list(contract_changes),
+                "weakening_detected": list(weakening_detected),
+                "output_usable": output_usable,
+            }
             with self.database.transaction() as connection:
                 connection.execute(
                     """INSERT OR REPLACE INTO validation_results
-                       (id, run_id, commit_sha, command_json, started_at,
-                        completed_at, exit_status, log_path)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (id, run_id, validation_command_id, commit_sha,
+                        command_json, started_at, completed_at, exit_status,
+                        log_path, verdict, findings_json, comparison_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         _stable_id(f"{run_id}:{commit_sha}:{_json(command)}"),
                         run_id,
+                        str(row["validation_command_id"]),
                         commit_sha,
                         _json(command),
                         result.started_at,
                         result.completed_at,
                         result.returncode,
                         str(result.log_path),
+                        "pass" if passed else "fail",
+                        _json(candidate_findings),
+                        _json(comparison),
                     ),
                 )
-            if result.returncode != 0:
-                failures.append(
-                    "$ "
-                    + " ".join(command)
-                    + f"\nexit={result.returncode}\n"
-                    + result.stdout[-8_000:]
-                    + "\n"
-                    + result.stderr[-8_000:]
-                )
+            if not passed:
+                details = [
+                    "$ " + " ".join(command),
+                    f"mode={mode}",
+                    f"exit={result.returncode}",
+                ]
+                if weakening_detected:
+                    details.append(
+                        "validation weakening detected: "
+                        + "; ".join(weakening_detected)
+                    )
+                if not output_usable:
+                    details.append("nonzero validation output had no usable findings")
+                if delta.new:
+                    details.append("new findings:\n" + "\n".join(delta.new))
+                details.extend((stdout[-8_000:], stderr[-8_000:]))
+                failures.append("\n".join(details))
         head_result = self._git(
-            policy, layout, ("rev-parse", "HEAD"), allow_failure=True
+            policy,
+            layout,
+            ("rev-parse", "HEAD"),
+            allow_failure=True,
         )
         status_result = self._git(
             policy,
@@ -934,11 +1693,17 @@ class ExecutionService:
             self._ensure_not_canceled(run_id)
             with self.database.transaction() as connection:
                 command = ["repogents", "verify-commit-invariant"]
+                comparison = {
+                    "mode": "invariant",
+                    "contract_changed": [],
+                    "output_usable": True,
+                }
                 connection.execute(
                     """INSERT OR REPLACE INTO validation_results
                        (id, run_id, commit_sha, command_json, started_at,
-                        completed_at, exit_status, log_path)
-                       VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
+                        completed_at, exit_status, log_path, verdict,
+                        findings_json, comparison_json)
+                       VALUES (?, ?, ?, ?, ?, ?, 1, ?, 'fail', '[]', ?)""",
                     (
                         _stable_id(f"{run_id}:{commit_sha}:{_json(command)}"),
                         run_id,
@@ -947,6 +1712,7 @@ class ExecutionService:
                         status_result.started_at,
                         status_result.completed_at,
                         str(status_result.log_path),
+                        _json(comparison),
                     ),
                 )
             self._git(
@@ -1000,9 +1766,17 @@ class ExecutionService:
         return secrets
 
     def _is_canceled(self, run_id: str) -> bool:
-        return (
-            RunState(str(self.lifecycle.get_run(run_id)["state"])) == RunState.CANCELED
-        )
+        if RunState(str(self.lifecycle.get_run(run_id)["state"])) == RunState.CANCELED:
+            return True
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT repositories.enabled, repositories.removed_at
+                   FROM runs
+                   JOIN repositories ON repositories.id=runs.repository_id
+                   WHERE runs.id=?""",
+                (run_id,),
+            ).fetchone()
+        return row is None or not bool(row["enabled"]) or row["removed_at"] is not None
 
     def _ensure_not_canceled(self, run_id: str) -> None:
         if self._is_canceled(run_id):
@@ -1023,8 +1797,18 @@ class ExecutionService:
 
     @staticmethod
     def _member_finished(transcript: Sequence[str], member: TeamMember) -> bool:
-        prefix = f"Member {member.stable_key} finished:"
-        return any(item.startswith(prefix) for item in transcript)
+        prefix = (
+            "Lead finished:"
+            if member.coordinates
+            else f"Member {member.stable_key} finished:"
+        )
+        revision_prefix = "Revision requested for assigned members:"
+        for item in reversed(transcript):
+            if item.startswith(prefix):
+                return True
+            if item.startswith(revision_prefix):
+                return False
+        return False
 
     @staticmethod
     def _member_prompt(base_context: str, assignment: Assignment) -> str:
@@ -1042,6 +1826,21 @@ class ExecutionService:
                     "model": member.model,
                     "instructions": member.instructions,
                     "assignment_reason": assignment.reasoning,
+                    "handoff": (
+                        (
+                            "Finish only to approve the candidate for commit and "
+                            "validation. Block with concrete revision feedback when "
+                            "the candidate is not correct; the controller will return "
+                            "it to the assigned implementation members without any "
+                            "external effect."
+                        )
+                        if member.independent_verifier
+                        else (
+                            "Only the stored lead owns the final blocked decision. "
+                            "If required work exceeds your permissions, finish with "
+                            "the exact evidence and required lead action."
+                        )
+                    ),
                 },
                 sort_keys=True,
                 indent=2,
@@ -1049,15 +1848,24 @@ class ExecutionService:
         )
 
     def _load_context(
-        self, run_id: str
+        self,
+        run_id: str,
+        issue_version_id: str,
     ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
         with self.database.connect() as connection:
             row = connection.execute(
-                """SELECT runs.*, issues.number AS issue_number, issues.title AS issue_title,
-                          issues.body AS issue_body, issues.discussion_json,
+                """SELECT runs.*, issues.number AS issue_number,
+                          issue_versions.title AS issue_title,
+                          issue_versions.body AS issue_body,
+                          issue_versions.discussion_json,
                           issues.url AS issue_url
-                   FROM runs JOIN issues ON issues.id=runs.issue_id WHERE runs.id=?""",
-                (run_id,),
+                   FROM runs
+                   JOIN issues ON issues.id=runs.issue_id
+                   JOIN issue_versions
+                     ON issue_versions.issue_id=issues.id
+                    AND issue_versions.id=?
+                   WHERE runs.id=?""",
+                (issue_version_id, run_id),
             ).fetchone()
             if row is None:
                 raise KeyError(run_id)
@@ -1067,6 +1875,7 @@ class ExecutionService:
             ).fetchone()
         run = dict(row)
         issue = {
+            "version_id": issue_version_id,
             "number": row["issue_number"],
             "title": row["issue_title"],
             "body": row["issue_body"],
@@ -1104,7 +1913,9 @@ class ExecutionService:
             "assignment": (
                 "If this run has no durable assignment yet, inspect enough "
                 "repository evidence to select stored members, then emit assign. "
-                "Include lead and select only members needed for this issue."
+                "Every assignment must include the stored lead and stored "
+                "independent verifier; select only the implementation members "
+                "needed for this issue."
             ),
             "constraints": [
                 "Infer terse requirements from issue discussion, repository instructions, source, and tests.",
