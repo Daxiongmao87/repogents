@@ -1344,6 +1344,26 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(discovery["last_success_at"])
         self.assertEqual(discovery["error"], "GitHub ready-issue discovery failed")
 
+    def test_ready_issue_discovery_becomes_stale_when_onboarding_is_not_ready(
+        self,
+    ) -> None:
+        self.lifecycle.poll_repository("repo-1")
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET onboarding_state='blocked' WHERE id='repo-1'"
+            )
+
+        self.assertEqual(self.lifecycle.poll_repository("repo-1"), ())
+
+        with self.db.connect() as connection:
+            discovery = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(discovery["status"], "stale")
+        self.assertIn('"number": 3', discovery["issues_json"])
+        self.assertIsNotNone(discovery["last_success_at"])
+        self.assertEqual(discovery["error"], "Repository onboarding is blocked")
+
     def test_reconcile_recreates_missing_run_storage_without_new_identity(self) -> None:
         run_id = self.lifecycle.poll_repository("repo-1")[0]
         record = self.lifecycle.get_run(run_id)
