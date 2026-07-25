@@ -1206,23 +1206,43 @@ class RunLifecycle:
                                        AND team_members.role='implementer'
                                  ))
                              )
-                             AND EXISTS (
-                                 SELECT 1
-                                 FROM pull_requests
-                                 JOIN feedback_versions
-                                   ON feedback_versions.pull_request_id=pull_requests.id
-                                 WHERE pull_requests.run_id=runs.id
-                                   AND feedback_versions.feedback_type='base_conflict'
-                                   AND feedback_versions.state='processing'
-                                   AND feedback_versions.source_sha IS NULL
-                                   AND feedback_versions.superseded_at IS NULL
-                             )
-                             AND EXISTS (
-                                 SELECT 1
-                                 FROM outbound_operations
-                                 WHERE outbound_operations.run_id=runs.id
-                                   AND outbound_operations.kind='feedback_revision_batch'
-                                   AND outbound_operations.state='pending'
+                             AND (
+                                 EXISTS (
+                                     SELECT 1
+                                     FROM pull_requests
+                                     JOIN feedback_versions
+                                       ON feedback_versions.pull_request_id=
+                                          pull_requests.id
+                                     WHERE pull_requests.run_id=runs.id
+                                       AND feedback_versions.feedback_type=
+                                           'base_conflict'
+                                       AND feedback_versions.state='pending'
+                                       AND feedback_versions.source_sha IS NULL
+                                       AND feedback_versions.superseded_at IS NULL
+                                 )
+                                 OR (
+                                     EXISTS (
+                                         SELECT 1
+                                         FROM pull_requests
+                                         JOIN feedback_versions
+                                           ON feedback_versions.pull_request_id=
+                                              pull_requests.id
+                                         WHERE pull_requests.run_id=runs.id
+                                           AND feedback_versions.feedback_type=
+                                               'base_conflict'
+                                           AND feedback_versions.state='processing'
+                                           AND feedback_versions.source_sha IS NULL
+                                           AND feedback_versions.superseded_at IS NULL
+                                     )
+                                     AND EXISTS (
+                                         SELECT 1
+                                         FROM outbound_operations
+                                         WHERE outbound_operations.run_id=runs.id
+                                           AND outbound_operations.kind=
+                                               'feedback_revision_batch'
+                                           AND outbound_operations.state='pending'
+                                     )
+                                 )
                              )
                              AND NOT EXISTS (
                                  SELECT 1

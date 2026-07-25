@@ -1047,6 +1047,112 @@ class RunLifecycleTests(unittest.TestCase):
             RunState.BLOCKED.value,
         )
 
+    def test_legacy_validation_block_recovers_after_conflict_replacement(
+        self,
+    ) -> None:
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        self.lifecycle.transition(run_id, RunState.VALIDATING)
+        self.lifecycle.transition(run_id, RunState.PUBLISHING)
+        self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
+        self.lifecycle.transition(run_id, RunState.RESOLVING_FEEDBACK)
+        now = "2026-01-01T01:00:00Z"
+        current_feedback_id = "current-conflict-feedback"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions)
+                   VALUES ('implementation-member', 'team-1', 'implementation',
+                           'implementer', 'source maintainer',
+                           'Implement source revisions',
+                           '["read","write","run","git_diff"]',
+                           'mini-swe-agent', 'configured', '')"""
+            )
+            connection.execute(
+                """INSERT INTO agent_assignments
+                   (id, run_id, team_member_id, reasoning, assigned_at)
+                   VALUES ('implementation-assignment', ?,
+                           'implementation-member',
+                           'Implement the feedback revision', ?)""",
+                (run_id, now),
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('pull-1', ?, 'PR1', 6, 'pull-url',
+                           'agent/issue-3-run-1', 'main', ?, ?, ?, 'open', ?, ?)""",
+                (run_id, "a" * 40, "b" * 40, "b" * 40, now, now),
+            )
+            connection.execute(
+                """INSERT INTO feedback_versions
+                   (id, pull_request_id, feedback_type, github_object_id,
+                    github_version, author, body, state, observed_at)
+                   VALUES (?, 'pull-1', 'base_conflict', 'PR1-current', ?,
+                           'repogents', 'merge newest main', 'pending', ?)""",
+                (
+                    current_feedback_id,
+                    f"{'b' * 40}:{'d' * 40}",
+                    "2026-01-01T01:01:00Z",
+                ),
+            )
+            connection.execute(
+                """INSERT INTO feedback_versions
+                   (id, pull_request_id, feedback_type, github_object_id,
+                    github_version, author, body, state, observed_at,
+                    decision_json, superseded_at, superseded_by_feedback_id)
+                   VALUES ('prior-conflict-feedback', 'pull-1',
+                           'base_conflict', 'PR1-prior', ?, 'repogents',
+                           'merge prior main', 'resolved', ?, ?, ?, ?)""",
+                (
+                    f"{'b' * 40}:{'c' * 40}",
+                    now,
+                    json.dumps(
+                        {
+                            "action": "revise",
+                            "reason": "The pull request conflicts with prior main.",
+                            "response": "Resolve the prior base conflict.",
+                        }
+                    ),
+                    "2026-01-01T01:01:00Z",
+                    current_feedback_id,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO outbound_operations
+                   (id, run_id, kind, idempotency_key, request_json, state,
+                    external_id, created_at, completed_at)
+                   VALUES ('prior-revision-batch', ?,
+                           'feedback_revision_batch', 'prior-batch', ?,
+                           'reconciled', ?, ?, ?)""",
+                (
+                    run_id,
+                    json.dumps({"feedback_ids": ["prior-conflict-feedback"]}),
+                    current_feedback_id,
+                    now,
+                    "2026-01-01T01:01:00Z",
+                ),
+            )
+        reason = (
+            "The issue-scoped candidate is complete, but required validation "
+            "cannot pass: strict validation flags source code that is inherited "
+            "unchanged from the controller-required fetched base with zero "
+            "base-to-HEAD diff."
+        )
+        self.lifecycle.transition(run_id, RunState.BLOCKED, reason=reason)
+
+        self.assertEqual(
+            self.lifecycle.reconcile_recoverable_blocked_runs(),
+            (run_id,),
+        )
+        recovered = self.lifecycle.get_run(run_id)
+        self.assertEqual(recovered["state"], RunState.RESOLVING_FEEDBACK.value)
+        self.assertIn("prepared base", recovered["reason"])
+        self.assertEqual(self.lifecycle.reconcile_recoverable_blocked_runs(), ())
+
     def test_classified_irreducible_acceptance_block_is_not_requeued(self) -> None:
         run_id = self.lifecycle.poll_repository("repo-1")[0]
         self.lifecycle.transition(run_id, RunState.IMPLEMENTING)

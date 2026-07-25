@@ -9,6 +9,7 @@ A pull-request feedback revision can merge a newer intended-base commit than the
 - [x] A prepared comparison base is accepted only when the candidate descends from that exact commit.
 - [x] Orchestration resumes implementing or validating feedback work through feedback resolution so the prepared-base contract survives process interruption and validation retries.
 - [x] A pre-fix feedback run blocked only because inherited prepared-base code was misclassified as issue-owned validation weakening is resumed exactly once through its pending revision batch.
+- [x] The same legacy blocker remains recoverable when polling supersedes its processing conflict generation with a current pending generation before recovery runs.
 - [x] Later ordinary feedback on the same pull request reuses the latest durably integrated conflict base instead of reverting source comparison to the activation base.
 - [x] Ordinary issue execution without a prepared feedback base retains its existing activation-base behavior.
 
@@ -20,6 +21,7 @@ A pull-request feedback revision can merge a newer intended-base commit than the
 - [x] `REGRESSION` - prove implementing, validating, and publishing runs with processing feedback route through feedback recovery, while ordinary queued execution is unchanged.
 - [x] `REGRESSION` - prove a later ordinary feedback batch reuses the base from the latest completed conflict revision.
 - [x] `REGRESSION` - recover the recognized pre-fix prepared-base validation blocker exactly once while unrelated blocked reasons remain unchanged.
+- [x] `REGRESSION` - recover a recognized validation-base blocker through the current pending conflict generation after its prior processing generation and revision batch were superseded.
 - [x] `REGRESSION` - run the focused execution, feedback, and orchestration suites.
 - [x] `REGRESSION` - run the complete project suite.
 - [ ] `LIVE` - resume Repogents issue #1 / pull request #6 and observe exact-SHA validation and same-pull publication against current `main`.
