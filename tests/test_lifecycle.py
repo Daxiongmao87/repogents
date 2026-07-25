@@ -1185,6 +1185,50 @@ class RunLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(self.lifecycle.reconcile_recoverable_blocked_runs(), ())
 
+    def test_legacy_publication_merge_base_block_is_requeued_once(
+        self,
+    ) -> None:
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        self.lifecycle.transition(run_id, RunState.VALIDATING)
+        validated_sha = "d" * 40
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET validated_sha=? WHERE id=?",
+                (validated_sha, run_id),
+            )
+        self.lifecycle.transition(run_id, RunState.PUBLISHING)
+        blocker = (
+            "publication blocked: validated commit has a merge conflict with "
+            "the current intended-base head"
+        )
+        self.lifecycle.transition(run_id, RunState.BLOCKED, reason=blocker)
+
+        self.assertEqual(
+            self.lifecycle.reconcile_recoverable_blocked_runs(),
+            (run_id,),
+        )
+        recovered = self.lifecycle.get_run(run_id)
+        self.assertEqual(recovered["state"], RunState.PUBLISHING.value)
+        self.assertEqual(recovered["validated_sha"], validated_sha)
+        self.assertIn("candidate/current merge base", recovered["reason"])
+
+        self.lifecycle.transition(run_id, RunState.BLOCKED, reason=blocker)
+        self.assertEqual(self.lifecycle.reconcile_recoverable_blocked_runs(), ())
+        self.assertEqual(
+            self.lifecycle.get_run(run_id)["state"],
+            RunState.BLOCKED.value,
+        )
+        with self.db.connect() as connection:
+            recovery_count = connection.execute(
+                """SELECT COUNT(*) FROM run_transitions
+                   WHERE run_id=? AND from_state='blocked'
+                     AND to_state='publishing'
+                     AND reason LIKE '%candidate/current merge base%'""",
+                (run_id,),
+            ).fetchone()[0]
+        self.assertEqual(recovery_count, 1)
+
     def test_classified_irreducible_acceptance_block_is_not_requeued(self) -> None:
         run_id = self.lifecycle.poll_repository("repo-1")[0]
         self.lifecycle.transition(run_id, RunState.IMPLEMENTING)

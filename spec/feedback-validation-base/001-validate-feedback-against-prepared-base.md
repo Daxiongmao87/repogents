@@ -16,6 +16,7 @@ A pull-request feedback revision can merge a newer intended-base commit than the
 - [x] Later ordinary feedback on the same pull request reuses the latest durably integrated conflict base instead of reverting source comparison to the activation base.
 - [x] Ordinary issue execution without a prepared feedback base retains its existing activation-base behavior.
 - [x] Publication preflight uses the candidate/current merge base after an integrated-base revision, so a later clean base advance neither creates a false conflict nor broadens issue scope review to inherited base changes.
+- [x] A run already blocked by the obsolete activation-base conflict check durably retries publication once with its validated SHA; a genuine conflict can block again without a recovery loop.
 
 ## Verification
 
@@ -31,6 +32,7 @@ A pull-request feedback revision can merge a newer intended-base commit than the
 - [x] `REGRESSION` - recover the recognized post-replay stale-base blocker exactly once while unrelated blockers remain unchanged.
 - [x] `REGRESSION` - reject a bound feedback revision during publication, restart in `implementing`, and prove the same batch is durably reopened, revised, and republished once.
 - [x] `REGRESSION` - integrate one newer base into a candidate, advance that base again without conflict, and prove publication reviews only the candidate delta while the existing true-conflict case still blocks.
+- [x] `REGRESSION` - recover the exact legacy publication conflict blocker to `publishing` once, preserve its validated SHA, and prove a repeated blocker is not requeued.
 - [x] `REGRESSION` - run the focused execution, feedback, and orchestration suites.
 - [x] `REGRESSION` - run the complete project suite.
 - [ ] `LIVE` - resume Repogents issue #1 / pull request #6 and observe exact-SHA validation and same-pull publication against current `main`.
