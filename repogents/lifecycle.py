@@ -390,23 +390,6 @@ class RunLifecycle:
                 (repository_id, ready_issue_generation),
             ).fetchone()
             if eligible is None:
-                connection.execute(
-                    """INSERT INTO ready_issue_discovery
-                       (repository_id, status, issues_json, last_success_at,
-                        last_attempt_at, error)
-                       VALUES (?, 'unavailable', '[]', NULL,
-                               strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                               'Repository is not eligible for ready-issue discovery')
-                       ON CONFLICT(repository_id) DO UPDATE SET
-                         status=CASE
-                           WHEN ready_issue_discovery.last_success_at IS NULL
-                             THEN 'unavailable'
-                           ELSE 'stale'
-                         END,
-                         last_attempt_at=excluded.last_attempt_at,
-                         error=excluded.error""",
-                    (repository_id,),
-                )
                 return
             connection.execute(
                 """INSERT INTO ready_issue_discovery
