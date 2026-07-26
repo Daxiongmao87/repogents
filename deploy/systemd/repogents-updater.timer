@@ -1,0 +1,12 @@
+[Unit]
+Description=Check origin/main for Repogents updates
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+AccuracySec=1s
+RandomizedDelaySec=10s
+Unit=repogents-updater.service
+
+[Install]
+WantedBy=timers.target
