@@ -1386,8 +1386,28 @@ class OnboardingTests(unittest.TestCase):
                     "2026-01-01T00:00:00Z",
                 ),
             )
+            connection.execute(
+                """INSERT INTO ready_issue_discovery
+                   (repository_id, status, issues_json, last_success_at,
+                    last_attempt_at, error)
+                   VALUES (?, 'available', ?, ?, ?, NULL)""",
+                (
+                    repository_id,
+                    '[{"number":1,"title":"Old issue","url":"old","updated_at":"2026-01-01T00:00:00Z"}]',
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
         service.reonboard(repository_id)
         second = service.get_repository(repository_id)
+        with self.db.connect() as connection:
+            discovery = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id=?",
+                (repository_id,),
+            ).fetchone()
+        self.assertEqual(second["onboarding_state"], "ready")
+        self.assertEqual(discovery["status"], "stale")
+        self.assertIn('\"number\":1', discovery["issues_json"])
         self.assertNotEqual(
             first["current_sandbox_version_id"], second["current_sandbox_version_id"]
         )

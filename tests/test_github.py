@@ -145,6 +145,47 @@ class GitHubAdapterTests(unittest.TestCase):
             events[0].event_id,
         )
 
+    def test_list_ready_issues_uses_only_open_labelled_list_payloads(self) -> None:
+        self.responses["repos/owner/repo/issues"] = [
+            {
+                "node_id": "I4",
+                "number": 4,
+                "html_url": "https://github.com/owner/repo/issues/4",
+                "title": "Another ready issue",
+                "updated_at": "2026-01-02T00:00:00Z",
+            },
+            {
+                "number": 99,
+                "title": "Pull request",
+                "html_url": "pull-url",
+                "updated_at": "2026-01-03T00:00:00Z",
+                "pull_request": {"url": "pull-url"},
+            },
+            {"malformed": True},
+            {
+                "node_id": "I3",
+                "number": 3,
+                "html_url": "https://github.com/owner/repo/issues/3",
+                "title": "Ready issue",
+                "updated_at": "2026-01-01T00:00:00Z",
+            },
+        ]
+
+        issues = self.client.list_ready_issues("owner", "repo")
+
+        self.assertEqual([issue.number for issue in issues], [3, 4])
+        self.assertEqual(issues[0].title, "Ready issue")
+        self.assertEqual(issues[0].body, "")
+        self.assertEqual(issues[0].discussion, ())
+        self.assertEqual(
+            self.client.requests,
+            [
+                (
+                    "GET",
+                    "repos/owner/repo/issues?state=open&labels=agent%3Aready&per_page=100&page=1",
+                )
+            ],
+        )
     def test_ready_label_event_on_later_page_is_returned(self) -> None:
         class PagedClient(StubGitHubClient):
             def _request(
@@ -498,6 +539,31 @@ class GitHubAdapterTests(unittest.TestCase):
         }
         with self.assertRaises(GitHubError):
             self.client.get_branch_head("owner", "repo", "main")
+
+    def test_invalid_json_response_is_normalized_to_github_error(self) -> None:
+        from unittest.mock import patch
+
+        from repogents.github import GitHubClient, GitHubError
+
+        class InvalidJsonResponse:
+            headers: dict[str, str] = {}
+
+            def __enter__(self) -> "InvalidJsonResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"truncated"'
+
+        client = GitHubClient(token="token", api_url="https://api.example.test")
+        with patch(
+            "repogents.github.urllib.request.urlopen",
+            return_value=InvalidJsonResponse(),
+        ):
+            with self.assertRaisesRegex(GitHubError, "invalid JSON response"):
+                client.get_repository("owner/repo")
 
 
 if __name__ == "__main__":

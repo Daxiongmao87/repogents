@@ -30,6 +30,9 @@ class FakeActivationClient:
     polls: int = 0
     issue_polls: int = 0
 
+    def list_ready_issues(self, owner: str, name: str) -> tuple[IssueInfo, ...]:
+        return tuple(event.issue for event in self.events)
+
     def list_ready_events(self, owner: str, name: str) -> list[ActivationEvent]:
         self.polls += 1
         return list(self.events)
@@ -1317,6 +1320,269 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual(
             [row["to_state"] for row in transitions][-1], RunState.CANCELED.value
         )
+
+    def test_ready_issue_discovery_records_successful_empty_inventory(self) -> None:
+        self.github.events = []
+
+        self.assertEqual(self.lifecycle.poll_repository("repo-1"), ())
+
+        with self.db.connect() as connection:
+            discovery = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(discovery["status"], "available")
+        self.assertEqual(discovery["issues_json"], "[]")
+        self.assertIsNotNone(discovery["last_success_at"])
+        self.assertIsNone(discovery["error"])
+
+    def test_ready_issue_discovery_records_unavailable_without_cache(self) -> None:
+        from repogents.github import GitHubError
+
+        class FailingDiscoveryClient(FakeActivationClient):
+            def list_ready_issues(self, owner: str, name: str) -> tuple[IssueInfo, ...]:
+                raise GitHubError("rate limited")
+
+        lifecycle = RunLifecycle(
+            database=self.db,
+            data_root=self.data_root,
+            github=FailingDiscoveryClient([]),
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+        )
+
+        self.assertEqual(lifecycle.poll_repository("repo-1"), ())
+
+        with self.db.connect() as connection:
+            discovery = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(discovery["status"], "unavailable")
+        self.assertEqual(discovery["issues_json"], "[]")
+        self.assertIsNone(discovery["last_success_at"])
+        self.assertEqual(discovery["error"], "GitHub ready-issue discovery failed")
+
+    def test_ready_issue_discovery_retains_stale_cache_after_failure(self) -> None:
+        from repogents.github import GitHubError
+
+        self.lifecycle.poll_repository("repo-1")
+
+        class FailingDiscoveryClient(FakeActivationClient):
+            def list_ready_issues(self, owner: str, name: str) -> tuple[IssueInfo, ...]:
+                raise GitHubError("server unavailable")
+
+        lifecycle = RunLifecycle(
+            database=self.db,
+            data_root=self.data_root,
+            github=FailingDiscoveryClient([]),
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+        )
+        lifecycle.poll_repository("repo-1")
+
+        with self.db.connect() as connection:
+            discovery = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(discovery["status"], "stale")
+        self.assertIn('"number": 3', discovery["issues_json"])
+        self.assertIsNotNone(discovery["last_success_at"])
+        self.assertEqual(discovery["error"], "GitHub ready-issue discovery failed")
+
+    def test_ready_issue_discovery_becomes_stale_when_onboarding_is_not_ready(
+        self,
+    ) -> None:
+        self.lifecycle.poll_repository("repo-1")
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET onboarding_state='blocked' WHERE id='repo-1'"
+            )
+
+        self.assertEqual(self.lifecycle.poll_repository("repo-1"), ())
+
+        with self.db.connect() as connection:
+            discovery = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(discovery["status"], "stale")
+        self.assertIn('"number": 3', discovery["issues_json"])
+        self.assertIsNotNone(discovery["last_success_at"])
+        self.assertEqual(discovery["error"], "Repository onboarding is blocked")
+
+    def test_ready_issue_discovery_stays_stale_across_pause_and_resume_until_success(
+        self,
+    ) -> None:
+        from repogents.github import GitHubError
+
+        self.lifecycle.poll_repository("repo-1")
+        paused_runs = self.lifecycle.set_repository_paused("repo-1", True)
+        self.assertEqual(len(paused_runs), 1)
+        with self.db.connect() as connection:
+            paused = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(paused["status"], "stale")
+        self.assertIn('\"number\": 3', paused["issues_json"])
+
+        resumed_runs = self.lifecycle.set_repository_paused("repo-1", False)
+        self.assertEqual(resumed_runs, paused_runs)
+        with self.db.connect() as connection:
+            resumed = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(resumed["status"], "stale")
+
+        class FailingDiscoveryClient(FakeActivationClient):
+            def list_ready_issues(self, owner: str, name: str) -> tuple[IssueInfo, ...]:
+                raise GitHubError("server unavailable")
+
+        failing = RunLifecycle(
+            database=self.db,
+            data_root=self.data_root,
+            github=FailingDiscoveryClient([]),
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+        )
+        self.assertEqual(failing.poll_repository("repo-1"), ())
+        with self.db.connect() as connection:
+            failed = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(failed["status"], "stale")
+        self.assertIn('\"number\": 3', failed["issues_json"])
+
+        class RefreshedDiscoveryClient(FakeActivationClient):
+            def list_ready_issues(self, owner: str, name: str) -> tuple[IssueInfo, ...]:
+                return (
+                    IssueInfo(
+                        number=4,
+                        title="Newly ready after resume",
+                        url="https://github.com/octo/example/issues/4",
+                        updated_at="2025-01-02T00:00:00Z",
+                        node_id="issue-node-4",
+                        body="",
+                        discussion=(),
+                    ),
+                )
+
+        refreshed_lifecycle = RunLifecycle(
+            database=self.db,
+            data_root=self.data_root,
+            github=RefreshedDiscoveryClient([]),
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+        )
+        refreshed_lifecycle.poll_repository("repo-1")
+        with self.db.connect() as connection:
+            refreshed = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(refreshed["status"], "available")
+        self.assertNotIn('\"number\": 3', refreshed["issues_json"])
+        self.assertIn('\"number\": 4', refreshed["issues_json"])
+        self.assertIsNone(refreshed["error"])
+
+    def test_inflight_ready_issue_success_stays_stale_across_pause_and_resume(
+        self,
+    ) -> None:
+        import threading
+
+        def issue(number: int, title: str) -> IssueInfo:
+            return IssueInfo(
+                number=number,
+                title=title,
+                url=f"https://github.com/octo/example/issues/{number}",
+                updated_at=f"2025-01-{number:02d}T00:00:00Z",
+                node_id=f"issue-node-{number}",
+                body="",
+                discussion=(),
+            )
+
+        class DiscoveryClient(FakeActivationClient):
+            def __init__(self, discovered: IssueInfo) -> None:
+                super().__init__([])
+                self.discovered = discovered
+
+            def list_ready_issues(
+                self, owner: str, name: str
+            ) -> tuple[IssueInfo, ...]:
+                return (self.discovered,)
+
+        initial = RunLifecycle(
+            database=self.db,
+            data_root=self.data_root,
+            github=DiscoveryClient(issue(3, "Ready before pause")),
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+        )
+        self.assertEqual(initial.poll_repository("repo-1"), ())
+
+        lookup_started = threading.Event()
+        release_lookup = threading.Event()
+
+        class BlockingDiscoveryClient(FakeActivationClient):
+            def list_ready_issues(
+                self, owner: str, name: str
+            ) -> tuple[IssueInfo, ...]:
+                lookup_started.set()
+                if not release_lookup.wait(timeout=5):
+                    raise AssertionError("timed out waiting to release discovery")
+                return (issue(4, "Pre-pause in-flight snapshot"),)
+
+        racing = RunLifecycle(
+            database=self.db,
+            data_root=self.data_root,
+            github=BlockingDiscoveryClient([]),
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+        )
+        errors: list[BaseException] = []
+
+        def poll() -> None:
+            try:
+                racing.poll_repository("repo-1")
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        poll_thread = threading.Thread(target=poll)
+        poll_thread.start()
+        self.assertTrue(lookup_started.wait(timeout=5))
+        self.lifecycle.set_repository_paused("repo-1", True)
+        release_lookup.set()
+        poll_thread.join(timeout=5)
+        self.assertFalse(poll_thread.is_alive())
+        self.assertEqual(errors, [])
+
+        with self.db.connect() as connection:
+            raced = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(raced["status"], "stale")
+        self.assertIn('\"number\": 3', raced["issues_json"])
+        self.assertNotIn('\"number\": 4', raced["issues_json"])
+
+        self.lifecycle.set_repository_paused("repo-1", False)
+        with self.db.connect() as connection:
+            resumed = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(resumed["status"], "stale")
+        self.assertIn('\"number\": 3', resumed["issues_json"])
+
+        refreshed = RunLifecycle(
+            database=self.db,
+            data_root=self.data_root,
+            github=DiscoveryClient(issue(5, "Ready after resume")),
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+        )
+        self.assertEqual(refreshed.poll_repository("repo-1"), ())
+        with self.db.connect() as connection:
+            current = connection.execute(
+                "SELECT * FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(current["status"], "available")
+        self.assertNotIn('\"number\": 3', current["issues_json"])
+        self.assertIn('\"number\": 5', current["issues_json"])
 
     def test_reconcile_recreates_missing_run_storage_without_new_identity(self) -> None:
         run_id = self.lifecycle.poll_repository("repo-1")[0]

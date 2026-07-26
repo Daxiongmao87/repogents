@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Generator
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 17
 
 SCHEMA_V1 = r"""
 BEGIN IMMEDIATE;
@@ -841,6 +841,30 @@ SCHEMA_V15 = (
 )
 
 
+SCHEMA_V16 = (
+    """
+    CREATE TABLE ready_issue_discovery (
+        repository_id TEXT PRIMARY KEY
+            REFERENCES repositories(id) ON DELETE CASCADE,
+        status TEXT NOT NULL
+            CHECK (status IN ('available', 'stale', 'unavailable')),
+        issues_json TEXT NOT NULL,
+        last_success_at TEXT,
+        last_attempt_at TEXT NOT NULL,
+        error TEXT
+    )
+    """,
+)
+
+SCHEMA_V17 = (
+    """
+    ALTER TABLE repositories
+    ADD COLUMN ready_issue_generation INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(ready_issue_generation) = 'integer'
+               AND ready_issue_generation >= 0)
+    """,
+)
+
 class Database:
     """Owns SQLite connection policy and transactional schema initialization."""
 
@@ -1032,6 +1056,22 @@ class Database:
                 connection.execute("""INSERT INTO schema_version(version, applied_at)
                        VALUES (
                            15,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )""")
+            if version < 16:
+                for statement in SCHEMA_V16:
+                    connection.execute(statement)
+                connection.execute("""INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           16,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )""")
+            if version < 17:
+                for statement in SCHEMA_V17:
+                    connection.execute(statement)
+                connection.execute("""INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           17,
                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                        )""")
             connection.commit()

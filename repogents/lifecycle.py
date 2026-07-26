@@ -15,7 +15,7 @@ from typing import Protocol
 
 from .controller import RunPaused, RunProcessSupervisor, git_environment
 from .database import Database
-from .github import ActivationEvent, IssueInfo, PullRequestInfo
+from .github import ActivationEvent, GitHubError, IssueInfo, PullRequestInfo
 from .sandbox import RunLayout
 
 
@@ -334,6 +334,9 @@ class RunLifecycle:
         if repository is None:
             raise KeyError(repository_id)
         if repository["onboarding_state"] != "ready":
+            self._record_ready_issue_inactive(
+                repository_id, str(repository["onboarding_state"])
+            )
             return ()
         if not bool(repository["enabled"]) or repository["removed_at"] is not None:
             return ()
@@ -341,6 +344,18 @@ class RunLifecycle:
         team_version_id = repository["current_team_version_id"]
         if not sandbox_version_id or not team_version_id:
             raise RuntimeError("ready repository has no stored sandbox or team version")
+        list_ready_issues = getattr(self.github, "list_ready_issues", None)
+        if callable(list_ready_issues):
+            try:
+                ready_issues = list_ready_issues(
+                    str(repository["owner"]), str(repository["name"])
+                )
+            except GitHubError:
+                self._record_ready_issue_failure(repository_id)
+            else:
+                self._record_ready_issue_success(
+                    repository_id, int(repository["ready_issue_generation"]), ready_issues
+                )
         events = self.github.list_ready_events(
             str(repository["owner"]), str(repository["name"])
         )
@@ -350,6 +365,83 @@ class RunLifecycle:
             if run_id is not None:
                 created.append(run_id)
         return tuple(created)
+
+    def _record_ready_issue_success(
+        self, repository_id: str, ready_issue_generation: int, issues: list[IssueInfo]
+    ) -> None:
+        values = [
+            {
+                "repository_id": repository_id,
+                "number": issue.number,
+                "title": issue.title,
+                "url": issue.url,
+                "updated_at": issue.updated_at,
+            }
+            for issue in issues
+        ]
+        with self.database.transaction() as connection:
+            eligible = connection.execute(
+                """SELECT 1 FROM repositories
+                   WHERE id=?
+                     AND enabled=1
+                     AND removed_at IS NULL
+                     AND onboarding_state='ready'
+                     AND ready_issue_generation=?""",
+                (repository_id, ready_issue_generation),
+            ).fetchone()
+            if eligible is None:
+                return
+            connection.execute(
+                """INSERT INTO ready_issue_discovery
+                   (repository_id, status, issues_json, last_success_at,
+                    last_attempt_at, error)
+                   VALUES (?, 'available', ?,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL)
+                   ON CONFLICT(repository_id) DO UPDATE SET
+                     status='available',
+                     issues_json=excluded.issues_json,
+                     last_success_at=excluded.last_success_at,
+                     last_attempt_at=excluded.last_attempt_at,
+                     error=NULL""",
+                (repository_id, json.dumps(values, sort_keys=True)),
+            )
+
+    def _record_ready_issue_failure(self, repository_id: str) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO ready_issue_discovery
+                   (repository_id, status, issues_json, last_success_at,
+                    last_attempt_at, error)
+                   VALUES (?, 'unavailable', '[]', NULL,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                           'GitHub ready-issue discovery failed')
+                   ON CONFLICT(repository_id) DO UPDATE SET
+                     status=CASE
+                       WHEN ready_issue_discovery.last_success_at IS NULL
+                         THEN 'unavailable'
+                       ELSE 'stale'
+                     END,
+                     last_attempt_at=excluded.last_attempt_at,
+                     error=excluded.error""",
+                (repository_id,),
+            )
+
+    def _record_ready_issue_inactive(
+        self, repository_id: str, onboarding_state: str
+    ) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                """UPDATE ready_issue_discovery
+                   SET status=CASE
+                         WHEN last_success_at IS NULL THEN 'unavailable'
+                         ELSE 'stale'
+                       END,
+                       last_attempt_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                       error=?
+                   WHERE repository_id=?""",
+                (f"Repository onboarding is {onboarding_state}", repository_id),
+            )
 
     def _store_issue_version(
         self,
@@ -1112,10 +1204,23 @@ class RunLifecycle:
             connection.execute(
                 """UPDATE repositories
                    SET enabled=?,
+                       ready_issue_generation=ready_issue_generation + 1,
                        updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                    WHERE id=?""",
                 (int(not paused), repository_id),
             )
+            if paused:
+                connection.execute(
+                    """UPDATE ready_issue_discovery
+                       SET status=CASE
+                             WHEN last_success_at IS NULL THEN 'unavailable'
+                             ELSE 'stale'
+                           END,
+                           last_attempt_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                           error='Repository is paused'
+                       WHERE repository_id=?""",
+                    (repository_id,),
+                )
         run_ids = tuple(str(row["id"]) for row in rows)
         if paused:
             for run_id in run_ids:

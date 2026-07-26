@@ -1506,6 +1506,123 @@ class ApplicationTests(unittest.TestCase):
                 self.assertEqual(publication.calls, [])
                 self.assertGreaterEqual(feedback.calls.count("run-1"), 1)
 
+    def test_state_reads_cached_ready_issue_discovery_without_github_calls(self) -> None:
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO repositories
+                   (id, github_node_id, owner, name, url, default_branch,
+                    onboarding_state, inputs_json, created_at, updated_at)
+                   VALUES ('repo-2', 'R2', 'owner', 'second',
+                           'https://github.com/owner/second', 'main', 'ready',
+                           '{}', '2026-01-01T00:00:00Z',
+                           '2026-01-01T00:00:00Z')"""
+            )
+            connection.execute(
+                """INSERT INTO ready_issue_discovery
+                   (repository_id, status, issues_json, last_success_at,
+                    last_attempt_at, error)
+                   VALUES ('repo-1', 'unavailable', '[]', NULL,
+                           '2026-01-02T00:00:00Z',
+                           'GitHub ready-issue discovery failed'),
+                          ('repo-2', 'available', ?,
+                           '2026-01-02T00:00:00Z',
+                           '2026-01-02T00:00:00Z', NULL)""",
+                (json.dumps([{
+                    "number": 7,
+                    "title": "Ready elsewhere",
+                    "url": "https://github.com/owner/second/issues/7",
+                    "updated_at": "2026-01-02T00:00:00Z",
+                }]),),
+            )
+
+        class UnexpectedGitHub:
+            def list_ready_issues(self, owner: str, name: str) -> tuple[object, ...]:
+                self.failures += 1
+                raise AssertionError("state must not call GitHub")
+
+            def __init__(self) -> None:
+                self.failures = 0
+
+        github = UnexpectedGitHub()
+        actions = ApplicationActions(
+            database=self.db,
+            onboarding=FakeOnboarding(),
+            lifecycle=FakeLifecycle(self.db),
+            scheduler=FakeScheduler(),
+        )
+
+        first = actions.state()
+        second = actions.state()
+
+        self.assertEqual(github.failures, 0)
+        self.assertEqual(first["ready_issues"], second["ready_issues"])
+        self.assertEqual(
+            first["ready_issues"],
+            [
+                {
+                    "repository_id": "repo-2",
+                    "repository": "owner/second",
+                    "number": 7,
+                    "title": "Ready elsewhere",
+                    "url": "https://github.com/owner/second/issues/7",
+                    "updated_at": "2026-01-02T00:00:00Z",
+                }
+            ],
+        )
+        discovery = {
+            item["repository_id"]: item for item in first["ready_issue_discovery"]
+        }
+        self.assertEqual(discovery["repo-1"]["status"], "unavailable")
+        self.assertIsNone(discovery["repo-1"]["last_success_at"])
+        self.assertEqual(discovery["repo-2"]["status"], "available")
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE ready_issue_discovery SET status='stale' WHERE repository_id='repo-2'"
+            )
+        stale = actions.state()
+        self.assertEqual(stale["ready_issues"], [])
+        stale_discovery = {
+            item["repository_id"]: item
+            for item in stale["ready_issue_discovery"]
+        }
+        self.assertEqual(stale_discovery["repo-2"]["status"], "stale")
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE ready_issue_discovery SET status='available' WHERE repository_id='repo-2'"
+            )
+        refreshed = actions.state()
+        self.assertEqual(refreshed["ready_issues"], first["ready_issues"])
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET onboarding_state='blocked' WHERE id='repo-2'"
+            )
+        blocked = actions.state()
+        self.assertEqual(blocked["ready_issues"], [])
+        blocked_discovery = {
+            item["repository_id"]: item
+            for item in blocked["ready_issue_discovery"]
+        }
+        self.assertEqual(blocked_discovery["repo-2"]["status"], "stale")
+        self.assertIn(
+            "onboarding is blocked", blocked_discovery["repo-2"]["error"]
+        )
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET onboarding_state='ready', enabled=0 WHERE id='repo-2'"
+            )
+        paused = actions.state()
+        self.assertEqual(paused["ready_issues"], [])
+        paused_discovery = {
+            item["repository_id"]: item
+            for item in paused["ready_issue_discovery"]
+        }
+        self.assertEqual(paused_discovery["repo-2"]["status"], "stale")
+        self.assertEqual(paused_discovery["repo-2"]["error"], "Repository is paused")
+
     def test_transient_feedback_resolution_preserves_waiting_run_for_next_tick(
         self,
     ) -> None:
@@ -1833,6 +1950,61 @@ class ApplicationTests(unittest.TestCase):
             actions.reorder_runs(["run-1", "run-2"])
         with self.assertRaises(KeyError):
             actions.set_run_forced("run-1", True)
+
+    def test_blocked_runs_keep_a_unique_slot_when_active_runs_are_reordered(
+        self,
+    ) -> None:
+        self.seed_second_run()
+        self.seed_second_repository_run(state="blocked")
+        with self.db.transaction() as connection:
+            connection.execute("UPDATE runs SET priority=1 WHERE id='run-1'")
+            connection.execute("UPDATE runs SET priority=2 WHERE id='run-2'")
+            connection.execute("UPDATE runs SET priority=0 WHERE id='run-3'")
+        scheduler = FakeScheduler()
+        actions = ApplicationActions(
+            database=self.db,
+            onboarding=FakeOnboarding(),
+            lifecycle=FakeLifecycle(self.db),
+            scheduler=scheduler,
+        )
+        with self.db.connect() as connection:
+            blocked_before = connection.execute(
+                "SELECT state, reason FROM runs WHERE id='run-3'"
+            ).fetchone()
+            transitions_before = connection.execute(
+                "SELECT COUNT(*) FROM run_transitions WHERE run_id='run-3'"
+            ).fetchone()[0]
+
+        actions.reorder_runs(["run-2", "run-1"])
+
+        with self.db.connect() as connection:
+            reordered = connection.execute(
+                "SELECT id, priority FROM runs WHERE state NOT IN ('canceled', 'closed') ORDER BY priority, created_at, id"
+            ).fetchall()
+            blocked_after = connection.execute(
+                "SELECT state, reason FROM runs WHERE id='run-3'"
+            ).fetchone()
+            transitions_after = connection.execute(
+                "SELECT COUNT(*) FROM run_transitions WHERE run_id='run-3'"
+            ).fetchone()[0]
+        self.assertEqual(
+            [tuple(row) for row in reordered],
+            [("run-3", 0), ("run-2", 1), ("run-1", 2)],
+        )
+        self.assertEqual(tuple(blocked_after), tuple(blocked_before))
+        self.assertEqual(transitions_after, transitions_before)
+
+        with self.db.transaction() as connection:
+            connection.execute("UPDATE runs SET state='queued' WHERE id='run-3'")
+            recovered = connection.execute(
+                "SELECT id, priority FROM runs WHERE state NOT IN ('blocked', 'canceled', 'closed') ORDER BY priority, created_at, id"
+            ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in recovered],
+            [("run-3", 0), ("run-2", 1), ("run-1", 2)],
+        )
+        self.assertEqual(len({row["priority"] for row in recovered}), 3)
+        self.assertEqual(scheduler.requests, 1)
 
     def test_terminal_runs_leave_the_active_queue_without_losing_history(
         self,

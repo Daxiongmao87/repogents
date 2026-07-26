@@ -732,7 +732,16 @@ class ApplicationActions:
             for row in transition_activity
             if row["occurred_at"] is not None
         }
+        with self.database.connect() as connection:
+            discovery_rows = connection.execute(
+                "SELECT * FROM ready_issue_discovery"
+            ).fetchall()
+        discovery_by_repository = {
+            str(row["repository_id"]): row for row in discovery_rows
+        }
         repository_values: list[dict[str, object]] = []
+        ready_issues: list[dict[str, object]] = []
+        ready_issue_discovery: list[dict[str, object]] = []
         for row in repositories:
             value = dict(row)
             repository_id = str(value["id"])
@@ -765,8 +774,63 @@ class ApplicationActions:
                 str(value.pop("inputs_json"))
             )
             repository_values.append(value)
+            discovery = discovery_by_repository.get(repository_id)
+            repository_ready = str(value["onboarding_state"]) == "ready"
+            repository_discoverable = repository_ready and bool(value["enabled"])
+            if not repository_ready:
+                discovery_unavailable_error = (
+                    f"Repository onboarding is {value['onboarding_state']}"
+                )
+            elif not value["enabled"]:
+                discovery_unavailable_error = "Repository is paused"
+            else:
+                discovery_unavailable_error = "Ready-issue discovery has not run yet"
+            if discovery is None:
+                ready_issue_discovery.append(
+                    {
+                        "repository_id": repository_id,
+                        "repository": value["identity"],
+                        "status": "unavailable",
+                        "last_success_at": None,
+                        "last_attempt_at": None,
+                        "error": discovery_unavailable_error,
+                    }
+                )
+                continue
+            discovery_status = str(discovery["status"])
+            discovery_error = discovery["error"]
+            if not repository_discoverable:
+                discovery_status = (
+                    "stale" if discovery["last_success_at"] is not None else "unavailable"
+                )
+                discovery_error = discovery_unavailable_error
+            ready_issue_discovery.append(
+                {
+                    "repository_id": repository_id,
+                    "repository": value["identity"],
+                    "status": discovery_status,
+                    "last_success_at": discovery["last_success_at"],
+                    "last_attempt_at": discovery["last_attempt_at"],
+                    "error": discovery_error,
+                }
+            )
+            if not repository_discoverable or discovery_status != "available":
+                continue
+            for issue in json.loads(str(discovery["issues_json"])):
+                ready_issues.append(
+                    {
+                        "repository_id": repository_id,
+                        "repository": value["identity"],
+                        "number": issue["number"],
+                        "title": issue["title"],
+                        "url": issue["url"],
+                        "updated_at": issue["updated_at"],
+                    }
+                )
         state: dict[str, object] = {
             "repositories": repository_values,
+            "ready_issues": ready_issues,
+            "ready_issue_discovery": ready_issue_discovery,
             "runs": visible_run_values,
         }
         if self.model_configuration is not None:
@@ -1025,22 +1089,31 @@ class ApplicationActions:
         ):
             raise ValueError("run_ids must be a list of unique nonempty strings")
         with self.database.transaction() as connection:
-            rows = connection.execute("""SELECT runs.id
+            rows = connection.execute("""SELECT runs.id, runs.state
                    FROM runs
                    JOIN repositories
                      ON repositories.id=runs.repository_id
                    WHERE repositories.removed_at IS NULL
                      AND runs.state NOT IN ('canceled', 'closed')
                    ORDER BY runs.priority, runs.created_at, runs.id""").fetchall()
-            visible_ids = [str(row["id"]) for row in rows]
+            visible_ids = [
+                str(row["id"]) for row in rows if str(row["state"]) != "blocked"
+            ]
             unknown = [run_id for run_id in run_ids if run_id not in visible_ids]
             if unknown:
                 raise KeyError(unknown[0])
             if set(run_ids) != set(visible_ids):
                 raise ValueError("run_ids must include every visible run exactly once")
+            requested = iter(run_ids)
+            ordered_ids = [
+                str(row["id"])
+                if str(row["state"]) == "blocked"
+                else next(requested)
+                for row in rows
+            ]
             connection.executemany(
                 "UPDATE runs SET priority=? WHERE id=?",
-                ((priority, run_id) for priority, run_id in enumerate(run_ids)),
+                ((priority, run_id) for priority, run_id in enumerate(ordered_ids)),
             )
         self.scheduler.request_tick()
 
@@ -1123,9 +1196,21 @@ class ApplicationActions:
             connection.execute(
                 """UPDATE repositories
                    SET enabled=0,
+                       ready_issue_generation=ready_issue_generation + 1,
                        removed_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                        updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                    WHERE id=?""",
+                (repository_id,),
+            )
+            connection.execute(
+                """UPDATE ready_issue_discovery
+                   SET status=CASE
+                         WHEN last_success_at IS NULL THEN 'unavailable'
+                         ELSE 'stale'
+                       END,
+                       last_attempt_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                       error='Repository was removed; ready issues require refresh'
+                   WHERE repository_id=?""",
                 (repository_id,),
             )
         self.scheduler.request_tick()
