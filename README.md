@@ -147,6 +147,24 @@ systemctl --user daemon-reload
 systemctl --user enable --now repogents.service
 ```
 
+To keep this checkout synchronized with `origin/main`, install and enable the
+updater timer:
+
+```bash
+install -Dm644 deploy/systemd/repogents-updater.service \
+  ~/.config/systemd/user/repogents-updater.service
+install -Dm644 deploy/systemd/repogents-updater.timer \
+  ~/.config/systemd/user/repogents-updater.timer
+systemctl --user daemon-reload
+systemctl --user enable --now repogents-updater.timer
+```
+
+The timer checks about once per minute. A clean local `main` is fast-forwarded,
+then `repogents.service` is restarted and the restarted commit is recorded.
+Tracked changes, another checked-out branch, or a non-fast-forward remote are
+refused without changing the checkout or restarting Repogents. Untracked
+application state does not block an update.
+
 Every device that can reach the selected address can open this unauthenticated single-user interface. Use this mode only on a trusted LAN, never forward the port to the internet, and retain the loopback/tunnel setup on untrusted networks. The LAN service uses plain HTTP, so enter API keys only from a trusted network path. Dashboard state refreshes every 10 seconds; selected-repository activity is pushed immediately over a reconnecting Server-Sent Events stream.
 
 ## Onboard a repository
