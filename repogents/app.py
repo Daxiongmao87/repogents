@@ -116,12 +116,14 @@ class Orchestrator:
         execution: ExecutionOperations,
         publication: PublicationOperations,
         feedback: FeedbackOperations,
+        known_secret_values: Callable[[str], tuple[str, ...]] | None = None,
     ) -> None:
         self.database = database
         self.lifecycle = lifecycle
         self.execution = execution
         self.publication = publication
         self.feedback = feedback
+        self.known_secret_values = known_secret_values or (lambda _run_id: ())
         self._lock = threading.Lock()
         self._activation_poll_lock = threading.Lock()
         self._advancing_runs = threading.Event()
@@ -360,8 +362,8 @@ class Orchestrator:
             except RunPaused:
                 return
             except Exception as error:
-                self._schedule_retry(run_id, operation, error)
-                detail = f"orchestration failed: {error or error.__class__.__name__}"
+                retry_error = self._schedule_retry(run_id, operation, error)
+                detail = f"orchestration failed: {retry_error}"
                 self.last_errors.append(f"run {run_id}: {detail}")
                 return
             self._clear_retry_state(run_id)
@@ -386,16 +388,20 @@ class Orchestrator:
         run_id: str,
         operation: str,
         error: Exception,
-    ) -> None:
+    ) -> str:
         detail, _ = _display_run_reason(str(error) or error.__class__.__name__)
-        last_error = detail or error.__class__.__name__
+        last_error = _redact_retry_error(
+            detail or error.__class__.__name__,
+            run_id,
+            self.known_secret_values,
+        )
         with self.database.transaction() as connection:
             row = connection.execute(
                 """SELECT state, retry_attempt_count FROM runs WHERE id=?""",
                 (run_id,),
             ).fetchone()
             if row is None or str(row["state"]) in _TERMINAL_OR_IDLE:
-                return
+                return last_error
             attempt = int(row["retry_attempt_count"]) + 1
             delay_seconds = min(10 * (2 ** min(attempt - 1, 5)), 300)
             now_value = datetime.now(timezone.utc)
@@ -418,6 +424,7 @@ class Orchestrator:
                    VALUES (?, ?, ?, ?, ?)""",
                 (run_id, row["state"], row["state"], reason, now),
             )
+        return last_error
 
     def _clear_retry_state(self, run_id: str) -> None:
         with self.database.transaction() as connection:
@@ -772,29 +779,35 @@ class ApplicationActions:
         for run in all_run_values:
             run_id = str(run["id"])
             repository_id = str(run["repository_id"])
-            state = str(run["state"])
+            run_state = str(run["state"])
             repository_ready = bool(run.pop("repository_enabled")) and (
                 str(run.pop("repository_onboarding_state")) == "ready"
             )
             restart_exists = bool(run.pop("restart_exists"))
             run["priority"] = int(run["priority"])
             run["retry_attempt_count"] = int(run["retry_attempt_count"])
+            if run["retry_last_error"] is not None:
+                run["retry_last_error"] = _redact_retry_error(
+                    str(run["retry_last_error"]),
+                    run_id,
+                    self.known_secret_values,
+                )
             run["reason"], run["reason_truncated"] = _display_run_reason(run["reason"])
             run["reason_severity"] = (
-                "error" if state == RunState.BLOCKED.value else "neutral"
+                "error" if run_state == RunState.BLOCKED.value else "neutral"
             )
             run["forced"] = run.pop("force_requested_at") is not None
             run["can_retry"] = (
                 repository_ready
-                and state not in _TERMINAL_RUN_STATES
+                and run_state not in _TERMINAL_RUN_STATES
                 and (
-                    state == RunState.BLOCKED.value
+                    run_state == RunState.BLOCKED.value
                     or run["retry_next_at"] is not None
                 )
             )
             run["can_restart"] = (
                 repository_ready
-                and state == RunState.CANCELED.value
+                and run_state == RunState.CANCELED.value
                 and not restart_exists
             )
             run["validation_baselines"] = baseline_by_run.get(run_id, [])
@@ -810,7 +823,7 @@ class ApplicationActions:
                 else None
             )
             runs_by_repository.setdefault(repository_id, []).append(run)
-            if state in _TERMINAL_RUN_STATES:
+            if run_state in _TERMINAL_RUN_STATES:
                 history_run_values.append(run)
             else:
                 visible_run_values.append(run)
@@ -1346,7 +1359,6 @@ class ApplicationActions:
     def cancel(self, run_id: str) -> None:
         self.lifecycle.cancel(run_id, "canceled by user")
 
-
     def retry(self, run_id: str) -> str:
         state = self.lifecycle.retry(run_id)
         self.scheduler.request_tick()
@@ -1528,6 +1540,11 @@ def build_runtime(
         execution=execution,
         publication=publication,
         feedback=feedback,
+        known_secret_values=lambda run_id: _run_secret_values(
+            database,
+            secret_resolver,
+            run_id,
+        ),
     )
     scheduler = Scheduler(orchestrator, interval=poll_interval)
     actions = ApplicationActions(
@@ -1581,6 +1598,18 @@ def _display_acceptance_verification(
                 continue
             observation["log_recorded"] = bool(observation.pop("log_path", None))
     return display
+
+
+def _redact_retry_error(
+    value: str,
+    run_id: str,
+    known_secret_values: Callable[[str], tuple[str, ...]],
+) -> str:
+    try:
+        secrets = known_secret_values(run_id)
+    except Exception:
+        return "retry error details unavailable because secret redaction failed"
+    return redact_text(value, secrets)
 
 
 def _format_utc(value: datetime) -> str:

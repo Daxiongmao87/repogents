@@ -1669,10 +1669,13 @@ class ApplicationTests(unittest.TestCase):
     def test_transient_orchestration_failure_uses_durable_backoff_across_restart(
         self,
     ) -> None:
+        raw_secret = "retry-error-secret"  # pragma: allowlist secret
         class FailingExecution(FakeExecution):
             def execute(self, run_id: str) -> str:
                 self.calls.append(run_id)
-                raise TimeoutError("temporary controller boundary failure")
+                raise TimeoutError(
+                    f"temporary controller boundary failure: {raw_secret}"
+                )
 
         with self.db.transaction() as connection:
             connection.execute(
@@ -1686,6 +1689,7 @@ class ApplicationTests(unittest.TestCase):
             execution=execution,
             publication=FakePublication(self.db),
             feedback=FakeFeedback(self.db),
+            known_secret_values=lambda _run_id: (raw_secret,),
         )
 
         orchestrator._advance("run-1")
@@ -1696,24 +1700,26 @@ class ApplicationTests(unittest.TestCase):
         self.assertIsNotNone(run["retry_next_at"])
         self.assertEqual(
             run["retry_last_error"],
-            "temporary controller boundary failure",
+            "temporary controller boundary failure: [REDACTED]",
         )
         self.assertEqual(execution.calls, ["run-1"])
         self.assertIn(
             "temporary controller boundary failure", orchestrator.last_errors[0]
         )
+        self.assertNotIn(raw_secret, "\n".join(orchestrator.last_errors))
         projected = ApplicationActions(
             database=self.db,
             onboarding=FakeOnboarding(),
             lifecycle=lifecycle,
             scheduler=FakeScheduler(),
+            known_secret_values=lambda _run_id: (raw_secret,),
         ).state()["runs"][0]
         self.assertIs(projected["can_retry"], True)
         self.assertEqual(projected["retry_attempt_count"], 1)
         self.assertIsNotNone(projected["retry_next_at"])
         self.assertEqual(
             projected["retry_last_error"],
-            "temporary controller boundary failure",
+            "temporary controller boundary failure: [REDACTED]",
         )
 
         resumed_execution = FakeExecution(self.db)
@@ -1723,6 +1729,7 @@ class ApplicationTests(unittest.TestCase):
             execution=resumed_execution,
             publication=FakePublication(self.db),
             feedback=FakeFeedback(self.db),
+            known_secret_values=lambda _run_id: (raw_secret,),
         )
         resumed._advance("run-1")
         self.assertEqual(resumed_execution.calls, [])
@@ -1739,6 +1746,80 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(recovered["retry_attempt_count"], 0)
         self.assertIsNone(recovered["retry_next_at"])
         self.assertIsNone(recovered["retry_last_error"])
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET state='implementing' WHERE id='run-1'"
+            )
+
+        def unavailable_secrets(_run_id: str) -> tuple[str, ...]:
+            raise RuntimeError("secret resolver unavailable")
+
+        unavailable = Orchestrator(
+            database=self.db,
+            lifecycle=lifecycle,
+            execution=FailingExecution(self.db),
+            publication=FakePublication(self.db),
+            feedback=FakeFeedback(self.db),
+            known_secret_values=unavailable_secrets,
+        )
+        unavailable._advance("run-1")
+        hidden = lifecycle.get_run("run-1")
+        self.assertEqual(
+            hidden["retry_last_error"],
+            "retry error details unavailable because secret redaction failed",
+        )
+        self.assertNotIn(raw_secret, "\n".join(unavailable.last_errors))
+        with self.db.connect() as connection:
+            retry_transition = connection.execute(
+                """SELECT reason FROM run_transitions
+                   WHERE run_id='run-1' ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+        self.assertNotIn(raw_secret, str(retry_transition["reason"]))
+
+    def test_state_redacts_legacy_stored_retry_error(self) -> None:
+        raw_secret = "legacy-retry-secret"  # pragma: allowlist secret
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs
+                   SET state='implementing',
+                       retry_attempt_count=1,
+                       retry_operation='execution',
+                       retry_next_at='2099-01-01T00:00:00Z',
+                       retry_last_error=?
+                   WHERE id='run-1'""",
+                (f"authenticated endpoint token={raw_secret}",),
+            )
+        actions = ApplicationActions(
+            database=self.db,
+            onboarding=FakeOnboarding(),
+            lifecycle=FakeLifecycle(self.db),
+            scheduler=FakeScheduler(),
+            known_secret_values=lambda _run_id: (raw_secret,),
+        )
+
+        projected = actions.state()["runs"][0]
+
+        self.assertEqual(
+            projected["retry_last_error"],
+            "authenticated endpoint token=[REDACTED]",
+        )
+        self.assertNotIn(raw_secret, json.dumps(projected))
+
+        def unavailable_secrets(_run_id: str) -> tuple[str, ...]:
+            raise RuntimeError("secret resolver unavailable")
+
+        unavailable = ApplicationActions(
+            database=self.db,
+            onboarding=FakeOnboarding(),
+            lifecycle=FakeLifecycle(self.db),
+            scheduler=FakeScheduler(),
+            known_secret_values=unavailable_secrets,
+        ).state()["runs"][0]
+        self.assertEqual(
+            unavailable["retry_last_error"],
+            "retry error details unavailable because secret redaction failed",
+        )
+        self.assertNotIn(raw_secret, json.dumps(unavailable))
 
     def test_build_runtime_starts_unconfigured_without_ambient_model_discovery(
         self,
