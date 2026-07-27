@@ -1090,6 +1090,41 @@ class OnboardingTests(unittest.TestCase):
         self.assertEqual(repository["onboarding_state"], "blocked")
         self.assertIn("secret://", repository["blocking_reason"])
 
+    def test_missing_saved_secret_needs_input_before_provisioning(self) -> None:
+        sandbox = RecordingSandbox()
+        service = OnboardingService(
+            database=self.db,
+            data_root=self.root / "data",
+            github=FakeGitHub(self.repository),
+            sources=FakeSources({"README.md": "Repository instructions.\n"}),
+            inspector=RepositoryInspector(),
+            team_formulator=FakeTeamFormulator(),
+            provisioner=SandboxEnvironmentProvisioner(
+                data_root=self.root / "data",
+                sandbox=sandbox,
+            ),
+        )
+
+        repository_id = service.onboard(
+            "example/demo",
+            {
+                "secret_bindings": [
+                    {
+                        "name": "PRODUCT_KEY",
+                        "reference": "secret://repository/github-123/missing-product-key",
+                        "commands": [["python3", "provision.py"]],
+                    }
+                ],
+                "provisioning_commands": [["python3", "provision.py"]],
+                "validation_commands": [["python3", "-m", "unittest"]],
+            },
+        )
+
+        repository = service.get_repository(repository_id)
+        self.assertEqual(repository["onboarding_state"], "needs_input")
+        self.assertIn("saved secret PRODUCT_KEY is not configured", repository["blocking_reason"])
+        self.assertEqual(sandbox.calls, [])
+
     def test_repository_without_usable_validation_needs_input(self) -> None:
         service, _ = self.service(
             FakeSources({"README.md": "No validation command is discoverable.\n"})
@@ -1494,6 +1529,107 @@ class OnboardingTests(unittest.TestCase):
         self.assertEqual(record["onboarding_state"], "blocked")
         self.assertIn("clone failed", record["blocking_reason"])
         self.assertEqual(len(blocked.list_repositories()), 2)
+
+    def test_missing_pinned_artifact_revision_needs_input(self) -> None:
+        from repogents.resources import RepositoryResourceStore
+
+        service, _ = self.service(FakeSources())
+        validation_commands = [["python", "-c", "pass"]]
+        repository_id = service.onboard(
+            "example/demo", {"validation_commands": validation_commands}
+        )
+        store = RepositoryResourceStore(self.db, self.root / "data")
+        artifact = store.upload_artifact(
+            repository_id,
+            name="fixture-sdk",
+            description="Licensed fixture SDK",
+            content=b"fixture revision one",
+        )
+        store.remove_artifact_revision(
+            repository_id, artifact["name"], int(artifact["revision"])
+        )
+
+        service.reonboard(
+            repository_id,
+            {
+                "artifact_bindings": [artifact],
+                "validation_commands": validation_commands,
+            },
+        )
+
+        repository = service.get_repository(repository_id)
+        self.assertEqual(repository["onboarding_state"], "needs_input")
+        self.assertIn("artifact fixture-sdk revision 1", repository["blocking_reason"])
+        self.assertIn("missing or inaccessible", repository["blocking_reason"])
+
+    def test_reonboarding_pins_distinct_artifact_revisions_without_bytes_in_evidence(
+        self,
+    ) -> None:
+        from repogents.resources import RepositoryResourceStore
+
+        service, _ = self.service(FakeSources())
+        validation_commands = [["python", "-c", "pass"]]
+        repository_id = service.onboard(
+            "example/demo", {"validation_commands": validation_commands}
+        )
+        store = RepositoryResourceStore(self.db, self.root / "data")
+        first = store.upload_artifact(
+            repository_id,
+            name="fixture-sdk",
+            description="Licensed fixture SDK",
+            content=b"private fixture revision one",
+        )
+        service.reonboard(
+            repository_id,
+            {
+                "artifact_bindings": [first],
+                "validation_commands": validation_commands,
+            },
+        )
+        first_repository = service.get_repository(repository_id)
+        first_sandbox_id = first_repository["current_sandbox_version_id"]
+
+        second = store.upload_artifact(
+            repository_id,
+            name="fixture-sdk",
+            description="Licensed fixture SDK replacement",
+            content=b"private fixture revision two",
+        )
+        service.reonboard(
+            repository_id,
+            {
+                "artifact_bindings": [second],
+                "validation_commands": validation_commands,
+            },
+        )
+        second_repository = service.get_repository(repository_id)
+        second_sandbox_id = second_repository["current_sandbox_version_id"]
+
+        self.assertNotEqual(first_sandbox_id, second_sandbox_id)
+        with self.db.connect() as connection:
+            pinned = connection.execute(
+                """SELECT sandbox_artifact_revisions.sandbox_version_id,
+                          artifact_revisions.revision, sandbox_versions.evidence_json
+                   FROM sandbox_artifact_revisions
+                   JOIN artifact_revisions
+                     ON artifact_revisions.id=sandbox_artifact_revisions.artifact_revision_id
+                   JOIN sandbox_versions
+                     ON sandbox_versions.id=sandbox_artifact_revisions.sandbox_version_id
+                   WHERE sandbox_versions.repository_id=?
+                   ORDER BY artifact_revisions.revision""",
+                (repository_id,),
+            ).fetchall()
+        self.assertEqual(
+            [(row["sandbox_version_id"], row["revision"]) for row in pinned],
+            [(first_sandbox_id, 1), (second_sandbox_id, 2)],
+        )
+        for row in pinned:
+            evidence = json.loads(row["evidence_json"])
+            projected = evidence["resources"]["artifacts"][0]
+            self.assertIn("description", projected)
+            self.assertIn("sandbox_path", projected)
+            self.assertNotIn("storage_path", projected)
+            self.assertNotIn("private fixture revision", row["evidence_json"])
 
 
 if __name__ == "__main__":

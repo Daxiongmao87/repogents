@@ -235,6 +235,51 @@ class LocalInterfaceServer:
                 for segment in path.strip("/").split("/")
                 if segment
             ]
+            if (
+                len(segments) == 4
+                and segments[:2] == ["api", "repositories"]
+                and segments[3] == "artifacts"
+            ):
+                name = payload.get("name")
+                description = payload.get("description", "")
+                encoded = payload.get("content_base64")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError("artifact name must be a nonempty string")
+                if not isinstance(description, str):
+                    raise ValueError("artifact description must be a string")
+                if not isinstance(encoded, str) or not encoded:
+                    raise ValueError("artifact content is required")
+                try:
+                    content = __import__("base64").b64decode(encoded, validate=True)
+                except Exception as error:
+                    raise ValueError("artifact content must be valid base64") from error
+                artifact = self.actions.upload_repository_artifact(
+                    segments[2],
+                    name=name.strip(),
+                    description=description,
+                    content=content,
+                )
+                self._send_json(request, HTTPStatus.CREATED, artifact)
+                return
+            if (
+                len(segments) == 4
+                and segments[:2] == ["api", "repositories"]
+                and segments[3] == "secrets"
+            ):
+                name = payload.get("name")
+                action = payload.get("action", "preserve")
+                value = payload.get("value", "")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError("secret name must be a nonempty string")
+                if not isinstance(action, str):
+                    raise ValueError("secret action must be a string")
+                if not isinstance(value, str):
+                    raise ValueError("secret value must be a string")
+                secret = self.actions.update_repository_secret(
+                    segments[2], name=name.strip(), action=action, value=value
+                )
+                self._send_json(request, HTTPStatus.OK, secret)
+                return
             if segments == ["api", "model-configuration"]:
                 configuration = self.actions.configure_model(payload)
                 self._send_json(request, HTTPStatus.OK, configuration)
@@ -263,6 +308,22 @@ class LocalInterfaceServer:
                     raise ValueError("inputs must be an object")
                 version_id = self.actions.reonboard(segments[2], inputs)
                 self._send_json(request, HTTPStatus.OK, {"version_id": version_id})
+                return
+            if (
+                len(segments) == 4
+                and segments[:2] == ["api", "repositories"]
+                and segments[3] == "artifacts"
+            ):
+                name = payload.get("name")
+                revision = payload.get("revision")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError("artifact name must be a nonempty string")
+                if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+                    raise ValueError("artifact revision must be a positive integer")
+                self.actions.remove_repository_artifact(
+                    segments[2], name=name.strip(), revision=revision
+                )
+                self._send_json(request, HTTPStatus.OK, {"ok": True})
                 return
             if (
                 len(segments) == 4
@@ -812,7 +873,15 @@ details > summary { cursor: pointer; }
             <details>
               <summary>Repository inputs</summary>
               <p class="muted">Optional JSON for host paths, services, secrets, provisioning, or validation overrides.</p>
-              <textarea name="inputs" aria-label="Repository inputs JSON">{}</textarea>
+              <div class="resources-editor" data-resources-editor>
+                <fieldset><legend>Artifacts</legend><p class="muted">Upload licensed SDKs, fixtures, or other binary resources. Artifacts are mounted read-only and pinned when the repository is onboarded.</p><div data-resource-list="artifacts"></div><button type="button" class="button small" data-add-resource="artifact">Add artifact</button></fieldset>
+                <fieldset><legend>Variables</legend><p class="muted">Non-secret environment values scoped to selected provisioning or validation commands.</p><div data-resource-list="variables"></div><button type="button" class="button small" data-add-resource="variable">Add variable</button></fieldset>
+                <fieldset><legend>Secrets</legend><p class="muted">Values are write-only. Blank values preserve configured secrets; use Replace or Remove explicitly.</p><div data-resource-list="secrets"></div><button type="button" class="button small" data-add-resource="secret">Add secret</button></fieldset>
+                <fieldset><legend>Permitted network services</legend><div data-resource-list="services"></div><button type="button" class="button small" data-add-resource="service">Add service</button></fieldset>
+                <fieldset><legend>Provisioning commands</legend><div data-resource-list="provisioning"></div><button type="button" class="button small" data-add-resource="provisioning">Add command</button></fieldset>
+                <fieldset><legend>Validation commands</legend><div data-resource-list="validation"></div><button type="button" class="button small" data-add-resource="validation">Add command</button></fieldset>
+              </div>
+              <details class="advanced-inputs"><summary>Advanced JSON view</summary><textarea name="inputs" aria-label="Advanced repository inputs JSON">{}</textarea></details>
             </details>
           </form>
           <div id="repository-list" aria-live="polite"></div>
@@ -893,6 +962,184 @@ let draggedRunId = null;
 let suppressRunClick = false;
 let modelCatalog = {available:false, reason:'Not loaded', models:[]};
 const displayInputs = new Map();
+const resourceEditor = document.querySelector('[data-resources-editor]');
+const resourceTemplates = {
+  artifact: () => `<div class="resource-row" data-resource-row="artifact"><label>Stable name <input data-field="name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]*"></label><label>Description <input data-field="description" required></label><label>Sandbox path <input data-field="sandbox_path" required value="/repository-resources/artifacts/" pattern="/repository-resources/artifacts/.+" title="Use a path below /repository-resources/artifacts/" aria-describedby="artifact-path-help"></label><span class="muted" id="artifact-path-help">Artifacts are mounted read-only below /repository-resources/artifacts/.</span><label>Artifact file <input data-field="file" type="file" required></label><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
+  variable: () => `<div class="resource-row" data-resource-row="variable"><label>Name <input data-field="name" required pattern="[A-Za-z_][A-Za-z0-9_]*"></label><label>Value <input data-field="value"></label><label>Command scopes <input data-field="commands" placeholder="one command per line"></label><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
+  secret: () => `<div class="resource-row" data-resource-row="secret"><label>Name <input data-field="name" required pattern="[A-Za-z_][A-Za-z0-9_]*"></label><span class="badge" data-field="configured_status">Not configured</span><label>Value <input data-field="value" type="password" autocomplete="new-password" placeholder="Blank preserves current value"></label><label>Action <select data-field="action"><option value="preserve">Preserve</option><option value="replace">Replace</option><option value="remove">Remove</option></select></label><label>Command scopes <input data-field="commands" placeholder="one command per line"></label><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
+  service: () => `<div class="resource-row" data-resource-row="service"><label>Host and port <input data-field="value" required placeholder="vendor.example:443"></label><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
+  provisioning: () => `<div class="resource-row" data-resource-row="provisioning"><label>Command arguments (JSON array) <input data-field="value" required placeholder='["python","provision.py"]'></label><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
+  validation: () => `<div class="resource-row" data-resource-row="validation"><label>Command arguments (JSON array) <input data-field="value" required placeholder='["python","-m","unittest"]'></label><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
+};
+const resourceFieldError = (control, message) => {
+  control.setCustomValidity(message);
+  control.reportValidity();
+  throw new Error(message);
+};
+const parsedJsonField = (control, description) => {
+  control.setCustomValidity('');
+  try {
+    return JSON.parse(control.value);
+  } catch (_failure) {
+    return resourceFieldError(control, `${description} must be valid JSON.`);
+  }
+};
+const commandRows = (control, description = 'Command scopes') => String(control.value || '').split('\n').map(line => line.trim()).filter(Boolean).map((line, index) => {
+  let command;
+  try {
+    command = JSON.parse(line);
+  } catch (_failure) {
+    return resourceFieldError(control, `${description} line ${index + 1} must be a JSON array.`);
+  }
+  if (!Array.isArray(command) || !command.length || command.some(argument => typeof argument !== 'string' || !argument)) {
+    return resourceFieldError(control, `${description} line ${index + 1} must be a non-empty JSON array of non-empty strings.`);
+  }
+  control.setCustomValidity('');
+  return command;
+});
+const resourceDraft = editor => {
+  const form = editor.closest('form');
+  const advancedControl = form.elements.inputs;
+  const advanced = parsedJsonField(advancedControl, 'Advanced repository inputs');
+  if (!advanced || Array.isArray(advanced) || typeof advanced !== 'object') {
+    return resourceFieldError(advancedControl, 'Advanced repository inputs must be a JSON object.');
+  }
+  const rows = kind => [...editor.querySelectorAll(`[data-resource-row="${kind}"]`)];
+  const control = (row, name) => row.querySelector(`[data-field="${name}"]`);
+  const field = (row, name) => control(row, name)?.value ?? '';
+  for (const input of editor.querySelectorAll('input, select, textarea')) input.setCustomValidity('');
+  if (!form.checkValidity()) {
+    form.reportValidity();
+    throw new Error('Correct the highlighted resource fields.');
+  }
+  advanced.allowed_services = rows('service').map(row => field(row, 'value').trim()).filter(Boolean);
+  advanced.provisioning_commands = rows('provisioning').map((row, index) => {
+    const commandControl = control(row, 'value');
+    const command = parsedJsonField(commandControl, `Provisioning command ${index + 1}`);
+    if (!Array.isArray(command) || !command.length || command.some(argument => typeof argument !== 'string' || !argument)) {
+      return resourceFieldError(commandControl, `Provisioning command ${index + 1} must be a non-empty JSON array of non-empty strings.`);
+    }
+    return command;
+  });
+  advanced.validation_commands = rows('validation').map((row, index) => {
+    const commandControl = control(row, 'value');
+    const command = parsedJsonField(commandControl, `Validation command ${index + 1}`);
+    if (!Array.isArray(command) || !command.length || command.some(argument => typeof argument !== 'string' || !argument)) {
+      return resourceFieldError(commandControl, `Validation command ${index + 1} must be a non-empty JSON array of non-empty strings.`);
+    }
+    return command;
+  });
+  advanced.variable_bindings = rows('variable').map(row => ({
+    name:field(row, 'name').trim(),
+    value:field(row, 'value'),
+    commands:commandRows(control(row, 'commands')),
+  }));
+  delete advanced.artifact_uploads;
+  const artifacts = rows('artifact').map(row => {
+    const pathControl = control(row, 'sandbox_path');
+    const sandboxPath = field(row, 'sandbox_path').trim();
+    if (!sandboxPath.startsWith('/repository-resources/artifacts/') || sandboxPath === '/repository-resources/artifacts/') {
+      return resourceFieldError(pathControl, 'Artifact sandbox path must be below /repository-resources/artifacts/.');
+    }
+    return {
+      name:field(row, 'name').trim(),
+      description:field(row, 'description'),
+      sandbox_path:sandboxPath,
+      revision:Number(row.dataset.revision || 0),
+      file:control(row, 'file')?.files?.[0] || null,
+    };
+  });
+  const secrets = rows('secret').map(row => ({
+    name:field(row, 'name').trim(),
+    value:field(row, 'value'),
+    action:field(row, 'action'),
+    commands:commandRows(control(row, 'commands')),
+  }));
+  // Keep advanced secret:// bindings so environment-backed references survive structured re-onboarding.
+  // Repository-managed secret rows are merged explicitly by structuredInputs below.
+  delete advanced.artifact_bindings;
+  return {advanced, artifacts, secrets};
+};
+const structuredInputs = (editor, repositoryId = '', artifactBindings = []) => {
+  const draft = resourceDraft(editor);
+  draft.advanced.artifact_bindings = artifactBindings;
+  const legacySecretBindings = (draft.advanced.secret_bindings || []).filter(binding =>
+    !String(binding?.reference || '').startsWith('secret://repository/')
+  );
+  const managedSecretBindings = draft.secrets.map(binding => ({
+    name:binding.name,
+    reference:`secret://repository/${repositoryId}/${binding.name.toLowerCase()}`,
+    commands:binding.commands,
+  }));
+  draft.advanced.secret_bindings = [...legacySecretBindings, ...managedSecretBindings];
+  return draft.advanced;
+};
+let reonboardRepositoryId = null;
+const hydrateResources = (editor, inputs = {}) => {
+  editor.querySelectorAll('[data-resource-row]').forEach(row => row.remove());
+  const append = (kind, values) => {
+    const listName = kind === 'artifact' ? 'artifacts' : kind === 'variable' ? 'variables' : kind === 'secret' ? 'secrets' : kind === 'service' ? 'services' : kind;
+    const list = editor.querySelector(`[data-resource-list="${listName}"]`);
+    if (!list) return;
+    list.insertAdjacentHTML('beforeend', resourceTemplates[kind]());
+    const row = list.lastElementChild;
+    if (kind === 'artifact' && Number.isInteger(values.revision)) {
+      row.dataset.revision = String(values.revision);
+      const fileControl = row.querySelector('[data-field="file"]');
+      if (fileControl) fileControl.required = false;
+    }
+    for (const [name, value] of Object.entries(values)) {
+      const control = row.querySelector(`[data-field="${name}"]`);
+      if (!control || control.type === 'file') continue;
+      if ('value' in control) control.value = value ?? '';
+      else control.textContent = value ?? '';
+    }
+  };
+  for (const value of inputs.allowed_services || []) append('service', {value});
+  for (const value of inputs.provisioning_commands || []) append('provisioning', {value:JSON.stringify(value)});
+  for (const value of inputs.validation_commands || []) append('validation', {value:JSON.stringify(value)});
+  for (const binding of inputs.variable_bindings || []) append('variable', {
+    name:binding.name, value:binding.value, commands:(binding.commands || []).map(JSON.stringify).join('\n'),
+  });
+  const secretStatus = new Map((inputs.resource_secrets || []).map(secret => [secret.name, Boolean(secret.configured)]));
+  for (const binding of inputs.secret_bindings || []) {
+    if (!String(binding.reference || '').startsWith('secret://repository/')) continue;
+    append('secret', {
+      name:binding.name, value:'', action:'preserve',
+      configured_status:secretStatus.get(binding.name) ? 'Configured' : 'Not configured',
+      commands:(binding.commands || []).map(JSON.stringify).join('\n'),
+    });
+  }
+  for (const artifact of inputs.artifact_bindings || []) append('artifact', {
+    name:artifact.name, description:artifact.description || '',
+    sandbox_path:artifact.sandbox_path, revision:artifact.revision,
+  });
+  const {resource_secrets: _resourceSecrets, ...advancedInputs} = inputs;
+  editor.closest('form').elements.inputs.value = JSON.stringify(advancedInputs, null, 2);
+};
+resourceEditor?.addEventListener('click', event => {
+  const add = event.target.closest('[data-add-resource]');
+  if (add) {
+    const kind = add.dataset.addResource;
+    const list = resourceEditor.querySelector(`[data-resource-list="${kind === 'artifact' ? 'artifacts' : kind === 'variable' ? 'variables' : kind === 'secret' ? 'secrets' : kind === 'service' ? 'services' : kind}"]`);
+    list?.insertAdjacentHTML('beforeend', resourceTemplates[kind]());
+    list?.lastElementChild?.querySelector('input,select')?.focus();
+  }
+  const remove = event.target.closest('[data-remove-resource]');
+  if (remove) {
+    const row = remove.closest('[data-resource-row]');
+    const revision = Number(row?.dataset.revision || 0);
+    const name = row?.querySelector('[data-field="name"]')?.value?.trim() || '';
+    if (revision && reonboardRepositoryId) {
+      if (!confirm(`Remove artifact ${name} revision ${revision} from durable storage? Referenced revisions cannot be removed.`)) return;
+      return action(async () => {
+        await mutate(`/api/repositories/${encodeURIComponent(reonboardRepositoryId)}/artifacts`, {name, revision});
+        row?.remove();
+      });
+    }
+    row?.remove();
+  }
+});
 const error = document.querySelector('#error');
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const boundedMessage = value => {
@@ -1318,13 +1565,52 @@ document.querySelector('#model-configuration-form').addEventListener('submit', a
   await refresh();
   await loadModelCatalog();
 });
+const fileBase64 = file => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onerror = () => reject(new Error(`Could not read artifact ${file.name}.`));
+  reader.onload = () => resolve(String(reader.result || '').split(',', 2)[1] || '');
+  reader.readAsDataURL(file);
+});
 document.querySelector('#add').addEventListener('submit', event => {
   event.preventDefault();
   action(async () => {
-    const form = new FormData(event.target);
-    await mutate('/api/repositories', {repository:form.get('repository'), inputs:JSON.parse(form.get('inputs'))});
-    event.target.reset();
-    event.target.elements.inputs.value = '{}';
+    const form = event.target;
+    const draft = resourceDraft(resourceEditor);
+    let repositoryId = reonboardRepositoryId;
+    if (!repositoryId) {
+      const created = await mutate('/api/repositories', {
+        repository:form.elements.repository.value,
+        inputs:{...draft.advanced, _defer_resource_onboarding:true},
+      });
+      repositoryId = created.repository_id;
+    }
+    const artifactBindings = [];
+    for (const artifact of draft.artifacts) {
+      let revision = artifact.revision;
+      if (artifact.file) {
+        const uploaded = await mutate(`/api/repositories/${encodeURIComponent(repositoryId)}/artifacts`, {
+          name:artifact.name,
+          description:artifact.description,
+          content_base64:await fileBase64(artifact.file),
+        });
+        revision = uploaded.revision;
+      }
+      if (!revision) throw new Error(`Choose a file for artifact ${artifact.name}.`);
+      artifactBindings.push({name:artifact.name, revision, sandbox_path:artifact.sandbox_path});
+    }
+    for (const secret of draft.secrets) {
+      await mutate(`/api/repositories/${encodeURIComponent(repositoryId)}/secrets`, {
+        name:secret.name, action:secret.action, value:secret.value,
+      });
+    }
+    const inputs = structuredInputs(resourceEditor, repositoryId, artifactBindings);
+    await mutate(`/api/repositories/${encodeURIComponent(repositoryId)}/reonboard`, {inputs});
+    reonboardRepositoryId = null;
+    form.reset();
+    hydrateResources(resourceEditor, {});
+    form.elements.repository.disabled = false;
+    form.elements.repository.placeholder = 'GitHub URL or owner/repository';
+    form.querySelector('button[type=submit]').textContent = 'Add repository';
   });
 });
 document.querySelector('#poll').addEventListener('click', () => action(() => mutate('/api/poll', {})));
@@ -1342,11 +1628,19 @@ document.body.addEventListener('click', event => {
     return action(() => mutate(`/api/repositories/${encodeURIComponent(b.dataset.enabled)}/enabled`, {enabled:b.dataset.nextEnabled === 'true'}));
   }
   if (b?.dataset.reonboard) {
-    return action(() => {
-      const raw = prompt('Repository inputs JSON object:', JSON.stringify(displayInputs.get(b.dataset.reonboard), null, 2));
-      if (raw === null) return Promise.resolve();
-      return mutate(`/api/repositories/${encodeURIComponent(b.dataset.reonboard)}/reonboard`, {inputs:JSON.parse(raw)});
+    reonboardRepositoryId = b.dataset.reonboard;
+    const repository = currentState.repositories.find(item => String(item.id) === String(reonboardRepositoryId));
+    const form = document.querySelector('#add');
+    form.elements.repository.value = repository?.full_name || repository?.repository || '';
+    form.elements.repository.disabled = true;
+    hydrateResources(resourceEditor, {
+      ...(displayInputs.get(b.dataset.reonboard) || {}),
+      resource_secrets:repository?.resource_secrets || [],
     });
+    form.querySelector('button[type="submit"]').textContent = 'Save resources and re-onboard';
+    form.scrollIntoView({behavior:'smooth', block:'start'});
+    resourceEditor.querySelector('input,select,textarea')?.focus();
+    return;
   }
   if (b?.dataset.remove) {
     if (!confirm('Remove this repository from active inventory? Its durable history will be preserved.')) return;

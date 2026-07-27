@@ -228,6 +228,45 @@ class FakeActions:
         self.calls.append(("reonboard", repository_id, inputs))
         return "sandbox-2"
 
+    def upload_repository_artifact(
+        self,
+        repository_id: str,
+        *,
+        name: str,
+        description: str,
+        content: bytes,
+    ) -> dict[str, object]:
+        self.calls.append(
+            ("upload-artifact", repository_id, name, description, content)
+        )
+        return {
+            "name": name,
+            "description": description,
+            "revision": 2,
+            "sha256": "a" * 64,
+            "size": len(content),
+        }
+
+    def remove_repository_artifact(
+        self, repository_id: str, *, name: str, revision: int
+    ) -> None:
+        self.calls.append(("remove-artifact", repository_id, name, revision))
+
+    def update_repository_secret(
+        self,
+        repository_id: str,
+        *,
+        name: str,
+        action: str,
+        value: str = "",
+    ) -> dict[str, object]:
+        self.calls.append(("secret", repository_id, name, action, value))
+        return {
+            "name": name,
+            "reference": f"secret://repository/{repository_id}/{name.lower()}",
+            "configured": action == "replace" and bool(value),
+        }
+
     def set_repository_enabled(self, repository_id: str, enabled: bool) -> None:
         if repository_id != "repo-1":
             raise KeyError(repository_id)
@@ -429,6 +468,64 @@ class InterfaceTests(unittest.TestCase):
         self.assertNotIn("api_key", model_configuration)
         self.assertNotIn("dashboard-secret", body.decode("utf-8"))
 
+    def test_repository_artifact_upload_decodes_bytes_without_echoing_content(
+        self,
+    ) -> None:
+        status, _, body = self.request(
+            "POST",
+            "/api/repositories/repo-1/artifacts",
+            {
+                "name": "fixture-sdk",
+                "description": "Licensed fixture SDK",
+                "content_base64": "Zml4dHVyZS1ieXRlcw==",
+            },
+        )
+
+        self.assertEqual(status, 201)
+        response = json.loads(body)
+        self.assertEqual(response["name"], "fixture-sdk")
+        self.assertEqual(response["revision"], 2)
+        self.assertNotIn("content", response)
+        self.assertNotIn(b"fixture-bytes", body)
+        self.assertIn(
+            (
+                "upload-artifact",
+                "repo-1",
+                "fixture-sdk",
+                "Licensed fixture SDK",
+                b"fixture-bytes",
+            ),
+            self.actions.calls,
+        )
+
+    def test_repository_secret_replace_and_remove_never_echo_values(self) -> None:
+        secret_value = "saved-product-key-123"
+        status, _, replace_body = self.request(
+            "POST",
+            "/api/repositories/repo-1/secrets",
+            {"name": "PRODUCT_KEY", "action": "replace", "value": secret_value},
+        )
+        self.assertEqual(status, 200)
+        replacement = json.loads(replace_body)
+        self.assertIs(replacement["configured"], True)
+        self.assertNotIn("value", replacement)
+        self.assertNotIn(secret_value.encode(), replace_body)
+        self.assertIn(
+            ("secret", "repo-1", "PRODUCT_KEY", "replace", secret_value),
+            self.actions.calls,
+        )
+
+        status, _, remove_body = self.request(
+            "POST",
+            "/api/repositories/repo-1/secrets",
+            {"name": "PRODUCT_KEY", "action": "remove", "value": ""},
+        )
+        self.assertEqual(status, 200)
+        removal = json.loads(remove_body)
+        self.assertIs(removal["configured"], False)
+        self.assertNotIn("value", removal)
+        self.assertNotIn(secret_value.encode(), remove_body)
+
     def test_dashboard_renders_display_inputs_and_prefills_reonboarding_from_them(
         self,
     ) -> None:
@@ -449,6 +546,8 @@ class InterfaceTests(unittest.TestCase):
             dashboard,
         )
         self.assertNotIn("r.inputs", dashboard)
+        self.assertIn("const {resource_secrets: _resourceSecrets, ...advancedInputs} = inputs;", dashboard)
+        self.assertIn("if (fileControl) fileControl.required = false;", dashboard)
         self.assertIn("data-retry", dashboard)
         self.assertIn("/retry", dashboard)
         self.assertIn("Issue acceptance", dashboard)

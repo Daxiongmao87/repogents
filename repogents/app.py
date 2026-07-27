@@ -36,6 +36,7 @@ from .publication import (
     MiniSweScopeReviewer,
     PublicationService,
 )
+from .resources import RepositoryResourceStore
 from .sandbox import SandboxManager, redact_text
 from .team import EvidenceTeamFormulator, TeamService
 
@@ -623,6 +624,7 @@ class ApplicationActions:
         onboarding: OnboardingOperations,
         lifecycle: LifecycleOperations,
         scheduler: SchedulerControl,
+        resource_store: RepositoryResourceStore | None = None,
         model_configuration: ModelProviderConfiguration | None = None,
         known_secret_values: Callable[[str], tuple[str, ...]] | None = None,
     ) -> None:
@@ -630,6 +632,7 @@ class ApplicationActions:
         self.onboarding = onboarding
         self.lifecycle = lifecycle
         self.scheduler = scheduler
+        self.resource_store = resource_store
         self.model_configuration = model_configuration
         self.known_secret_values = known_secret_values or (lambda _run_id: ())
 
@@ -913,6 +916,11 @@ class ApplicationActions:
             value["team"] = teams_by_repository.get(repository_id)
             value["display_inputs"] = _display_repository_inputs(
                 str(value.pop("inputs_json"))
+            )
+            value["resource_secrets"] = (
+                self.resource_store.list_secrets(repository_id)
+                if self.resource_store is not None
+                else []
             )
             repository_values.append(value)
             discovery = discovery_by_repository.get(repository_id)
@@ -1357,13 +1365,101 @@ class ApplicationActions:
             )
         self.scheduler.request_tick()
 
+    def upload_repository_artifact(
+        self,
+        repository_id: str,
+        *,
+        name: str,
+        description: str,
+        content: bytes,
+    ) -> dict[str, object]:
+        if self.resource_store is None:
+            raise RuntimeError("repository resource storage is unavailable")
+        return dict(
+            self.resource_store.upload_artifact(
+                repository_id,
+                name=name,
+                description=description,
+                content=content,
+            )
+        )
+
+    def remove_repository_artifact(
+        self, repository_id: str, *, name: str, revision: int
+    ) -> None:
+        if self.resource_store is None:
+            raise RuntimeError("repository resource storage is unavailable")
+        self.resource_store.remove_artifact_revision(repository_id, name, revision)
+
+    def update_repository_secret(
+        self,
+        repository_id: str,
+        *,
+        name: str,
+        action: str,
+        value: str = "",
+    ) -> dict[str, object]:
+        if self.resource_store is None:
+            raise RuntimeError("repository resource storage is unavailable")
+        return dict(
+            self.resource_store.update_secret(
+                repository_id, name=name, action=action, value=value
+            )
+        )
+
+    def _resolve_resource_inputs(
+        self, repository_id: str, inputs: dict[str, object]
+    ) -> dict[str, object]:
+        resolved = dict(inputs)
+        raw_artifacts = resolved.get("artifact_bindings")
+        if raw_artifacts is not None:
+            if self.resource_store is None:
+                raise RuntimeError("repository resource storage is unavailable")
+            if not isinstance(raw_artifacts, list):
+                raise ValueError("artifact_bindings must be a list")
+            bindings: list[dict[str, object]] = []
+            for index, raw in enumerate(raw_artifacts):
+                if not isinstance(raw, dict):
+                    raise ValueError(f"artifact_bindings[{index}] must be an object")
+                name = raw.get("name")
+                revision = raw.get("revision")
+                sandbox_path = raw.get("sandbox_path")
+                if not isinstance(name, str):
+                    raise ValueError(f"artifact_bindings[{index}] name must be a string")
+                if not isinstance(revision, int) or isinstance(revision, bool):
+                    raise ValueError(
+                        f"artifact_bindings[{index}] revision must be an integer"
+                    )
+                if not isinstance(sandbox_path, str):
+                    raise ValueError(
+                        f"artifact_bindings[{index}] sandbox_path must be a string"
+                    )
+                bindings.append(
+                    self.resource_store.artifact_binding(
+                        repository_id, name, revision, sandbox_path=sandbox_path
+                    )
+                )
+            resolved["artifact_bindings"] = bindings
+        return resolved
+
     def add_repository(self, identity: str, inputs: dict[str, object]) -> str:
-        repository_id = self.onboarding.onboard(identity, inputs)
-        self.scheduler.request_tick()
+        staged_inputs = dict(inputs)
+        defer_resources = staged_inputs.pop("_defer_resource_onboarding", False)
+        if not isinstance(defer_resources, bool):
+            raise ValueError("_defer_resource_onboarding must be a boolean")
+        if defer_resources:
+            repository_id = self.onboarding.onboard(
+                identity, staged_inputs, build_versions=False
+            )
+        else:
+            repository_id = self.onboarding.onboard(identity, staged_inputs)
+            self.scheduler.request_tick()
         return str(repository_id)
 
     def reonboard(self, repository_id: str, inputs: dict[str, object]) -> str:
-        version_id = self.onboarding.reonboard(repository_id, inputs)
+        version_id = self.onboarding.reonboard(
+            repository_id, self._resolve_resource_inputs(repository_id, inputs)
+        )
         self.scheduler.request_tick()
         return str(version_id)
 
@@ -1409,7 +1505,7 @@ def build_runtime(
     model_base_url: str | None = None,
     poll_interval: float = 10.0,
 ) -> RuntimeComponents:
-    secret_resolver = EnvironmentSecretResolver()
+    environment_secret_resolver = EnvironmentSecretResolver()
     root = Path(data_root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     model_configuration = ModelProviderConfiguration(
@@ -1432,6 +1528,18 @@ def build_runtime(
     model_state_root = root / "model-state"
     database = Database(root / "repogents.sqlite3")
     database.initialize()
+    resource_store = RepositoryResourceStore(database, root)
+
+    def secret_resolver(reference: str) -> str:
+        saved_value = resource_store.resolve_secret(reference)
+        if saved_value is not None:
+            return saved_value
+        if reference.startswith(("secret://repository/", "secret://repository-")):
+            raise RuntimeError(
+                f"required repository secret is missing or inaccessible: {reference}"
+            )
+        return environment_secret_resolver(reference)
+
     github = GitHubClient(token=github_token)
     sandbox = SandboxManager()
     processes = RunProcessSupervisor()
@@ -1563,6 +1671,7 @@ def build_runtime(
         onboarding=onboarding,
         lifecycle=lifecycle,
         scheduler=scheduler,
+        resource_store=resource_store,
         model_configuration=model_configuration,
         known_secret_values=lambda run_id: _run_secret_values(
             database,

@@ -869,7 +869,8 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertNotEqual(replacement_run_id, source_run_id)
         with self.db.connect() as connection:
             source = connection.execute(
-                "SELECT state, reason FROM runs WHERE id=?", (source_run_id,)
+                "SELECT state, reason, sandbox_version_id FROM runs WHERE id=?",
+                (source_run_id,),
             ).fetchone()
             replacement = connection.execute(
                 """SELECT runs.*, issues.title, activation_events.github_event_id
@@ -881,7 +882,9 @@ class RunLifecycleTests(unittest.TestCase):
                 (replacement_run_id,),
             ).fetchone()
             run_count = connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
-        self.assertEqual(tuple(source), ("canceled", "operator canceled"))
+        self.assertEqual(
+            tuple(source), ("canceled", "operator canceled", "sandbox-1")
+        )
         self.assertEqual(replacement["state"], "queued")
         self.assertEqual(replacement["sandbox_version_id"], "sandbox-2")
         self.assertEqual(replacement["team_version_id"], "team-2")

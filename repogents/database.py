@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Generator
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 SCHEMA_V1 = r"""
 BEGIN IMMEDIATE;
@@ -886,6 +886,64 @@ SCHEMA_V18 = (
     """,
 )
 
+SCHEMA_V19 = (
+    """
+    CREATE TABLE repository_artifacts (
+        id TEXT PRIMARY KEY,
+        repository_id TEXT NOT NULL
+            REFERENCES repositories(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (repository_id, name)
+    )
+    """,
+    """
+    CREATE TABLE artifact_revisions (
+        id TEXT PRIMARY KEY,
+        artifact_id TEXT NOT NULL
+            REFERENCES repository_artifacts(id) ON DELETE RESTRICT,
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        content_hash TEXT NOT NULL,
+        size INTEGER NOT NULL CHECK (size >= 0),
+        storage_path TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (artifact_id, revision),
+        UNIQUE (artifact_id, content_hash)
+    )
+    """,
+    """
+    CREATE TABLE sandbox_artifact_revisions (
+        sandbox_version_id TEXT NOT NULL
+            REFERENCES sandbox_versions(id) ON DELETE RESTRICT,
+        artifact_revision_id TEXT NOT NULL
+            REFERENCES artifact_revisions(id) ON DELETE RESTRICT,
+        sandbox_path TEXT NOT NULL,
+        PRIMARY KEY (sandbox_version_id, artifact_revision_id),
+        UNIQUE (sandbox_version_id, sandbox_path)
+    )
+    """,
+    """
+    CREATE TABLE repository_secrets (
+        id TEXT PRIMARY KEY,
+        repository_id TEXT NOT NULL
+            REFERENCES repositories(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        reference TEXT NOT NULL,
+        storage_path TEXT,
+        configured_at TEXT,
+        updated_at TEXT NOT NULL,
+        UNIQUE (repository_id, name),
+        UNIQUE (repository_id, reference),
+        CHECK ((storage_path IS NULL) = (configured_at IS NULL))
+    )
+    """,
+    """
+    CREATE INDEX artifact_revisions_hash
+        ON artifact_revisions(content_hash)
+    """,
+)
+
 class Database:
     """Owns SQLite connection policy and transactional schema initialization."""
 
@@ -1101,6 +1159,14 @@ class Database:
                 connection.execute("""INSERT INTO schema_version(version, applied_at)
                        VALUES (
                            18,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )""")
+            if version < 19:
+                for statement in SCHEMA_V19:
+                    connection.execute(statement)
+                connection.execute("""INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           19,
                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                        )""")
             connection.commit()

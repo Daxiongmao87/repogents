@@ -41,8 +41,15 @@ class Mount:
         host = Path(self.host_path).expanduser().resolve()
         if not host.exists():
             raise ValueError(f"allowed host path does not exist: {host}")
-        if not self.sandbox_path.startswith("/mnt/inputs/"):
-            raise ValueError("repository host mounts must live below /mnt/inputs")
+        is_host_input = self.sandbox_path.startswith("/mnt/inputs/")
+        is_artifact = self.sandbox_path.startswith("/repository-resources/artifacts/")
+        if not is_host_input and not is_artifact:
+            raise ValueError(
+                "repository mounts must live below /mnt/inputs or "
+                "/repository-resources/artifacts"
+            )
+        if is_artifact and self.writable:
+            raise ValueError("repository artifact mounts must be read-only")
         if ".." in Path(self.sandbox_path).parts:
             raise ValueError("sandbox mount target cannot contain '..'")
         object.__setattr__(self, "host_path", host)
@@ -548,6 +555,7 @@ class SandboxManager:
         proxy_socket: str | None = None,
         proxy_socket_host: Path | None = None,
         secrets: dict[str, str] | None = None,
+        environment_bindings: dict[str, str] | None = None,
         persistent_writable: bool = False,
         checkout_writable: bool = True,
     ) -> tuple[list[str], dict[str, str]]:
@@ -562,6 +570,15 @@ class SandboxManager:
         for name, value in secret_values.items():
             if not _ENVIRONMENT_NAME.fullmatch(name) or "\x00" in value:
                 raise ValueError("invalid secret binding")
+        variable_values = environment_bindings or {}
+        for name, value in variable_values.items():
+            if not _ENVIRONMENT_NAME.fullmatch(name) or not isinstance(value, str) or "\x00" in value:
+                raise ValueError("invalid environment binding")
+        overlap = set(secret_values) & set(variable_values)
+        if overlap:
+            raise ValueError(
+                f"environment bindings conflict with secrets: {','.join(sorted(overlap))}"
+            )
         if not persistent_writable:
             for source, target, sandbox_source in (
                 (
@@ -729,6 +746,8 @@ class SandboxManager:
             )
         if (python_environment / "bin" / "python3").exists():
             argv.extend(("--setenv", "VIRTUAL_ENV", "/repository-state/python-venv"))
+        for name, value in sorted(variable_values.items()):
+            argv.extend(("--setenv", name, value))
         for name, value in sorted(secret_values.items()):
             argv.extend(("--setenv", name, value))
         argv.extend(("--chdir", "/workspace"))
@@ -760,9 +779,22 @@ class SandboxManager:
         *,
         timeout: float,
         secrets: dict[str, str] | None = None,
+        environment_bindings: dict[str, str] | None = None,
         persistent_writable: bool = False,
         checkout_writable: bool = True,
     ) -> SandboxResult:
+        normalized_environment: dict[str, str] = {}
+        for name, value in (environment_bindings or {}).items():
+            if (
+                not isinstance(name, str)
+                or not name
+                or not (name[0].isalpha() or name[0] == "_")
+                or not all(character.isalnum() or character == "_" for character in name)
+            ):
+                raise ValueError(f"invalid environment variable name: {name!r}")
+            if not isinstance(value, str):
+                raise ValueError(f"environment variable {name!r} must have a string value")
+            normalized_environment[name] = value
         invocation_id = str(uuid.uuid4())
         log_path = layout.logs / f"command-{invocation_id}.json"
         network_log_path = layout.logs / f"network-{invocation_id}.jsonl"
@@ -796,6 +828,7 @@ class SandboxManager:
                 proxy_socket=proxy_socket_sandbox if proxy else None,
                 proxy_socket_host=proxy_socket_host,
                 secrets=secrets,
+                environment_bindings=normalized_environment,
                 persistent_writable=persistent_writable,
                 checkout_writable=checkout_writable,
             )

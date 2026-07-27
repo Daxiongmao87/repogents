@@ -799,6 +799,7 @@ class ExecutionService:
         if not re.fullmatch(r"[0-9a-f]{40}", source_base_sha):
             raise ValueError("source comparison base SHA is invalid")
         secret_bindings = _secret_bindings(sandbox_row)
+        variable_bindings = _variable_bindings(sandbox_row)
         resolved_secret_values: set[str] = set()
         try:
             self._ensure_validation_baselines(
@@ -807,6 +808,7 @@ class ExecutionService:
                 policy,
                 layout,
                 secret_bindings,
+                variable_bindings,
                 resolved_secret_values,
             )
         except _RunCanceled:
@@ -959,6 +961,7 @@ class ExecutionService:
                     policy,
                     layout,
                     secret_bindings,
+                    variable_bindings,
                     resolved_secret_values,
                     source_base_sha,
                 )
@@ -1451,6 +1454,7 @@ class ExecutionService:
         policy: SandboxPolicy,
         layout: RunLayout,
         secret_bindings: tuple[SecretBinding, ...],
+        variable_bindings: tuple[tuple[str, str, tuple[tuple[str, ...], ...]], ...],
         resolved_secret_values: set[str],
     ) -> None:
         run_id = str(run["id"])
@@ -1537,12 +1541,18 @@ class ExecutionService:
                 secret_bindings,
                 resolved_secret_values,
             )
+            environment_bindings = {
+                name: value
+                for name, value, commands in variable_bindings
+                if tuple(command) in commands
+            }
             result = self.sandbox.run(
                 policy,
                 layout,
                 tuple(command),
                 timeout=600,
                 secrets=secrets,
+                environment_bindings=environment_bindings or None,
             )
             if result.canceled:
                 raise _RunCanceled(run_id)
@@ -1659,6 +1669,7 @@ class ExecutionService:
         policy: SandboxPolicy,
         layout: RunLayout,
         secret_bindings: tuple[SecretBinding, ...],
+        variable_bindings: tuple[tuple[str, str, tuple[tuple[str, ...], ...]], ...],
         resolved_secret_values: set[str],
         source_base_sha: str,
     ) -> tuple[bool, str]:
@@ -1737,6 +1748,11 @@ class ExecutionService:
                 secret_bindings,
                 resolved_secret_values,
             )
+            environment_bindings = {
+                name: value
+                for name, value, commands in variable_bindings
+                if tuple(command) in commands
+            }
             self._ensure_not_canceled(run_id)
             result = self.sandbox.run(
                 policy,
@@ -1744,6 +1760,7 @@ class ExecutionService:
                 tuple(command),
                 timeout=600,
                 secrets=secrets,
+                environment_bindings=environment_bindings or None,
             )
             if result.canceled:
                 raise _RunCanceled(run_id)
@@ -2111,6 +2128,19 @@ def _sandbox_policy(row: dict[str, object]) -> SandboxPolicy:
                 writable=str(value.get("mode", "read-only")) == "writable",
             )
         )
+    artifacts = payload.get("artifact_bindings", [])
+    if not isinstance(artifacts, list):
+        raise ValueError("stored artifact bindings must be a list")
+    for value in artifacts:
+        if not isinstance(value, dict):
+            raise ValueError("stored artifact binding is invalid")
+        storage_path = value.get("storage_path")
+        sandbox_path = value.get("sandbox_path")
+        if not isinstance(storage_path, str) or not Path(storage_path).is_absolute():
+            raise ValueError("stored artifact storage path is invalid")
+        if not isinstance(sandbox_path, str) or not sandbox_path.startswith("/"):
+            raise ValueError("stored artifact sandbox path is invalid")
+        mounts.append(Mount(Path(storage_path), sandbox_path, writable=False))
     names = tuple(binding[0] for binding in _secret_bindings(row))
     return SandboxPolicy(
         persistent_root=Path(str(row["root_path"])),
@@ -2156,6 +2186,49 @@ def _secret_bindings(row: dict[str, object]) -> tuple[SecretBinding, ...]:
             normalized_commands.append(tuple(command))
         names.add(name)
         bindings.append((name, reference, tuple(normalized_commands)))
+    return tuple(bindings)
+
+
+def _variable_bindings(
+    row: dict[str, object],
+) -> tuple[tuple[str, str, tuple[tuple[str, ...], ...]], ...]:
+    payload = json.loads(str(row["policy_json"]))
+    values = payload.get("variable_bindings", [])
+    if not isinstance(values, list):
+        raise ValueError("stored variable bindings must be a list")
+    bindings: list[tuple[str, str, tuple[tuple[str, ...], ...]]] = []
+    names: set[str] = set()
+    for item in values:
+        if not isinstance(item, dict):
+            raise ValueError("stored variable binding is invalid")
+        name = item.get("name")
+        value = item.get("value")
+        commands = item.get("commands")
+        if not isinstance(name, str) or not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*", name
+        ):
+            raise ValueError("stored variable binding name is invalid")
+        if name in names:
+            raise ValueError(f"duplicate stored variable binding name: {name}")
+        if not isinstance(value, str):
+            raise ValueError(f"stored variable binding value is invalid for {name}")
+        if not isinstance(commands, list) or not commands:
+            raise ValueError(f"stored variable binding commands are invalid for {name}")
+        normalized_commands: list[tuple[str, ...]] = []
+        for command in commands:
+            if (
+                not isinstance(command, list)
+                or not command
+                or not all(
+                    isinstance(argument, str) and argument for argument in command
+                )
+            ):
+                raise ValueError(
+                    f"stored variable binding command is invalid for {name}"
+                )
+            normalized_commands.append(tuple(command))
+        names.add(name)
+        bindings.append((name, value, tuple(normalized_commands)))
     return tuple(bindings)
 
 

@@ -434,6 +434,7 @@ class SourceManager(Protocol):
 
 
 ProvisioningSecretBinding = tuple[str, str, tuple[tuple[str, ...], ...]]
+ProvisioningVariableBinding = tuple[str, str, tuple[tuple[str, ...], ...]]
 
 
 class TeamFormulator(Protocol):
@@ -453,6 +454,7 @@ class EnvironmentProvisioner(Protocol):
         inspection: RepositoryInspection,
         policy: SandboxPolicy,
         provisioning_commands: tuple[tuple[str, ...], ...],
+        variable_bindings: tuple[ProvisioningVariableBinding, ...] = (),
         secret_bindings: tuple[ProvisioningSecretBinding, ...] = (),
     ) -> dict[str, object]: ...
 
@@ -481,6 +483,7 @@ class SandboxEnvironmentProvisioner:
         inspection: RepositoryInspection,
         policy: SandboxPolicy,
         provisioning_commands: tuple[tuple[str, ...], ...],
+        variable_bindings: tuple[ProvisioningVariableBinding, ...] = (),
         secret_bindings: tuple[ProvisioningSecretBinding, ...] = (),
     ) -> dict[str, object]:
         requirements = source_path / "requirements.txt"
@@ -516,12 +519,21 @@ class SandboxEnvironmentProvisioner:
                 name: self.secret_resolver(reference) for name, reference in matched
             }
 
+        def command_variables(command: tuple[str, ...]) -> dict[str, str] | None:
+            matched = {
+                name: value
+                for name, value, commands in variable_bindings
+                if command in commands
+            }
+            return matched or None
+
         def run(command: tuple[str, ...], timeout: float = 600) -> None:
             result = self.sandbox.run(
                 policy,
                 layout,
                 command,
                 secrets=command_secrets(command),
+                environment_bindings=command_variables(command),
                 timeout=timeout,
                 persistent_writable=True,
             )
@@ -898,7 +910,13 @@ class OnboardingService:
         self.team_formulator = team_formulator
         self.provisioner = provisioner
 
-    def onboard(self, identity: str, inputs: dict[str, object] | None = None) -> str:
+    def onboard(
+        self,
+        identity: str,
+        inputs: dict[str, object] | None = None,
+        *,
+        build_versions: bool = True,
+    ) -> str:
         repository = self.github.get_repository(identity)
         repository_id = f"github-{repository.database_id}"
         try:
@@ -972,7 +990,7 @@ class OnboardingService:
                     now,
                 ),
             )
-        if initial_state == "blocked":
+        if initial_state == "blocked" or not build_versions:
             return repository_id
         try:
             return self._build_versions(repository_id, repository, normalized_inputs)
@@ -1139,20 +1157,62 @@ class OnboardingService:
         allowed_services = tuple(
             sorted(set(inputs.get("allowed_services", [])) | set(inferred_services))
         )
+        artifact_bindings = inputs.get("artifact_bindings", [])
+        for artifact in artifact_bindings:
+            storage_path = Path(str(artifact["storage_path"]))
+            if not storage_path.is_file():
+                raise MissingRepositoryInput(
+                    "artifact_bindings",
+                    f"artifact {artifact['name']} revision {artifact['revision']} is missing or inaccessible; upload or select an available revision",
+                )
+        variable_bindings = inputs.get("variable_bindings", [])
+        configured_secret_bindings = inputs.get("secret_bindings", [])
+        for binding in configured_secret_bindings:
+            reference = str(binding["reference"])
+            if not reference.startswith("secret://repository/"):
+                continue
+            with self.database.connect() as connection:
+                secret_row = connection.execute(
+                    "SELECT storage_path FROM repository_secrets WHERE reference=?",
+                    (reference,),
+                ).fetchone()
+            if secret_row is None or secret_row["storage_path"] is None:
+                raise MissingRepositoryInput(
+                    "secret_bindings",
+                    f"saved secret {binding['name']} is not configured; replace it before re-onboarding",
+                )
+            secret_path = Path(str(secret_row["storage_path"]))
+            try:
+                with secret_path.open("rb") as secret_file:
+                    secret_file.read(1)
+            except OSError as error:
+                raise MissingRepositoryInput(
+                    "secret_bindings",
+                    f"saved secret {binding['name']} is inaccessible; replace it before re-onboarding",
+                ) from error
         secret_bindings: tuple[ProvisioningSecretBinding, ...] = tuple(
             (
                 str(value["name"]),
                 str(value["reference"]),
                 tuple(tuple(command) for command in value["commands"]),
             )
-            for value in inputs.get("secret_bindings", [])
+            for value in configured_secret_bindings
         )
         secret_names = tuple(value[0] for value in secret_bindings)
+        artifact_mounts = tuple(
+            Mount(
+                Path(str(value["storage_path"])),
+                str(value["sandbox_path"]),
+                writable=False,
+            )
+            for value in artifact_bindings
+        )
         sandbox_policy = SandboxPolicy(
             persistent_root=sandbox_path,
             mounts=(
                 Mount(source_path, "/mnt/inputs/source", writable=False),
                 *host_mounts,
+                *artifact_mounts,
             ),
             allowed_services=allowed_services,
             allowed_secret_names=secret_names,
@@ -1173,22 +1233,85 @@ class OnboardingService:
                 inspection=inspection,
                 policy=sandbox_policy,
                 provisioning_commands=provisioning_commands,
+                variable_bindings=tuple(
+                    (
+                        str(value["name"]),
+                        str(value["value"]),
+                        tuple(tuple(command) for command in value["commands"]),
+                    )
+                    for value in variable_bindings
+                ),
                 secret_bindings=secret_bindings,
             )
             if self.provisioner is not None
             else {"commands": [], "manifests": list(inspection.manifests)}
         )
+        artifact_bindings = inputs.get("artifact_bindings", [])
+        variable_bindings = inputs.get("variable_bindings", [])
         policy = {
             "version": sandbox_version,
             "base_sha": base_sha,
             "allowed_host_paths": inputs.get("allowed_host_paths", []),
             "allowed_services": list(allowed_services),
+            "artifact_bindings": artifact_bindings,
+            "variable_bindings": variable_bindings,
             "secret_bindings": inputs.get("secret_bindings", []),
             "persistent_root": str(sandbox_path),
         }
+        artifact_evidence = [
+            {
+                key: artifact[key]
+                for key in (
+                    "name",
+                    "description",
+                    "revision",
+                    "content_hash",
+                    "size",
+                    "created_at",
+                    "sandbox_path",
+                )
+            }
+            for artifact in artifact_bindings
+        ]
+        secret_evidence: list[dict[str, Any]] = []
+        for binding in inputs.get("secret_bindings", []):
+            reference = str(binding["reference"])
+            configured = True
+            if reference.startswith("secret://repository/"):
+                with self.database.connect() as connection:
+                    secret_row = connection.execute(
+                        "SELECT storage_path FROM repository_secrets WHERE reference=?",
+                        (reference,),
+                    ).fetchone()
+                if secret_row is None or secret_row["storage_path"] is None:
+                    raise MissingRepositoryInput(
+                        "secret_bindings",
+                        f"saved secret {binding['name']} is not configured; replace it before re-onboarding",
+                    )
+                secret_path = Path(str(secret_row["storage_path"]))
+                try:
+                    with secret_path.open("rb") as secret_file:
+                        secret_file.read(1)
+                except OSError as error:
+                    raise MissingRepositoryInput(
+                        "secret_bindings",
+                        f"saved secret {binding['name']} is inaccessible; replace it before re-onboarding",
+                    ) from error
+            secret_evidence.append(
+                {
+                    "name": binding["name"],
+                    "configured": configured,
+                    "commands": binding["commands"],
+                }
+            )
         evidence = inspection.evidence() | {
             "base_sha": base_sha,
             "provisioning": provisioning,
+            "resources": {
+                "artifacts": artifact_evidence,
+                "variables": variable_bindings,
+                "secrets": secret_evidence,
+            },
         }
         (sandbox_path / "policy.json").write_text(_json(policy), encoding="utf-8")
         (sandbox_path / "evidence.json").write_text(_json(evidence), encoding="utf-8")
@@ -1214,6 +1337,28 @@ class OnboardingService:
                     now,
                 ),
             )
+            for artifact in artifact_bindings:
+                artifact_revision = connection.execute(
+                    """SELECT artifact_revisions.id
+                       FROM repository_artifacts
+                       JOIN artifact_revisions
+                         ON artifact_revisions.artifact_id=repository_artifacts.id
+                       WHERE repository_artifacts.repository_id=?
+                         AND repository_artifacts.name=?
+                         AND artifact_revisions.revision=?""",
+                    (repository_id, artifact["name"], artifact["revision"]),
+                ).fetchone()
+                if artifact_revision is None:
+                    raise MissingRepositoryInput(
+                        "artifact_bindings",
+                        f"artifact {artifact['name']} revision {artifact['revision']} is missing or inaccessible; upload or select an available revision",
+                    )
+                connection.execute(
+                    """INSERT INTO sandbox_artifact_revisions
+                       (sandbox_version_id, artifact_revision_id, sandbox_path)
+                       VALUES (?, ?, ?)""",
+                    (sandbox_id, artifact_revision["id"], artifact["sandbox_path"]),
+                )
             connection.execute(
                 """INSERT INTO team_versions
                    (id, repository_id, version, evidence_json,
@@ -1327,6 +1472,8 @@ def _normalize_repository_inputs(inputs: dict[str, object]) -> dict[str, Any]:
     allowed_keys = {
         "allowed_host_paths",
         "allowed_services",
+        "artifact_bindings",
+        "variable_bindings",
         "secret_bindings",
         "provisioning_commands",
         "validation_commands",
@@ -1380,6 +1527,88 @@ def _normalize_repository_inputs(inputs: dict[str, object]) -> dict[str, Any]:
                 services.append(service)
         normalized["allowed_services"] = services
 
+    if "artifact_bindings" in inputs:
+        values = inputs["artifact_bindings"]
+        if not isinstance(values, list):
+            raise ValueError("artifact_bindings must be a list")
+        artifacts: list[dict[str, object]] = []
+        artifact_names: set[str] = set()
+        sandbox_paths: set[str] = set()
+        for index, value in enumerate(values):
+            if not isinstance(value, dict):
+                raise ValueError(f"artifact_bindings[{index}] must be an object")
+            name = value.get("name")
+            description = value.get("description", "")
+            revision = value.get("revision")
+            content_hash = value.get("content_hash")
+            size = value.get("size")
+            created_at = value.get("created_at")
+            storage_path = value.get("storage_path")
+            sandbox_path = value.get("sandbox_path")
+            if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None:
+                raise ValueError(f"artifact_bindings[{index}] name is invalid")
+            if name in artifact_names:
+                raise ValueError(f"duplicate artifact binding name: {name}")
+            if not isinstance(description, str):
+                raise ValueError(f"artifact_bindings[{index}] description must be a string")
+            if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+                raise ValueError(f"artifact_bindings[{index}] revision must be a positive integer")
+            if not isinstance(content_hash, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", content_hash) is None:
+                raise ValueError(f"artifact_bindings[{index}] content_hash must be sha256:<hex>")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                raise ValueError(f"artifact_bindings[{index}] size must be a nonnegative integer")
+            if not isinstance(created_at, str) or not created_at.strip():
+                raise ValueError(f"artifact_bindings[{index}] created_at must be a string")
+            if not isinstance(storage_path, str) or not Path(storage_path).is_absolute():
+                raise ValueError(f"artifact_bindings[{index}] storage_path must be absolute")
+            if not isinstance(sandbox_path, str) or not sandbox_path.startswith("/"):
+                raise ValueError(f"artifact_bindings[{index}] sandbox_path must be absolute")
+            if sandbox_path in sandbox_paths:
+                raise ValueError(f"duplicate artifact sandbox path: {sandbox_path}")
+            artifact_names.add(name)
+            sandbox_paths.add(sandbox_path)
+            artifacts.append({
+                "name": name,
+                "description": description,
+                "revision": revision,
+                "content_hash": content_hash,
+                "size": size,
+                "created_at": created_at.strip(),
+                "storage_path": str(Path(storage_path).expanduser().resolve()),
+                "sandbox_path": sandbox_path,
+            })
+        normalized["artifact_bindings"] = artifacts
+
+    if "variable_bindings" in inputs:
+        values = inputs["variable_bindings"]
+        if not isinstance(values, list):
+            raise ValueError("variable_bindings must be a list")
+        variables: list[dict[str, object]] = []
+        variable_names: set[str] = set()
+        for index, value in enumerate(values):
+            if not isinstance(value, dict):
+                raise ValueError(f"variable_bindings[{index}] must be an object")
+            name = value.get("name")
+            variable_value = value.get("value")
+            if not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+                raise ValueError(f"variable_bindings[{index}] name is not a valid environment name")
+            if name in variable_names:
+                raise ValueError(f"duplicate variable binding name: {name}")
+            if not isinstance(variable_value, str):
+                raise ValueError(f"variable_bindings[{index}] value must be a string")
+            commands = _normalize_commands(
+                value.get("commands"),
+                f"variable_bindings[{index}].commands",
+                require_nonempty=True,
+            )
+            variable_names.add(name)
+            variables.append({
+                "name": name,
+                "value": variable_value,
+                "commands": [list(command) for command in commands],
+            })
+        normalized["variable_bindings"] = variables
+
     if "secret_bindings" in inputs:
         values = inputs["secret_bindings"]
         if not isinstance(values, list):
@@ -1400,13 +1629,13 @@ def _normalize_repository_inputs(inputs: dict[str, object]) -> dict[str, Any]:
             reference_value = reference.strip()
             if (
                 re.fullmatch(
-                    r"secret://[A-Za-z0-9][A-Za-z0-9_.-]*",
+                    r"secret://(?:[A-Za-z0-9][A-Za-z0-9_.-]*|repository/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)",
                     reference_value,
                 )
                 is None
             ):
                 raise ValueError(
-                    f"secret_bindings[{index}] reference must use secret://name"
+                    f"secret_bindings[{index}] reference must use secret://name or a saved repository-secret reference"
                 )
             commands = _normalize_commands(
                 value.get("commands"),
