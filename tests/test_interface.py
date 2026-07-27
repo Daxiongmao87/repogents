@@ -548,6 +548,20 @@ class InterfaceTests(unittest.TestCase):
         self.assertNotIn("r.inputs", dashboard)
         self.assertIn("const {resource_secrets: _resourceSecrets, ...advancedInputs} = inputs;", dashboard)
         self.assertIn("if (fileControl) fileControl.required = false;", dashboard)
+        self.assertEqual(
+            dashboard.count(
+                '<textarea data-field="commands" rows="3" placeholder="one command per line"></textarea>'
+            ),
+            2,
+        )
+        self.assertNotIn(
+            '<input data-field="commands" placeholder="one command per line">',
+            dashboard,
+        )
+        self.assertIn(
+            "String(control.value || '').split('\\n')",
+            dashboard,
+        )
         self.assertIn("data-retry", dashboard)
         self.assertIn("/retry", dashboard)
         self.assertIn("Issue acceptance", dashboard)
