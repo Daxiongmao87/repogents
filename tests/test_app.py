@@ -2206,6 +2206,23 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(blocked["runs"][0]["reason_severity"], "error")
         self.assertEqual(blocked["repositories"][0]["latest_run_state"], "blocked")
         self.assertIs(blocked["runs"][0]["can_retry"], True)
+        self.assertIs(blocked["runs"][0]["retry_visible"], True)
+        self.assertIsNone(blocked["runs"][0]["retry_disabled_reason"])
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET enabled=0 WHERE id='repo-1'"
+            )
+        paused_blocked = actions.state()["runs"][0]
+        self.assertIs(paused_blocked["can_retry"], False)
+        self.assertIs(paused_blocked["retry_visible"], True)
+        self.assertEqual(
+            paused_blocked["retry_disabled_reason"],
+            "Resume this repository before retrying.",
+        )
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET enabled=1 WHERE id='repo-1'"
+            )
         self.assertIs(blocked["repositories"][0]["active"], False)
 
         with self.db.transaction() as connection:

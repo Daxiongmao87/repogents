@@ -13,6 +13,7 @@ This item supersedes the no-manual-retry contract in `spec/remove-manual-retry/0
 - Retry is rejected unless a run is blocked or has a pending automatic retry. Restart is rejected for non-canceled runs, closed GitHub issues, paused/removed/not-ready repositories, and issues that already have a nonterminal run.
 - Known repository secrets are redacted from retry errors before persistence and again before dashboard projection; redaction lookup failure stores or displays a generic error rather than raw exception text.
 - The local HTTP API and dashboard expose these recovery operations without weakening cancellation process boundaries or creating duplicate runs under repeated requests.
+- A blocked run's Retry now control remains visible but disabled when repository state makes retry ineligible, and the dashboard states the repository prerequisite instead of hiding the recovery path.
 
 ## Acceptance Criteria
 
@@ -23,6 +24,7 @@ This item supersedes the no-manual-retry contract in `spec/remove-manual-retry/0
 - [x] A canceled run can create exactly one fresh run using current issue, repository-version, and base-branch state while the canceled run remains unchanged.
 - [x] Repeated restart requests return the same replacement run and cannot create duplicate activation or run records.
 - [x] Blocked and terminal runs are visible in the dashboard with state-appropriate Retry now or Restart issue controls.
+- [x] A blocked run in a paused repository still displays a disabled Retry now control with a resume prerequisite.
 - [x] Invalid retry and restart requests fail without mutating durable state or scheduling work.
 
 ## Verification
@@ -34,5 +36,6 @@ This item supersedes the no-manual-retry contract in `spec/remove-manual-retry/0
 - [x] `INTEGRATION` — restart a canceled run twice and prove one fresh run, current versions/base, preserved canceled evidence, and no duplicate checkout identity.
 - [x] `HTTP` — exercise retry/restart routes, invalid-state errors, and scheduler wakeups.
 - [x] `CLIENT` — render blocked and canceled history, expose the correct recovery buttons, and dispatch the corresponding mutations.
+- [x] `CLIENT` — render a paused repository's blocked history and prove Retry now remains visible, disabled, and accompanied by the resume prerequisite.
 - [x] `REGRESSION` — run the complete deterministic project suite.
 - [ ] `LIVE` — deploy the daemon and inspect the blocked Simulacrum issue plus canceled Repogents issue in Chromium, proving recovery controls are visible without invoking them.

@@ -478,6 +478,8 @@ class InterfaceTests(unittest.TestCase):
             'id="run-history"',
             "data-retry=",
             "data-restart=",
+            "run.retry_visible",
+            'disabled aria-disabled="true"',
             "All active issues",
             'id="all-active-runs"',
             "Issue Log",

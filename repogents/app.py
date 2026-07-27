@@ -780,9 +780,11 @@ class ApplicationActions:
             run_id = str(run["id"])
             repository_id = str(run["repository_id"])
             run_state = str(run["state"])
-            repository_ready = bool(run.pop("repository_enabled")) and (
+            repository_enabled = bool(run.pop("repository_enabled"))
+            repository_onboarding_ready = (
                 str(run.pop("repository_onboarding_state")) == "ready"
             )
+            repository_ready = repository_enabled and repository_onboarding_ready
             restart_exists = bool(run.pop("restart_exists"))
             run["priority"] = int(run["priority"])
             run["retry_attempt_count"] = int(run["retry_attempt_count"])
@@ -797,14 +799,23 @@ class ApplicationActions:
                 "error" if run_state == RunState.BLOCKED.value else "neutral"
             )
             run["forced"] = run.pop("force_requested_at") is not None
+            run["retry_visible"] = (
+                run_state == RunState.BLOCKED.value
+                or run["retry_next_at"] is not None
+            )
             run["can_retry"] = (
                 repository_ready
                 and run_state not in _TERMINAL_RUN_STATES
-                and (
-                    run_state == RunState.BLOCKED.value
-                    or run["retry_next_at"] is not None
-                )
+                and bool(run["retry_visible"])
             )
+            retry_disabled_reason: str | None = None
+            if bool(run["retry_visible"]) and not bool(run["can_retry"]):
+                retry_disabled_reason = (
+                    "Resume this repository before retrying."
+                    if not repository_enabled
+                    else "Complete repository onboarding before retrying."
+                )
+            run["retry_disabled_reason"] = retry_disabled_reason
             run["can_restart"] = (
                 repository_ready
                 and run_state == RunState.CANCELED.value

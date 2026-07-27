@@ -1097,9 +1097,16 @@ function renderReadyIssues() {
 const retryStatus = run => run.retry_next_at
   ? `<span class="run-card-line warning">Automatic retry #${esc(run.retry_attempt_count)} for ${esc(run.retry_operation || 'operation')} at ${esc(date(run.retry_next_at))}: ${esc(run.retry_last_error || 'Unknown error')}</span>`
   : '';
-const recoveryButtons = run => `
-  ${run.can_retry ? `<button class="button small" data-retry="${esc(run.id)}">Retry now</button>` : ''}
-  ${run.can_restart ? `<button class="button small" data-restart="${esc(run.id)}">Restart issue</button>` : ''}`;
+const recoveryButtons = run => {
+  const unavailable = esc(run.retry_disabled_reason || 'Retry is currently unavailable.');
+  const retry = run.retry_visible
+    ? `<button class="button small" data-retry="${esc(run.id)}"${run.can_retry ? '' : ` disabled aria-disabled="true" title="${unavailable}"`}>Retry now</button>`
+    : '';
+  const prerequisite = run.retry_visible && !run.can_retry
+    ? `<span class="muted">${unavailable}</span>`
+    : '';
+  return `${retry}${prerequisite}${run.can_restart ? `<button class="button small" data-restart="${esc(run.id)}">Restart issue</button>` : ''}`;
+};
 
 function runCard(run, reorderable) {
   return `
