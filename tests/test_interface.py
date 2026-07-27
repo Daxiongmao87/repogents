@@ -5,6 +5,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from unittest.mock import patch
 from repogents.interface import LocalInterfaceServer
 
 
@@ -161,6 +162,25 @@ class FakeActions:
                     },
                 }
             ],
+            "run_history": [
+                {
+                    "id": "run-2",
+                    "repository_id": "repo-1",
+                    "repository": "owner/repo",
+                    "issue_number": 2,
+                    "issue_title": "Canceled fixture",
+                    "issue_url": "https://github.com/owner/repo/issues/2",
+                    "state": "canceled",
+                    "reason": "Canceled by operator",
+                    "reason_truncated": False,
+                    "reason_severity": "neutral",
+                    "pull_number": None,
+                    "pull_url": None,
+                    "can_retry": False,
+                    "can_restart": True,
+                    "updated_at": "2025-12-31T23:00:00Z",
+                }
+            ],
             "model_configuration": dict(self.model_configuration),
         }
 
@@ -288,6 +308,14 @@ class FakeActions:
 
     def cancel(self, run_id: str) -> None:
         self.calls.append(("cancel", run_id))
+
+    def retry(self, run_id: str) -> str:
+        self.calls.append(("retry", run_id))
+        return "implementing"
+
+    def restart(self, run_id: str) -> str:
+        self.calls.append(("restart", run_id))
+        return "run-3"
 
     def reorder_runs(self, run_ids: list[str]) -> None:
         self.calls.append(("reorder", list(run_ids)))
@@ -421,8 +449,8 @@ class InterfaceTests(unittest.TestCase):
             dashboard,
         )
         self.assertNotIn("r.inputs", dashboard)
-        self.assertNotIn("data-retry", dashboard)
-        self.assertNotIn("/retry", dashboard)
+        self.assertIn("data-retry", dashboard)
+        self.assertIn("/retry", dashboard)
         self.assertIn("Issue acceptance", dashboard)
         self.assertIn("/api/acceptance-artifacts/", dashboard)
         self.assertIn("scope", dashboard)
@@ -446,6 +474,10 @@ class InterfaceTests(unittest.TestCase):
             "Runs",
             "Active issue runs for the selected repository.",
             'id="runs"',
+            "Run history",
+            'id="run-history"',
+            "data-retry=",
+            "data-restart=",
             "All active issues",
             'id="all-active-runs"',
             "Issue Log",
@@ -811,6 +843,8 @@ class InterfaceTests(unittest.TestCase):
             ("/api/runs/priority", {"run_ids": ["run-1"]}),
             ("/api/runs/run-1/force", {"forced": True}),
             ("/api/runs/run-1/cancel", {}),
+            ("/api/runs/run-1/retry", {}),
+            ("/api/runs/run-2/restart", {}),
             ("/api/poll", {}),
         ]
         for path, payload in routes:
@@ -827,6 +861,8 @@ class InterfaceTests(unittest.TestCase):
                 ("reorder", ["run-1"]),
                 ("force", "run-1", True),
                 ("cancel", "run-1"),
+                ("retry", "run-1"),
+                ("restart", "run-2"),
                 ("poll",),
             ],
         )
@@ -837,10 +873,31 @@ class InterfaceTests(unittest.TestCase):
         )
         self.assertEqual(status, 404)
 
+    def test_invalid_retry_and_restart_states_return_bounded_errors(self) -> None:
+        for action_name, path, detail in (
+            ("retry", "/api/runs/run-1/retry", "no retry is pending"),
+            (
+                "restart",
+                "/api/runs/run-1/restart",
+                "only canceled runs can be restarted",
+            ),
+        ):
+            with self.subTest(action=action_name):
+                with patch.object(
+                    self.actions,
+                    action_name,
+                    side_effect=ValueError(detail),
+                ):
+                    status, _, body = self.request("POST", path, {})
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(body), {"error": detail})
+                self.assertLess(len(body), 200)
+
     def test_invalid_payload_and_unknown_route_are_bounded_json_errors(self) -> None:
         status, _, body = self.request(
             "POST",
             "/api/repositories",
+
             {"repository": "", "inputs": []},
         )
         self.assertEqual(status, 400)
@@ -872,7 +929,7 @@ class InterfaceTests(unittest.TestCase):
         calls_before = list(self.actions.calls)
         status, _, body = self.request(
             "POST",
-            "/api/runs/run-1/retry",
+            "/api/runs/run-1/resume",
             {},
         )
         self.assertEqual(status, 404)

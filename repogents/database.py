@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Generator
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 SCHEMA_V1 = r"""
 BEGIN IMMEDIATE;
@@ -865,6 +865,27 @@ SCHEMA_V17 = (
     """,
 )
 
+SCHEMA_V18 = (
+    """
+    ALTER TABLE runs
+    ADD COLUMN retry_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(retry_attempt_count) = 'integer'
+               AND retry_attempt_count >= 0)
+    """,
+    """
+    ALTER TABLE runs
+    ADD COLUMN retry_operation TEXT
+    """,
+    """
+    ALTER TABLE runs
+    ADD COLUMN retry_next_at TEXT
+    """,
+    """
+    ALTER TABLE runs
+    ADD COLUMN retry_last_error TEXT
+    """,
+)
+
 class Database:
     """Owns SQLite connection policy and transactional schema initialization."""
 
@@ -1072,6 +1093,14 @@ class Database:
                 connection.execute("""INSERT INTO schema_version(version, applied_at)
                        VALUES (
                            17,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )""")
+            if version < 18:
+                for statement in SCHEMA_V18:
+                    connection.execute(statement)
+                connection.execute("""INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           18,
                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                        )""")
             connection.commit()

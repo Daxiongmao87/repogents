@@ -76,6 +76,14 @@ class FakeLifecycle:
     def cancel(self, run_id: str, reason: str) -> None:
         self.calls.append(("cancel", run_id, reason))
 
+    def retry(self, run_id: str) -> str:
+        self.calls.append(("retry", run_id))
+        return "implementing"
+
+    def restart(self, run_id: str) -> str:
+        self.calls.append(("restart", run_id))
+        return "replacement-run"
+
     def set_repository_paused(
         self, repository_id: str, paused: bool
     ) -> tuple[str, ...]:
@@ -1449,13 +1457,17 @@ class ApplicationTests(unittest.TestCase):
             )
         self.assertEqual(stored["allowed_services"], ["packages.example:443"])
         actions.cancel("run-1")
+        self.assertEqual(actions.retry("run-1"), "implementing")
+        self.assertEqual(actions.restart("run-1"), "replacement-run")
         actions.poll()
         self.assertEqual(
             onboarding.calls[-1],
             ("reonboard", "repo-1", {"allowed_services": ["api.github.com:443"]}),
         )
         self.assertIn(("cancel", "run-1", "canceled by user"), lifecycle.calls)
-        self.assertEqual(scheduler.requests, 3)
+        self.assertIn(("retry", "run-1"), lifecycle.calls)
+        self.assertIn(("restart", "run-1"), lifecycle.calls)
+        self.assertEqual(scheduler.requests, 5)
 
     def test_processing_feedback_in_source_states_routes_through_recovery(
         self,
@@ -1654,7 +1666,9 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(feedback.calls, ["run-1"])
         self.assertIn("GitHub unavailable", orchestrator.last_errors[0])
 
-    def test_transient_orchestration_failure_preserves_run_for_next_tick(self) -> None:
+    def test_transient_orchestration_failure_uses_durable_backoff_across_restart(
+        self,
+    ) -> None:
         class FailingExecution(FakeExecution):
             def execute(self, run_id: str) -> str:
                 self.calls.append(run_id)
@@ -1678,11 +1692,53 @@ class ApplicationTests(unittest.TestCase):
 
         run = lifecycle.get_run("run-1")
         self.assertEqual(run["state"], "implementing")
-        self.assertIsNone(run["reason"])
+        self.assertEqual(run["retry_attempt_count"], 1)
+        self.assertIsNotNone(run["retry_next_at"])
+        self.assertEqual(
+            run["retry_last_error"],
+            "temporary controller boundary failure",
+        )
         self.assertEqual(execution.calls, ["run-1"])
         self.assertIn(
             "temporary controller boundary failure", orchestrator.last_errors[0]
         )
+        projected = ApplicationActions(
+            database=self.db,
+            onboarding=FakeOnboarding(),
+            lifecycle=lifecycle,
+            scheduler=FakeScheduler(),
+        ).state()["runs"][0]
+        self.assertIs(projected["can_retry"], True)
+        self.assertEqual(projected["retry_attempt_count"], 1)
+        self.assertIsNotNone(projected["retry_next_at"])
+        self.assertEqual(
+            projected["retry_last_error"],
+            "temporary controller boundary failure",
+        )
+
+        resumed_execution = FakeExecution(self.db)
+        resumed = Orchestrator(
+            database=self.db,
+            lifecycle=lifecycle,
+            execution=resumed_execution,
+            publication=FakePublication(self.db),
+            feedback=FakeFeedback(self.db),
+        )
+        resumed._advance("run-1")
+        self.assertEqual(resumed_execution.calls, [])
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET retry_next_at='2000-01-01T00:00:00Z' WHERE id='run-1'"
+            )
+        resumed._advance("run-1")
+
+        recovered = lifecycle.get_run("run-1")
+        self.assertEqual(recovered["state"], "waiting_for_feedback")
+        self.assertEqual(resumed_execution.calls, ["run-1"])
+        self.assertEqual(recovered["retry_attempt_count"], 0)
+        self.assertIsNone(recovered["retry_next_at"])
+        self.assertIsNone(recovered["retry_last_error"])
 
     def test_build_runtime_starts_unconfigured_without_ambient_model_discovery(
         self,
@@ -2035,6 +2091,9 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual([run["id"] for run in state["runs"]], ["run-2"])
         self.assertEqual([run["queue_position"] for run in state["runs"]], [1])
         self.assertEqual(state["runs"][0]["reason_severity"], "neutral")
+        self.assertEqual([run["id"] for run in state["run_history"]], ["run-1"])
+        self.assertIs(state["runs"][0]["can_retry"], False)
+        self.assertIs(state["run_history"][0]["can_restart"], False)
         repository = state["repositories"][0]
         self.assertEqual(repository["latest_run_state"], "queued")
         self.assertIs(repository["active"], True)
@@ -2065,14 +2124,23 @@ class ApplicationTests(unittest.TestCase):
         blocked = actions.state()
         self.assertEqual(blocked["runs"][0]["reason_severity"], "error")
         self.assertEqual(blocked["repositories"][0]["latest_run_state"], "blocked")
+        self.assertIs(blocked["runs"][0]["can_retry"], True)
         self.assertIs(blocked["repositories"][0]["active"], False)
 
         with self.db.transaction() as connection:
             connection.execute(
-                "UPDATE runs SET state='canceled' WHERE id='run-2'"
+                """UPDATE runs SET state='canceled',
+                   updated_at='2026-01-01T00:04:00Z'
+                   WHERE id='run-2'"""
             )
         terminal = actions.state()
         self.assertEqual(terminal["runs"], [])
+        self.assertEqual(
+            [run["id"] for run in terminal["run_history"]],
+            ["run-2", "run-1"],
+        )
+        self.assertIs(terminal["run_history"][0]["can_restart"], True)
+        self.assertIs(terminal["run_history"][1]["can_restart"], False)
         self.assertIsNone(terminal["repositories"][0]["latest_run_state"])
         with self.db.connect() as connection:
             durable_count = connection.execute(

@@ -718,6 +718,207 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual(len(created), 1)
         self.assertNotEqual(created[0], run_id)
 
+    def test_retry_blocked_run_restores_the_state_that_entered_block(self) -> None:
+        paths = (
+            (RunState.QUEUED, ()),
+            (RunState.IMPLEMENTING, (RunState.IMPLEMENTING,)),
+            (
+                RunState.VALIDATING,
+                (RunState.IMPLEMENTING, RunState.VALIDATING),
+            ),
+            (
+                RunState.PUBLISHING,
+                (
+                    RunState.IMPLEMENTING,
+                    RunState.VALIDATING,
+                    RunState.PUBLISHING,
+                ),
+            ),
+            (
+                RunState.WAITING_FOR_FEEDBACK,
+                (
+                    RunState.IMPLEMENTING,
+                    RunState.VALIDATING,
+                    RunState.PUBLISHING,
+                    RunState.WAITING_FOR_FEEDBACK,
+                ),
+            ),
+            (
+                RunState.RESOLVING_FEEDBACK,
+                (
+                    RunState.IMPLEMENTING,
+                    RunState.VALIDATING,
+                    RunState.PUBLISHING,
+                    RunState.WAITING_FOR_FEEDBACK,
+                    RunState.RESOLVING_FEEDBACK,
+                ),
+            ),
+        )
+        run_ids: list[str] = []
+        for index, (expected, path) in enumerate(paths, start=1):
+            if index > 1:
+                self.github.events.append(
+                    ActivationEvent(
+                        event_id=f"retry-event-{index}",
+                        applied_at=f"2026-01-{index + 1:02d}T00:00:00Z",
+                        issue=self.event.issue,
+                    )
+                )
+            run_id = self.lifecycle.poll_repository("repo-1")[0]
+            run_ids.append(run_id)
+            for state in path:
+                self.lifecycle.transition(run_id, state)
+            self.lifecycle.transition(
+                run_id,
+                RunState.BLOCKED,
+                reason=f"recoverable failure from {expected.value}",
+            )
+
+            resumed = self.lifecycle.retry(run_id)
+
+            self.assertEqual(resumed, expected.value)
+            record = self.lifecycle.get_run(run_id)
+            self.assertEqual(record["state"], expected.value)
+            self.assertEqual(record["reason"], "retry requested by user")
+            self.lifecycle.cancel(run_id, "fixture complete")
+
+        with self.assertRaisesRegex(ValueError, "no retry is pending"):
+            self.lifecycle.retry(run_ids[-1])
+
+    def test_retry_pending_automatic_failure_clears_delay_without_state_change(
+        self,
+    ) -> None:
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs
+                   SET retry_attempt_count=2,
+                       retry_next_at='2099-01-01T00:00:00Z',
+                       retry_last_error='temporary network failure'
+                   WHERE id=?""",
+                (run_id,),
+            )
+
+        resumed = self.lifecycle.retry(run_id)
+
+        self.assertEqual(resumed, "implementing")
+        run = self.lifecycle.get_run(run_id)
+        self.assertEqual(run["state"], "implementing")
+        self.assertEqual(run["retry_attempt_count"], 2)
+        self.assertIsNone(run["retry_next_at"])
+        self.assertEqual(run["retry_last_error"], "temporary network failure")
+        with self.db.connect() as connection:
+            transition = connection.execute(
+                """SELECT from_state, to_state, reason
+                   FROM run_transitions WHERE run_id=? ORDER BY id DESC LIMIT 1""",
+                (run_id,),
+            ).fetchone()
+        self.assertEqual(
+            tuple(transition),
+            ("implementing", "implementing", "retry requested by user"),
+        )
+        self.lifecycle.cancel(run_id, "fixture complete")
+        terminal = self.lifecycle.get_run(run_id)
+        self.assertEqual(terminal["retry_attempt_count"], 0)
+        self.assertIsNone(terminal["retry_next_at"])
+        self.assertIsNone(terminal["retry_last_error"])
+
+    def test_restart_canceled_run_is_idempotent_and_uses_current_versions(self) -> None:
+        source_run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.cancel(source_run_id, "operator canceled")
+        sandbox_root = self.data_root / "repositories" / "repo-1" / "sandbox" / "2"
+        sandbox_root.mkdir(parents=True)
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO sandbox_versions
+                   (id, repository_id, version, root_path, policy_json,
+                    evidence_json, created_at)
+                   VALUES ('sandbox-2', 'repo-1', 2, ?, '{}', '{}',
+                           '2026-01-02T00:00:00Z')""",
+                (str(sandbox_root),),
+            )
+            connection.execute(
+                """INSERT INTO team_versions
+                   (id, repository_id, version, evidence_json, created_at)
+                   VALUES ('team-2', 'repo-1', 2, '{}',
+                           '2026-01-02T00:00:00Z')"""
+            )
+            connection.execute(
+                """UPDATE repositories
+                   SET current_sandbox_version_id='sandbox-2',
+                       current_team_version_id='team-2'
+                   WHERE id='repo-1'"""
+            )
+        self.github.current_issue = IssueInfo(
+            node_id=self.event.issue.node_id,
+            number=self.event.issue.number,
+            url=self.event.issue.url,
+            title="Current issue title",
+            body="Current requirements",
+            discussion=self.event.issue.discussion,
+            updated_at="2026-01-02T00:00:00Z",
+            state="open",
+        )
+        self.github.base_sha = "c" * 40
+
+        replacement_run_id = self.lifecycle.restart(source_run_id)
+        repeated_run_id = self.lifecycle.restart(source_run_id)
+
+        self.assertEqual(repeated_run_id, replacement_run_id)
+        self.assertNotEqual(replacement_run_id, source_run_id)
+        with self.db.connect() as connection:
+            source = connection.execute(
+                "SELECT state, reason FROM runs WHERE id=?", (source_run_id,)
+            ).fetchone()
+            replacement = connection.execute(
+                """SELECT runs.*, issues.title, activation_events.github_event_id
+                   FROM runs
+                   JOIN issues ON issues.id=runs.issue_id
+                   JOIN activation_events
+                     ON activation_events.id=runs.activation_event_id
+                   WHERE runs.id=?""",
+                (replacement_run_id,),
+            ).fetchone()
+            run_count = connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        self.assertEqual(tuple(source), ("canceled", "operator canceled"))
+        self.assertEqual(replacement["state"], "queued")
+        self.assertEqual(replacement["sandbox_version_id"], "sandbox-2")
+        self.assertEqual(replacement["team_version_id"], "team-2")
+        self.assertEqual(replacement["base_sha"], "c" * 40)
+        self.assertEqual(replacement["title"], "Current issue title")
+        self.assertEqual(
+            replacement["github_event_id"],
+            f"manual-restart:{source_run_id}",
+        )
+        self.assertEqual(run_count, 2)
+        self.assertEqual(len(self.checkouts.calls), 2)
+        with self.assertRaisesRegex(ValueError, "only canceled runs can be restarted"):
+            self.lifecycle.restart(replacement_run_id)
+
+    def test_restart_rejects_closed_github_issue_without_creating_a_run(self) -> None:
+        source_run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.cancel(source_run_id, "operator canceled")
+        self.github.current_issue = IssueInfo(
+            node_id=self.event.issue.node_id,
+            number=self.event.issue.number,
+            url=self.event.issue.url,
+            title=self.event.issue.title,
+            body=self.event.issue.body,
+            discussion=self.event.issue.discussion,
+            updated_at="2026-01-02T00:00:00Z",
+            state="closed",
+        )
+
+        with self.assertRaisesRegex(ValueError, "GitHub issue is not open"):
+            self.lifecycle.restart(source_run_id)
+
+        with self.db.connect() as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0],
+                1,
+            )
+
     def test_block_is_durable_and_cancel_preserves_run_evidence(self) -> None:
         run_id = self.lifecycle.poll_repository("repo-1")[0]
         self.lifecycle.transition(run_id, RunState.IMPLEMENTING)

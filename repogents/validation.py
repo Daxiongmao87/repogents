@@ -22,6 +22,10 @@ _UNITTEST_FINDING = re.compile(r"^(FAIL|ERROR):\s+(.+?)\s*$")
 _PYTEST_FINDING = re.compile(r"^(FAILED|ERROR)\s+([^\s]+)(?:\s+-\s+.*)?$")
 _GO_TEST_FINDING = re.compile(r"^---\s+(FAIL):\s+([^\s(]+)")
 _JEST_FINDING = re.compile(r"^\s*●\s+(.+?)\s*$")
+_PRETTIER_FINDING = re.compile(
+    r"^\[warn\]\s+(.+\.[^./\s]+)\s*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,18 @@ def extract_findings(stdout: str, stderr: str) -> tuple[str, ...]:
         line = raw_line.rstrip()
         stripped = line.strip()
         if not stripped:
+            continue
+
+        prettier = _PRETTIER_FINDING.match(stripped)
+        if prettier is not None:
+            findings.append(
+                _identity(
+                    prettier.group(1),
+                    "warning",
+                    "prettier",
+                    "File is not formatted",
+                )
+            )
             continue
 
         eslint = _ESLINT_FINDING.match(line)

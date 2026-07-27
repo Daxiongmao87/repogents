@@ -35,6 +35,8 @@ class InterfaceActions(Protocol):
     def set_run_forced(self, run_id: str, forced: bool) -> None: ...
 
     def cancel(self, run_id: str) -> None: ...
+    def retry(self, run_id: str) -> str: ...
+    def restart(self, run_id: str) -> str: ...
 
     def poll(self) -> None: ...
 
@@ -316,6 +318,30 @@ class LocalInterfaceServer:
             ):
                 self.actions.cancel(segments[2])
                 self._send_json(request, HTTPStatus.OK, {"ok": True})
+                return
+            if (
+                len(segments) == 4
+                and segments[:2] == ["api", "runs"]
+                and segments[3] == "retry"
+            ):
+                state = self.actions.retry(segments[2])
+                self._send_json(
+                    request,
+                    HTTPStatus.OK,
+                    {"ok": True, "state": state},
+                )
+                return
+            if (
+                len(segments) == 4
+                and segments[:2] == ["api", "runs"]
+                and segments[3] == "restart"
+            ):
+                replacement_run_id = self.actions.restart(segments[2])
+                self._send_json(
+                    request,
+                    HTTPStatus.OK,
+                    {"ok": True, "run_id": replacement_run_id},
+                )
                 return
             if segments == ["api", "poll"]:
                 self.actions.poll()
@@ -802,6 +828,8 @@ details > summary { cursor: pointer; }
         <div class="panel-body" id="ready-issues"></div>
         <div class="panel-header"><div><h2>Runs</h2><p class="muted">Active issue runs for the selected repository.</p></div></div>
         <div class="panel-body" id="runs"></div>
+        <div class="panel-header"><div><h2>Run history</h2><p class="muted">Blocked and finished runs remain available with their durable evidence and recovery controls.</p></div></div>
+        <div class="panel-body" id="run-history"></div>
       </section>
       <section class="panel">
         <div class="panel-header"><div><h2>All active issues</h2><p class="muted">Drag active issue buttons to set execution priority.</p></div></div>
@@ -856,7 +884,7 @@ details > summary { cursor: pointer; }
   </div>
 </dialog>
 <script>
-let currentState = {repositories:[], runs:[], model_configuration:{}};
+let currentState = {repositories:[], runs:[], run_history:[], model_configuration:{}};
 let selectedRepositoryId = null;
 let runActivityStream = null;
 let runActivityStreamRunId = null;
@@ -875,6 +903,7 @@ const githubLink = (url, label) => /^https:\/\/github\.com\//.test(url || '') ? 
 const short = value => value ? esc(String(value).slice(0, 12)) : '—';
 const date = value => value ? new Date(value).toLocaleString() : 'Never';
 const actionableRun = r => ['queued','implementing','validating','publishing','resolving_feedback'].includes(r.state);
+const allRuns = () => [...(currentState.runs || []), ...(currentState.run_history || [])];
 const deltaCounts = c => c?.mode ? ` · ${esc(c.mode)}: ${esc(c.new_count ?? 0)} new, ${esc(c.resolved_count ?? 0)} resolved, ${esc(c.unchanged_count ?? 0)} unchanged` : '';
 const validationBaseline = b => `<li><code>${esc((b.command || []).join(' '))}</code> — ${esc(b.mode)} baseline, exit ${esc(b.exit_status)}, ${esc((b.findings || []).length)} findings for <code>${short(b.base_sha)}</code>; log <code>${esc(b.log_path)}</code></li>`;
 const validationResult = v => `<li><strong>${esc(v.verdict || 'unknown')}</strong> <code>${esc((v.command || []).join(' '))}</code> — exit ${esc(v.exit_status)}${deltaCounts(v.comparison)} for <code>${short(v.commit_sha)}</code>; log <code>${esc(v.log_path)}</code></li>`;
@@ -1065,6 +1094,13 @@ function renderReadyIssues() {
       <span class="run-card-line muted">Updated ${esc(date(issue.updated_at))}</span>
     </article>`).join('') || `<p class="muted">${status === 'available' ? 'No agent:ready issues for this repository.' : 'No current agent:ready inventory is available.'}</p>`}`;
 }
+const retryStatus = run => run.retry_next_at
+  ? `<span class="run-card-line warning">Automatic retry #${esc(run.retry_attempt_count)} for ${esc(run.retry_operation || 'operation')} at ${esc(date(run.retry_next_at))}: ${esc(run.retry_last_error || 'Unknown error')}</span>`
+  : '';
+const recoveryButtons = run => `
+  ${run.can_retry ? `<button class="button small" data-retry="${esc(run.id)}">Retry now</button>` : ''}
+  ${run.can_restart ? `<button class="button small" data-restart="${esc(run.id)}">Restart issue</button>` : ''}`;
+
 function runCard(run, reorderable) {
   return `
     <button type="button"
@@ -1075,22 +1111,42 @@ function runCard(run, reorderable) {
       <span class="row"><strong>${esc(run.repository)} · Issue #${esc(run.issue_number)}: ${esc(run.issue_title)}</strong><span class="badge">${esc(run.state)}</span></span>
       <span class="run-card-line">Last completed: ${esc(run.last_completed_state ?? 'none')}${run.pull_number ? ` · Pull request #${esc(run.pull_number)}` : ''}${run.forced ? ' · Forced work' : ''}</span>
       ${run.reason ? `<span class="run-card-line ${run.reason_severity === 'error' ? 'error' : 'muted'}">${esc(run.reason)}${run.reason_truncated ? ' · Open Issue Log for full details.' : ''}</span>` : ''}
+      ${retryStatus(run)}
       <span class="run-card-line${reorderable ? ' drag-hint' : ' muted'}">Priority ${esc(run.queue_position)}${reorderable ? ' · Drag to reorder · Alt+Arrow to move' : ''}</span>
     </button>`;
+}
+function historyCard(run) {
+  return `
+    <article class="card run-card ${String(run.id) === selectedRunId ? 'selected' : ''}">
+      <span class="row"><strong>${esc(run.repository)} · Issue #${esc(run.issue_number)}: ${esc(run.issue_title)}</strong><span class="badge">${esc(run.state)}</span></span>
+      <span class="run-card-line">Updated ${esc(date(run.updated_at))}${run.pull_number ? ` · Pull request #${esc(run.pull_number)}` : ''}</span>
+      ${run.reason ? `<span class="run-card-line ${run.reason_severity === 'error' ? 'error' : 'muted'}">${esc(run.reason)}${run.reason_truncated ? ' · Open Issue Log for full details.' : ''}</span>` : ''}
+      ${retryStatus(run)}
+      <div class="actions">
+        <button class="button small" data-run-select="${esc(run.id)}">Open Issue Log</button>
+        ${recoveryButtons(run)}
+      </div>
+    </article>`;
 }
 function renderRuns() {
   renderReadyIssues();
   const activeRuns = currentState.runs.filter(run => !['blocked', 'canceled', 'closed'].includes(String(run.state)));
   const repositoryRuns = activeRuns.filter(run => String(run.repository_id) === selectedRepositoryId);
+  const historyRuns = [
+    ...currentState.runs.filter(run => String(run.state) === 'blocked'),
+    ...(currentState.run_history || []),
+  ].filter(run => String(run.repository_id) === selectedRepositoryId);
   document.querySelector('#runs').innerHTML = repositoryRuns.map(run => runCard(run, false)).join('')
     || `<p class="muted">${selectedRepositoryId ? 'No active issue runs for this repository.' : 'Select a repository to view its active issue runs.'}</p>`;
+  document.querySelector('#run-history').innerHTML = historyRuns.map(historyCard).join('')
+    || `<p class="muted">${selectedRepositoryId ? 'No blocked or finished runs for this repository.' : 'Select a repository to view its run history.'}</p>`;
   document.querySelector('#all-active-runs').innerHTML = activeRuns.map(run => runCard(run, true)).join('')
     || '<p class="muted">No active issue runs.</p>';
   renderIssueLogDetails();
 }
 function renderIssueLogDetails() {
   const details = document.querySelector('#issue-log-details');
-  const run = currentState.runs.find(item => String(item.id) === selectedRunId);
+  const run = allRuns().find(item => String(item.id) === selectedRunId);
   if (!run) {
     document.querySelector('#issue-log-identity').textContent = 'Select an issue to view its live log.';
     document.querySelector('#issue-log-state').textContent = 'Idle';
@@ -1107,6 +1163,7 @@ function renderIssueLogDetails() {
       </div>
       <div class="actions">
         ${actionableRun(run) ? `<button class="button small" data-force-run="${esc(run.id)}" data-next-forced="${run.forced ? 'false' : 'true'}">${run.forced ? 'Release forced work' : 'Force work on this issue'}</button>` : ''}
+        ${recoveryButtons(run)}
         ${!['canceled','closed'].includes(run.state) ? `<button class="button small danger" data-cancel="${esc(run.id)}">Cancel</button>` : ''}
       </div>
     </div>
@@ -1161,7 +1218,7 @@ function connectRunActivityStream(runId) {
 }
 function selectRun(runId) {
   const normalized = String(runId);
-  const run = currentState.runs.find(item => String(item.id) === normalized);
+  const run = allRuns().find(item => String(item.id) === normalized);
   if (!run) return;
   selectedRunId = normalized;
   renderRuns();
@@ -1180,7 +1237,7 @@ async function refresh() {
     }
     if (
       selectedRunId
-      && !currentState.runs.some(run => String(run.id) === selectedRunId)
+      && !allRuns().some(run => String(run.id) === selectedRunId)
     ) {
       selectedRunId = null;
       closeRunActivityStream();
@@ -1293,6 +1350,16 @@ document.body.addEventListener('click', event => {
       `/api/runs/${encodeURIComponent(b.dataset.forceRun)}/force`,
       {forced:b.dataset.nextForced === 'true'},
     ));
+  }
+  if (b?.dataset.retry) {
+    return action(() => mutate(`/api/runs/${encodeURIComponent(b.dataset.retry)}/retry`, {}));
+  }
+  if (b?.dataset.restart) {
+    if (!confirm('Restart this issue as a new run?')) return;
+    return action(async () => {
+      const result = await mutate(`/api/runs/${encodeURIComponent(b.dataset.restart)}/restart`, {});
+      selectedRunId = String(result.run_id);
+    });
   }
   if (b?.dataset.cancel) {
     if (!confirm('Cancel this run?')) return;

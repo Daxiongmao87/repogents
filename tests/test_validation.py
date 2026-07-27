@@ -46,6 +46,23 @@ FAILED (failures=1)
         self.assertTrue(extract_findings(first, ""))
         self.assertEqual(extract_findings("command failed", ""), ())
 
+    def test_extracts_prettier_file_findings_without_summary_noise(self) -> None:
+        output = """
+[warn] scripts/core/tool-loop-handler.js
+[warn] CONTRIBUTING.md
+[warn] README.md
+[warn] Code style issues found in 3 files. Run Prettier with --write to fix.
+"""
+
+        self.assertEqual(
+            extract_findings("", output),
+            (
+                "scripts/core/tool-loop-handler.js|warning|prettier|File is not formatted",
+                "CONTRIBUTING.md|warning|prettier|File is not formatted",
+                "README.md|warning|prettier|File is not formatted",
+            ),
+        )
+
 
 class ValidationDeltaTests(unittest.TestCase):
     def test_accepts_equal_or_reduced_debt_and_rejects_any_new_finding(self) -> None:

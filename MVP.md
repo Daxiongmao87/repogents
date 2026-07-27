@@ -296,13 +296,13 @@ The application exposes these issue-run states:
 - `canceled`; and
 - `closed`.
 
-`blocked`, `canceled`, and `closed` record a reason. `canceled` and `closed` are terminal. A blocked run performs no autonomous work and may be canceled; recoverable internal failures do not enter `blocked`.
+`blocked`, `canceled`, and `closed` record a reason. `canceled` and `closed` are terminal. A blocked run performs no autonomous work and may be explicitly retried from the durable state that entered `blocked` or canceled; recoverable internal failures do not enter `blocked`.
 
 A run may remain `waiting_for_feedback` without retaining an agent process. New feedback for an open pull request returns the same run to `resolving_feedback`; a merged or externally closed pull request moves that attempt to `closed`. A closed-unmerged attempt is replaced only under the open-issue rule in §5.1.
 
 ### 5.3 Failure handling
 
-Recoverable model, controller-tool, validation-infrastructure, orchestration, and reconcilable external-operation failures preserve the current durable run state and are retried automatically on a later scheduler cycle. A run enters `blocked` only when work cannot continue because of:
+Recoverable model, controller-tool, validation-infrastructure, orchestration, and reconcilable external-operation failures preserve the current durable run state and are retried automatically with bounded backoff on a later scheduler cycle. The current consecutive attempt count, operation, deadline, and last error are durable across application restarts and clear after a successful controller boundary. A run enters `blocked` only when work cannot continue because of:
 
 - contradictory or insufficient requirements;
 - missing repository inputs;
@@ -312,7 +312,7 @@ Recoverable model, controller-tool, validation-infrastructure, orchestration, an
 - validation that the lead cannot make pass without violating scope; or
 - a publication or feedback error that cannot be reconciled automatically.
 
-The interface displays the blocking reason and the last completed state. Restart and automatic reconciliation resume the same nonblocked run and reconcile existing local and GitHub state before repeating an external operation.
+The interface displays the blocking reason, last completed state, and any pending automatic-retry attempt, deadline, and error. **Retry now** resumes a blocked run from its recorded pre-block state or removes the delay from a pending automatic retry. Automatic reconciliation then reuses the same run and reconciles existing local and GitHub state before repeating an external operation.
 
 ### 5.4 Cancellation
 
@@ -325,6 +325,8 @@ Cancellation:
 - retains its logs and durable state;
 - retains the repository's sandbox and caches; and
 - leaves any existing GitHub branch or pull request untouched.
+
+Canceled runs remain in issue history. **Restart issue** on a canceled run creates one idempotent fresh run only while the GitHub issue is open and no nonterminal run exists for it. The new run uses the current issue content, current repository sandbox and team versions, current default branch, and freshly fetched base SHA; the canceled run and its evidence remain unchanged.
 
 ## 6. Autonomous Implementation and Validation
 
@@ -481,8 +483,10 @@ The application provides one local interface that allows the user to:
 - view all inventoried repositories;
 - view repository onboarding state and blocking reasons;
 - explicitly re-run repository onboarding when the stored environment or team must be refreshed;
-- view active issues and runs;
-- view each issue's current state and blocking reason;
+- view active issues and runs plus blocked and terminal run history;
+- view each issue's current state, blocking reason, and pending automatic-retry details;
+- retry a blocked run or pending automatic retry;
+- restart a canceled open issue as a fresh run;
 - cancel a blocked or active run as applicable;
 - open issue links on GitHub;
 - open pull-request links on GitHub.

@@ -831,6 +831,65 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(comparison["contract_changed"], ["src/a.py"])
         self.assertEqual(comparison["weakening_detected"], [])
 
+    def test_prettier_baseline_debt_is_stored_before_agent_action(self) -> None:
+        self._set_validation_command(
+            [
+                "python3",
+                "-c",
+                (
+                    "import sys; "
+                    "sys.stderr.write('[warn] scripts/core/tool-loop-handler.js\\n"
+                    "[warn] README.md\\n"
+                    "[warn] Code style issues found in 2 files. "
+                    "Run Prettier with --write to fix.\\n'); "
+                    "raise SystemExit(1)"
+                ),
+            ]
+        )
+        with self.db.transaction() as connection:
+            connection.execute("DELETE FROM agent_assignments WHERE run_id='run-1'")
+
+        class BaselineObservedRuntime:
+            def __init__(self) -> None:
+                self.contexts: list[str] = []
+
+            def next_action(
+                self, context: str, state_directory: Path
+            ) -> dict[str, object]:
+                del state_directory
+                self.contexts.append(context)
+                return {
+                    "action": "block",
+                    "reason": "fixture observed execution after baseline",
+                }
+
+        runtime = BaselineObservedRuntime()
+        service = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=lambda _runtime, _model, _timeout: runtime,
+        )
+
+        self.assertIsNone(service.execute("run-1"))
+
+        with self.db.connect() as connection:
+            baseline = connection.execute(
+                """SELECT mode, exit_status, findings_json
+                   FROM validation_baselines WHERE run_id='run-1'"""
+            ).fetchone()
+        self.assertEqual(baseline["mode"], "delta")
+        self.assertEqual(baseline["exit_status"], 1)
+        self.assertEqual(
+            json.loads(baseline["findings_json"]),
+            [
+                "scripts/core/tool-loop-handler.js|warning|prettier|File is not formatted",
+                "README.md|warning|prettier|File is not formatted",
+            ],
+        )
+        self.assertEqual(len(runtime.contexts), 1)
+
     def test_unparseable_failed_baseline_blocks_before_agent_action(self) -> None:
         self._set_validation_command(
             ["python3", "-c", "print('command failed'); raise SystemExit(1)"]

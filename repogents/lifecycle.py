@@ -1152,7 +1152,15 @@ class RunLifecycle:
                 """UPDATE runs
                    SET state=?, last_completed_state=?, reason=?, updated_at=?,
                        canceled_at=CASE WHEN ?='canceled' THEN ? ELSE canceled_at END,
-                       closed_at=CASE WHEN ?='closed' THEN ? ELSE closed_at END
+                       closed_at=CASE WHEN ?='closed' THEN ? ELSE closed_at END,
+                       retry_attempt_count=CASE
+                           WHEN ? THEN 0 ELSE retry_attempt_count END,
+                       retry_operation=CASE
+                           WHEN ? THEN NULL ELSE retry_operation END,
+                       retry_next_at=CASE
+                           WHEN ? THEN NULL ELSE retry_next_at END,
+                       retry_last_error=CASE
+                           WHEN ? THEN NULL ELSE retry_last_error END
                    WHERE id=?""",
                 (
                     target.value,
@@ -1163,6 +1171,10 @@ class RunLifecycle:
                     now,
                     target.value,
                     now,
+                    int(target in {RunState.CANCELED, RunState.CLOSED}),
+                    int(target in {RunState.CANCELED, RunState.CLOSED}),
+                    int(target in {RunState.CANCELED, RunState.CLOSED}),
+                    int(target in {RunState.CANCELED, RunState.CLOSED}),
                     run_id,
                 ),
             )
@@ -1181,6 +1193,171 @@ class RunLifecycle:
             finally:
                 if self.processes is not None:
                     self.processes.cancel(run_id)
+
+    def retry(self, run_id: str) -> str:
+        """Resume a blocked run or remove a pending automatic-retry delay."""
+
+        reason = "retry requested by user"
+        with self._run_lock(run_id):
+            with self.database.transaction() as connection:
+                row = connection.execute(
+                    """SELECT runs.*,
+                              repositories.enabled AS repository_enabled,
+                              repositories.removed_at AS repository_removed_at,
+                              repositories.onboarding_state
+                       FROM runs
+                       JOIN repositories
+                         ON repositories.id=runs.repository_id
+                       WHERE runs.id=?""",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
+                if (
+                    not bool(row["repository_enabled"])
+                    or row["repository_removed_at"] is not None
+                    or str(row["onboarding_state"]) != "ready"
+                ):
+                    raise ValueError("repository is not ready to run")
+
+                current = RunState(str(row["state"]))
+                now = _utc_now()
+                if current == RunState.BLOCKED:
+                    transition = connection.execute(
+                        """SELECT from_state
+                           FROM run_transitions
+                           WHERE run_id=? AND to_state='blocked'
+                           ORDER BY id DESC LIMIT 1""",
+                        (run_id,),
+                    ).fetchone()
+                    if transition is None or transition["from_state"] is None:
+                        raise ValueError("blocked run has no resumable prior state")
+                    target = RunState(str(transition["from_state"]))
+                    if target in {
+                        RunState.BLOCKED,
+                        RunState.CANCELED,
+                        RunState.CLOSED,
+                    }:
+                        raise ValueError(
+                            f"blocked run cannot resume from {target.value}"
+                        )
+                    connection.execute(
+                        """UPDATE runs
+                           SET state=?, reason=?, updated_at=?,
+                               retry_attempt_count=0,
+                               retry_operation=NULL,
+                               retry_next_at=NULL,
+                               retry_last_error=NULL
+                           WHERE id=?""",
+                        (target.value, reason, now, run_id),
+                    )
+                else:
+                    if row["retry_next_at"] is None:
+                        raise ValueError(
+                            "run is not blocked and no retry is pending"
+                        )
+                    target = current
+                    connection.execute(
+                        """UPDATE runs
+                           SET retry_next_at=NULL, updated_at=?
+                           WHERE id=?""",
+                        (now, run_id),
+                    )
+                connection.execute(
+                    """INSERT INTO run_transitions
+                       (run_id, from_state, to_state, reason, occurred_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (run_id, current.value, target.value, reason, now),
+                )
+                return target.value
+
+    def restart(self, run_id: str) -> str:
+        """Create one fresh run for a canceled run's current open issue."""
+
+        event_id = f"manual-restart:{run_id}"
+        with self.database.connect() as connection:
+            existing = connection.execute(
+                """SELECT runs.id
+                   FROM activation_events
+                   JOIN runs ON runs.activation_event_id=activation_events.id
+                   WHERE activation_events.github_event_id=?""",
+                (event_id,),
+            ).fetchone()
+            context = connection.execute(
+                """SELECT runs.state, runs.repository_id, runs.issue_id,
+                          issues.number,
+                          repositories.*,
+                          repositories.id AS stored_repository_id
+                   FROM runs
+                   JOIN issues ON issues.id=runs.issue_id
+                   JOIN repositories ON repositories.id=runs.repository_id
+                   WHERE runs.id=?""",
+                (run_id,),
+            ).fetchone()
+            active = (
+                None
+                if context is None
+                else connection.execute(
+                    """SELECT id FROM runs
+                       WHERE issue_id=? AND id!=?
+                         AND state NOT IN ('canceled', 'closed')
+                       ORDER BY created_at, id LIMIT 1""",
+                    (context["issue_id"], run_id),
+                ).fetchone()
+            )
+        if existing is not None:
+            return str(existing["id"])
+        if context is None:
+            raise KeyError(run_id)
+        if str(context["state"]) != RunState.CANCELED.value:
+            raise ValueError("only canceled runs can be restarted")
+        if active is not None:
+            raise ValueError("issue already has a nonterminal run")
+        if (
+            not bool(context["enabled"])
+            or context["removed_at"] is not None
+            or str(context["onboarding_state"]) != "ready"
+            or not context["current_sandbox_version_id"]
+            or not context["current_team_version_id"]
+        ):
+            raise ValueError("repository is not ready to run")
+
+        issue = self.github.get_issue(
+            str(context["owner"]),
+            str(context["name"]),
+            int(context["number"]),
+        )
+        if issue.state != "open":
+            raise ValueError("GitHub issue is not open")
+        event = ActivationEvent(
+            event_id=event_id,
+            applied_at=_utc_now(),
+            issue=issue,
+        )
+        replacement_run_id = self._activate(context, event)
+        if replacement_run_id is not None:
+            return replacement_run_id
+
+        with self.database.connect() as connection:
+            existing = connection.execute(
+                """SELECT runs.id
+                   FROM activation_events
+                   JOIN runs ON runs.activation_event_id=activation_events.id
+                   WHERE activation_events.github_event_id=?""",
+                (event_id,),
+            ).fetchone()
+            active = connection.execute(
+                """SELECT id FROM runs
+                   WHERE issue_id=? AND id!=?
+                     AND state NOT IN ('canceled', 'closed')
+                   ORDER BY created_at, id LIMIT 1""",
+                (context["issue_id"], run_id),
+            ).fetchone()
+        if existing is not None:
+            return str(existing["id"])
+        if active is not None:
+            raise ValueError("issue already has a nonterminal run")
+        raise RuntimeError("restart could not create a replacement run")
 
     def set_repository_paused(
         self, repository_id: str, paused: bool

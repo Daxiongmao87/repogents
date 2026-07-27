@@ -5,6 +5,7 @@ import sqlite3
 import urllib.parse
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +71,9 @@ class LifecycleOperations(Protocol):
     def get_run(self, run_id: str) -> dict[str, object]: ...
 
     def cancel(self, run_id: str, reason: str) -> None: ...
+    def retry(self, run_id: str) -> str: ...
+    def restart(self, run_id: str) -> str: ...
+
     def set_repository_paused(
         self, repository_id: str, paused: bool
     ) -> tuple[str, ...]: ...
@@ -320,6 +324,9 @@ class Orchestrator:
                 return
             run = self.lifecycle.get_run(run_id)
             state = str(run["state"])
+            if not self._retry_is_due(run):
+                return
+            operation = state
             try:
                 if state in {
                     RunState.QUEUED.value,
@@ -330,30 +337,105 @@ class Orchestrator:
                         state != RunState.QUEUED.value
                         and self._has_processing_feedback(run_id)
                     ):
+                        operation = "feedback_resolution"
                         self.feedback.resolve_run(run_id)
                     else:
+                        operation = "execution"
                         self.execution.execute(run_id)
                 elif state == RunState.PUBLISHING.value:
                     if self._has_processing_feedback(run_id):
+                        operation = "feedback_resolution"
                         self.feedback.resolve_run(run_id)
                     else:
+                        operation = "publication"
                         self.publication.publish(run_id)
                 elif state in {
                     RunState.WAITING_FOR_FEEDBACK.value,
                     RunState.RESOLVING_FEEDBACK.value,
                 }:
+                    operation = "feedback_resolution"
                     self.feedback.resolve_run(run_id)
                 else:
                     return
             except RunPaused:
                 return
             except Exception as error:
+                self._schedule_retry(run_id, operation, error)
                 detail = f"orchestration failed: {error or error.__class__.__name__}"
                 self.last_errors.append(f"run {run_id}: {detail}")
                 return
+            self._clear_retry_state(run_id)
             after = str(self.lifecycle.get_run(run_id)["state"])
             if after == state or after in _TERMINAL_OR_IDLE:
                 return
+
+    def _retry_is_due(self, run: dict[str, object]) -> bool:
+        value = run.get("retry_next_at")
+        if value is None:
+            return True
+        try:
+            deadline = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        return deadline <= datetime.now(timezone.utc)
+
+    def _schedule_retry(
+        self,
+        run_id: str,
+        operation: str,
+        error: Exception,
+    ) -> None:
+        detail, _ = _display_run_reason(str(error) or error.__class__.__name__)
+        last_error = detail or error.__class__.__name__
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                """SELECT state, retry_attempt_count FROM runs WHERE id=?""",
+                (run_id,),
+            ).fetchone()
+            if row is None or str(row["state"]) in _TERMINAL_OR_IDLE:
+                return
+            attempt = int(row["retry_attempt_count"]) + 1
+            delay_seconds = min(10 * (2 ** min(attempt - 1, 5)), 300)
+            now_value = datetime.now(timezone.utc)
+            now = _format_utc(now_value)
+            next_at = _format_utc(now_value + timedelta(seconds=delay_seconds))
+            reason = (
+                f"automatic retry {attempt} for {operation} scheduled at "
+                f"{next_at}: {last_error}"
+            )
+            connection.execute(
+                """UPDATE runs
+                   SET retry_attempt_count=?, retry_operation=?,
+                       retry_next_at=?, retry_last_error=?, updated_at=?
+                   WHERE id=?""",
+                (attempt, operation, next_at, last_error, now, run_id),
+            )
+            connection.execute(
+                """INSERT INTO run_transitions
+                   (run_id, from_state, to_state, reason, occurred_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (run_id, row["state"], row["state"], reason, now),
+            )
+
+    def _clear_retry_state(self, run_id: str) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                """UPDATE runs
+                   SET retry_attempt_count=0,
+                       retry_operation=NULL,
+                       retry_next_at=NULL,
+                       retry_last_error=NULL
+                   WHERE id=?
+                     AND (
+                         retry_attempt_count != 0
+                         OR retry_operation IS NOT NULL
+                         OR retry_next_at IS NOT NULL
+                         OR retry_last_error IS NOT NULL
+                     )""",
+                (run_id,),
+            )
 
     def _run_is_enabled(self, run_id: str) -> bool:
         with self.database.connect() as connection:
@@ -576,8 +658,18 @@ class ApplicationActions:
                           run_team.version AS team_version,
                           runs.priority, runs.force_requested_at,
                           runs.created_at, runs.updated_at,
+                          runs.retry_attempt_count, runs.retry_operation,
+                          runs.retry_next_at, runs.retry_last_error,
+                          repositories.enabled AS repository_enabled,
+                          repositories.onboarding_state
+                            AS repository_onboarding_state,
                           pull_requests.number AS pull_number,
-                          pull_requests.url AS pull_url
+                          pull_requests.url AS pull_url,
+                          EXISTS (
+                              SELECT 1 FROM activation_events AS restart_events
+                              WHERE restart_events.github_event_id=
+                                    'manual-restart:' || runs.id
+                          ) AS restart_exists
                    FROM runs
                    JOIN repositories ON repositories.id=runs.repository_id
                    JOIN issues ON issues.id=runs.issue_id
@@ -675,19 +767,36 @@ class ApplicationActions:
             assignments_by_run.setdefault(run_id, []).append(value)
         all_run_values = [dict(row) for row in runs]
         visible_run_values: list[dict[str, object]] = []
+        history_run_values: list[dict[str, object]] = []
         runs_by_repository: dict[str, list[dict[str, object]]] = {}
         for run in all_run_values:
             run_id = str(run["id"])
             repository_id = str(run["repository_id"])
+            state = str(run["state"])
+            repository_ready = bool(run.pop("repository_enabled")) and (
+                str(run.pop("repository_onboarding_state")) == "ready"
+            )
+            restart_exists = bool(run.pop("restart_exists"))
             run["priority"] = int(run["priority"])
-            runs_by_repository.setdefault(repository_id, []).append(run)
-            if str(run["state"]) in _TERMINAL_RUN_STATES:
-                continue
+            run["retry_attempt_count"] = int(run["retry_attempt_count"])
             run["reason"], run["reason_truncated"] = _display_run_reason(run["reason"])
             run["reason_severity"] = (
-                "error" if str(run["state"]) == RunState.BLOCKED.value else "neutral"
+                "error" if state == RunState.BLOCKED.value else "neutral"
             )
             run["forced"] = run.pop("force_requested_at") is not None
+            run["can_retry"] = (
+                repository_ready
+                and state not in _TERMINAL_RUN_STATES
+                and (
+                    state == RunState.BLOCKED.value
+                    or run["retry_next_at"] is not None
+                )
+            )
+            run["can_restart"] = (
+                repository_ready
+                and state == RunState.CANCELED.value
+                and not restart_exists
+            )
             run["validation_baselines"] = baseline_by_run.get(run_id, [])
             run["validation_results"] = validation_by_run.get(run_id, [])
             run["assignments"] = assignments_by_run.get(run_id, [])
@@ -700,7 +809,15 @@ class ApplicationActions:
                 if acceptance is not None
                 else None
             )
-            visible_run_values.append(run)
+            runs_by_repository.setdefault(repository_id, []).append(run)
+            if state in _TERMINAL_RUN_STATES:
+                history_run_values.append(run)
+            else:
+                visible_run_values.append(run)
+        history_run_values.sort(
+            key=lambda run: (str(run["updated_at"]), str(run["id"])),
+            reverse=True,
+        )
         for queue_position, run in enumerate(visible_run_values, start=1):
             run["queue_position"] = queue_position
         teams_by_repository: dict[str, dict[str, object]] = {}
@@ -832,6 +949,7 @@ class ApplicationActions:
             "ready_issues": ready_issues,
             "ready_issue_discovery": ready_issue_discovery,
             "runs": visible_run_values,
+            "run_history": history_run_values,
         }
         if self.model_configuration is not None:
             state["model_configuration"] = self.model_configuration.public_state()
@@ -1228,6 +1346,17 @@ class ApplicationActions:
     def cancel(self, run_id: str) -> None:
         self.lifecycle.cancel(run_id, "canceled by user")
 
+
+    def retry(self, run_id: str) -> str:
+        state = self.lifecycle.retry(run_id)
+        self.scheduler.request_tick()
+        return state
+
+    def restart(self, run_id: str) -> str:
+        replacement_run_id = self.lifecycle.restart(run_id)
+        self.scheduler.request_tick()
+        return replacement_run_id
+
     def poll(self) -> None:
         self.scheduler.request_tick()
 
@@ -1452,6 +1581,10 @@ def _display_acceptance_verification(
                 continue
             observation["log_recorded"] = bool(observation.pop("log_path", None))
     return display
+
+
+def _format_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _display_run_reason(value: object) -> tuple[str | None, bool]:
