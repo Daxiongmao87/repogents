@@ -70,17 +70,29 @@ class RepositoryResourceRevisionTests(unittest.TestCase):
         restarted = RepositoryResourceStore(
             Database(self.root / "repogents.sqlite3"), self.root
         )
-        self.assertEqual(value, restarted.resolve_secret(str(projection["reference"])))
+        self.assertEqual(
+            value,
+            restarted.resolve_secret(
+                str(projection["reference"]), repository_id=self.repository_id
+            ),
+        )
 
         database_bytes = (self.root / "repogents.sqlite3").read_bytes()
         self.assertNotIn(value.encode("utf-8"), database_bytes)
-        secret_path = (
-            self.root
-            / "repository-resources"
-            / "secrets"
-            / self.repository_id
-            / "PRODUCT_KEY"
-        )
+        with self.database.connect() as connection:
+            revision_row = connection.execute(
+                """SELECT repository_secret_revisions.storage_path
+                   FROM repository_secret_revisions
+                   JOIN repository_secrets
+                     ON repository_secrets.id=repository_secret_revisions.repository_secret_id
+                  WHERE repository_secrets.repository_id=?
+                    AND repository_secrets.name=?
+                  ORDER BY repository_secret_revisions.revision DESC
+                  LIMIT 1""",
+                (self.repository_id, "PRODUCT_KEY"),
+            ).fetchone()
+        self.assertIsNotNone(revision_row)
+        secret_path = Path(str(revision_row["storage_path"]))
         self.assertEqual(0o600, os.stat(secret_path).st_mode & 0o777)
         self.assertEqual(0o700, os.stat(secret_path.parent).st_mode & 0o777)
 

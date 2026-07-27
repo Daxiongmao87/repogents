@@ -750,6 +750,10 @@ class PublicationService:
             raise PublicationRevisionRequired(
                 "potential secret in committed diff: " + ", ".join(findings)
             )
+        if self._contains_artifact_content(str(context["id"]), diff):
+            raise PublicationRevisionRequired(
+                "committed diff contains uploaded artifact content"
+            )
         return diff, changed_files
 
     def _stage_pull_request(
@@ -970,8 +974,113 @@ class PublicationService:
         )
         return pull
 
-    @staticmethod
+    def _contains_artifact_content(self, run_id: str, candidate: str) -> bool:
+        """Scan artifact files for every bounded literal or decoded candidate sequence."""
+        import base64
+
+        candidate_bytes = candidate.encode("utf-8", "surrogatepass")
+        short_probes: set[bytes] = set()
+        window_probes: set[bytes] = set()
+
+        def add_probe(value: bytes) -> None:
+            if not value:
+                return
+            if len(value) < 6:
+                short_probes.add(value)
+                return
+            for offset in range(len(value) - 5):
+                window_probes.add(value[offset : offset + 6])
+
+        probe_sources = [candidate_bytes]
+        probe_sources.extend(
+            line[1:]
+            for line in candidate_bytes.splitlines()
+            if line.startswith(b"+") and not line.startswith(b"+++")
+        )
+        for source in probe_sources:
+            if len(source) <= 5:
+                add_probe(source)
+            words = list(re.finditer(rb"\S+", source))
+            for word in words:
+                value = word.group(0)
+                if len(value) >= 6 or any(
+                    byte < ord("a") or byte > ord("z") for byte in value
+                ):
+                    add_probe(value)
+            for index in range(len(words) - 1):
+                phrase = source[words[index].start() : words[index + 1].end()]
+                if len(phrase) <= 5:
+                    add_probe(phrase)
+            for token in re.findall(rb"[A-Za-z0-9_./:+\-=]{3,}", source):
+                add_probe(token)
+            for phrase in re.findall(rb"(?<!\S)(?:\S\s+)+\S(?!\S)", source):
+                add_probe(phrase)
+            for encoded in re.findall(
+                rb"(?<![0-9A-Fa-f])[0-9A-Fa-f]{2,}(?![0-9A-Fa-f])", source
+            ):
+                if len(encoded) % 2 == 0:
+                    try:
+                        add_probe(bytes.fromhex(encoded.decode("ascii")))
+                    except ValueError:
+                        pass
+            for encoded in re.findall(
+                rb"(?<![A-Za-z0-9_\-/+])(?:[A-Za-z0-9_\-/+]{4,}={0,2}|[A-Za-z0-9_\-/+]{2,3}={1,2})(?![A-Za-z0-9_\-/+])",
+                source,
+            ):
+                padded = encoded + b"=" * (-len(encoded) % 4)
+                for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+                    try:
+                        add_probe(decoder(padded))
+                    except (ValueError, base64.binascii.Error):
+                        pass
+
+        if not short_probes and not window_probes:
+            return False
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT sandbox_versions.policy_json
+                   FROM runs
+                   JOIN sandbox_versions
+                     ON sandbox_versions.id=runs.sandbox_version_id
+                   WHERE runs.id=?""",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise PublicationBlocked(
+                "run sandbox version is unavailable for artifact scanning"
+            )
+        payload = json.loads(str(row["policy_json"]))
+        bindings = payload.get("artifact_bindings", [])
+        if not isinstance(bindings, list):
+            raise PublicationBlocked("stored artifact bindings are invalid")
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                raise PublicationBlocked("stored artifact binding is invalid")
+            storage_path = binding.get("storage_path")
+            if not isinstance(storage_path, str):
+                raise PublicationBlocked("stored artifact path is invalid")
+            try:
+                with Path(storage_path).open("rb") as artifact:
+                    overlap = b""
+                    while chunk := artifact.read(1024 * 1024):
+                        block = overlap + chunk
+                        if any(probe in block for probe in short_probes):
+                            return True
+                        if any(
+                            block[offset : offset + 6] in window_probes
+                            for offset in range(max(0, len(block) - 5))
+                        ):
+                            return True
+                        overlap = block[-5:]
+            except OSError as error:
+                name = str(binding.get("name") or storage_path)
+                raise PublicationBlocked(
+                    f"required artifact {name} is unavailable for publication scanning"
+                ) from error
+        return False
+
     def _pull_body(
+        self,
         context: dict[str, object],
         validated_sha: str,
         acceptance: dict[str, object],
@@ -987,6 +1096,10 @@ class PublicationService:
         if validated_sha not in body:
             raise PublicationBlocked(
                 "acceptance proof does not identify the validated commit SHA"
+            )
+        if self._contains_artifact_content(str(context["id"]), body):
+            raise PublicationBlocked(
+                "pull-request proof contains uploaded artifact content"
             )
         if len(body.encode("utf-8")) > 60_000:
             raise PublicationBlocked(

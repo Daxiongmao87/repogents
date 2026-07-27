@@ -794,7 +794,10 @@ class ExecutionService:
             str(run["repository_id"]),
             run_id,
         )
-        policy = _sandbox_policy(sandbox_row)
+        policy = self._resource_command_policy(
+            str(run["sandbox_version_id"]),
+            _sandbox_policy(sandbox_row),
+        )
         source_base_sha = comparison_base_sha or str(run["base_sha"])
         if not re.fullmatch(r"[0-9a-f]{40}", source_base_sha):
             raise ValueError("source comparison base SHA is invalid")
@@ -1447,6 +1450,44 @@ class ExecutionService:
             raise RevisionRequired("agent produced no committed issue change")
         return head
 
+    def _resource_command_policy(
+        self, sandbox_version_id: str, policy: SandboxPolicy
+    ) -> SandboxPolicy:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT policy_json FROM sandbox_versions WHERE id=?",
+                (sandbox_version_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("sandbox version not found for repository resources")
+        payload = json.loads(str(row["policy_json"]))
+        artifacts = payload.get("artifact_bindings", [])
+        if not isinstance(artifacts, list):
+            raise ValueError("stored artifact bindings must be a list")
+        mounts = list(policy.mounts)
+        for value in artifacts:
+            if not isinstance(value, dict):
+                raise ValueError("stored artifact binding is invalid")
+            storage_path = value.get("storage_path")
+            sandbox_path = value.get("sandbox_path")
+            if not isinstance(storage_path, str) or not Path(storage_path).is_absolute():
+                raise ValueError("stored artifact storage path is invalid")
+            if not isinstance(sandbox_path, str) or not sandbox_path.startswith("/"):
+                raise ValueError("stored artifact sandbox path is invalid")
+            if not Path(storage_path).is_file():
+                name = str(value.get("name") or sandbox_path)
+                revision = value.get("revision")
+                raise BaselineUnavailable(
+                    f"required artifact {name} revision {revision} is missing or inaccessible"
+                )
+            mounts.append(Mount(Path(storage_path), sandbox_path, writable=False))
+        return SandboxPolicy(
+            persistent_root=policy.persistent_root,
+            mounts=tuple(mounts),
+            allowed_services=policy.allowed_services,
+            allowed_secret_names=policy.allowed_secret_names,
+        )
+
     def _ensure_validation_baselines(
         self,
         run: dict[str, object],
@@ -1547,7 +1588,7 @@ class ExecutionService:
                 if tuple(command) in commands
             }
             result = self.sandbox.run(
-                policy,
+                self._resource_command_policy(sandbox_version_id, policy),
                 layout,
                 tuple(command),
                 timeout=600,
@@ -1755,7 +1796,7 @@ class ExecutionService:
             }
             self._ensure_not_canceled(run_id)
             result = self.sandbox.run(
-                policy,
+                self._resource_command_policy(sandbox_version_id, policy),
                 layout,
                 tuple(command),
                 timeout=600,
@@ -2128,9 +2169,25 @@ def _sandbox_policy(row: dict[str, object]) -> SandboxPolicy:
                 writable=str(value.get("mode", "read-only")) == "writable",
             )
         )
+    names = tuple(binding[0] for binding in _secret_bindings(row))
+    return SandboxPolicy(
+        persistent_root=Path(str(row["root_path"])),
+        mounts=tuple(mounts),
+        allowed_services=tuple(
+            str(value) for value in payload.get("allowed_services", [])
+        ),
+        allowed_secret_names=names,
+    )
+
+
+def _resource_command_policy(
+    row: dict[str, object], base_policy: SandboxPolicy
+) -> SandboxPolicy:
+    payload = json.loads(str(row["policy_json"]))
     artifacts = payload.get("artifact_bindings", [])
     if not isinstance(artifacts, list):
         raise ValueError("stored artifact bindings must be a list")
+    mounts = list(base_policy.mounts)
     for value in artifacts:
         if not isinstance(value, dict):
             raise ValueError("stored artifact binding is invalid")
@@ -2141,14 +2198,11 @@ def _sandbox_policy(row: dict[str, object]) -> SandboxPolicy:
         if not isinstance(sandbox_path, str) or not sandbox_path.startswith("/"):
             raise ValueError("stored artifact sandbox path is invalid")
         mounts.append(Mount(Path(storage_path), sandbox_path, writable=False))
-    names = tuple(binding[0] for binding in _secret_bindings(row))
     return SandboxPolicy(
-        persistent_root=Path(str(row["root_path"])),
+        persistent_root=base_policy.persistent_root,
         mounts=tuple(mounts),
-        allowed_services=tuple(
-            str(value) for value in payload.get("allowed_services", [])
-        ),
-        allowed_secret_names=names,
+        allowed_services=base_policy.allowed_services,
+        allowed_secret_names=base_policy.allowed_secret_names,
     )
 
 

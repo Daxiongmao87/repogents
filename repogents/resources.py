@@ -267,7 +267,9 @@ class RepositoryResourceStore:
             }
         if action == "replace":
             self._secure_directory(secret_directory)
-            self._atomic_secret_write(path, value)
+            revision_id = str(uuid.uuid4())
+            revision_path = secret_directory / f"{name.lower()}-{revision_id}.secret"
+            self._atomic_secret_write(revision_path, value)
             with self.database.transaction() as connection:
                 connection.execute(
                     """INSERT INTO repository_secrets
@@ -277,12 +279,34 @@ class RepositoryResourceStore:
                            reference=excluded.reference, storage_path=excluded.storage_path,
                            configured_at=excluded.configured_at, updated_at=excluded.updated_at""",
                     (
-                        str(uuid.uuid4()), repository_id, name, reference, str(path), now, now
+                        str(uuid.uuid4()), repository_id, name, reference,
+                        str(revision_path), now, now
                     ),
+                )
+                secret_row = connection.execute(
+                    "SELECT id FROM repository_secrets WHERE repository_id=? AND name=?",
+                    (repository_id, name),
+                ).fetchone()
+                assert secret_row is not None
+                revision = int(
+                    connection.execute(
+                        """SELECT COALESCE(MAX(revision), 0) + 1
+                           FROM repository_secret_revisions
+                          WHERE repository_secret_id=?""",
+                        (str(secret_row["id"]),),
+                    ).fetchone()[0]
+                )
+                connection.execute(
+                    """INSERT INTO repository_secret_revisions
+                       (id, repository_secret_id, revision, storage_path, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (revision_id, str(secret_row["id"]), revision, str(revision_path), now),
                 )
             return {"name": name, "reference": reference, "configured": True}
 
-        path.unlink(missing_ok=True)
+        # Secret revision files are immutable resources. Removing the current
+        # value clears only the mutable repository pointer; retained sandbox
+        # versions may still be pinned to an earlier revision file.
         with self.database.transaction() as connection:
             connection.execute(
                 """INSERT INTO repository_secrets
@@ -314,13 +338,42 @@ class RepositoryResourceStore:
             for row in rows
         ]
 
-    def resolve_secret(self, reference: str) -> str | None:
-        """Controller-only resolution used immediately before authorized execution."""
+    def resolve_secret(
+        self, reference: str, *, repository_id: str | None = None
+    ) -> str | None:
+        """Resolve an authorized secret without crossing repository boundaries.
+
+        Mutable repository references require the caller's repository identity.
+        Immutable revision references remain usable by retained sandbox versions,
+        but are repository-scoped whenever the caller supplies that identity.
+        """
+        revision_prefix = "secret://repository-revision/"
         with self.database.connect() as connection:
-            row = connection.execute(
-                "SELECT storage_path FROM repository_secrets WHERE reference=?",
-                (reference,),
-            ).fetchone()
+            if reference.startswith(revision_prefix):
+                revision_id = reference.removeprefix(revision_prefix)
+                if repository_id is None:
+                    row = connection.execute(
+                        "SELECT storage_path FROM repository_secret_revisions WHERE id=?",
+                        (revision_id,),
+                    ).fetchone()
+                else:
+                    row = connection.execute(
+                        """SELECT repository_secret_revisions.storage_path
+                           FROM repository_secret_revisions
+                           JOIN repository_secrets
+                             ON repository_secrets.id=repository_secret_revisions.repository_secret_id
+                          WHERE repository_secret_revisions.id=?
+                            AND repository_secrets.repository_id=?""",
+                        (revision_id, repository_id),
+                    ).fetchone()
+            elif repository_id is None:
+                return None
+            else:
+                row = connection.execute(
+                    """SELECT storage_path FROM repository_secrets
+                       WHERE repository_id=? AND reference=?""",
+                    (repository_id, reference),
+                ).fetchone()
         if row is None or row["storage_path"] is None:
             return None
         path = Path(str(row["storage_path"]))

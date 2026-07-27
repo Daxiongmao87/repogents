@@ -516,7 +516,8 @@ class SandboxEnvironmentProvisioner:
                     "environment provisioning requires a controller secret resolver"
                 )
             return {
-                name: self.secret_resolver(reference) for name, reference in matched
+                name: self.secret_resolver(reference, repository_id=repository_id)
+                for name, reference in matched
             }
 
         def command_variables(command: tuple[str, ...]) -> dict[str, str] | None:
@@ -1157,14 +1158,67 @@ class OnboardingService:
         allowed_services = tuple(
             sorted(set(inputs.get("allowed_services", [])) | set(inferred_services))
         )
-        artifact_bindings = inputs.get("artifact_bindings", [])
-        for artifact in artifact_bindings:
-            storage_path = Path(str(artifact["storage_path"]))
-            if not storage_path.is_file():
+        artifact_bindings: list[dict[str, object]] = []
+        for requested_artifact in inputs.get("artifact_bindings", []):
+            with self.database.connect() as connection:
+                artifact_row = connection.execute(
+                    """SELECT repository_artifacts.name,
+                              repository_artifacts.description,
+                              artifact_revisions.revision,
+                              artifact_revisions.content_hash,
+                              artifact_revisions.size,
+                              artifact_revisions.created_at,
+                              artifact_revisions.storage_path
+                       FROM repository_artifacts
+                       JOIN artifact_revisions
+                         ON artifact_revisions.artifact_id=repository_artifacts.id
+                       WHERE repository_artifacts.repository_id=?
+                         AND repository_artifacts.name=?
+                         AND artifact_revisions.revision=?""",
+                    (
+                        repository_id,
+                        requested_artifact["name"],
+                        requested_artifact["revision"],
+                    ),
+                ).fetchone()
+            if artifact_row is None:
                 raise MissingRepositoryInput(
                     "artifact_bindings",
-                    f"artifact {artifact['name']} revision {artifact['revision']} is missing or inaccessible; upload or select an available revision",
+                    f"artifact {requested_artifact['name']} revision {requested_artifact['revision']} is missing or inaccessible; upload or select an available revision",
                 )
+            storage_path = Path(str(artifact_row["storage_path"]))
+            try:
+                artifact_size = storage_path.stat().st_size
+                import hashlib
+
+                digest = hashlib.sha256()
+                with storage_path.open("rb") as artifact_file:
+                    for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except (OSError, ValueError):
+                raise MissingRepositoryInput(
+                    "artifact_bindings",
+                    f"artifact {requested_artifact['name']} revision {requested_artifact['revision']} is missing or inaccessible; upload or select an available revision",
+                ) from None
+            expected_hash = str(artifact_row["content_hash"])
+            actual_hash = f"sha256:{digest.hexdigest()}"
+            if artifact_size != int(artifact_row["size"]) or actual_hash != expected_hash:
+                raise MissingRepositoryInput(
+                    "artifact_bindings",
+                    f"artifact {requested_artifact['name']} revision {requested_artifact['revision']} failed its stored integrity check; replace or re-upload the artifact",
+                )
+            artifact_bindings.append(
+                {
+                    "name": str(artifact_row["name"]),
+                    "description": str(artifact_row["description"]),
+                    "revision": int(artifact_row["revision"]),
+                    "content_hash": expected_hash,
+                    "size": int(artifact_row["size"]),
+                    "created_at": str(artifact_row["created_at"]),
+                    "storage_path": str(storage_path),
+                    "sandbox_path": requested_artifact["sandbox_path"],
+                }
+            )
         variable_bindings = inputs.get("variable_bindings", [])
         configured_secret_bindings = inputs.get("secret_bindings", [])
         for binding in configured_secret_bindings:
@@ -1173,8 +1227,8 @@ class OnboardingService:
                 continue
             with self.database.connect() as connection:
                 secret_row = connection.execute(
-                    "SELECT storage_path FROM repository_secrets WHERE reference=?",
-                    (reference,),
+                    "SELECT storage_path FROM repository_secrets WHERE repository_id=? AND reference=?",
+                    (repository_id, reference),
                 ).fetchone()
             if secret_row is None or secret_row["storage_path"] is None:
                 raise MissingRepositoryInput(
@@ -1246,8 +1300,42 @@ class OnboardingService:
             if self.provisioner is not None
             else {"commands": [], "manifests": list(inspection.manifests)}
         )
-        artifact_bindings = inputs.get("artifact_bindings", [])
         variable_bindings = inputs.get("variable_bindings", [])
+        sandbox_secret_pins: list[dict[str, Any]] = []
+        pinned_secret_bindings: list[dict[str, Any]] = []
+        for binding in inputs.get("secret_bindings", []):
+            pinned_binding = dict(binding)
+            reference = str(binding["reference"])
+            if reference.startswith("secret://repository/"):
+                with self.database.connect() as connection:
+                    revision_row = connection.execute(
+                        """SELECT repository_secret_revisions.id,
+                                  repository_secret_revisions.revision
+                           FROM repository_secrets
+                           JOIN repository_secret_revisions
+                             ON repository_secret_revisions.repository_secret_id=repository_secrets.id
+                            AND repository_secret_revisions.storage_path=repository_secrets.storage_path
+                          WHERE repository_secrets.repository_id=?
+                            AND repository_secrets.reference=?""",
+                        (repository_id, reference),
+                    ).fetchone()
+                if revision_row is None:
+                    raise MissingRepositoryInput(
+                        "secret_bindings",
+                        f"saved secret {binding['name']} has no accessible immutable revision; replace it before re-onboarding",
+                    )
+                revision_id = str(revision_row["id"])
+                pinned_binding["reference"] = (
+                    f"secret://repository-revision/{revision_id}"
+                )
+                sandbox_secret_pins.append(
+                    {
+                        "secret_revision_id": revision_id,
+                        "name": str(binding["name"]),
+                        "commands": binding["commands"],
+                    }
+                )
+            pinned_secret_bindings.append(pinned_binding)
         policy = {
             "version": sandbox_version,
             "base_sha": base_sha,
@@ -1255,7 +1343,7 @@ class OnboardingService:
             "allowed_services": list(allowed_services),
             "artifact_bindings": artifact_bindings,
             "variable_bindings": variable_bindings,
-            "secret_bindings": inputs.get("secret_bindings", []),
+            "secret_bindings": pinned_secret_bindings,
             "persistent_root": str(sandbox_path),
         }
         artifact_evidence = [
@@ -1358,6 +1446,18 @@ class OnboardingService:
                        (sandbox_version_id, artifact_revision_id, sandbox_path)
                        VALUES (?, ?, ?)""",
                     (sandbox_id, artifact_revision["id"], artifact["sandbox_path"]),
+                )
+            for secret_pin in sandbox_secret_pins:
+                connection.execute(
+                    """INSERT INTO sandbox_secret_revisions
+                       (sandbox_version_id, secret_revision_id, name, commands_json)
+                       VALUES (?, ?, ?, ?)""",
+                    (
+                        sandbox_id,
+                        secret_pin["secret_revision_id"],
+                        secret_pin["name"],
+                        _json(secret_pin["commands"]),
+                    ),
                 )
             connection.execute(
                 """INSERT INTO team_versions

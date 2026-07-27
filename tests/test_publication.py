@@ -1646,5 +1646,168 @@ class PublicationTests(unittest.TestCase):
         self.assertIn("forbidden", self.lifecycle.get_run("run-1")["reason"].lower())
 
 
+class ArtifactPublicationIsolationTests(unittest.TestCase):
+    def _artifact_scanner(self, content: bytes):
+        import tempfile
+        from contextlib import contextmanager
+
+        from repogents.publication import PublicationService
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        artifact_path = Path(temporary.name) / "fixture.bin"
+        artifact_path.write_bytes(content)
+        row = {
+            "policy_json": json.dumps(
+                {
+                    "artifact_bindings": [
+                        {
+                            "name": "fixture-sdk",
+                            "storage_path": str(artifact_path),
+                        }
+                    ]
+                }
+            )
+        }
+
+        class Connection:
+            def execute(self, statement: str, parameters: tuple[str, ...]):
+                del statement, parameters
+                return self
+
+            def fetchone(self):
+                return row
+
+        class Database:
+            @contextmanager
+            def connect(self):
+                yield Connection()
+
+        service = PublicationService.__new__(PublicationService)
+        service.database = Database()
+        return service
+
+    def test_artifact_scanning_detects_short_literal_content_on_added_lines(self) -> None:
+        for content in (b"Q", b"QZ", b"XYZ", b"WXYZ", b"VWXYZ"):
+            with self.subTest(content=content):
+                service = self._artifact_scanner(content)
+                literal = content.decode("ascii")
+                self.assertTrue(
+                    service._contains_artifact_content(
+                        "run-1", f"diff --git a/value b/value\n+{literal}\n"
+                    )
+                )
+
+    def test_artifact_scanning_detects_one_and_two_byte_encoded_content(self) -> None:
+        import base64
+
+        for content in (b"\x01", b"\x01\xfe"):
+            with self.subTest(content=content, encoding="base64"):
+                service = self._artifact_scanner(content)
+                self.assertTrue(
+                    service._contains_artifact_content(
+                        "run-1", base64.b64encode(content).decode("ascii")
+                    )
+                )
+            with self.subTest(content=content, encoding="hex"):
+                service = self._artifact_scanner(content)
+                self.assertTrue(
+                    service._contains_artifact_content("run-1", content.hex())
+                )
+
+    def test_artifact_scanning_detects_short_literal_content(self) -> None:
+        cases = (
+            (b"prefix-LIC-suffix", "added LIC value"),
+            (b"prefix-a b-suffix", "copied a b value"),
+            (b"prefix-!!!-suffix", "copied !!! value"),
+        )
+        for content, candidate in cases:
+            with self.subTest(content=content):
+                service = self._artifact_scanner(content)
+                self.assertTrue(
+                    service._contains_artifact_content("run-1", candidate)
+                )
+
+    def test_artifact_scanning_detects_short_encoded_binary_fragments(self) -> None:
+        import base64
+
+        content = bytes(range(32))
+        fragment = content[3:6]
+        service = self._artifact_scanner(content)
+
+        self.assertTrue(
+            service._contains_artifact_content(
+                "run-1", base64.b64encode(fragment).decode("ascii")
+            )
+        )
+        self.assertTrue(
+            service._contains_artifact_content("run-1", fragment.hex())
+        )
+
+    def test_artifact_scanning_streams_large_artifacts(self) -> None:
+        content = b"x" * (3 * 1024 * 1024) + b"BOUNDARY-PROBE"
+        service = self._artifact_scanner(content)
+
+        self.assertTrue(
+            service._contains_artifact_content("run-1", "contains BOUNDARY-PROBE")
+        )
+        self.assertFalse(
+            service._contains_artifact_content("run-1", "artifact metadata only")
+        )
+
+    def test_committed_diff_review_uses_bounded_artifact_scanner(self) -> None:
+        import inspect
+
+        from repogents.publication import PublicationService
+
+        source = inspect.getsource(PublicationService)
+        self.assertIn("_contains_artifact_content(str(context[\"id\"]), diff)", source)
+        self.assertNotIn("_artifact_text_values", source)
+        self.assertIn("committed diff contains uploaded artifact content", source)
+
+    def test_pull_request_body_rejects_uploaded_artifact_content(self) -> None:
+        from unittest.mock import patch
+
+        from repogents.publication import PublicationBlocked
+
+        artifact_content = b"licensed fixture bytes must remain controller-only"
+        service = self._artifact_scanner(artifact_content)
+        context = {
+            "id": "run-1",
+            "issue_url": "https://github.com/example/project/issues/7",
+            "issue_number": 7,
+            "validated_issue_version_id": "issue-version-1",
+        }
+        with patch(
+            "repogents.publication.render_acceptance_markdown",
+            return_value=f"Validated commit {'a' * 40}\nlicensed fixture bytes",
+        ):
+            with self.assertRaisesRegex(
+                PublicationBlocked, "pull-request proof contains uploaded artifact content"
+            ):
+                service._pull_body(context, "a" * 40, {})
+
+    def test_pull_request_body_allows_artifact_metadata_without_bytes(self) -> None:
+        from unittest.mock import patch
+
+        artifact_content = b"controller-only-product-key-material"
+        service = self._artifact_scanner(artifact_content)
+        metadata = "fixture-sdk revision 2 at /repository-resources/artifacts/fixture-sdk"
+        context = {
+            "id": "run-1",
+            "issue_url": "https://github.com/example/project/issues/7",
+            "issue_number": 7,
+            "validated_issue_version_id": "issue-version-1",
+        }
+        with patch(
+            "repogents.publication.render_acceptance_markdown",
+            return_value=f"Validated commit {'b' * 40}\n{metadata}",
+        ):
+            body = service._pull_body(context, "b" * 40, {})
+
+        self.assertIn(metadata, body)
+        self.assertNotIn(artifact_content.decode("ascii"), body)
+
+
 if __name__ == "__main__":
     unittest.main()

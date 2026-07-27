@@ -2870,5 +2870,59 @@ class MiniSweRejectionTests(unittest.TestCase):
             service.execute("run-1")
 
 
+class RepositoryArtifactRuntimeIsolationTests(unittest.TestCase):
+    def test_agent_policy_mounts_artifact_read_only_while_model_evidence_retains_only_metadata(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from repogents.execution import _resource_command_policy, _sandbox_policy
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            artifact_path = root / "fixture-sdk.bin"
+            (root / "persistent").mkdir()
+            artifact_bytes = b"licensed-artifact-bytes-must-not-reach-model-context"
+            artifact_path.write_bytes(artifact_bytes)
+            metadata = {
+                "name": "fixture-sdk",
+                "description": "Licensed fixture SDK used only by resource commands",
+                "revision": 1,
+                "content_hash": "sha256:" + ("a" * 64),
+                "size": len(artifact_bytes),
+                "created_at": "2026-01-01T00:00:00Z",
+                "storage_path": str(artifact_path),
+                "sandbox_path": "/repository-resources/artifacts/fixture-sdk",
+            }
+            row = {
+                "root_path": str(root / "persistent"),
+                "policy_json": json.dumps({"artifact_bindings": [metadata]}),
+            }
+
+            policy = _resource_command_policy(row, _sandbox_policy(row))
+
+            artifact_mount = next(
+                mount for mount in policy.mounts if mount.host_path == artifact_path
+            )
+            self.assertEqual(
+                artifact_mount.sandbox_path,
+                "/repository-resources/artifacts/fixture-sdk",
+            )
+            self.assertFalse(artifact_mount.writable)
+            projected_evidence = json.dumps(
+                {
+                    "name": metadata["name"],
+                    "description": metadata["description"],
+                    "revision": metadata["revision"],
+                    "content_hash": metadata["content_hash"],
+                    "size": metadata["size"],
+                    "sandbox_path": metadata["sandbox_path"],
+                },
+                sort_keys=True,
+            )
+            self.assertIn("Licensed fixture SDK", projected_evidence)
+            self.assertNotIn(artifact_bytes.decode(), projected_evidence)
+
+
 if __name__ == "__main__":
     unittest.main()

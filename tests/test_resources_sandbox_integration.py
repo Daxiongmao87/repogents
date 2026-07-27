@@ -155,6 +155,13 @@ class RepositoryResourcesSandboxIntegrationTests(OnboardingTests):
                 ),
             )
 
+        replacement_secret_value = "replacement-product-key-that-must-not-leak"
+        store.update_secret(
+            repository_id,
+            name="PRODUCT_KEY",
+            action="replace",
+            value=replacement_secret_value,
+        )
         second = store.upload_artifact(
             repository_id,
             name="fixture-sdk",
@@ -180,9 +187,35 @@ class RepositoryResourcesSandboxIntegrationTests(OnboardingTests):
                    ORDER BY artifact_revisions.revision""",
                 (first_sandbox_id, second_sandbox_id),
             ).fetchall()
+            secret_pins = connection.execute(
+                """SELECT sandbox_secret_revisions.sandbox_version_id,
+                          repository_secret_revisions.revision,
+                          repository_secret_revisions.id
+                   FROM sandbox_secret_revisions
+                   JOIN repository_secret_revisions
+                     ON repository_secret_revisions.id=sandbox_secret_revisions.secret_revision_id
+                   WHERE sandbox_secret_revisions.sandbox_version_id IN (?, ?)
+                   ORDER BY repository_secret_revisions.revision""",
+                (first_sandbox_id, second_sandbox_id),
+            ).fetchall()
         self.assertEqual(
             [(first_sandbox_id, 1), (second_sandbox_id, 2)],
             [(str(row["sandbox_version_id"]), int(row["revision"])) for row in pinned],
+        )
+        self.assertEqual(
+            [(first_sandbox_id, 1), (second_sandbox_id, 2)],
+            [
+                (str(row["sandbox_version_id"]), int(row["revision"]))
+                for row in secret_pins
+            ],
+        )
+        pinned_secret_values = [
+            store.resolve_secret(f"secret://repository-revision/{row['id']}")
+            for row in secret_pins
+        ]
+        self.assertEqual(
+            [secret_value, replacement_secret_value],
+            pinned_secret_values,
         )
 
         # Validate the already-created run after v2 exists.  Execution must keep

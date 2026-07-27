@@ -608,6 +608,135 @@ class SandboxPolicyTests(unittest.TestCase):
         )
         self.assertEqual(later.stdout.strip(), "missing")
 
+    def test_artifact_content_is_redacted_before_logs_or_results(self) -> None:
+        artifact = self.root / "fixture.bin"
+        artifact.write_bytes(b"prefix-LICENSED-FIXTURE-\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b-suffix")
+        sandbox_path = "/repository-resources/artifacts/fixture-sdk"
+        policy = SandboxPolicy(
+            persistent_root=self.persistent,
+            mounts=(Mount(artifact, sandbox_path),),
+        )
+        code = (
+            "from pathlib import Path; "
+            f"data=Path('{sandbox_path}').read_bytes(); "
+            "print(data[7:15].decode()); print(data[24:36].hex())"
+        )
+
+        result = SandboxManager().run(
+            policy, self.layout, ("python3", "-c", code), timeout=20
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("LICENSED", result.stdout)
+        self.assertNotIn(artifact.read_bytes()[24:36].hex(), result.stdout)
+        self.assertIn("[REDACTED]", result.stdout)
+        persisted = result.log_path.read_text(encoding="utf-8")
+        self.assertNotIn("LICENSED", persisted)
+        self.assertNotIn(artifact.read_bytes()[24:36].hex(), persisted)
+
+    def test_short_and_encoded_artifact_fragments_are_redacted(self) -> None:
+        import base64
+
+        artifact = self.root / "fixture.bin"
+        artifact.write_bytes(b"prefix-XYZ-\x00\x01\x02\x03\x04\x05-suffix")
+        sandbox_path = "/repository-resources/artifacts/fixture-sdk"
+        policy = SandboxPolicy(
+            persistent_root=self.persistent,
+            mounts=(Mount(artifact, sandbox_path),),
+        )
+        literal = "XYZ"
+        binary = artifact.read_bytes()[11:17]
+        encoded = base64.urlsafe_b64encode(binary).decode("ascii")
+        code = f"print({literal!r}); print({encoded!r})"
+
+        result = SandboxManager().run(
+            policy, self.layout, ("python3", "-c", code), timeout=20
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(literal, result.stdout)
+        self.assertNotIn(encoded, result.stdout)
+        self.assertEqual(result.stdout.count("[REDACTED]"), 2)
+        persisted = result.log_path.read_text(encoding="utf-8")
+        self.assertNotIn(literal, persisted)
+        self.assertNotIn(encoded, persisted)
+
+    def test_punctuation_and_whitespace_separated_artifact_content_is_redacted(self) -> None:
+        artifact = self.root / "literal-fixture.bin"
+        artifact.write_bytes(b"prefix-a b-middle-!!!-suffix")
+        policy = SandboxPolicy(
+            persistent_root=self.persistent,
+            mounts=(
+                Mount(artifact, "/repository-resources/artifacts/literal-fixture"),
+            ),
+        )
+        code = "print('a b'); print('!!!')"
+
+        result = SandboxManager().run(
+            policy, self.layout, ("python3", "-c", code), timeout=20
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("a b", result.stdout)
+        self.assertNotIn("!!!", result.stdout)
+        self.assertEqual(result.stdout.count("[REDACTED]"), 2)
+        persisted = result.log_path.read_text(encoding="utf-8")
+        self.assertNotIn("a b", persisted)
+        self.assertNotIn("!!!", persisted)
+
+    def test_one_and_two_byte_artifact_content_is_redacted_from_results_and_logs(self) -> None:
+        import base64
+
+        artifact = self.root / "tiny-fixture.bin"
+        artifact.write_bytes(b"QZ\x01\xfe")
+        sandbox_path = "/repository-resources/artifacts/tiny-fixture"
+        policy = SandboxPolicy(
+            persistent_root=self.persistent,
+            mounts=(Mount(artifact, sandbox_path),),
+        )
+        encoded_one = base64.b64encode(b"\x01").decode("ascii")
+        encoded_two = base64.b64encode(b"\x01\xfe").decode("ascii")
+        code = (
+            "print('Q'); print('QZ'); print('01'); print('01fe'); "
+            f"print({encoded_one!r}); print({encoded_two!r})"
+        )
+
+        result = SandboxManager().run(
+            policy, self.layout, ("python3", "-c", code), timeout=20
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for exposed in ("Q", "QZ", "01", "01fe", encoded_one, encoded_two):
+            self.assertNotIn(exposed, result.stdout)
+        self.assertEqual(result.stdout.count("[REDACTED]"), 6)
+        import json
+
+        persisted = json.loads(result.log_path.read_text(encoding="utf-8"))
+        persisted_output = "\n".join(
+            (persisted["stdout"], persisted["stderr"], *persisted["command"])
+        )
+        for exposed in ("Q", "QZ", "01", "01fe", encoded_one, encoded_two):
+            self.assertNotIn(exposed, persisted_output)
+
+    def test_large_artifact_redaction_does_not_build_artifact_sized_markers(self) -> None:
+        artifact = self.root / "large-fixture.bin"
+        marker = b"licensed-tail-marker"
+        artifact.write_bytes((b"A" * (4 * 1024 * 1024)) + marker)
+        sandbox_path = "/repository-resources/artifacts/fixture-sdk"
+        policy = SandboxPolicy(
+            persistent_root=self.persistent,
+            mounts=(Mount(artifact, sandbox_path),),
+        )
+        code = f"print({marker.decode('ascii')!r})"
+
+        result = SandboxManager().run(
+            policy, self.layout, ("python3", "-c", code), timeout=20
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "[REDACTED]")
+        self.assertNotIn(marker.decode("ascii"), result.log_path.read_text(encoding="utf-8"))
+
     def test_direct_host_loopback_is_unreachable(self) -> None:
         server = socket.socket()
         server.bind(("127.0.0.1", 0))

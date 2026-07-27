@@ -1530,8 +1530,12 @@ def build_runtime(
     database.initialize()
     resource_store = RepositoryResourceStore(database, root)
 
-    def secret_resolver(reference: str) -> str:
-        saved_value = resource_store.resolve_secret(reference)
+    def secret_resolver(
+        reference: str, *, repository_id: str | None = None
+    ) -> str:
+        saved_value = resource_store.resolve_secret(
+            reference, repository_id=repository_id
+        )
         if saved_value is not None:
             return saved_value
         if reference.startswith(("secret://repository/", "secret://repository-")):

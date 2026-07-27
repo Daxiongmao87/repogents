@@ -239,6 +239,7 @@ class LocalInterfaceServer:
                 len(segments) == 4
                 and segments[:2] == ["api", "repositories"]
                 and segments[3] == "artifacts"
+                and "revision" not in payload
             ):
                 name = payload.get("name")
                 description = payload.get("description", "")
@@ -874,6 +875,7 @@ details > summary { cursor: pointer; }
               <summary>Repository inputs</summary>
               <p class="muted">Optional JSON for host paths, services, secrets, provisioning, or validation overrides.</p>
               <div class="resources-editor" data-resources-editor>
+                <fieldset><legend>Host path mounts</legend><p class="muted">Mount an existing host path at an optional stable sandbox target. Choose writable access only when the repository requires it.</p><div data-resource-list="host-paths"></div><button type="button" class="button small" data-add-resource="host-path">Add host path</button></fieldset>
                 <fieldset><legend>Artifacts</legend><p class="muted">Upload licensed SDKs, fixtures, or other binary resources. Artifacts are mounted read-only and pinned when the repository is onboarded.</p><div data-resource-list="artifacts"></div><button type="button" class="button small" data-add-resource="artifact">Add artifact</button></fieldset>
                 <fieldset><legend>Variables</legend><p class="muted">Non-secret environment values scoped to selected provisioning or validation commands.</p><div data-resource-list="variables"></div><button type="button" class="button small" data-add-resource="variable">Add variable</button></fieldset>
                 <fieldset><legend>Secrets</legend><p class="muted">Values are write-only. Blank values preserve configured secrets; use Replace or Remove explicitly.</p><div data-resource-list="secrets"></div><button type="button" class="button small" data-add-resource="secret">Add secret</button></fieldset>
@@ -963,10 +965,16 @@ let suppressRunClick = false;
 let modelCatalog = {available:false, reason:'Not loaded', models:[]};
 const displayInputs = new Map();
 const resourceEditor = document.querySelector('[data-resources-editor]');
+const resourcePolicyPreview = document.createElement('section');
+resourcePolicyPreview.className = 'resource-policy-preview';
+resourcePolicyPreview.setAttribute('aria-live', 'polite');
+resourcePolicyPreview.innerHTML = '<h3>Resulting policy preview</h3><p class="muted">This normalized policy will be pinned to the new immutable repository environment. Secret values are never displayed.</p><pre data-resource-policy-preview>Complete the resource fields to preview the resulting policy.</pre>';
+resourceEditor?.append(resourcePolicyPreview);
 const resourceTemplates = {
+  'host-path': () => `<div class="resource-row" data-resource-row="host-path"><label>Host path <input data-field="path" required placeholder="/opt/vendor-sdk"></label><label>Sandbox target (optional) <input data-field="target" placeholder="/vendor-sdk"></label><label>Access <select data-field="mode"><option value="read-only">Read-only</option><option value="writable">Writable</option></select></label><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
   artifact: () => `<div class="resource-row" data-resource-row="artifact"><label>Stable name <input data-field="name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]*"></label><label>Description <input data-field="description" required></label><label>Sandbox path <input data-field="sandbox_path" required value="/repository-resources/artifacts/" pattern="/repository-resources/artifacts/.+" title="Use a path below /repository-resources/artifacts/" aria-describedby="artifact-path-help"></label><span class="muted" id="artifact-path-help">Artifacts are mounted read-only below /repository-resources/artifacts/.</span><label>Artifact file <input data-field="file" type="file" required></label><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
-  variable: () => `<div class="resource-row" data-resource-row="variable"><label>Name <input data-field="name" required pattern="[A-Za-z_][A-Za-z0-9_]*"></label><label>Value <input data-field="value"></label><label>Command scopes <textarea data-field="commands" rows="3" placeholder="one command per line"></textarea></label><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
-  secret: () => `<div class="resource-row" data-resource-row="secret"><label>Name <input data-field="name" required pattern="[A-Za-z_][A-Za-z0-9_]*"></label><span class="badge" data-field="configured_status">Not configured</span><label>Value <input data-field="value" type="password" autocomplete="new-password" placeholder="Blank preserves current value"></label><label>Action <select data-field="action"><option value="preserve">Preserve</option><option value="replace">Replace</option><option value="remove">Remove</option></select></label><label>Command scopes <textarea data-field="commands" rows="3" placeholder="one command per line"></textarea></label><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
+  variable: () => `<div class="resource-row" data-resource-row="variable"><label>Name <input data-field="name" required pattern="[A-Za-z_][A-Za-z0-9_]*"></label><label>Value <input data-field="value"></label><fieldset data-field="commands" class="command-scopes"><legend>Command scopes</legend><p class="muted">Select configured provisioning and validation commands.</p></fieldset><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
+  secret: () => `<div class="resource-row" data-resource-row="secret"><label>Name <input data-field="name" required pattern="[A-Za-z_][A-Za-z0-9_]*"></label><span class="badge" data-field="configured_status">Not configured</span><label>Value <input data-field="value" type="password" autocomplete="new-password" placeholder="Blank preserves current value"></label><label>Action <select data-field="action"><option value="preserve">Preserve</option><option value="replace">Replace</option><option value="remove">Remove</option></select></label><fieldset data-field="commands" class="command-scopes"><legend>Command scopes</legend><p class="muted">Select configured provisioning and validation commands.</p></fieldset><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
   service: () => `<div class="resource-row" data-resource-row="service"><label>Host and port <input data-field="value" required placeholder="vendor.example:443"></label><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
   provisioning: () => `<div class="resource-row" data-resource-row="provisioning"><label>Command arguments (JSON array) <input data-field="value" required placeholder='["python","provision.py"]'></label><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
   validation: () => `<div class="resource-row" data-resource-row="validation"><label>Command arguments (JSON array) <input data-field="value" required placeholder='["python","-m","unittest"]'></label><button type="button" class="button small" data-remove-resource>Remove</button></div>`,
@@ -984,18 +992,45 @@ const parsedJsonField = (control, description) => {
     return resourceFieldError(control, `${description} must be valid JSON.`);
   }
 };
-const commandRows = (control, description = 'Command scopes') => String(control.value || '').split('\n').map(line => line.trim()).filter(Boolean).map((line, index) => {
-  let command;
-  try {
-    command = JSON.parse(line);
-  } catch (_failure) {
-    return resourceFieldError(control, `${description} line ${index + 1} must be a JSON array.`);
+const configuredCommandChoices = editor => ['provisioning', 'validation'].flatMap(kind =>
+  [...editor.querySelectorAll(`[data-resource-row="${kind}"]`)].map((row, index) => ({
+    kind, index, value:row.querySelector('[data-field="value"]')?.value || '',
+  }))
+);
+const refreshCommandScopes = editor => {
+  const choices = configuredCommandChoices(editor);
+  for (const scope of editor.querySelectorAll('[data-field="commands"]')) {
+    const selected = new Set([
+      ...[...scope.querySelectorAll('input:checked')].map(input => input.value),
+      ...String(scope.textContent || '').split('\n').map(value => value.trim()).filter(value => value.startsWith('[')),
+    ]);
+    scope.querySelectorAll('label, .scope-empty').forEach(node => node.remove());
+    for (const choice of choices) {
+      const signature = choice.value.trim();
+      const label = document.createElement('label');
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.value = signature;
+      input.dataset.commandKind = choice.kind;
+      input.dataset.commandIndex = String(choice.index);
+      input.checked = selected.has(signature);
+      label.append(input, ` ${choice.kind === 'provisioning' ? 'Provisioning' : 'Validation'} ${choice.index + 1}: ${signature}`);
+      scope.append(label);
+    }
+    if (!choices.length) scope.insertAdjacentHTML('beforeend', '<span class="muted scope-empty">Add a provisioning or validation command to select it.</span>');
   }
-  if (!Array.isArray(command) || !command.length || command.some(argument => typeof argument !== 'string' || !argument)) {
-    return resourceFieldError(control, `${description} line ${index + 1} must be a non-empty JSON array of non-empty strings.`);
-  }
-  control.setCustomValidity('');
-  return command;
+};
+const commandRows = control => {
+  const editor = control.closest('[data-resources-editor]');
+  refreshCommandScopes(editor);
+  return [...control.querySelectorAll('input:checked')].map(input => {
+    const row = editor.querySelectorAll(`[data-resource-row="${input.dataset.commandKind}"]`)[Number(input.dataset.commandIndex)];
+    return parsedJsonField(row.querySelector('[data-field="value"]'), 'Selected command scope');
+  });
+};
+resourceEditor?.addEventListener('focusin', () => refreshCommandScopes(resourceEditor));
+resourceEditor?.addEventListener('input', event => {
+  if (event.target.matches('[data-resource-row="provisioning"] [data-field="value"], [data-resource-row="validation"] [data-field="value"]')) refreshCommandScopes(resourceEditor);
 });
 const resourceDraft = editor => {
   const form = editor.closest('form');
@@ -1012,8 +1047,20 @@ const resourceDraft = editor => {
     form.reportValidity();
     throw new Error('Correct the highlighted resource fields.');
   }
-  advanced.allowed_services = rows('service').map(row => field(row, 'value').trim()).filter(Boolean);
-  advanced.provisioning_commands = rows('provisioning').map((row, index) => {
+  const hostPaths = rows('host-path').map(row => {
+    const path = field(row, 'path').trim();
+    const target = field(row, 'target').trim();
+    const mount = {path, mode:field(row, 'mode')};
+    if (target) mount.target = target;
+    return mount;
+  });
+  if (hostPaths.length) advanced.allowed_host_paths = hostPaths;
+  else delete advanced.allowed_host_paths;
+  const services = rows('service').map(row => field(row, 'value').trim()).filter(Boolean);
+  if (services.length) advanced.allowed_services = services;
+  else delete advanced.allowed_services;
+  const provisioningRows = rows('provisioning');
+  if (provisioningRows.length) advanced.provisioning_commands = provisioningRows.map((row, index) => {
     const commandControl = control(row, 'value');
     const command = parsedJsonField(commandControl, `Provisioning command ${index + 1}`);
     if (!Array.isArray(command) || !command.length || command.some(argument => typeof argument !== 'string' || !argument)) {
@@ -1021,7 +1068,9 @@ const resourceDraft = editor => {
     }
     return command;
   });
-  advanced.validation_commands = rows('validation').map((row, index) => {
+  else delete advanced.provisioning_commands;
+  const validationRows = rows('validation');
+  if (validationRows.length) advanced.validation_commands = validationRows.map((row, index) => {
     const commandControl = control(row, 'value');
     const command = parsedJsonField(commandControl, `Validation command ${index + 1}`);
     if (!Array.isArray(command) || !command.length || command.some(argument => typeof argument !== 'string' || !argument)) {
@@ -1029,11 +1078,14 @@ const resourceDraft = editor => {
     }
     return command;
   });
-  advanced.variable_bindings = rows('variable').map(row => ({
+  else delete advanced.validation_commands;
+  const variableBindings = rows('variable').map(row => ({
     name:field(row, 'name').trim(),
     value:field(row, 'value'),
     commands:commandRows(control(row, 'commands')),
   }));
+  if (variableBindings.length) advanced.variable_bindings = variableBindings;
+  else delete advanced.variable_bindings;
   delete advanced.artifact_uploads;
   const artifacts = rows('artifact').map(row => {
     const pathControl = control(row, 'sandbox_path');
@@ -1074,6 +1126,39 @@ const structuredInputs = (editor, repositoryId = '', artifactBindings = []) => {
   draft.advanced.secret_bindings = [...legacySecretBindings, ...managedSecretBindings];
   return draft.advanced;
 };
+const updateResourcePolicyPreview = () => {
+  const preview = resourcePolicyPreview.querySelector('[data-resource-policy-preview]');
+  if (!resourceEditor || !preview) return;
+  try {
+    const draft = resourceDraft(resourceEditor);
+    const artifactBindings = draft.artifacts.map(artifact => ({
+      name:artifact.name,
+      description:artifact.description,
+      sandbox_path:artifact.sandbox_path,
+      revision:artifact.revision || 'new immutable revision',
+      size:artifact.file ? artifact.file.size : null,
+      mount:'read-only',
+    }));
+    const repositorySecrets = draft.secrets.map(secret => {
+      const row = [...resourceEditor.querySelectorAll('[data-resource-row="secret"]')].find(candidate =>
+        field(candidate, 'name').trim() === secret.name
+      );
+      return {
+        name:secret.name,
+        configured:row?.querySelector('[data-field="configured_status"]')?.textContent === 'Configured',
+        action:secret.action,
+        commands:secret.commands,
+      };
+    });
+    preview.textContent = JSON.stringify({
+      ...draft.advanced,
+      artifact_bindings:artifactBindings,
+      repository_secrets:repositorySecrets,
+    }, null, 2);
+  } catch (error) {
+    preview.textContent = 'Complete the highlighted resource fields to preview the resulting policy.';
+  }
+};
 let reonboardRepositoryId = null;
 const hydrateResources = (editor, inputs = {}) => {
   editor.querySelectorAll('[data-resource-row]').forEach(row => row.remove());
@@ -1089,17 +1174,24 @@ const hydrateResources = (editor, inputs = {}) => {
       if (fileControl) fileControl.required = false;
     }
     for (const [name, value] of Object.entries(values)) {
+      if (name === 'commands' && Array.isArray(value)) {
+        row.dataset.selectedCommands = JSON.stringify(value.map(command => JSON.stringify(command)));
+        continue;
+      }
       const control = row.querySelector(`[data-field="${name}"]`);
       if (!control || control.type === 'file') continue;
       if ('value' in control) control.value = value ?? '';
       else control.textContent = value ?? '';
     }
   };
+  for (const mount of inputs.allowed_host_paths || []) append('host-path', {
+    path:mount.path, target:mount.target || '', mode:mount.mode || 'read-only',
+  });
   for (const value of inputs.allowed_services || []) append('service', {value});
   for (const value of inputs.provisioning_commands || []) append('provisioning', {value:JSON.stringify(value)});
   for (const value of inputs.validation_commands || []) append('validation', {value:JSON.stringify(value)});
   for (const binding of inputs.variable_bindings || []) append('variable', {
-    name:binding.name, value:binding.value, commands:(binding.commands || []).map(JSON.stringify).join('\n'),
+    name:binding.name, value:binding.value, commands:binding.commands || [],
   });
   const secretStatus = new Map((inputs.resource_secrets || []).map(secret => [secret.name, Boolean(secret.configured)]));
   for (const binding of inputs.secret_bindings || []) {
@@ -1107,39 +1199,40 @@ const hydrateResources = (editor, inputs = {}) => {
     append('secret', {
       name:binding.name, value:'', action:'preserve',
       configured_status:secretStatus.get(binding.name) ? 'Configured' : 'Not configured',
-      commands:(binding.commands || []).map(JSON.stringify).join('\n'),
+      commands:binding.commands || [],
     });
   }
   for (const artifact of inputs.artifact_bindings || []) append('artifact', {
     name:artifact.name, description:artifact.description || '',
     sandbox_path:artifact.sandbox_path, revision:artifact.revision,
   });
+  refreshCommandScopes(editor);
+  for (const row of editor.querySelectorAll('[data-resource-row="variable"], [data-resource-row="secret"]')) {
+    const selected = new Set(JSON.parse(row.dataset.selectedCommands || '[]'));
+    for (const input of row.querySelectorAll('[data-field="commands"] input')) input.checked = selected.has(input.value);
+    delete row.dataset.selectedCommands;
+  }
   const {resource_secrets: _resourceSecrets, ...advancedInputs} = inputs;
+  delete advancedInputs.allowed_host_paths;
   editor.closest('form').elements.inputs.value = JSON.stringify(advancedInputs, null, 2);
+  updateResourcePolicyPreview();
 };
 resourceEditor?.addEventListener('click', event => {
   const add = event.target.closest('[data-add-resource]');
   if (add) {
     const kind = add.dataset.addResource;
-    const list = resourceEditor.querySelector(`[data-resource-list="${kind === 'artifact' ? 'artifacts' : kind === 'variable' ? 'variables' : kind === 'secret' ? 'secrets' : kind === 'service' ? 'services' : kind}"]`);
+    const listName = kind === 'host-path' ? 'host-paths' : kind === 'artifact' ? 'artifacts' : kind === 'variable' ? 'variables' : kind === 'secret' ? 'secrets' : kind === 'service' ? 'services' : kind;
+    const list = resourceEditor.querySelector(`[data-resource-list="${listName}"]`);
     list?.insertAdjacentHTML('beforeend', resourceTemplates[kind]());
     list?.lastElementChild?.querySelector('input,select')?.focus();
   }
   const remove = event.target.closest('[data-remove-resource]');
   if (remove) {
-    const row = remove.closest('[data-resource-row]');
-    const revision = Number(row?.dataset.revision || 0);
-    const name = row?.querySelector('[data-field="name"]')?.value?.trim() || '';
-    if (revision && reonboardRepositoryId) {
-      if (!confirm(`Remove artifact ${name} revision ${revision} from durable storage? Referenced revisions cannot be removed.`)) return;
-      return action(async () => {
-        await mutate(`/api/repositories/${encodeURIComponent(reonboardRepositoryId)}/artifacts`, {name, revision});
-        row?.remove();
-      });
-    }
-    row?.remove();
+    remove.closest('[data-resource-row]')?.remove();
   }
+  if (add || remove) updateResourcePolicyPreview();
 });
+resourceEditor?.addEventListener('change', updateResourcePolicyPreview);
 const error = document.querySelector('#error');
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const boundedMessage = value => {

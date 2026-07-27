@@ -251,6 +251,8 @@ class FakeActions:
         self, repository_id: str, *, name: str, revision: int
     ) -> None:
         self.calls.append(("remove-artifact", repository_id, name, revision))
+        if revision == 1:
+            raise ValueError("artifact revision is retained by sandbox version sandbox-1")
 
     def update_repository_secret(
         self,
@@ -498,6 +500,56 @@ class InterfaceTests(unittest.TestCase):
             self.actions.calls,
         )
 
+    def test_artifact_row_removal_only_unbinds_the_next_environment(self) -> None:
+        status, _, body = self.request("GET", "/")
+
+        self.assertEqual(status, 200)
+        dashboard = body.decode("utf-8")
+        self.assertIn(
+            "remove.closest('[data-resource-row]')?.remove();", dashboard
+        )
+        self.assertNotIn(
+            "Remove artifact ${name} revision ${revision} from durable storage?",
+            dashboard,
+        )
+        self.assertNotIn(
+            "await mutate(`/api/repositories/${encodeURIComponent(reonboardRepositoryId)}/artifacts`, {name, revision});",
+            dashboard,
+        )
+
+    def test_repository_artifact_removal_endpoint_removes_unreferenced_revision(
+        self,
+    ) -> None:
+        status, _, body = self.request(
+            "POST",
+            "/api/repositories/repo-1/artifacts",
+            {"name": "fixture-sdk", "revision": 2},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"ok": True})
+        self.assertIn(
+            ("remove-artifact", "repo-1", "fixture-sdk", 2),
+            self.actions.calls,
+        )
+
+    def test_repository_artifact_removal_endpoint_rejects_retained_revision(
+        self,
+    ) -> None:
+        status, _, body = self.request(
+            "POST",
+            "/api/repositories/repo-1/artifacts",
+            {"name": "fixture-sdk", "revision": 1},
+        )
+
+        self.assertEqual(status, 400)
+        response = json.loads(body)
+        self.assertIn("retained by sandbox version", response["error"])
+        self.assertIn(
+            ("remove-artifact", "repo-1", "fixture-sdk", 1),
+            self.actions.calls,
+        )
+
     def test_repository_secret_replace_and_remove_never_echo_values(self) -> None:
         secret_value = "saved-product-key-123"
         status, _, replace_body = self.request(
@@ -549,24 +601,117 @@ class InterfaceTests(unittest.TestCase):
         self.assertIn("const {resource_secrets: _resourceSecrets, ...advancedInputs} = inputs;", dashboard)
         self.assertIn("if (fileControl) fileControl.required = false;", dashboard)
         self.assertEqual(
-            dashboard.count(
-                '<textarea data-field="commands" rows="3" placeholder="one command per line"></textarea>'
-            ),
+            dashboard.count('<fieldset data-field="commands" class="command-scopes">'),
             2,
         )
-        self.assertNotIn(
-            '<input data-field="commands" placeholder="one command per line">',
-            dashboard,
-        )
-        self.assertIn(
-            "String(control.value || '').split('\\n')",
-            dashboard,
-        )
+        self.assertNotIn('textarea data-field="commands"', dashboard)
+        self.assertIn("delete advanced.provisioning_commands;", dashboard)
+        self.assertIn("delete advanced.validation_commands;", dashboard)
+        self.assertIn("delete advanced.allowed_services;", dashboard)
+        self.assertIn("delete advanced.variable_bindings;", dashboard)
+        self.assertIn("Host path mounts", dashboard)
+        self.assertIn('data-add-resource="host-path"', dashboard)
+        self.assertIn('data-resource-row="host-path"', dashboard)
+        self.assertIn("const hostPaths = rows('host-path').map", dashboard)
+        self.assertIn("advanced.allowed_host_paths = hostPaths;", dashboard)
+        self.assertIn("for (const mount of inputs.allowed_host_paths || []) append('host-path'", dashboard)
+        self.assertIn("delete advancedInputs.allowed_host_paths;", dashboard)
+        self.assertIn("input.dataset.commandKind = choice.kind;", dashboard)
+        self.assertIn("input.dataset.commandIndex = String(choice.index);", dashboard)
+        self.assertIn("row.dataset.selectedCommands = JSON.stringify(value.map(command => JSON.stringify(command)));", dashboard)
+        self.assertIn("return [...control.querySelectorAll('input:checked')].map(input =>", dashboard)
         self.assertIn("data-retry", dashboard)
         self.assertIn("/retry", dashboard)
         self.assertIn("Issue acceptance", dashboard)
         self.assertIn("/api/acceptance-artifacts/", dashboard)
         self.assertIn("scope", dashboard)
+
+    def test_command_scoped_resource_serialization_executes_against_resources_editor(
+        self,
+    ) -> None:
+        import shutil
+        import subprocess
+
+        status, _, body = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        dashboard = body.decode("utf-8")
+        start = dashboard.index("const commandRows = control => {")
+        end = dashboard.index("\nresourceEditor?.addEventListener", start)
+        command_rows = dashboard[start:end]
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required for the interface JavaScript regression test")
+        script = "\n".join(
+            (
+                "const parsedJsonField = control => JSON.parse(control.value);",
+                "const refreshCommandScopes = editor => { if (!editor) throw new Error('missing resources editor'); };",
+                command_rows,
+                "const row = {querySelector: () => ({value: '[\"python\",\"provision.py\"]'})};",
+                "const editor = {querySelectorAll: selector => selector.includes('provisioning') ? [row] : []};",
+                "const checked = {dataset: {commandKind: 'provisioning', commandIndex: '0'}};",
+                "const control = {closest: selector => selector === '[data-resources-editor]' ? editor : null, querySelectorAll: selector => selector === 'input:checked' ? [checked] : []};",
+                "process.stdout.write(JSON.stringify(commandRows(control)));",
+            )
+        )
+        completed = subprocess.run(
+            [node, "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout), [["python", "provision.py"]])
+
+    def test_resources_policy_preview_is_accessible_and_omits_secret_values(
+        self,
+    ) -> None:
+        import shutil
+        import subprocess
+
+        status, _, body = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        dashboard = body.decode("utf-8")
+        self.assertIn("Resulting policy preview", dashboard)
+        self.assertIn("resourcePolicyPreview.setAttribute('aria-live', 'polite')", dashboard)
+
+        start = dashboard.index("const updateResourcePolicyPreview = () => {")
+        end = dashboard.index("\nlet reonboardRepositoryId", start)
+        preview_source = dashboard[start:end]
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required for the interface JavaScript regression test")
+        secret_value = "saved-product-key-123"
+        script = "\n".join(
+            (
+                "const preview = {textContent: ''};",
+                "const resourcePolicyPreview = {querySelector: () => preview};",
+                "const secretRow = {querySelector: selector => selector.includes('configured_status') ? {textContent: 'Configured'} : null};",
+                "const resourceEditor = {querySelectorAll: selector => selector === '[data-resource-row=\"secret\"]' ? [secretRow] : []};",
+                "const field = (_row, name) => name === 'name' ? 'PRODUCT_KEY' : '';",
+                "const resourceDraft = () => ({advanced: {variable_bindings: [{name: 'SDK_MODE', value: 'fixture', commands: [['python', 'validate.py']]}]}, artifacts: [{name: 'fixture-sdk', description: 'Fixture SDK', sandbox_path: '/repository-resources/artifacts/fixture-sdk', revision: 0, file: {size: 17}}], secrets: [{name: 'PRODUCT_KEY', value: 'saved-product-key-123', action: 'replace', commands: [['python', 'validate.py']]}]});",
+                preview_source,
+                "updateResourcePolicyPreview();",
+                "process.stdout.write(preview.textContent);",
+            )
+        )
+        completed = subprocess.run(
+            [node, "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        policy = json.loads(completed.stdout)
+        self.assertEqual(policy["artifact_bindings"][0]["mount"], "read-only")
+        self.assertEqual(
+            policy["artifact_bindings"][0]["revision"],
+            "new immutable revision",
+        )
+        self.assertEqual(
+            policy["artifact_bindings"][0]["sandbox_path"],
+            "/repository-resources/artifacts/fixture-sdk",
+        )
+        self.assertEqual(policy["repository_secrets"][0]["configured"], True)
+        self.assertEqual(policy["repository_secrets"][0]["action"], "replace")
+        self.assertNotIn(secret_value, completed.stdout)
 
     def test_dashboard_contains_issue_queue_and_inline_log(
         self,

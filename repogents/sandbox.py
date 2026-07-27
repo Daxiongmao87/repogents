@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 import os
@@ -153,6 +154,93 @@ def redact_text(text: str, known_secrets: Iterable[str]) -> str:
         {value for value in known_secrets if value}, key=len, reverse=True
     ):
         redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
+
+
+def redact_artifact_content(text: str, artifact_paths: Iterable[Path]) -> str:
+    """Redact candidate output tokens whose decoded bytes occur in an artifact.
+
+    Work is bounded by command output and fixed-size artifact reads rather than by
+    constructing overlapping marker collections proportional to artifact size.
+    """
+    candidates: dict[str, set[bytes]] = {}
+
+    def add_candidate(token: str, value: bytes) -> None:
+        if value:
+            candidates.setdefault(token, set()).add(value)
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        stripped_bytes = stripped.encode("utf-8", "surrogatepass")
+        if stripped and len(stripped_bytes) <= 2:
+            add_candidate(stripped, stripped_bytes)
+
+    for quote, quoted_literal in re.findall(
+        r"(['\"])([^'\"\r\n]+)\1", text
+    ):
+        del quote
+        add_candidate(quoted_literal, quoted_literal.encode("utf-8", "surrogatepass"))
+
+    for short_hex in re.findall(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{2}(?![0-9A-Fa-f])", text):
+        try:
+            add_candidate(short_hex, bytes.fromhex(short_hex))
+        except ValueError:
+            pass
+
+    for literal in re.findall(r"(?<!\S)\S{3,}(?!\S)", text):
+        add_candidate(literal, literal.encode("utf-8", "surrogatepass"))
+
+    for line in text.splitlines():
+        tokens = list(re.finditer(r"\S+", line))
+        for start, match in enumerate(tokens):
+            if len(match.group(0).encode("utf-8", "surrogatepass")) > 2:
+                continue
+            for following in tokens[start + 1 :]:
+                if len(following.group(0).encode("utf-8", "surrogatepass")) > 2:
+                    break
+                literal = line[match.start() : following.end()]
+                if len(literal.encode("utf-8", "surrogatepass")) >= 3:
+                    add_candidate(
+                        literal, literal.encode("utf-8", "surrogatepass")
+                    )
+
+    for token in re.findall(r"[A-Za-z0-9_./:+\-=]{3,}", text):
+        add_candidate(token, token.encode("utf-8", "surrogatepass"))
+        if len(token) >= 2 and len(token) % 2 == 0 and re.fullmatch(r"[0-9A-Fa-f]+", token):
+            try:
+                add_candidate(token, bytes.fromhex(token))
+            except ValueError:
+                pass
+        if len(token) >= 4 and re.fullmatch(r"[A-Za-z0-9_\-/+]+={0,2}", token):
+            encoded = token.encode("ascii")
+            padded = encoded + b"=" * (-len(encoded) % 4)
+            for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+                try:
+                    add_candidate(token, decoder(padded))
+                except (ValueError, base64.binascii.Error):
+                    pass
+    if not candidates:
+        return text
+
+    probes = {probe for values in candidates.values() for probe in values}
+    maximum = max(map(len, probes))
+    matched: set[bytes] = set()
+    for path in artifact_paths:
+        try:
+            with path.open("rb") as artifact:
+                overlap = b""
+                while chunk := artifact.read(1024 * 1024):
+                    block = overlap + chunk
+                    matched.update(probe for probe in probes - matched if probe in block)
+                    if len(matched) == len(probes):
+                        break
+                    overlap = block[-(maximum - 1) :] if maximum > 1 else b""
+        except OSError:
+            continue
+    redacted = text
+    for token, values in sorted(candidates.items(), key=lambda item: len(item[0]), reverse=True):
+        if values & matched:
+            redacted = redacted.replace(token, "[REDACTED]")
     return redacted
 
 
@@ -820,6 +908,12 @@ class SandboxManager:
         timed_out = False
         canceled = False
         secret_values = tuple((secrets or {}).values())
+        artifact_paths = tuple(
+            mount.host_path
+            for mount in policy.mounts
+            if mount.sandbox_path.startswith("/repository-resources/artifacts/")
+        )
+        redaction_values = secret_values
         try:
             argv, environment = self.build_command(
                 policy,
@@ -866,10 +960,20 @@ class SandboxManager:
             if proxy_directory is not None:
                 shutil.rmtree(proxy_directory, ignore_errors=True)
         completed_at = _utc_now()
-        stdout = redact_text(stdout_raw.decode("utf-8", "replace"), secret_values)
-        stderr = redact_text(stderr_raw.decode("utf-8", "replace"), secret_values)
+        stdout = redact_artifact_content(
+            redact_text(stdout_raw.decode("utf-8", "replace"), redaction_values),
+            artifact_paths,
+        )
+        stderr = redact_artifact_content(
+            redact_text(stderr_raw.decode("utf-8", "replace"), redaction_values),
+            artifact_paths,
+        )
+        redacted_command = [
+            redact_artifact_content(redact_text(argument, redaction_values), artifact_paths)
+            for argument in command
+        ]
         record = {
-            "command": list(command),
+            "command": redacted_command,
             "started_at": started_at,
             "completed_at": completed_at,
             "returncode": returncode,

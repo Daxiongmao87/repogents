@@ -922,7 +922,10 @@ class OnboardingTests(unittest.TestCase):
         sandbox = RecordingSandbox()
         resolved_references: list[str] = []
 
-        def resolve_secret(reference: str) -> str:
+        def resolve_secret(
+            reference: str, *, repository_id: str | None = None
+        ) -> str:
+            self.assertIsNotNone(repository_id)
             resolved_references.append(reference)
             return "resolved-package-token"
 
@@ -1089,6 +1092,72 @@ class OnboardingTests(unittest.TestCase):
         repository = service.get_repository(repository_id)
         self.assertEqual(repository["onboarding_state"], "blocked")
         self.assertIn("secret://", repository["blocking_reason"])
+
+    def test_other_repository_saved_secret_needs_input_before_provisioning(self) -> None:
+        from repogents.resources import RepositoryResourceStore
+
+        foreign_repository = RepositoryInfo(
+            node_id="R_foreign",
+            database_id=999,
+            owner="example",
+            name="foreign",
+            url="https://github.com/example/foreign",
+            default_branch="main",
+            is_private=False,
+        )
+        foreign_service, foreign_github = self.service(
+            FakeSources({"README.md": "Repository instructions.\n"})
+        )
+        foreign_github.info = foreign_repository
+        foreign_repository_id = foreign_service.onboard(
+            "example/foreign",
+            {"validation_commands": [["python3", "-m", "unittest"]]},
+        )
+        foreign_secret = RepositoryResourceStore(
+            self.db, self.root / "data"
+        ).update_secret(
+            foreign_repository_id,
+            name="PRODUCT_KEY",
+            action="replace",
+            value="foreign-product-key",
+        )
+
+        sandbox = RecordingSandbox()
+        service = OnboardingService(
+            database=self.db,
+            data_root=self.root / "data",
+            github=FakeGitHub(self.repository),
+            sources=FakeSources({"README.md": "Repository instructions.\n"}),
+            inspector=RepositoryInspector(),
+            team_formulator=FakeTeamFormulator(),
+            provisioner=SandboxEnvironmentProvisioner(
+                data_root=self.root / "data",
+                sandbox=sandbox,
+                secret_resolver=RepositoryResourceStore(
+                    self.db, self.root / "data"
+                ).resolve_secret,
+            ),
+        )
+
+        repository_id = service.onboard(
+            "example/demo",
+            {
+                "secret_bindings": [
+                    {
+                        "name": "PRODUCT_KEY",
+                        "reference": foreign_secret["reference"],
+                        "commands": [["python3", "provision.py"]],
+                    }
+                ],
+                "provisioning_commands": [["python3", "provision.py"]],
+                "validation_commands": [["python3", "-m", "unittest"]],
+            },
+        )
+
+        repository = service.get_repository(repository_id)
+        self.assertEqual(repository["onboarding_state"], "needs_input")
+        self.assertIn("saved secret PRODUCT_KEY is not configured", repository["blocking_reason"])
+        self.assertEqual(sandbox.calls, [])
 
     def test_missing_saved_secret_needs_input_before_provisioning(self) -> None:
         sandbox = RecordingSandbox()
@@ -1630,6 +1699,89 @@ class OnboardingTests(unittest.TestCase):
             self.assertIn("sandbox_path", projected)
             self.assertNotIn("storage_path", projected)
             self.assertNotIn("private fixture revision", row["evidence_json"])
+
+
+    def test_reonboarding_resolves_artifact_metadata_and_storage_from_durable_revision(
+        self,
+    ) -> None:
+        from repogents.resources import RepositoryResourceStore
+
+        service, _ = self.service(FakeSources())
+        validation_commands = [["python", "-c", "pass"]]
+        repository_id = service.onboard(
+            "example/demo", {"validation_commands": validation_commands}
+        )
+        store = RepositoryResourceStore(self.db, self.root / "data")
+        uploaded = store.upload_artifact(
+            repository_id,
+            name="fixture-sdk",
+            description="Controller-owned fixture",
+            content=b"authoritative artifact bytes",
+        )
+        spoofed = dict(uploaded)
+        spoofed.update(
+            {
+                "description": "Caller-controlled description",
+                "content_hash": "sha256:" + "0" * 64,
+                "size": 999999,
+                "created_at": "1900-01-01T00:00:00Z",
+                "storage_path": str(self.root / "caller-controlled.bin"),
+            }
+        )
+
+        service.reonboard(
+            repository_id,
+            {
+                "artifact_bindings": [spoofed],
+                "validation_commands": validation_commands,
+            },
+        )
+
+        repository = service.get_repository(repository_id)
+        self.assertEqual(repository["onboarding_state"], "ready")
+        with self.db.connect() as connection:
+            sandbox = connection.execute(
+                "SELECT policy_json, evidence_json FROM sandbox_versions WHERE id=?",
+                (repository["current_sandbox_version_id"],),
+            ).fetchone()
+        policy_artifact = json.loads(sandbox["policy_json"])["artifact_bindings"][0]
+        evidence_artifact = json.loads(sandbox["evidence_json"])["resources"]["artifacts"][0]
+        self.assertEqual(policy_artifact["storage_path"], uploaded["storage_path"])
+        self.assertEqual(policy_artifact["content_hash"], uploaded["content_hash"])
+        self.assertEqual(policy_artifact["size"], uploaded["size"])
+        self.assertEqual(evidence_artifact["description"], "Controller-owned fixture")
+        self.assertNotIn("Caller-controlled", sandbox["evidence_json"])
+
+    def test_reonboarding_rejects_tampered_durable_artifact_bytes(self) -> None:
+        from repogents.resources import RepositoryResourceStore
+
+        service, _ = self.service(FakeSources())
+        validation_commands = [["python", "-c", "pass"]]
+        repository_id = service.onboard(
+            "example/demo", {"validation_commands": validation_commands}
+        )
+        store = RepositoryResourceStore(self.db, self.root / "data")
+        uploaded = store.upload_artifact(
+            repository_id,
+            name="fixture-sdk",
+            description="Controller-owned fixture",
+            content=b"original artifact bytes",
+        )
+        artifact_path = Path(uploaded["storage_path"])
+        artifact_path.chmod(0o600)
+        artifact_path.write_bytes(b"tampered artifact bytes")
+
+        service.reonboard(
+            repository_id,
+            {
+                "artifact_bindings": [uploaded],
+                "validation_commands": validation_commands,
+            },
+        )
+
+        repository = service.get_repository(repository_id)
+        self.assertEqual(repository["onboarding_state"], "needs_input")
+        self.assertIn("failed its stored integrity check", repository["blocking_reason"])
 
 
 if __name__ == "__main__":

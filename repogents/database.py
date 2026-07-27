@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Generator
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 SCHEMA_V1 = r"""
 BEGIN IMMEDIATE;
@@ -944,6 +944,32 @@ SCHEMA_V19 = (
     """,
 )
 
+SCHEMA_V20 = (
+    """
+    CREATE TABLE repository_secret_revisions (
+        id TEXT PRIMARY KEY,
+        repository_secret_id TEXT NOT NULL
+            REFERENCES repository_secrets(id) ON DELETE RESTRICT,
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        storage_path TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (repository_secret_id, revision),
+        UNIQUE (storage_path)
+    )
+    """,
+    """
+    CREATE TABLE sandbox_secret_revisions (
+        sandbox_version_id TEXT NOT NULL
+            REFERENCES sandbox_versions(id) ON DELETE RESTRICT,
+        secret_revision_id TEXT NOT NULL
+            REFERENCES repository_secret_revisions(id) ON DELETE RESTRICT,
+        name TEXT NOT NULL,
+        commands_json TEXT NOT NULL,
+        PRIMARY KEY (sandbox_version_id, secret_revision_id, name)
+    )
+    """,
+)
+
 class Database:
     """Owns SQLite connection policy and transactional schema initialization."""
 
@@ -1167,6 +1193,14 @@ class Database:
                 connection.execute("""INSERT INTO schema_version(version, applied_at)
                        VALUES (
                            19,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )""")
+            if version < 20:
+                for statement in SCHEMA_V20:
+                    connection.execute(statement)
+                connection.execute("""INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           20,
                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                        )""")
             connection.commit()
