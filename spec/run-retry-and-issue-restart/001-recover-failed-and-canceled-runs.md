@@ -38,4 +38,4 @@ This item supersedes the no-manual-retry contract in `spec/remove-manual-retry/0
 - [x] `CLIENT` — render blocked and canceled history, expose the correct recovery buttons, and dispatch the corresponding mutations.
 - [x] `CLIENT` — render a paused repository's blocked history and prove Retry now remains visible, disabled, and accompanied by the resume prerequisite.
 - [x] `REGRESSION` — run the complete deterministic project suite.
-- [ ] `LIVE` — deploy the daemon and inspect the blocked Simulacrum issue plus canceled Repogents issue in Chromium, proving recovery controls are visible without invoking them.
+- [x] `LIVE` — deploy the daemon and inspect the blocked Simulacrum issue plus canceled Repogents issue in Chromium, proving recovery controls are visible without invoking them.
