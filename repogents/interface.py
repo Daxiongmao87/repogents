@@ -1141,7 +1141,7 @@ const updateResourcePolicyPreview = () => {
     }));
     const repositorySecrets = draft.secrets.map(secret => {
       const row = [...resourceEditor.querySelectorAll('[data-resource-row="secret"]')].find(candidate =>
-        field(candidate, 'name').trim() === secret.name
+        (control(candidate, 'name')?.value ?? '').trim() === secret.name
       );
       return {
         name:secret.name,

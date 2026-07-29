@@ -685,7 +685,7 @@ class InterfaceTests(unittest.TestCase):
                 "const resourcePolicyPreview = {querySelector: () => preview};",
                 "const secretRow = {querySelector: selector => selector.includes('configured_status') ? {textContent: 'Configured'} : null};",
                 "const resourceEditor = {querySelectorAll: selector => selector === '[data-resource-row=\"secret\"]' ? [secretRow] : []};",
-                "const field = (_row, name) => name === 'name' ? 'PRODUCT_KEY' : '';",
+                "const control = (_row, name) => name === 'name' ? {value: 'PRODUCT_KEY'} : null;",
                 "const resourceDraft = () => ({advanced: {variable_bindings: [{name: 'SDK_MODE', value: 'fixture', commands: [['python', 'validate.py']]}]}, artifacts: [{name: 'fixture-sdk', description: 'Fixture SDK', sandbox_path: '/repository-resources/artifacts/fixture-sdk', revision: 0, file: {size: 17}}], secrets: [{name: 'PRODUCT_KEY', value: 'saved-product-key-123', action: 'replace', commands: [['python', 'validate.py']]}]});",
                 preview_source,
                 "updateResourcePolicyPreview();",
