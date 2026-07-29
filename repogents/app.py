@@ -914,9 +914,39 @@ class ApplicationActions:
             )
             value["latest_activity_at"] = max(activity_times)
             value["team"] = teams_by_repository.get(repository_id)
-            value["display_inputs"] = _display_repository_inputs(
-                str(value.pop("inputs_json"))
-            )
+            raw_inputs = str(value.pop("inputs_json"))
+            value["display_inputs"] = _display_repository_inputs(raw_inputs)
+            try:
+                persisted_inputs = json.loads(raw_inputs)
+            except (TypeError, ValueError):
+                persisted_inputs = {}
+            if isinstance(persisted_inputs, dict):
+                artifact_bindings = persisted_inputs.get("artifact_bindings", [])
+                if isinstance(artifact_bindings, list):
+                    value["display_inputs"]["artifact_bindings"] = [
+                        {
+                            key: binding[key]
+                            for key in (
+                                "name",
+                                "description",
+                                "revision",
+                                "content_hash",
+                                "size",
+                                "created_at",
+                                "sandbox_path",
+                            )
+                            if key in binding
+                        }
+                        for binding in artifact_bindings
+                        if isinstance(binding, dict)
+                    ]
+                variable_bindings = persisted_inputs.get("variable_bindings", [])
+                if isinstance(variable_bindings, list):
+                    value["display_inputs"]["variable_bindings"] = [
+                        dict(binding)
+                        for binding in variable_bindings
+                        if isinstance(binding, dict)
+                    ]
             value["resource_secrets"] = (
                 self.resource_store.list_secrets(repository_id)
                 if self.resource_store is not None
@@ -1384,6 +1414,17 @@ class ApplicationActions:
             )
         )
 
+    def update_repository_artifact_description(
+        self, repository_id: str, *, name: str, description: str
+    ) -> dict[str, object]:
+        if self.resource_store is None:
+            raise RuntimeError("repository resource storage is unavailable")
+        return dict(
+            self.resource_store.update_artifact_description(
+                repository_id, name=name, description=description
+            )
+        )
+
     def remove_repository_artifact(
         self, repository_id: str, *, name: str, revision: int
     ) -> None:
@@ -1773,13 +1814,43 @@ def _display_repository_inputs(raw: str) -> dict[str, object]:
     ):
         if key in payload:
             display[key] = payload[key]
+    variable_bindings = payload.get("variable_bindings")
+    if isinstance(variable_bindings, list):
+        display["variable_bindings"] = [
+            {
+                key: value[key]
+                for key in ("name", "value", "commands")
+                if key in value
+            }
+            for value in variable_bindings
+            if isinstance(value, dict)
+        ]
+    artifact_bindings = payload.get("artifact_bindings")
+    if isinstance(artifact_bindings, list):
+        display["artifact_bindings"] = [
+            {
+                key: value[key]
+                for key in (
+                    "name",
+                    "description",
+                    "revision",
+                    "content_hash",
+                    "size",
+                    "created_at",
+                    "sandbox_path",
+                )
+                if key in value
+            }
+            for value in artifact_bindings
+            if isinstance(value, dict)
+        ]
     bindings = payload.get("secret_bindings")
     if isinstance(bindings, list):
         display["secret_bindings"] = [
             {
                 key: value[key]
                 for key in ("name", "reference", "commands")
-                if isinstance(value, dict) and key in value
+                if key in value
             }
             for value in bindings
             if isinstance(value, dict)

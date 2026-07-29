@@ -1687,61 +1687,203 @@ class ArtifactPublicationIsolationTests(unittest.TestCase):
         service.database = Database()
         return service
 
-    def test_artifact_scanning_detects_short_literal_content_on_added_lines(self) -> None:
-        for content in (b"Q", b"QZ", b"XYZ", b"WXYZ", b"VWXYZ"):
-            with self.subTest(content=content):
-                service = self._artifact_scanner(content)
-                literal = content.decode("ascii")
-                self.assertTrue(
+    def test_committed_blob_scanning_rejects_wrapped_and_partial_artifact_bytes(self) -> None:
+        import subprocess
+        import tempfile
+
+        artifact = bytes(range(256)) * 2
+        service = self._artifact_scanner(artifact)
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+
+            def commit_blob(content: bytes, message: str) -> str:
+                (checkout / "payload.bin").write_bytes(content)
+                subprocess.run(["git", "add", "payload.bin"], cwd=checkout, check=True)
+                subprocess.run(
+                    [
+                        "git",
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=f@example.com",
+                        "commit",
+                        "-qm",
+                        message,
+                    ],
+                    cwd=checkout,
+                    check=True,
+                )
+                return subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=checkout,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    text=True,
+                ).stdout.strip()
+
+            wrapped_sha = commit_blob(b"wrapper-prefix\x00" + artifact + b"wrapper-suffix", "wrapped")
+            self.assertTrue(
+                service._contains_committed_artifact_blob(
+                    "run-1", checkout, wrapped_sha, ["payload.bin"]
+                )
+            )
+
+            partial_sha = commit_blob(
+                b"binary-prefix\x00" + artifact[80:208] + b"binary-suffix",
+                "partial",
+            )
+            self.assertTrue(
+                service._contains_committed_artifact_blob(
+                    "run-1", checkout, partial_sha, ["payload.bin"]
+                )
+            )
+
+            unrelated_sha = commit_blob(b"unrelated\x00binary\xffpayload" * 8, "unrelated")
+            self.assertFalse(
+                service._contains_committed_artifact_blob(
+                    "run-1", checkout, unrelated_sha, ["payload.bin"]
+                )
+            )
+
+    def test_committed_blob_scanning_preserves_raw_git_paths_and_allows_deletion(self) -> None:
+        import subprocess
+        import tempfile
+
+        artifact = bytes(range(256)) * 2
+        service = self._artifact_scanner(artifact)
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+            filenames = ("caf\u00e9.bin", 'quoted\\\"artifact.bin')
+            for filename in filenames:
+                (checkout / filename).write_bytes(artifact)
+            subprocess.run(["git", "add", "-A"], cwd=checkout, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=f@example.com",
+                    "commit",
+                    "-qm",
+                    "add raw path artifacts",
+                ],
+                cwd=checkout,
+                check=True,
+            )
+            added_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+
+            for filename in filenames:
+                with self.subTest(filename=filename):
+                    self.assertTrue(
+                        service._contains_committed_artifact_blob(
+                            "run-1", checkout, added_sha, [filename]
+                        )
+                    )
+
+            for filename in filenames:
+                (checkout / filename).unlink()
+            subprocess.run(["git", "add", "-A"], cwd=checkout, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=f@example.com",
+                    "commit",
+                    "-qm",
+                    "remove raw path artifacts",
+                ],
+                cwd=checkout,
+                check=True,
+            )
+            deletion_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+            self.assertFalse(
+                service._contains_committed_artifact_blob(
+                    "run-1", checkout, deletion_sha, filenames
+                )
+            )
+
+    def test_artifact_scanning_allows_common_code_tokens(self) -> None:
+        content = b"import function return licensed implementation details"
+        service = self._artifact_scanner(content)
+
+        for token in ("import", "function", "return"):
+            with self.subTest(token=token):
+                self.assertFalse(
                     service._contains_artifact_content(
-                        "run-1", f"diff --git a/value b/value\n+{literal}\n"
+                        "run-1",
+                        f"diff --git a/code.py b/code.py\n+{token} value\n",
+                        committed_diff=True,
                     )
                 )
 
-    def test_artifact_scanning_detects_one_and_two_byte_encoded_content(self) -> None:
-        import base64
+    def test_artifact_scanning_ignores_context_and_removed_lines(self) -> None:
+        content = b"licensed fixture literal that is sufficiently distinctive"
+        service = self._artifact_scanner(content)
+        literal = content.decode("ascii")
 
-        for content in (b"\x01", b"\x01\xfe"):
-            with self.subTest(content=content, encoding="base64"):
-                service = self._artifact_scanner(content)
-                self.assertTrue(
-                    service._contains_artifact_content(
-                        "run-1", base64.b64encode(content).decode("ascii")
-                    )
-                )
-            with self.subTest(content=content, encoding="hex"):
-                service = self._artifact_scanner(content)
-                self.assertTrue(
-                    service._contains_artifact_content("run-1", content.hex())
-                )
-
-    def test_artifact_scanning_detects_short_literal_content(self) -> None:
-        cases = (
-            (b"prefix-LIC-suffix", "added LIC value"),
-            (b"prefix-a b-suffix", "copied a b value"),
-            (b"prefix-!!!-suffix", "copied !!! value"),
+        self.assertFalse(
+            service._contains_artifact_content(
+                "run-1",
+                f"diff --git a/value b/value\n {literal}\n-{literal}\n+unrelated replacement\n",
+                committed_diff=True,
+            )
         )
-        for content, candidate in cases:
-            with self.subTest(content=content):
-                service = self._artifact_scanner(content)
-                self.assertTrue(
-                    service._contains_artifact_content("run-1", candidate)
-                )
 
-    def test_artifact_scanning_detects_short_encoded_binary_fragments(self) -> None:
-        import base64
+    def test_artifact_scanning_ignores_deletion_only_diff(self) -> None:
+        content = b"licensed fixture literal that is sufficiently distinctive"
+        service = self._artifact_scanner(content)
+        literal = content.decode("ascii")
 
-        content = bytes(range(32))
-        fragment = content[3:6]
+        self.assertFalse(
+            service._contains_artifact_content(
+                "run-1",
+                f"diff --git a/value b/value\n--- a/value\n+++ /dev/null\n-{literal}\n",
+                committed_diff=True,
+            )
+        )
+
+    def test_artifact_scanning_detects_distinctive_added_literal(self) -> None:
+        content = b"licensed fixture literal that is sufficiently distinctive"
         service = self._artifact_scanner(content)
 
         self.assertTrue(
             service._contains_artifact_content(
-                "run-1", base64.b64encode(fragment).decode("ascii")
+                "run-1",
+                f"diff --git a/value b/value\n+{content.decode('ascii')}\n",
+                committed_diff=True,
+            )
+        )
+
+    def test_artifact_scanning_detects_full_encoded_binary_content(self) -> None:
+        import base64
+
+        content = bytes(range(64))
+        service = self._artifact_scanner(content)
+
+        self.assertTrue(
+            service._contains_artifact_content(
+                "run-1", base64.b64encode(content).decode("ascii")
             )
         )
         self.assertTrue(
-            service._contains_artifact_content("run-1", fragment.hex())
+            service._contains_artifact_content("run-1", content.hex())
         )
 
     def test_artifact_scanning_streams_large_artifacts(self) -> None:
@@ -1761,7 +1903,7 @@ class ArtifactPublicationIsolationTests(unittest.TestCase):
         from repogents.publication import PublicationService
 
         source = inspect.getsource(PublicationService)
-        self.assertIn("_contains_artifact_content(str(context[\"id\"]), diff)", source)
+        self.assertIn("diff, committed_diff=True", source)
         self.assertNotIn("_artifact_text_values", source)
         self.assertIn("committed diff contains uploaded artifact content", source)
 
@@ -1780,7 +1922,7 @@ class ArtifactPublicationIsolationTests(unittest.TestCase):
         }
         with patch(
             "repogents.publication.render_acceptance_markdown",
-            return_value=f"Validated commit {'a' * 40}\nlicensed fixture bytes",
+            return_value=f"Validated commit {'a' * 40}\n{artifact_content.decode('ascii')}",
         ):
             with self.assertRaisesRegex(
                 PublicationBlocked, "pull-request proof contains uploaded artifact content"

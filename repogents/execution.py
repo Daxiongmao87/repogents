@@ -627,6 +627,7 @@ class AgentToolExecutor:
         layout: RunLayout,
         action: dict[str, object],
         secrets: dict[str, str] | None = None,
+        environment_bindings: dict[str, str] | None = None,
         checkout_writable: bool = True,
     ) -> str:
         name = action.get("action")
@@ -669,6 +670,7 @@ class AgentToolExecutor:
                 command,
                 timeout=timeout,
                 secrets=secrets,
+                environment_bindings=environment_bindings,
                 checkout_writable=checkout_writable,
             )
             if result.canceled:
@@ -853,6 +855,7 @@ class ExecutionService:
                 base_context,
                 transcript,
                 secret_bindings,
+                variable_bindings,
                 resolved_secret_values,
                 allow_assignment=True,
                 require_assignment=True,
@@ -877,6 +880,7 @@ class ExecutionService:
                         self._member_prompt(base_context, assignment),
                         transcript,
                         secret_bindings,
+                        variable_bindings,
                         resolved_secret_values,
                     )
                     if yielded or member_outcome is None:
@@ -890,6 +894,7 @@ class ExecutionService:
                         base_context,
                         transcript,
                         secret_bindings,
+                        variable_bindings,
                         resolved_secret_values,
                         allow_assignment=True,
                     )
@@ -909,6 +914,7 @@ class ExecutionService:
                         self._member_prompt(base_context, verifier_assignment),
                         transcript,
                         secret_bindings,
+                        variable_bindings,
                         resolved_secret_values,
                     )
                 except RevisionRequired as error:
@@ -1023,6 +1029,7 @@ class ExecutionService:
         base_context: str,
         transcript: list[str],
         secret_bindings: tuple[SecretBinding, ...],
+        variable_bindings: tuple[tuple[str, str, tuple[tuple[str, ...], ...]], ...],
         resolved_secret_values: set[str],
         *,
         allow_assignment: bool = False,
@@ -1211,14 +1218,26 @@ class ExecutionService:
                     return None, False
                 self._ensure_not_canceled(layout.run_id)
                 secrets: dict[str, str] | None = None
+                environment_bindings: dict[str, str] | None = None
                 argv = action.get("argv")
                 if name == "run" and isinstance(argv, list):
+                    command = tuple(argv)
                     secrets = self._command_secrets(
-                        tuple(argv), secret_bindings, resolved_secret_values
+                        command, secret_bindings, resolved_secret_values
                     )
+                    environment_bindings = {
+                        variable_name: variable_value
+                        for variable_name, variable_value, commands in variable_bindings
+                        if command in commands
+                    } or None
                 self._ensure_not_canceled(layout.run_id)
                 result = self.tools.execute(
-                    member, policy, layout, action, secrets=secrets
+                    member,
+                    policy,
+                    layout,
+                    action,
+                    secrets=secrets,
+                    environment_bindings=environment_bindings,
                 )
                 self._ensure_not_canceled(layout.run_id)
                 serialized_action = _serialize_action_for_history(
@@ -1588,7 +1607,7 @@ class ExecutionService:
                 if tuple(command) in commands
             }
             result = self.sandbox.run(
-                self._resource_command_policy(sandbox_version_id, policy),
+                policy,
                 layout,
                 tuple(command),
                 timeout=600,
@@ -1796,7 +1815,7 @@ class ExecutionService:
             }
             self._ensure_not_canceled(run_id)
             result = self.sandbox.run(
-                self._resource_command_policy(sandbox_version_id, policy),
+                policy,
                 layout,
                 tuple(command),
                 timeout=600,

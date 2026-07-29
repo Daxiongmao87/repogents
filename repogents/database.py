@@ -6,7 +6,28 @@ from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Generator
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
+
+SCHEMA_V21 = (
+    """
+    CREATE TABLE artifact_revision_build_reservations (
+        id TEXT PRIMARY KEY,
+        repository_id TEXT NOT NULL
+            REFERENCES repositories(id) ON DELETE CASCADE,
+        artifact_revision_id TEXT NOT NULL
+            REFERENCES artifact_revisions(id) ON DELETE RESTRICT,
+        sandbox_version_id TEXT NOT NULL,
+        sandbox_path TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (sandbox_version_id, artifact_revision_id),
+        UNIQUE (sandbox_version_id, sandbox_path)
+    )
+    """,
+    """
+    CREATE INDEX artifact_revision_build_reservations_revision
+        ON artifact_revision_build_reservations(artifact_revision_id)
+    """,
+)
 
 SCHEMA_V1 = r"""
 BEGIN IMMEDIATE;
@@ -1201,6 +1222,14 @@ class Database:
                 connection.execute("""INSERT INTO schema_version(version, applied_at)
                        VALUES (
                            20,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )""")
+            if version < 21:
+                for statement in SCHEMA_V21:
+                    connection.execute(statement)
+                connection.execute("""INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           21,
                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                        )""")
             connection.commit()

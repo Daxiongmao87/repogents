@@ -19,6 +19,7 @@ from repogents.onboarding import (
     RepositoryInspection,
     RepositoryInspector,
     SandboxEnvironmentProvisioner,
+    _normalize_repository_inputs,
 )
 from repogents.team import EvidenceTeamFormulator
 
@@ -1159,6 +1160,113 @@ class OnboardingTests(unittest.TestCase):
         self.assertIn("saved secret PRODUCT_KEY is not configured", repository["blocking_reason"])
         self.assertEqual(sandbox.calls, [])
 
+    def test_repository_secret_is_pinned_before_all_provisioning_commands(self) -> None:
+        from repogents.resources import RepositoryResourceStore
+
+        initial_service, _ = self.service(
+            FakeSources({"README.md": "Repository instructions.\n"})
+        )
+        repository_id = initial_service.onboard(
+            "example/demo",
+            {"validation_commands": [["python3", "-m", "unittest"]]},
+        )
+        store = RepositoryResourceStore(self.db, self.root / "data")
+        secret = store.update_secret(
+            repository_id,
+            name="PRODUCT_KEY",
+            action="replace",
+            value="original-product-key",
+        )
+
+        class ReplacingSandbox(RecordingSandbox):
+            def run(
+                inner_self,
+                policy: object,
+                layout: object,
+                command: tuple[str, ...],
+                **options: object,
+            ) -> object:
+                result = super().run(policy, layout, command, **options)
+                if len(inner_self.calls) == 1:
+                    store.update_secret(
+                        repository_id,
+                        name="PRODUCT_KEY",
+                        action="replace",
+                        value="replacement-product-key",
+                    )
+                return result
+
+        sandbox = ReplacingSandbox()
+        service = OnboardingService(
+            database=self.db,
+            data_root=self.root / "data",
+            github=FakeGitHub(self.repository),
+            sources=FakeSources({"README.md": "Repository instructions.\n"}),
+            inspector=RepositoryInspector(),
+            team_formulator=FakeTeamFormulator(),
+            provisioner=SandboxEnvironmentProvisioner(
+                data_root=self.root / "data",
+                sandbox=sandbox,
+                secret_resolver=store.resolve_secret,
+            ),
+        )
+
+        service.reonboard(
+            repository_id,
+            {
+                "secret_bindings": [
+                    {
+                        "name": "PRODUCT_KEY",
+                        "reference": secret["reference"],
+                        "commands": [
+                            ["python3", "first.py"],
+                            ["python3", "second.py"],
+                        ],
+                    }
+                ],
+                "provisioning_commands": [
+                    ["python3", "first.py"],
+                    ["python3", "second.py"],
+                ],
+                "validation_commands": [["python3", "-m", "unittest"]],
+            },
+        )
+
+        self.assertEqual(
+            [call[3]["secrets"] for call in sandbox.calls],
+            [
+                {"PRODUCT_KEY": "original-product-key"},
+                {"PRODUCT_KEY": "original-product-key"},
+            ],
+        )
+        with self.db.connect() as connection:
+            current = connection.execute(
+                """SELECT sandbox_versions.policy_json
+                     FROM repositories
+                     JOIN sandbox_versions
+                       ON sandbox_versions.id=repositories.current_sandbox_version_id
+                    WHERE repositories.id=?""",
+                (repository_id,),
+            ).fetchone()
+            pin = connection.execute(
+                """SELECT repository_secret_revisions.storage_path
+                     FROM sandbox_secret_revisions
+                     JOIN repository_secret_revisions
+                       ON repository_secret_revisions.id=sandbox_secret_revisions.secret_revision_id
+                    WHERE sandbox_secret_revisions.sandbox_version_id=(
+                        SELECT current_sandbox_version_id FROM repositories WHERE id=?
+                    )""",
+                (repository_id,),
+            ).fetchone()
+        stored_binding = json.loads(current["policy_json"])["secret_bindings"][0]
+        self.assertTrue(
+            stored_binding["reference"].startswith("secret://repository-revision/")
+        )
+        self.assertEqual(
+            Path(str(pin["storage_path"])).read_text(encoding="utf-8"),
+            "original-product-key",
+        )
+
     def test_missing_saved_secret_needs_input_before_provisioning(self) -> None:
         sandbox = RecordingSandbox()
         service = OnboardingService(
@@ -1193,6 +1301,65 @@ class OnboardingTests(unittest.TestCase):
         self.assertEqual(repository["onboarding_state"], "needs_input")
         self.assertIn("saved secret PRODUCT_KEY is not configured", repository["blocking_reason"])
         self.assertEqual(sandbox.calls, [])
+
+    def test_variable_secret_binding_overlap_is_rejected_for_provisioning(self) -> None:
+        command = ["python3", "provision.py"]
+        with self.assertRaisesRegex(ValueError, "binding name conflict for PRODUCT_KEY"):
+            _normalize_repository_inputs(
+                {
+                    "variable_bindings": [
+                        {"name": "PRODUCT_KEY", "value": "visible", "commands": [command]}
+                    ],
+                    "secret_bindings": [
+                        {
+                            "name": "PRODUCT_KEY",
+                            "reference": "secret://product-key",
+                            "commands": [command],
+                        }
+                    ],
+                }
+            )
+
+    def test_variable_secret_binding_overlap_is_rejected_for_validation(self) -> None:
+        command = ["python3", "-m", "unittest"]
+        with self.assertRaisesRegex(ValueError, "binding name conflict for TOKEN"):
+            _normalize_repository_inputs(
+                {
+                    "variable_bindings": [
+                        {"name": "TOKEN", "value": "visible", "commands": [command]}
+                    ],
+                    "secret_bindings": [
+                        {
+                            "name": "TOKEN",
+                            "reference": "secret://token",
+                            "commands": [command],
+                        }
+                    ],
+                }
+            )
+
+    def test_same_variable_secret_name_is_allowed_for_disjoint_commands(self) -> None:
+        normalized = _normalize_repository_inputs(
+            {
+                "variable_bindings": [
+                    {
+                        "name": "TOKEN",
+                        "value": "visible",
+                        "commands": [["python3", "provision.py"]],
+                    }
+                ],
+                "secret_bindings": [
+                    {
+                        "name": "TOKEN",
+                        "reference": "secret://token",
+                        "commands": [["python3", "validate.py"]],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(normalized["variable_bindings"][0]["name"], "TOKEN")
+        self.assertEqual(normalized["secret_bindings"][0]["name"], "TOKEN")
 
     def test_repository_without_usable_validation_needs_input(self) -> None:
         service, _ = self.service(
@@ -1700,6 +1867,208 @@ class OnboardingTests(unittest.TestCase):
             self.assertNotIn("storage_path", projected)
             self.assertNotIn("private fixture revision", row["evidence_json"])
 
+
+    def test_artifact_revision_is_reserved_while_provisioning_runs(self) -> None:
+        import threading
+
+        from repogents.resources import RepositoryResourceStore
+
+        service, _ = self.service(FakeSources())
+        validation_commands = [["python", "-c", "pass"]]
+        repository_id = service.onboard(
+            "example/demo", {"validation_commands": validation_commands}
+        )
+        service.provisioner = mock.Mock()
+        store = RepositoryResourceStore(self.db, self.root / "data")
+        artifact = store.upload_artifact(
+            repository_id,
+            name="fixture-sdk",
+            description="Reserved during provisioning",
+            content=b"immutable fixture bytes",
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def paused_provision(**_kwargs: object) -> dict[str, object]:
+            entered.set()
+            self.assertTrue(release.wait(5), "test did not release provisioning")
+            return {"commands": [], "manifests": []}
+
+        failures: list[BaseException] = []
+
+        def reonboard() -> None:
+            try:
+                with mock.patch.object(
+                    service.provisioner, "provision", side_effect=paused_provision
+                ):
+                    service.reonboard(
+                        repository_id,
+                        {
+                            "artifact_bindings": [
+                                dict(
+                                    artifact,
+                                    sandbox_path="/repository-resources/artifacts/sdk",
+                                )
+                            ],
+                            "validation_commands": validation_commands,
+                        },
+                    )
+            except BaseException as error:  # pragma: no cover - thread handoff
+                failures.append(error)
+
+        worker = threading.Thread(target=reonboard)
+        worker.start()
+        self.assertTrue(entered.wait(5), "provisioning was not reached")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "retained|reserved|referenced"):
+                store.remove_artifact_revision(
+                    repository_id, artifact["name"], int(artifact["revision"])
+                )
+            self.assertTrue(Path(str(artifact["storage_path"])).is_file())
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(service.get_repository(repository_id)["onboarding_state"], "ready")
+        with self.db.connect() as connection:
+            reservations = connection.execute(
+                "SELECT COUNT(*) FROM artifact_revision_build_reservations WHERE repository_id=?",
+                (repository_id,),
+            ).fetchone()[0]
+        self.assertEqual(reservations, 0)
+
+    def test_failed_and_interrupted_builds_release_artifact_reservations(self) -> None:
+        from repogents.resources import RepositoryResourceStore
+
+        service, _ = self.service(FakeSources())
+        validation_commands = [["python", "-c", "pass"]]
+        repository_id = service.onboard(
+            "example/demo", {"validation_commands": validation_commands}
+        )
+        store = RepositoryResourceStore(self.db, self.root / "data")
+        artifact = store.upload_artifact(
+            repository_id,
+            name="fixture-sdk",
+            description="Failure cleanup fixture",
+            content=b"failure cleanup bytes",
+        )
+        service.provisioner = mock.Mock()
+        inputs = {
+            "artifact_bindings": [
+                dict(
+                    artifact,
+                    sandbox_path="/repository-resources/artifacts/sdk",
+                )
+            ],
+            "validation_commands": validation_commands,
+        }
+        with mock.patch.object(
+            service.provisioner, "provision", side_effect=RuntimeError("boom")
+        ):
+            service.reonboard(repository_id, inputs)
+        with self.db.connect() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM artifact_revision_build_reservations WHERE repository_id=?",
+                    (repository_id,),
+                ).fetchone()[0],
+                0,
+            )
+            revision_id = connection.execute(
+                """SELECT artifact_revisions.id FROM artifact_revisions
+                   JOIN repository_artifacts ON repository_artifacts.id=artifact_revisions.artifact_id
+                  WHERE repository_artifacts.repository_id=? AND repository_artifacts.name=?""",
+                (repository_id, artifact["name"]),
+            ).fetchone()[0]
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET onboarding_state='provisioning' WHERE id=?",
+                (repository_id,),
+            )
+            connection.execute(
+                """INSERT INTO artifact_revision_build_reservations
+                   (id, repository_id, artifact_revision_id, sandbox_version_id, sandbox_path, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    "interrupted-reservation",
+                    repository_id,
+                    revision_id,
+                    "interrupted-sandbox",
+                    "/repository-resources/artifacts/sdk",
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+        self.assertEqual(service.recover_interrupted(), (repository_id,))
+        with self.db.connect() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM artifact_revision_build_reservations WHERE repository_id=?",
+                    (repository_id,),
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_artifact_targets_reject_normalized_and_nested_collisions(self) -> None:
+        from repogents.resources import RepositoryResourceStore
+
+        service, _ = self.service(FakeSources())
+        validation_commands = [["python", "-c", "pass"]]
+        repository_id = service.onboard(
+            "example/demo", {"validation_commands": validation_commands}
+        )
+        store = RepositoryResourceStore(self.db, self.root / "data")
+        first = store.upload_artifact(
+            repository_id, name="sdk", description="SDK", content=b"sdk"
+        )
+        second = store.upload_artifact(
+            repository_id, name="header", description="Header", content=b"header"
+        )
+
+        for left, right in (
+            ("/repository-resources/artifacts/sdk", "/repository-resources/artifacts/sdk/."),
+            ("/repository-resources/artifacts/sdk", "/repository-resources/artifacts/sdk/header"),
+        ):
+            service.reonboard(
+                repository_id,
+                {
+                    "artifact_bindings": [
+                        dict(first, sandbox_path=left),
+                        dict(second, sandbox_path=right),
+                    ],
+                    "validation_commands": validation_commands,
+                },
+            )
+            repository = service.get_repository(repository_id)
+            self.assertEqual(repository["onboarding_state"], "needs_input")
+            self.assertRegex(str(repository["blocking_reason"]), "collision|overlap|distinct")
+
+        service.reonboard(
+            repository_id,
+            {
+                "artifact_bindings": [
+                    dict(first, sandbox_path="/repository-resources/artifacts/sdk"),
+                    dict(second, sandbox_path="/repository-resources/artifacts/header"),
+                ],
+                "validation_commands": validation_commands,
+            },
+        )
+        repository = service.get_repository(repository_id)
+        self.assertEqual(repository["onboarding_state"], "ready")
+        with self.db.connect() as connection:
+            policy = json.loads(
+                connection.execute(
+                    "SELECT policy_json FROM sandbox_versions WHERE id=?",
+                    (repository["current_sandbox_version_id"],),
+                ).fetchone()[0]
+            )
+        self.assertEqual(
+            [binding["sandbox_path"] for binding in policy["artifact_bindings"]],
+            [
+                "/repository-resources/artifacts/sdk",
+                "/repository-resources/artifacts/header",
+            ],
+        )
 
     def test_reonboarding_resolves_artifact_metadata_and_storage_from_durable_revision(
         self,

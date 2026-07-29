@@ -172,7 +172,7 @@ class DatabaseTests(unittest.TestCase):
             version = connection.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
-            self.assertEqual(version, 20)
+            self.assertEqual(version, 21)
 
     def test_activity_revision_advances_only_after_durable_change(self) -> None:
         initial = self.db.activity_revision
@@ -296,7 +296,7 @@ class DatabaseTests(unittest.TestCase):
             )
         self.assertEqual(tuple(member), (300, "lead"))
         self.assertEqual(contract_version, 1)
-        self.assertEqual(versions, tuple(range(1, 21)))
+        self.assertEqual(versions, tuple(range(1, 22)))
 
     def test_concurrent_schema_v1_migration_converges_once(self) -> None:
         legacy_path = Path(self.tempdir.name) / "concurrent-legacy.sqlite3"
@@ -349,7 +349,7 @@ class DatabaseTests(unittest.TestCase):
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(team_members)")
             )
-        self.assertEqual(versions, tuple(range(1, 21)))
+        self.assertEqual(versions, tuple(range(1, 22)))
         self.assertEqual(columns.count("action_timeout_seconds"), 1)
         self.assertEqual(columns.count("atomic_role"), 1)
         with Database(legacy_path).connect() as connection:
@@ -786,7 +786,7 @@ class DatabaseTests(unittest.TestCase):
                    WHERE id='pull-1'"""
             ).fetchone()[0]
 
-        self.assertEqual(version, 20)
+        self.assertEqual(version, 21)
         self.assertEqual(issue_version["version"], 1)
         self.assertEqual(issue_version["title"], "Issue")
         self.assertEqual(issue_version["body"], "Body")
@@ -873,7 +873,7 @@ class DatabaseTests(unittest.TestCase):
                      (SELECT COUNT(*) FROM pull_requests
                        WHERE id='pull-legacy' AND run_id='run-1')""").fetchone()
 
-        self.assertEqual(schema_version, 20)
+        self.assertEqual(schema_version, 21)
         self.assertEqual(run["state"], "implementing")
         self.assertIn("legacy issue snapshot", run["reason"])
         self.assertEqual(run["validated_sha"], "b" * 40)
@@ -973,7 +973,7 @@ class DatabaseTests(unittest.TestCase):
                      AND to_state='waiting_for_feedback'"""
             ).fetchone()[0]
 
-        self.assertEqual(schema_version, 20)
+        self.assertEqual(schema_version, 21)
         self.assertEqual(run["state"], "waiting_for_feedback")
         self.assertEqual(run["last_completed_state"], "waiting_for_feedback")
         self.assertIsNone(run["reason"])
@@ -1038,7 +1038,7 @@ class DatabaseTests(unittest.TestCase):
                    FROM feedback_versions WHERE id='feedback-legacy'"""
             ).fetchone()
 
-        self.assertEqual(schema_version, 20)
+        self.assertEqual(schema_version, 21)
         self.assertTrue(
             {"review_thread_id", "review_thread_resolved"}.issubset(columns)
         )
@@ -1120,7 +1120,7 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()
             integrity = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-        self.assertEqual(schema_version, 20)
+        self.assertEqual(schema_version, 21)
         self.assertTrue(
             {"superseded_at", "superseded_by_feedback_id"}.issubset(columns)
         )
@@ -1256,7 +1256,7 @@ class DatabaseTests(unittest.TestCase):
                           retry_next_at, retry_last_error
                    FROM runs WHERE id='run-1'"""
             ).fetchone()
-        self.assertEqual(version, 20)
+        self.assertEqual(version, 21)
         self.assertEqual(tuple(retry_state), (0, None, None, None))
 
 

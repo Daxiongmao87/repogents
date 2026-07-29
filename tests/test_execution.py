@@ -2870,6 +2870,93 @@ class MiniSweRejectionTests(unittest.TestCase):
             service.execute("run-1")
 
 
+    def test_execute_mounts_artifact_once_for_baseline_and_validation(self) -> None:
+        artifact_path = self.root / "fixture-sdk.bin"
+        artifact_path.write_bytes(b"licensed fixture sdk")
+        sandbox_path = "/repository-resources/artifacts/fixture-sdk"
+        with self.db.transaction() as connection:
+            row = connection.execute(
+                "SELECT policy_json FROM sandbox_versions WHERE id='sandbox-1'"
+            ).fetchone()
+            policy_payload = json.loads(row["policy_json"])
+            policy_payload["artifact_bindings"] = [
+                {
+                    "name": "fixture-sdk",
+                    "description": "Licensed fixture SDK",
+                    "revision": 1,
+                    "content_hash": "sha256:" + ("a" * 64),
+                    "size": artifact_path.stat().st_size,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "storage_path": str(artifact_path),
+                    "sandbox_path": sandbox_path,
+                }
+            ]
+            connection.execute(
+                "UPDATE sandbox_versions SET policy_json=? WHERE id='sandbox-1'",
+                (json.dumps(policy_payload),),
+            )
+            connection.execute(
+                "UPDATE team_members SET runtime='mini-swe-agent', model='test/lead' WHERE id='lead-1'"
+            )
+            connection.execute(
+                "UPDATE team_members SET model='test/verification' WHERE id='verification-1'"
+            )
+            connection.execute(
+                "UPDATE runs SET state='validating' WHERE id='run-1'"
+            )
+        (self.checkout / "value.py").write_text(
+            "def value():\n    return 2\n", encoding="utf-8"
+        )
+
+        lead_runtime = ScriptedRuntime(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 2",
+                    "count": 1,
+                },
+                {"action": "finish", "summary": "implemented"},
+            ]
+        )
+        verification_runtime = ScriptedRuntime(
+            [{"action": "finish", "summary": "verified"}]
+        )
+        observed_mount_counts: list[int] = []
+        original_run = self.sandbox.run
+
+        def record_run(
+            policy: object,
+            layout: object,
+            argv: tuple[str, ...],
+            **kwargs: object,
+        ) -> object:
+            mounts = getattr(policy, "mounts")
+            observed_mount_counts.append(
+                sum(mount.sandbox_path == sandbox_path for mount in mounts)
+            )
+            return original_run(policy, layout, argv, **kwargs)
+
+        runtimes = {
+            "test/lead": lead_runtime,
+            "test/verification": verification_runtime,
+        }
+        service = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=lambda _stored_runtime, stored_model, _stored_timeout: runtimes[stored_model],
+            max_actions=10,
+        )
+        with mock.patch.object(self.sandbox, "run", side_effect=record_run):
+            service.execute("run-1")
+
+        self.assertGreaterEqual(len(observed_mount_counts), 2)
+        self.assertTrue(all(count == 1 for count in observed_mount_counts))
+
+
 class RepositoryArtifactRuntimeIsolationTests(unittest.TestCase):
     def test_agent_policy_mounts_artifact_read_only_while_model_evidence_retains_only_metadata(self) -> None:
         import json

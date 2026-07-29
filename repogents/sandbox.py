@@ -204,6 +204,26 @@ def redact_artifact_content(text: str, artifact_paths: Iterable[Path]) -> str:
                         literal, literal.encode("utf-8", "surrogatepass")
                     )
 
+    # Tiny artifact values must be recognized when they are delimited tokens or
+    # assignment values, without treating characters inside longer words as
+    # independent candidates.
+    for match in re.finditer(r"(?<![A-Za-z0-9_])([A-Za-z0-9_]{1,2})(?![A-Za-z0-9_])", text):
+        token = match.group(1)
+        add_candidate(token, token.encode("utf-8", "surrogatepass"))
+
+    # Extract assignment values separately because the general token scan keeps
+    # the name and value together (for example, encoded=AQ==).
+    for token in re.findall(r"(?<==)([A-Za-z0-9_./:+\-]+={0,2})(?![A-Za-z0-9_])", text):
+        add_candidate(token, token.encode("utf-8", "surrogatepass"))
+        if len(token) >= 4 and re.fullmatch(r"[A-Za-z0-9_\-/+]+={0,2}", token):
+            encoded = token.encode("ascii")
+            padded = encoded + b"=" * (-len(encoded) % 4)
+            for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+                try:
+                    add_candidate(token, decoder(padded))
+                except (ValueError, base64.binascii.Error):
+                    pass
+
     for token in re.findall(r"[A-Za-z0-9_./:+\-=]{3,}", text):
         add_candidate(token, token.encode("utf-8", "surrogatepass"))
         if len(token) >= 2 and len(token) % 2 == 0 and re.fullmatch(r"[0-9A-Fa-f]+", token):
@@ -236,7 +256,11 @@ def redact_artifact_content(text: str, artifact_paths: Iterable[Path]) -> str:
                         break
                     overlap = block[-(maximum - 1) :] if maximum > 1 else b""
         except OSError:
-            continue
+            # The caller must fail the complete result closed: independently
+            # redacting fields could otherwise preserve stdout, stderr, or an
+            # argument that was processed before another artifact became
+            # unreadable.
+            raise
     redacted = text
     for token, values in sorted(candidates.items(), key=lambda item: len(item[0]), reverse=True):
         if values & matched:
@@ -960,18 +984,26 @@ class SandboxManager:
             if proxy_directory is not None:
                 shutil.rmtree(proxy_directory, ignore_errors=True)
         completed_at = _utc_now()
-        stdout = redact_artifact_content(
-            redact_text(stdout_raw.decode("utf-8", "replace"), redaction_values),
-            artifact_paths,
-        )
-        stderr = redact_artifact_content(
-            redact_text(stderr_raw.decode("utf-8", "replace"), redaction_values),
-            artifact_paths,
-        )
-        redacted_command = [
-            redact_artifact_content(redact_text(argument, redaction_values), artifact_paths)
-            for argument in command
-        ]
+        try:
+            stdout = redact_artifact_content(
+                redact_text(stdout_raw.decode("utf-8", "replace"), redaction_values),
+                artifact_paths,
+            )
+            stderr = redact_artifact_content(
+                redact_text(stderr_raw.decode("utf-8", "replace"), redaction_values),
+                artifact_paths,
+            )
+            redacted_command = [
+                redact_artifact_content(
+                    redact_text(argument, redaction_values), artifact_paths
+                )
+                for argument in command
+            ]
+        except OSError:
+            redaction_failure = "[ARTIFACT REDACTION FAILED]"
+            stdout = redaction_failure
+            stderr = redaction_failure
+            redacted_command = [redaction_failure]
         record = {
             "command": redacted_command,
             "started_at": started_at,

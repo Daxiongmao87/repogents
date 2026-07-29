@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
@@ -717,6 +718,75 @@ class SandboxPolicyTests(unittest.TestCase):
         )
         for exposed in ("Q", "QZ", "01", "01fe", encoded_one, encoded_two):
             self.assertNotIn(exposed, persisted_output)
+
+    def test_embedded_and_assignment_tiny_artifact_fragments_are_redacted(self) -> None:
+        artifact = self.root / "embedded-tiny-fixture.bin"
+        artifact.write_bytes(b"QZ\x01\xfe")
+        sandbox_path = "/repository-resources/artifacts/embedded-tiny-fixture"
+        policy = SandboxPolicy(
+            persistent_root=self.persistent,
+            mounts=(Mount(artifact, sandbox_path),),
+        )
+        encoded_one = base64.b64encode(b"\x01").decode("ascii")
+        encoded_two = base64.b64encode(b"\x01\xfe").decode("ascii")
+        code = (
+            "print('prefix QZ suffix'); print('artifact=QZ'); "
+            f"print('encoded={encoded_one}'); print('prefix {encoded_two} suffix')"
+        )
+
+        result = SandboxManager().run(
+            policy, self.layout, ("python3", "-c", code), timeout=20
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        persisted = json.loads(result.log_path.read_text(encoding="utf-8"))
+        exposed_output = "\n".join(
+            (result.stdout, result.stderr, persisted["stdout"], persisted["stderr"], *persisted["command"])
+        )
+        for exposed in ("QZ", encoded_one, encoded_two):
+            self.assertNotIn(exposed, exposed_output)
+        self.assertIn("prefix [REDACTED] suffix", result.stdout)
+        self.assertIn("artifact=[REDACTED]", result.stdout)
+        self.assertIn("encoded=[REDACTED]", result.stdout)
+
+    def test_artifact_redaction_failure_replaces_complete_result_and_log(self) -> None:
+        import repogents.sandbox as sandbox_module
+
+        artifact = self.root / "vanishing-fixture.bin"
+        secret_content = "licensed-fixture-content"
+        artifact.write_text(secret_content, encoding="utf-8")
+        sandbox_path = "/repository-resources/artifacts/vanishing-fixture"
+        policy = SandboxPolicy(
+            persistent_root=self.persistent,
+            mounts=(Mount(artifact, sandbox_path),),
+        )
+        original_redact = sandbox_module.redact_artifact_content
+        inspection_started = False
+
+        def remove_before_inspection(text: str, artifact_paths: object) -> str:
+            nonlocal inspection_started
+            if not inspection_started:
+                inspection_started = True
+                artifact.unlink()
+            return original_redact(text, artifact_paths)
+
+        command = ("python3", "-c", f"print({secret_content!r})")
+        with mock.patch(
+            "repogents.sandbox.redact_artifact_content",
+            side_effect=remove_before_inspection,
+        ):
+            result = SandboxManager().run(policy, self.layout, command, timeout=20)
+
+        marker = "[ARTIFACT REDACTION FAILED]"
+        self.assertEqual(result.stdout, marker)
+        self.assertEqual(result.stderr, marker)
+        persisted_text = result.log_path.read_text(encoding="utf-8")
+        persisted = json.loads(persisted_text)
+        self.assertEqual(persisted["stdout"], marker)
+        self.assertEqual(persisted["stderr"], marker)
+        self.assertEqual(persisted["command"], [marker])
+        self.assertNotIn(secret_content, persisted_text)
+        self.assertNotIn(secret_content, result.stdout + result.stderr)
 
     def test_large_artifact_redaction_does_not_build_artifact_sized_markers(self) -> None:
         artifact = self.root / "large-fixture.bin"

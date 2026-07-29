@@ -228,13 +228,73 @@ class LocalInterfaceServer:
 
     def _post(self, request: BaseHTTPRequestHandler) -> None:
         try:
-            payload = self._read_json(request)
-            path = urllib.parse.urlsplit(request.path).path
+            parsed_path = urllib.parse.urlsplit(request.path)
+            path = parsed_path.path
             segments = [
                 urllib.parse.unquote(segment)
                 for segment in path.strip("/").split("/")
                 if segment
             ]
+            if (
+                len(segments) == 4
+                and segments[:2] == ["api", "repositories"]
+                and segments[3] == "artifact-uploads"
+            ):
+                # Binary uploads must not be CORS-simple requests, and all request
+                # provenance checks happen before reading any attacker-controlled body.
+                if request.headers.get("Content-Type", "") != "application/octet-stream":
+                    raise ValueError(
+                        "artifact uploads require Content-Type application/octet-stream"
+                    )
+                fetch_site = request.headers.get("Sec-Fetch-Site", "").lower()
+                if fetch_site and fetch_site not in {"same-origin", "none"}:
+                    raise ValueError("cross-origin artifact uploads are not allowed")
+                origin = request.headers.get("Origin")
+                if origin:
+                    host = request.headers.get("Host", "")
+                    parsed_origin = urllib.parse.urlsplit(origin)
+                    if (
+                        parsed_origin.scheme not in {"http", "https"}
+                        or parsed_origin.netloc != host
+                        or parsed_origin.path not in {"", "/"}
+                        or parsed_origin.query
+                        or parsed_origin.fragment
+                    ):
+                        raise ValueError("cross-origin artifact uploads are not allowed")
+                maximum_size = 64 * 1024 * 1024
+                raw_length = request.headers.get("Content-Length")
+                if raw_length is None:
+                    raise ValueError("artifact upload content length is required")
+                try:
+                    content_length = int(raw_length)
+                except ValueError as error:
+                    raise ValueError("artifact upload content length is invalid") from error
+                if content_length < 1:
+                    raise ValueError("artifact content is required")
+                if content_length > maximum_size:
+                    raise ValueError("artifact upload exceeds the 64 MiB limit")
+                query = urllib.parse.parse_qs(parsed_path.query, keep_blank_values=True)
+                name = query.get("name", [""])[0]
+                description = query.get("description", [""])[0]
+                if not name.strip():
+                    raise ValueError("artifact name must be a nonempty string")
+                content = bytearray()
+                remaining = content_length
+                while remaining:
+                    chunk = request.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError("artifact upload was interrupted")
+                    content.extend(chunk)
+                    remaining -= len(chunk)
+                artifact = self.actions.upload_repository_artifact(
+                    segments[2],
+                    name=name.strip(),
+                    description=description,
+                    content=bytes(content),
+                )
+                self._send_json(request, HTTPStatus.CREATED, artifact)
+                return
+            payload = self._read_json(request)
             if (
                 len(segments) == 4
                 and segments[:2] == ["api", "repositories"]
@@ -261,6 +321,22 @@ class LocalInterfaceServer:
                     content=content,
                 )
                 self._send_json(request, HTTPStatus.CREATED, artifact)
+                return
+            if (
+                len(segments) == 5
+                and segments[:2] == ["api", "repositories"]
+                and segments[3:] == ["artifacts", "description"]
+            ):
+                name = payload.get("name")
+                description = payload.get("description", "")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError("artifact name must be a nonempty string")
+                if not isinstance(description, str):
+                    raise ValueError("artifact description must be a string")
+                artifact = self.actions.update_repository_artifact_description(
+                    segments[2], name=name.strip(), description=description
+                )
+                self._send_json(request, HTTPStatus.OK, artifact)
                 return
             if (
                 len(segments) == 4
@@ -1022,13 +1098,11 @@ const refreshCommandScopes = editor => {
 };
 const commandRows = control => {
   const editor = control.closest('[data-resources-editor]');
-  refreshCommandScopes(editor);
   return [...control.querySelectorAll('input:checked')].map(input => {
     const row = editor.querySelectorAll(`[data-resource-row="${input.dataset.commandKind}"]`)[Number(input.dataset.commandIndex)];
     return parsedJsonField(row.querySelector('[data-field="value"]'), 'Selected command scope');
   });
 };
-resourceEditor?.addEventListener('focusin', () => refreshCommandScopes(resourceEditor));
 resourceEditor?.addEventListener('input', event => {
   if (event.target.matches('[data-resource-row="provisioning"] [data-field="value"], [data-resource-row="validation"] [data-field="value"]')) refreshCommandScopes(resourceEditor);
 });
@@ -1079,11 +1153,21 @@ const resourceDraft = editor => {
     return command;
   });
   else delete advanced.validation_commands;
-  const variableBindings = rows('variable').map(row => ({
-    name:field(row, 'name').trim(),
-    value:field(row, 'value'),
-    commands:commandRows(control(row, 'commands')),
-  }));
+  const variableBindings = rows('variable').map((row, index) => {
+    const commandsControl = control(row, 'commands');
+    const commands = commandRows(commandsControl);
+    if (!commands.length) {
+      return resourceFieldError(
+        commandsControl,
+        `Variable ${index + 1} must apply to at least one provisioning or validation command.`,
+      );
+    }
+    return {
+      name:field(row, 'name').trim(),
+      value:field(row, 'value'),
+      commands,
+    };
+  });
   if (variableBindings.length) advanced.variable_bindings = variableBindings;
   else delete advanced.variable_bindings;
   delete advanced.artifact_uploads;
@@ -1115,14 +1199,18 @@ const resourceDraft = editor => {
 const structuredInputs = (editor, repositoryId = '', artifactBindings = []) => {
   const draft = resourceDraft(editor);
   draft.advanced.artifact_bindings = artifactBindings;
-  const legacySecretBindings = (draft.advanced.secret_bindings || []).filter(binding =>
-    !String(binding?.reference || '').startsWith('secret://repository/')
-  );
-  const managedSecretBindings = draft.secrets.map(binding => ({
-    name:binding.name,
-    reference:`secret://repository/${repositoryId}/${binding.name.toLowerCase()}`,
-    commands:binding.commands,
-  }));
+  const legacySecretBindings = (draft.advanced.secret_bindings || []).filter(binding => {
+    const reference = String(binding?.reference || '');
+    return !reference.startsWith('secret://repository/')
+      && !reference.startsWith('secret://repository-revision/');
+  });
+  const managedSecretBindings = draft.secrets
+    .filter(binding => binding.action !== 'remove')
+    .map(binding => ({
+      name:binding.name,
+      reference:`secret://repository/${repositoryId}/${binding.name.toLowerCase()}`,
+      commands:binding.commands,
+    }));
   draft.advanced.secret_bindings = [...legacySecretBindings, ...managedSecretBindings];
   return draft.advanced;
 };
@@ -1141,7 +1229,7 @@ const updateResourcePolicyPreview = () => {
     }));
     const repositorySecrets = draft.secrets.map(secret => {
       const row = [...resourceEditor.querySelectorAll('[data-resource-row="secret"]')].find(candidate =>
-        (control(candidate, 'name')?.value ?? '').trim() === secret.name
+        (candidate.querySelector('[data-field="name"]')?.value ?? '').trim() === secret.name
       );
       return {
         name:secret.name,
@@ -1195,10 +1283,13 @@ const hydrateResources = (editor, inputs = {}) => {
   });
   const secretStatus = new Map((inputs.resource_secrets || []).map(secret => [secret.name, Boolean(secret.configured)]));
   for (const binding of inputs.secret_bindings || []) {
-    if (!String(binding.reference || '').startsWith('secret://repository/')) continue;
+    const reference = String(binding.reference || '');
+    const mutableRepositorySecret = reference.startsWith('secret://repository/');
+    const pinnedRepositorySecret = reference.startsWith('secret://repository-revision/');
+    if (!mutableRepositorySecret && !pinnedRepositorySecret) continue;
     append('secret', {
       name:binding.name, value:'', action:'preserve',
-      configured_status:secretStatus.get(binding.name) ? 'Configured' : 'Not configured',
+      configured_status:pinnedRepositorySecret || secretStatus.get(binding.name) ? 'Configured' : 'Not configured',
       commands:binding.commands || [],
     });
   }
@@ -1217,20 +1308,30 @@ const hydrateResources = (editor, inputs = {}) => {
   editor.closest('form').elements.inputs.value = JSON.stringify(advancedInputs, null, 2);
   updateResourcePolicyPreview();
 };
+const resourceListName = kind => kind === 'host-path' ? 'host-paths' : kind === 'artifact' ? 'artifacts' : kind === 'variable' ? 'variables' : kind === 'secret' ? 'secrets' : kind === 'service' ? 'services' : kind;
+const appendResourceRow = (editor, kind, {focus = true} = {}) => {
+  const template = resourceTemplates[kind];
+  const list = editor.querySelector(`[data-resource-list="${resourceListName(kind)}"]`);
+  if (!template || !list) return null;
+  list.insertAdjacentHTML('beforeend', template());
+  const row = list.lastElementChild;
+  if (kind === 'variable' || kind === 'secret') refreshCommandScopes(editor);
+  if (focus) row?.querySelector('input,select')?.focus();
+  return row;
+};
+for (const button of resourceEditor?.querySelectorAll('[data-add-resource]') || []) {
+  button.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    appendResourceRow(resourceEditor, button.dataset.addResource);
+    updateResourcePolicyPreview();
+  });
+}
 resourceEditor?.addEventListener('click', event => {
-  const add = event.target.closest('[data-add-resource]');
-  if (add) {
-    const kind = add.dataset.addResource;
-    const listName = kind === 'host-path' ? 'host-paths' : kind === 'artifact' ? 'artifacts' : kind === 'variable' ? 'variables' : kind === 'secret' ? 'secrets' : kind === 'service' ? 'services' : kind;
-    const list = resourceEditor.querySelector(`[data-resource-list="${listName}"]`);
-    list?.insertAdjacentHTML('beforeend', resourceTemplates[kind]());
-    list?.lastElementChild?.querySelector('input,select')?.focus();
-  }
   const remove = event.target.closest('[data-remove-resource]');
-  if (remove) {
-    remove.closest('[data-resource-row]')?.remove();
-  }
-  if (add || remove) updateResourcePolicyPreview();
+  if (!remove) return;
+  remove.closest('[data-resource-row]')?.remove();
+  updateResourcePolicyPreview();
 });
 resourceEditor?.addEventListener('change', updateResourcePolicyPreview);
 const error = document.querySelector('#error');
@@ -1658,12 +1759,19 @@ document.querySelector('#model-configuration-form').addEventListener('submit', a
   await refresh();
   await loadModelCatalog();
 });
-const fileBase64 = file => new Promise((resolve, reject) => {
-  const reader = new FileReader();
-  reader.onerror = () => reject(new Error(`Could not read artifact ${file.name}.`));
-  reader.onload = () => resolve(String(reader.result || '').split(',', 2)[1] || '');
-  reader.readAsDataURL(file);
-});
+async function uploadArtifact(repositoryId, artifact) {
+  const query = new URLSearchParams({
+    name: artifact.name,
+    description: artifact.description,
+  });
+  const response = await fetch(
+    `/api/repositories/${encodeURIComponent(repositoryId)}/artifact-uploads?${query}`,
+    {method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:artifact.file},
+  );
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
+  return payload;
+}
 document.querySelector('#add').addEventListener('submit', event => {
   event.preventDefault();
   action(async () => {
@@ -1681,12 +1789,12 @@ document.querySelector('#add').addEventListener('submit', event => {
     for (const artifact of draft.artifacts) {
       let revision = artifact.revision;
       if (artifact.file) {
-        const uploaded = await mutate(`/api/repositories/${encodeURIComponent(repositoryId)}/artifacts`, {
-          name:artifact.name,
-          description:artifact.description,
-          content_base64:await fileBase64(artifact.file),
-        });
+        const uploaded = await uploadArtifact(repositoryId, artifact);
         revision = uploaded.revision;
+      } else if (revision) {
+        await mutate(`/api/repositories/${encodeURIComponent(repositoryId)}/artifacts/description`, {
+          name:artifact.name, description:artifact.description,
+        });
       }
       if (!revision) throw new Error(`Choose a file for artifact ${artifact.name}.`);
       artifactBindings.push({name:artifact.name, revision, sandbox_path:artifact.sandbox_path});

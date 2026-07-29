@@ -404,6 +404,24 @@ class InterfaceTests(unittest.TestCase):
         except urllib.error.HTTPError as error:
             return error.code, dict(error.headers), error.read()
 
+    def binary_request(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        content_type: str = "application/octet-stream",
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, str], bytes]:
+        request = urllib.request.Request(self.base + path, data=content, method="POST")
+        request.add_header("Content-Type", content_type)
+        for name, value in (headers or {}).items():
+            request.add_header(name, value)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, dict(response.headers), response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, dict(error.headers), error.read()
+
     @staticmethod
     def read_sse_event(response: object) -> tuple[str, dict[str, object]]:
         event = "message"
@@ -489,6 +507,52 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(response["revision"], 2)
         self.assertNotIn("content", response)
         self.assertNotIn(b"fixture-bytes", body)
+        self.assertIn(
+            (
+                "upload-artifact",
+                "repo-1",
+                "fixture-sdk",
+                "Licensed fixture SDK",
+                b"fixture-bytes",
+            ),
+            self.actions.calls,
+        )
+
+    def test_binary_artifact_upload_requires_octet_stream_before_storage(self) -> None:
+        before = list(self.actions.calls)
+        status, _, body = self.binary_request(
+            "/api/repositories/repo-1/artifact-uploads?name=fixture-sdk",
+            b"attacker-controlled-bytes",
+            content_type="text/plain",
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn(b"application/octet-stream", body)
+        self.assertEqual(self.actions.calls, before)
+
+    def test_binary_artifact_upload_rejects_untrusted_origin_before_storage(self) -> None:
+        before = list(self.actions.calls)
+        status, _, body = self.binary_request(
+            "/api/repositories/repo-1/artifact-uploads?name=fixture-sdk",
+            b"attacker-controlled-bytes",
+            headers={"Origin": "https://attacker.example"},
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn(b"cross-origin artifact uploads are not allowed", body)
+        self.assertEqual(self.actions.calls, before)
+
+    def test_binary_artifact_upload_accepts_dashboard_media_type(self) -> None:
+        status, _, body = self.binary_request(
+            "/api/repositories/repo-1/artifact-uploads?name=fixture-sdk&description=Licensed%20fixture%20SDK",
+            b"fixture-bytes",
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+
+        self.assertEqual(status, 201)
+        response = json.loads(body)
+        self.assertEqual(response["name"], "fixture-sdk")
+        self.assertNotIn("content", response)
         self.assertIn(
             (
                 "upload-artifact",
@@ -626,6 +690,56 @@ class InterfaceTests(unittest.TestCase):
         self.assertIn("/api/acceptance-artifacts/", dashboard)
         self.assertIn("scope", dashboard)
 
+    def test_variable_resource_requires_command_scope_before_serialization(
+        self,
+    ) -> None:
+        import shutil
+        import subprocess
+
+        status, _, body = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        dashboard = body.decode("utf-8")
+        start = dashboard.index("  const variableBindings = rows('variable').map")
+        end = dashboard.index("  delete advanced.artifact_uploads;", start)
+        variable_source = dashboard[start:end]
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required for the interface JavaScript regression test")
+        script = "\n".join(
+            (
+                "const resourceFieldError = (control, message) => { control.message = message; throw new Error(message); };",
+                "const commandRows = control => control.commands;",
+                "const control = (row, name) => row.controls[name];",
+                "const field = (row, name) => row.controls[name].value;",
+                "const draft = variableRows => {",
+                "  const advanced = {};",
+                "  const rows = kind => kind === 'variable' ? variableRows : [];",
+                variable_source,
+                "  return advanced.variable_bindings;",
+                "};",
+                "const row = commands => ({controls: {name: {value: 'SDK_MODE'}, value: {value: 'fixture'}, commands: {commands}}});",
+                "let error = '';",
+                "try { draft([row([])]); } catch (caught) { error = caught.message; }",
+                "const scoped = draft([row([['python', 'validate.py']])]);",
+                "process.stdout.write(JSON.stringify({error, scoped}));",
+            )
+        )
+        completed = subprocess.run(
+            [node, "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(
+            result["error"],
+            "Variable 1 must apply to at least one provisioning or validation command.",
+        )
+        self.assertEqual(
+            result["scoped"],
+            [{"name": "SDK_MODE", "value": "fixture", "commands": [["python", "validate.py"]]}],
+        )
+
     def test_command_scoped_resource_serialization_executes_against_resources_editor(
         self,
     ) -> None:
@@ -661,6 +775,164 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(completed.stdout), [["python", "provision.py"]])
 
+    def test_command_scope_checkbox_is_not_rebuilt_when_focused(self) -> None:
+        status, _, body = self.request("GET", "/")
+
+        self.assertEqual(status, 200)
+        dashboard = body.decode("utf-8")
+        self.assertNotIn(
+            "resourceEditor?.addEventListener('focusin', () => refreshCommandScopes(resourceEditor));",
+            dashboard,
+        )
+        command_rows_start = dashboard.index("const commandRows = control => {")
+        command_rows_end = dashboard.index("\nresourceEditor?.addEventListener('input'", command_rows_start)
+        self.assertNotIn(
+            "refreshCommandScopes(editor);",
+            dashboard[command_rows_start:command_rows_end],
+        )
+        self.assertIn(
+            "resourceEditor?.addEventListener('input', event => {",
+            dashboard,
+        )
+        self.assertIn(
+            "if (event.target.matches('[data-resource-row=\"provisioning\"] [data-field=\"value\"], [data-resource-row=\"validation\"] [data-field=\"value\"]')) refreshCommandScopes(resourceEditor);",
+            dashboard,
+        )
+        self.assertIn(
+            "if (kind === 'variable' || kind === 'secret') refreshCommandScopes(editor);",
+            dashboard,
+        )
+
+    def test_new_variable_and_secret_rows_receive_existing_command_scopes(self) -> None:
+        status, _, body = self.request("GET", "/")
+
+        self.assertEqual(status, 200)
+        dashboard = body.decode("utf-8")
+        start = dashboard.index("const appendResourceRow =")
+        end = dashboard.index("\nfor (const button of resourceEditor?.querySelectorAll", start)
+        append_row = dashboard[start:end]
+        self.assertIn(
+            "if (kind === 'variable' || kind === 'secret') refreshCommandScopes(editor);",
+            append_row,
+        )
+
+    def test_provisioning_then_validation_add_buttons_append_distinct_rows(
+        self,
+    ) -> None:
+        import shutil
+        import subprocess
+
+        status, _, body = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        dashboard = body.decode("utf-8")
+        start = dashboard.index("const resourceListName =")
+        end = dashboard.index("\nresourceEditor?.addEventListener('change'", start)
+        listeners = dashboard[start:end]
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required for the interface JavaScript regression test")
+        script = "\n".join(
+            (
+                "const rows = {provisioning: [], validation: []};",
+                "const makeRow = kind => ({kind, querySelector: () => ({focus() {}})});",
+                "const lists = Object.fromEntries(['provisioning', 'validation'].map(kind => [kind, {lastElementChild: null, insertAdjacentHTML() { this.lastElementChild = makeRow(kind); rows[kind].push(this.lastElementChild); }}]));",
+                "const makeButton = kind => ({dataset: {addResource: kind}, handlers: {}, addEventListener(name, handler) { this.handlers[name] = handler; }});",
+                "const buttons = [makeButton('provisioning'), makeButton('validation')];",
+                "const resourceEditor = {querySelectorAll: selector => selector === '[data-add-resource]' ? buttons : [], querySelector: selector => { const match = selector.match(/data-resource-list=\"([^\"]+)/); return match ? lists[match[1]] || null : null; }, addEventListener() {}};",
+                "const resourceTemplates = {provisioning: () => '<row>', validation: () => '<row>'};",
+                "let previewUpdates = 0; const updateResourcePolicyPreview = () => { previewUpdates += 1; };",
+                listeners,
+                "const event = {preventDefault() {}, stopPropagation() {}};",
+                "buttons[0].handlers.click(event); rows.provisioning[0].value = '[\"python\",\"provision.py\"]'; buttons[1].handlers.click(event);",
+                "process.stdout.write(JSON.stringify({provisioning: rows.provisioning.length, validation: rows.validation.length, previewUpdates}));",
+            )
+        )
+        completed = subprocess.run(
+            [node, "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {"provisioning": 1, "validation": 1, "previewUpdates": 2},
+        )
+
+    def test_pinned_repository_secret_round_trips_through_structured_editor(
+        self,
+    ) -> None:
+        import shutil
+        import subprocess
+
+        status, _, body = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        dashboard = body.decode("utf-8")
+        structured_start = dashboard.index("const structuredInputs =")
+        structured_end = dashboard.index("\nconst updateResourcePolicyPreview", structured_start)
+        hydrate_start = dashboard.index("const hydrateResources =")
+        hydrate_end = dashboard.index("\nresourceEditor?.addEventListener", hydrate_start)
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required for the interface JavaScript regression test")
+        script = "\n".join(
+            (
+                "const rows = [];",
+                "const form = {elements: {inputs: {value: '{}'}}};",
+                'const makeRow = () => { const controls = {name: {value: \"\"}, value: {value: \"\"}, action: {value: \"preserve\"}, configured_status: {textContent: \"\"}}; return {dataset: {}, controls, querySelector: selector => { const match = selector.match(/data-field=\"([^\"]+)/); return match ? controls[match[1]] || null : null; }, querySelectorAll: () => []}; };',
+                "const list = {lastElementChild: null, insertAdjacentHTML: () => { list.lastElementChild = makeRow(); rows.push(list.lastElementChild); }};",
+                "const editor = {querySelectorAll: selector => selector === '[data-resource-row]' ? [] : selector.includes('secret') ? rows : [], querySelector: selector => selector.includes('secrets') ? list : null, closest: () => form};",
+                "const resourceTemplates = {secret: () => ''};",
+                "const resourceEditor = editor;",
+                "const refreshCommandScopes = () => {};",
+                "const updateResourcePolicyPreview = () => {};",
+                dashboard[hydrate_start:hydrate_end],
+                "hydrateResources(editor, {secret_bindings: [{name: 'PRODUCT_KEY', reference: 'secret://repository-revision/rev-1', commands: [['python', 'validate.py']]}, {name: 'ENV_TOKEN', reference: 'secret://package-token', commands: [['python', 'validate.py']]}]});",
+                "const hydratedStatus = rows[0].controls.configured_status.textContent;",
+                "const resourceDraft = () => ({advanced: JSON.parse(form.elements.inputs.value), artifacts: [], secrets: rows.map(row => ({name: row.controls.name.value, value: row.controls.value.value, action: row.controls.action.value, commands: [['python', 'validate.py']]}))});",
+                dashboard[structured_start:structured_end],
+                "const preserve = structuredInputs(editor, 'repo-1', []);",
+                "rows[0].controls.action.value = 'replace';",
+                "const replace = structuredInputs(editor, 'repo-1', []);",
+                "rows[0].controls.action.value = 'remove';",
+                "const remove = structuredInputs(editor, 'repo-1', []);",
+                "process.stdout.write(JSON.stringify({hydratedStatus, preserve: preserve.secret_bindings, replace: replace.secret_bindings, remove: remove.secret_bindings}));",
+            )
+        )
+        completed = subprocess.run(
+            [node, "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["hydratedStatus"], "Configured")
+        for action in ("preserve", "replace"):
+            self.assertEqual(
+                result[action],
+                [
+                    {
+                        "name": "ENV_TOKEN",
+                        "reference": "secret://package-token",
+                        "commands": [["python", "validate.py"]],
+                    },
+                    {
+                        "name": "PRODUCT_KEY",
+                        "reference": "secret://repository/repo-1/product_key",
+                        "commands": [["python", "validate.py"]],
+                    },
+                ],
+            )
+        self.assertEqual(
+            result["remove"],
+            [
+                {
+                    "name": "ENV_TOKEN",
+                    "reference": "secret://package-token",
+                    "commands": [["python", "validate.py"]],
+                }
+            ],
+        )
+
     def test_resources_policy_preview_is_accessible_and_omits_secret_values(
         self,
     ) -> None:
@@ -683,9 +955,8 @@ class InterfaceTests(unittest.TestCase):
             (
                 "const preview = {textContent: ''};",
                 "const resourcePolicyPreview = {querySelector: () => preview};",
-                "const secretRow = {querySelector: selector => selector.includes('configured_status') ? {textContent: 'Configured'} : null};",
+                "const secretRow = {querySelector: selector => selector.includes('configured_status') ? {textContent: 'Configured'} : selector.includes('data-field=\"name\"') ? {value: 'PRODUCT_KEY'} : null};",
                 "const resourceEditor = {querySelectorAll: selector => selector === '[data-resource-row=\"secret\"]' ? [secretRow] : []};",
-                "const control = (_row, name) => name === 'name' ? {value: 'PRODUCT_KEY'} : null;",
                 "const resourceDraft = () => ({advanced: {variable_bindings: [{name: 'SDK_MODE', value: 'fixture', commands: [['python', 'validate.py']]}]}, artifacts: [{name: 'fixture-sdk', description: 'Fixture SDK', sandbox_path: '/repository-resources/artifacts/fixture-sdk', revision: 0, file: {size: 17}}], secrets: [{name: 'PRODUCT_KEY', value: 'saved-product-key-123', action: 'replace', commands: [['python', 'validate.py']]}]});",
                 preview_source,
                 "updateResourcePolicyPreview();",

@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import uuid
 from dataclasses import asdict, dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Protocol, Sequence
 
 from .controller import git_environment
@@ -1057,7 +1057,7 @@ class OnboardingService:
                 normalized_inputs,
                 prior_failure=prior_failure,
             )
-        except MissingRepositoryInput as error:
+        except (MissingRepositoryInput, ValueError) as error:
             self._set_failure(repository_id, "needs_input", str(error))
         except Exception as error:
             self._set_failure(repository_id, "blocked", str(error))
@@ -1162,7 +1162,8 @@ class OnboardingService:
         for requested_artifact in inputs.get("artifact_bindings", []):
             with self.database.connect() as connection:
                 artifact_row = connection.execute(
-                    """SELECT repository_artifacts.name,
+                    """SELECT artifact_revisions.id AS artifact_revision_id,
+                              repository_artifacts.name,
                               repository_artifacts.description,
                               artifact_revisions.revision,
                               artifact_revisions.content_hash,
@@ -1209,6 +1210,7 @@ class OnboardingService:
                 )
             artifact_bindings.append(
                 {
+                    "artifact_revision_id": str(artifact_row["artifact_revision_id"]),
                     "name": str(artifact_row["name"]),
                     "description": str(artifact_row["description"]),
                     "revision": int(artifact_row["revision"]),
@@ -1219,6 +1221,23 @@ class OnboardingService:
                     "sandbox_path": requested_artifact["sandbox_path"],
                 }
             )
+        reservation_created_at = _utc_now()
+        with self.database.transaction() as connection:
+            for artifact in artifact_bindings:
+                connection.execute(
+                    """INSERT INTO artifact_revision_build_reservations
+                       (id, repository_id, artifact_revision_id, sandbox_version_id,
+                        sandbox_path, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(uuid.uuid4()),
+                        repository_id,
+                        artifact["artifact_revision_id"],
+                        sandbox_id,
+                        artifact["sandbox_path"],
+                        reservation_created_at,
+                    ),
+                )
         variable_bindings = inputs.get("variable_bindings", [])
         configured_secret_bindings = inputs.get("secret_bindings", [])
         for binding in configured_secret_bindings:
@@ -1278,29 +1297,6 @@ class OnboardingService:
                    WHERE id=?""",
                 (_utc_now(), repository_id),
             )
-        provisioning = (
-            self.provisioner.provision(
-                repository_id=repository_id,
-                version=sandbox_version,
-                source_path=source_path,
-                sandbox_path=sandbox_path,
-                inspection=inspection,
-                policy=sandbox_policy,
-                provisioning_commands=provisioning_commands,
-                variable_bindings=tuple(
-                    (
-                        str(value["name"]),
-                        str(value["value"]),
-                        tuple(tuple(command) for command in value["commands"]),
-                    )
-                    for value in variable_bindings
-                ),
-                secret_bindings=secret_bindings,
-            )
-            if self.provisioner is not None
-            else {"commands": [], "manifests": list(inspection.manifests)}
-        )
-        variable_bindings = inputs.get("variable_bindings", [])
         sandbox_secret_pins: list[dict[str, Any]] = []
         pinned_secret_bindings: list[dict[str, Any]] = []
         for binding in inputs.get("secret_bindings", []):
@@ -1336,6 +1332,36 @@ class OnboardingService:
                     }
                 )
             pinned_secret_bindings.append(pinned_binding)
+        secret_bindings: tuple[ProvisioningSecretBinding, ...] = tuple(
+            (
+                str(value["name"]),
+                str(value["reference"]),
+                tuple(tuple(command) for command in value["commands"]),
+            )
+            for value in pinned_secret_bindings
+        )
+        provisioning = (
+            self.provisioner.provision(
+                repository_id=repository_id,
+                version=sandbox_version,
+                source_path=source_path,
+                sandbox_path=sandbox_path,
+                inspection=inspection,
+                policy=sandbox_policy,
+                provisioning_commands=provisioning_commands,
+                variable_bindings=tuple(
+                    (
+                        str(value["name"]),
+                        str(value["value"]),
+                        tuple(tuple(command) for command in value["commands"]),
+                    )
+                    for value in variable_bindings
+                ),
+                secret_bindings=secret_bindings,
+            )
+            if self.provisioner is not None
+            else {"commands": [], "manifests": list(inspection.manifests)}
+        )
         policy = {
             "version": sandbox_version,
             "base_sha": base_sha,
@@ -1426,27 +1452,32 @@ class OnboardingService:
                 ),
             )
             for artifact in artifact_bindings:
-                artifact_revision = connection.execute(
-                    """SELECT artifact_revisions.id
-                       FROM repository_artifacts
-                       JOIN artifact_revisions
-                         ON artifact_revisions.artifact_id=repository_artifacts.id
-                       WHERE repository_artifacts.repository_id=?
-                         AND repository_artifacts.name=?
-                         AND artifact_revisions.revision=?""",
-                    (repository_id, artifact["name"], artifact["revision"]),
-                ).fetchone()
-                if artifact_revision is None:
-                    raise MissingRepositoryInput(
-                        "artifact_bindings",
-                        f"artifact {artifact['name']} revision {artifact['revision']} is missing or inaccessible; upload or select an available revision",
-                    )
                 connection.execute(
                     """INSERT INTO sandbox_artifact_revisions
                        (sandbox_version_id, artifact_revision_id, sandbox_path)
-                       VALUES (?, ?, ?)""",
-                    (sandbox_id, artifact_revision["id"], artifact["sandbox_path"]),
+                       SELECT ?, artifact_revision_id, sandbox_path
+                         FROM artifact_revision_build_reservations
+                        WHERE repository_id=?
+                          AND sandbox_version_id=?
+                          AND artifact_revision_id=?
+                          AND sandbox_path=?""",
+                    (
+                        sandbox_id,
+                        repository_id,
+                        sandbox_id,
+                        artifact["artifact_revision_id"],
+                        artifact["sandbox_path"],
+                    ),
                 )
+                if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise MissingRepositoryInput(
+                        "artifact_bindings",
+                        f"artifact {artifact['name']} revision {artifact['revision']} lost its build reservation",
+                    )
+            connection.execute(
+                "DELETE FROM artifact_revision_build_reservations WHERE repository_id=? AND sandbox_version_id=?",
+                (repository_id, sandbox_id),
+            )
             for secret_pin in sandbox_secret_pins:
                 connection.execute(
                     """INSERT INTO sandbox_secret_revisions
@@ -1541,6 +1572,10 @@ class OnboardingService:
                         interrupted_state,
                     ),
                 )
+                connection.execute(
+                    "DELETE FROM artifact_revision_build_reservations WHERE repository_id=?",
+                    (repository_id,),
+                )
                 recovered.append(repository_id)
         return tuple(recovered)
 
@@ -1549,6 +1584,10 @@ class OnboardingService:
             connection.execute(
                 "UPDATE repositories SET onboarding_state=?, blocking_reason=?, updated_at=? WHERE id=?",
                 (state, reason, _utc_now(), repository_id),
+            )
+            connection.execute(
+                "DELETE FROM artifact_revision_build_reservations WHERE repository_id=?",
+                (repository_id,),
             )
 
     def list_repositories(self) -> list[dict[str, object]]:
@@ -1663,10 +1702,30 @@ def _normalize_repository_inputs(inputs: dict[str, object]) -> dict[str, Any]:
                 raise ValueError(f"artifact_bindings[{index}] storage_path must be absolute")
             if not isinstance(sandbox_path, str) or not sandbox_path.startswith("/"):
                 raise ValueError(f"artifact_bindings[{index}] sandbox_path must be absolute")
-            if sandbox_path in sandbox_paths:
-                raise ValueError(f"duplicate artifact sandbox path: {sandbox_path}")
+            sandbox_target = PurePosixPath(sandbox_path)
+            if ".." in sandbox_target.parts:
+                raise ValueError(
+                    f"artifact_bindings[{index}] sandbox_path must not contain traversal"
+                )
+            normalized_sandbox_path = str(sandbox_target)
+            artifact_root = PurePosixPath("/repository-resources/artifacts")
+            if sandbox_target == artifact_root or artifact_root not in sandbox_target.parents:
+                raise ValueError(
+                    f"artifact_bindings[{index}] sandbox_path must be below {artifact_root}"
+                )
+            for existing_path in sandbox_paths:
+                existing_target = PurePosixPath(existing_path)
+                if (
+                    sandbox_target == existing_target
+                    or sandbox_target in existing_target.parents
+                    or existing_target in sandbox_target.parents
+                ):
+                    raise ValueError(
+                        "artifact sandbox paths must be distinct non-nested targets: "
+                        f"{existing_path} and {normalized_sandbox_path}"
+                    )
             artifact_names.add(name)
-            sandbox_paths.add(sandbox_path)
+            sandbox_paths.add(normalized_sandbox_path)
             artifacts.append({
                 "name": name,
                 "description": description,
@@ -1675,7 +1734,7 @@ def _normalize_repository_inputs(inputs: dict[str, object]) -> dict[str, Any]:
                 "size": size,
                 "created_at": created_at.strip(),
                 "storage_path": str(Path(storage_path).expanduser().resolve()),
-                "sandbox_path": sandbox_path,
+                "sandbox_path": normalized_sandbox_path,
             })
         normalized["artifact_bindings"] = artifacts
 
@@ -1755,6 +1814,25 @@ def _normalize_repository_inputs(inputs: dict[str, object]) -> dict[str, Any]:
                 }
             )
         normalized["secret_bindings"] = bindings
+
+    variable_bindings = normalized.get("variable_bindings", [])
+    secret_bindings = normalized.get("secret_bindings", [])
+    if isinstance(variable_bindings, list) and isinstance(secret_bindings, list):
+        secret_commands_by_name = {
+            binding["name"]: {tuple(command) for command in binding["commands"]}
+            for binding in secret_bindings
+        }
+        for binding in variable_bindings:
+            name = binding["name"]
+            overlapping_commands = (
+                {tuple(command) for command in binding["commands"]}
+                & secret_commands_by_name.get(name, set())
+            )
+            if overlapping_commands:
+                command = min(overlapping_commands)
+                raise ValueError(
+                    f"variable and secret binding name conflict for {name} on command {list(command)!r}"
+                )
 
     for key in ("provisioning_commands", "validation_commands"):
         if key not in inputs:

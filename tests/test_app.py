@@ -334,6 +334,25 @@ class ApplicationTests(unittest.TestCase):
                     json.dumps(
                         {
                             "allowed_services": ["packages.example:443"],
+                            "artifact_bindings": [
+                                {
+                                    "name": "fixture-sdk",
+                                    "description": "Pinned fixture SDK",
+                                    "revision": 2,
+                                    "content_hash": "a" * 64,
+                                    "size": 4096,
+                                    "created_at": "2026-01-01T00:00:00Z",
+                                    "sandbox_path": "/resources/fixture-sdk",
+                                    "storage_path": "/controller/private/artifact",
+                                }
+                            ],
+                            "variable_bindings": [
+                                {
+                                    "name": "SDK_CHANNEL",
+                                    "value": "stable",
+                                    "commands": [["python3", "provision.py"]],
+                                }
+                            ],
                             "secret_bindings": [
                                 {
                                     "name": "PACKAGE_TOKEN",
@@ -1422,6 +1441,24 @@ class ApplicationTests(unittest.TestCase):
                     {
                         "name": "PACKAGE_TOKEN",
                         "reference": "secret://package-token",
+                        "commands": [["python3", "provision.py"]],
+                    }
+                ],
+                "artifact_bindings": [
+                    {
+                        "name": "fixture-sdk",
+                        "description": "Pinned fixture SDK",
+                        "revision": 2,
+                        "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "size": 4096,
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "sandbox_path": "/resources/fixture-sdk",
+                    }
+                ],
+                "variable_bindings": [
+                    {
+                        "name": "SDK_CHANNEL",
+                        "value": "stable",
                         "commands": [["python3", "provision.py"]],
                     }
                 ],

@@ -721,18 +721,34 @@ class PublicationService:
                 "every required validation command must have a passing policy "
                 "verdict for the exact published SHA"
             )
-        changed_output = _git(
-            checkout,
-            (
+        changed_result = subprocess.run(
+            [
+                "git",
                 "diff",
                 "--name-only",
+                "-z",
                 "--diff-filter=ACMRTD",
                 comparison_base_sha,
                 validated_sha,
                 "--",
-            ),
+            ],
+            cwd=checkout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
         )
-        changed_files = tuple(line for line in changed_output.splitlines() if line)
+        if changed_result.returncode != 0:
+            raise PublicationBlocked("changed paths are unavailable for publication scanning")
+        if changed_result.stdout and not changed_result.stdout.endswith(b"\0"):
+            raise PublicationBlocked("changed path metadata is malformed")
+        raw_changed_files = changed_result.stdout.split(b"\0")
+        if raw_changed_files and raw_changed_files[-1] == b"":
+            raw_changed_files.pop()
+        if any(not path for path in raw_changed_files):
+            raise PublicationBlocked("changed path metadata is malformed")
+        changed_files = tuple(
+            path.decode("utf-8", "surrogateescape") for path in raw_changed_files
+        )
         if not changed_files:
             raise PublicationBlocked("validated commit contains no issue change")
         forbidden = tuple(path for path in changed_files if _forbidden_artifact(path))
@@ -750,9 +766,17 @@ class PublicationService:
             raise PublicationRevisionRequired(
                 "potential secret in committed diff: " + ", ".join(findings)
             )
-        if self._contains_artifact_content(str(context["id"]), diff):
+        if self._contains_artifact_content(
+            str(context["id"]), diff, committed_diff=True
+        ):
             raise PublicationRevisionRequired(
                 "committed diff contains uploaded artifact content"
+            )
+        if self._contains_committed_artifact_blob(
+            str(context["id"]), checkout, validated_sha, changed_files
+        ):
+            raise PublicationRevisionRequired(
+                "committed file contains uploaded artifact content"
             )
         return diff, changed_files
 
@@ -974,29 +998,41 @@ class PublicationService:
         )
         return pull
 
-    def _contains_artifact_content(self, run_id: str, candidate: str) -> bool:
-        """Scan artifact files for every bounded literal or decoded candidate sequence."""
+    def _contains_artifact_content(
+        self, run_id: str, candidate: str, *, committed_diff: bool = False
+    ) -> bool:
+        """Scan publishable candidate text for uploaded artifact content."""
         import base64
 
         candidate_bytes = candidate.encode("utf-8", "surrogatepass")
         short_probes: set[bytes] = set()
         window_probes: set[bytes] = set()
+        probe_width = 16
 
         def add_probe(value: bytes) -> None:
+            value = value.strip()
             if not value:
                 return
-            if len(value) < 6:
-                short_probes.add(value)
+            if len(value) < probe_width:
+                if len(value) >= 12 and (
+                    any(byte < 32 or byte > 126 for byte in value)
+                    or len(set(value)) >= 6
+                ):
+                    short_probes.add(value)
                 return
-            for offset in range(len(value) - 5):
-                window_probes.add(value[offset : offset + 6])
+            for offset in range(len(value) - probe_width + 1):
+                window_probes.add(value[offset : offset + probe_width])
 
-        probe_sources = [candidate_bytes]
-        probe_sources.extend(
-            line[1:]
-            for line in candidate_bytes.splitlines()
-            if line.startswith(b"+") and not line.startswith(b"+++")
-        )
+        # Committed diffs publish only added lines. Pull-request proof bodies are
+        # not diffs and must be scanned in full.
+        if committed_diff:
+            probe_sources = [
+                line[1:]
+                for line in candidate_bytes.splitlines()
+                if line.startswith(b"+") and not line.startswith(b"+++")
+            ]
+        else:
+            probe_sources = [candidate_bytes]
         for source in probe_sources:
             if len(source) <= 5:
                 add_probe(source)
@@ -1067,16 +1103,132 @@ class PublicationService:
                         if any(probe in block for probe in short_probes):
                             return True
                         if any(
-                            block[offset : offset + 6] in window_probes
-                            for offset in range(max(0, len(block) - 5))
+                            block[offset : offset + probe_width] in window_probes
+                            for offset in range(max(0, len(block) - probe_width + 1))
                         ):
                             return True
-                        overlap = block[-5:]
+                        overlap = block[-(probe_width - 1) :]
             except OSError as error:
                 name = str(binding.get("name") or storage_path)
                 raise PublicationBlocked(
                     f"required artifact {name} is unavailable for publication scanning"
                 ) from error
+        return False
+
+    def _contains_committed_artifact_blob(
+        self,
+        run_id: str,
+        checkout: Path,
+        validated_sha: str,
+        changed_files: Sequence[str],
+    ) -> bool:
+        """Compare changed committed regular-file blobs with pinned artifacts."""
+        import hashlib
+
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT sandbox_versions.policy_json
+                   FROM runs
+                   JOIN sandbox_versions
+                     ON sandbox_versions.id=runs.sandbox_version_id
+                   WHERE runs.id=?""",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise PublicationBlocked(
+                "run sandbox version is unavailable for artifact scanning"
+            )
+        payload = json.loads(str(row["policy_json"]))
+        bindings = payload.get("artifact_bindings", [])
+        if not isinstance(bindings, list):
+            raise PublicationBlocked("stored artifact bindings are invalid")
+
+        def contains_artifact_bytes(blob: bytes, artifact: bytes) -> bool:
+            if not artifact:
+                return False
+            if artifact in blob:
+                return True
+            # Binary patches do not expose raw bytes in the textual diff. Scan
+            # overlapping, sufficiently distinctive raw windows so embedded or
+            # partial binary copies are rejected without reviving arbitrary
+            # six-byte source-token false positives. The overlap guarantees any
+            # copied run of at least 95 bytes contains a complete 64-byte probe.
+            width = 64
+            stride = 32
+            if len(artifact) < width:
+                return False
+            offsets = range(0, len(artifact) - width + 1, stride)
+            if any(artifact[offset : offset + width] in blob for offset in offsets):
+                return True
+            final_offset = len(artifact) - width
+            return final_offset % stride != 0 and artifact[final_offset:] in blob
+
+        # Keep artifact memory bounded by releasing each pinned artifact before
+        # loading the next one. This deliberately trades repeated Git blob reads
+        # for a bound independent of the aggregate size of repository artifacts.
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                raise PublicationBlocked("stored artifact binding is invalid")
+            storage_path = binding.get("storage_path")
+            if not isinstance(storage_path, str):
+                raise PublicationBlocked("stored artifact path is invalid")
+            name = str(binding.get("name") or storage_path)
+            try:
+                artifact_bytes = Path(storage_path).read_bytes()
+            except OSError as error:
+                raise PublicationBlocked(
+                    f"required artifact {name} is unavailable for publication scanning"
+                ) from error
+
+            for path in changed_files:
+                raw_path = path.encode("utf-8", "surrogateescape")
+                tree = subprocess.run(
+                    [
+                        b"git",
+                        b"--literal-pathspecs",
+                        b"ls-tree",
+                        b"-z",
+                        validated_sha.encode("ascii"),
+                        b"--",
+                        raw_path,
+                    ],
+                    cwd=checkout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                if tree.returncode != 0:
+                    raise PublicationBlocked(
+                        f"committed path {path} is unavailable for artifact scanning"
+                    )
+                if not tree.stdout:
+                    continue  # the raw changed path is genuinely absent at this tree
+                if not tree.stdout.endswith(b"\0") or tree.stdout.count(b"\0") != 1:
+                    raise PublicationBlocked(
+                        f"committed path {path} has invalid Git metadata"
+                    )
+                header, separator, recorded_path = tree.stdout[:-1].partition(b"\t")
+                fields = header.split()
+                if not separator or len(fields) != 3 or recorded_path != raw_path:
+                    raise PublicationBlocked(
+                        f"committed path {path} has invalid Git metadata"
+                    )
+                mode, object_type, object_id = fields
+                if mode not in {b"100644", b"100755"} or object_type != b"blob":
+                    continue  # symlink, submodule, or non-regular entry
+                blob = subprocess.run(
+                    ["git", "cat-file", "blob", object_id.decode("ascii")],
+                    cwd=checkout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                if blob.returncode != 0:
+                    raise PublicationBlocked(
+                        f"committed blob {path} is unavailable for artifact scanning"
+                    )
+                if contains_artifact_bytes(blob.stdout, artifact_bytes):
+                    return True
         return False
 
     def _pull_body(

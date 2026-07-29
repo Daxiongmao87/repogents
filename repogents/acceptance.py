@@ -19,8 +19,10 @@ from .execution import (
     SecretBinding,
     SecretResolver,
     _default_runtime_factory,
+    _resource_command_policy,
     _sandbox_policy,
     _secret_bindings,
+    _variable_bindings,
 )
 from .lifecycle import RunLifecycle, RunState
 from .mini_swe import MINI_SWE_RUNTIME
@@ -326,8 +328,9 @@ class AcceptanceService:
             "stored screenshot decision",
         )
         observations = self._observations(verification_id)
-        policy = _sandbox_policy(sandbox_row)
+        policy = _resource_command_policy(sandbox_row, _sandbox_policy(sandbox_row))
         bindings = _secret_bindings(sandbox_row)
+        variable_bindings = _variable_bindings(sandbox_row)
         layout = RunLayout.create(
             self.data_root,
             str(context["repository_id"]),
@@ -487,14 +490,38 @@ class AcceptanceService:
                 bindings,
                 resolved_secret_values,
             )
-            result = self.tools.execute(
-                verifier,
-                policy,
-                layout,
-                action,
-                secrets=secrets,
-                checkout_writable=False,
-            )
+            environment_bindings: dict[str, str] | None = None
+            if name == "run":
+                argv = action.get("argv")
+                if isinstance(argv, list) and all(
+                    isinstance(value, str) for value in argv
+                ):
+                    command = tuple(argv)
+                    selected_variables = {
+                        variable_name: variable_value
+                        for variable_name, variable_value, commands in variable_bindings
+                        if command in commands
+                    }
+                    environment_bindings = selected_variables or None
+            if environment_bindings is None:
+                result = self.tools.execute(
+                    verifier,
+                    policy,
+                    layout,
+                    action,
+                    secrets=secrets,
+                    checkout_writable=False,
+                )
+            else:
+                result = self.tools.execute(
+                    verifier,
+                    policy,
+                    layout,
+                    action,
+                    secrets=secrets,
+                    environment_bindings=environment_bindings,
+                    checkout_writable=False,
+                )
             result = redact_text(result, resolved_secret_values)
             completed_at = _utc_now()
             observation = self._record_observation(

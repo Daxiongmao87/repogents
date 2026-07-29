@@ -295,7 +295,9 @@ class RepositoryResourcesSandboxIntegrationTests(OnboardingTests):
             "resource-run-v1",
             commit_sha,
             first_sandbox_id,
-            _sandbox_policy(sandbox_row),
+            execution._resource_command_policy(
+                first_sandbox_id, _sandbox_policy(sandbox_row)
+            ),
             layout,
             _secret_bindings(sandbox_row),
             _variable_bindings(sandbox_row),
