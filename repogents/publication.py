@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -21,6 +22,8 @@ from .github import GitHubClient, PullRequestInfo
 from .mini_swe import MINI_SWE_RUNTIME, MiniSweInference
 from .lifecycle import RunLifecycle, RunState
 from .sandbox import SecretScanner
+
+_SCOPE_REVIEW_RUBRIC_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -304,18 +307,38 @@ class MiniSweScopeReviewer:
             raise RuntimeError("scope reviewer requires an explicit stored model")
         prompt = json.dumps(
             {
+                "rubric_version": _SCOPE_REVIEW_RUBRIC_VERSION,
                 "task": (
-                    "Independently review the complete committed "
-                    "base-to-validated-head diff before publication. Approve only "
-                    "when it correctly and fully implements the issue, has adequate "
-                    "validation, complies with immutable stored repository evidence "
-                    "and instructions, and excludes unrelated or forbidden artifacts."
+                    "Judge only whether the complete committed "
+                    "base-to-validated-head diff is aligned with the issue, "
+                    "necessary regression protection, immutable repository "
+                    "instructions, and publication artifact boundaries."
                 ),
                 "decision_rules": [
                     (
-                        "Use only the issue and immutable stored repository "
-                        "evidence and instructions; do not apply ambient host "
+                        "Approve only issue-related changes and necessary "
+                        "regression protection for the requested behavior."
+                    ),
+                    (
+                        "Reject changes that violate immutable stored "
+                        "repository instructions; do not apply ambient host "
                         "rules."
+                    ),
+                    (
+                        "Reject forbidden controller, credential, secret, "
+                        "coordination, generated, or other non-publishable "
+                        "artifacts."
+                    ),
+                    (
+                        "Reject unexplained changed files that do not map to "
+                        "the issue or necessary regression protection."
+                    ),
+                    (
+                        "You must not judge implementation completeness, must "
+                        "not judge test adequacy, must not judge runtime "
+                        "correctness, must not judge visual quality, and must "
+                        "not judge acceptance proof. Those belong to "
+                        "deterministic validation and independent acceptance."
                     ),
                     (
                         "Local plans, specification ledgers, and coordination "
@@ -324,10 +347,10 @@ class MiniSweScopeReviewer:
                         "compliant."
                     ),
                     (
-                        "If plans, specification ledgers, or coordination files "
-                        "appear in changed_files, reject them when present unless "
-                        "immutable stored repository instructions explicitly "
-                        "require those tracked files."
+                        "If plans, specification ledgers, or coordination "
+                        "files appear in changed_files, reject them when "
+                        "present unless immutable stored repository "
+                        "instructions explicitly require those tracked files."
                     ),
                 ],
                 "issue": issue,
@@ -476,7 +499,7 @@ class PublicationService:
             checkout = Path(str(context["checkout_path"]))
             issue = self._scope_review_issue(context, validated_sha)
             diff, changed_files = self._preflight(context, checkout, validated_sha)
-            scope = self.scope_reviewer.review(issue, diff, changed_files)
+            scope = self._scope_decision(issue, diff, changed_files)
             if not scope.in_scope:
                 raise PublicationRevisionRequired(
                     f"scope review rejected publication: {scope.reason}"
@@ -512,6 +535,25 @@ class PublicationService:
                 raise PublicationBlocked(
                     "issue acceptance proof does not match the validated issue version"
                 )
+            specification_revision_id = acceptance.get(
+                "specification_revision_id"
+            )
+            if (
+                not isinstance(specification_revision_id, str)
+                or not specification_revision_id
+            ):
+                raise PublicationBlocked(
+                    "issue acceptance proof does not identify its specification revision"
+                )
+            context["accepted_specification_revision_id"] = (
+                specification_revision_id
+            )
+            self._require_publishing(
+                run_id,
+                validated_sha=validated_sha,
+                issue_version_id=str(context["validated_issue_version_id"]),
+                specification_revision_id=specification_revision_id,
+            )
             self._require_feedback_resolved(run_id, validated_sha)
             proof_body = self._pull_body(context, validated_sha, acceptance)
             branch = f"agent/issue-{context['issue_number']}-{run_id}"
@@ -527,6 +569,7 @@ class PublicationService:
                 run_id,
                 validated_sha=validated_sha,
                 issue_version_id=str(context["validated_issue_version_id"]),
+                specification_revision_id=specification_revision_id,
             )
             self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
             return pull
@@ -548,8 +591,84 @@ class PublicationService:
                     reason=f"publication blocked: {error}",
                 )
             return None
-        except Exception:
-            return None
+
+    def _scope_decision(
+        self,
+        issue: dict[str, object],
+        diff: str,
+        changed_files: tuple[str, ...],
+    ) -> ScopeDecision:
+        stored_verifier = issue.get("stored_verifier")
+        if not isinstance(stored_verifier, dict):
+            raise RuntimeError(
+                "stored scope reviewer configuration is invalid"
+            )
+        reviewer_model = stored_verifier.get("model")
+        if not isinstance(reviewer_model, str) or not reviewer_model:
+            raise RuntimeError("stored scope reviewer model is invalid")
+        diff_sha256 = hashlib.sha256(diff.encode("utf-8")).hexdigest()
+        review_input = {
+            "rubric_version": _SCOPE_REVIEW_RUBRIC_VERSION,
+            "issue": issue,
+            "changed_files": changed_files,
+            "diff_sha256": diff_sha256,
+            "reviewer_model": reviewer_model,
+        }
+        input_sha256 = hashlib.sha256(
+            _json(review_input).encode("utf-8")
+        ).hexdigest()
+        with self.database.connect() as connection:
+            stored = connection.execute(
+                """SELECT in_scope, reason
+                   FROM publication_scope_reviews
+                   WHERE input_sha256=?""",
+                (input_sha256,),
+            ).fetchone()
+        if stored is not None:
+            return ScopeDecision(
+                bool(stored["in_scope"]),
+                str(stored["reason"]),
+            )
+
+        decision = self.scope_reviewer.review(issue, diff, changed_files)
+        reason = decision.reason.strip()
+        if not reason:
+            raise RuntimeError("scope reviewer returned an empty reason")
+        with self.database.transaction() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO publication_scope_reviews
+                   (id, run_id, issue_version_id, base_sha, candidate_sha,
+                    diff_sha256, input_sha256, reviewer_model, rubric_version,
+                    changed_files_json, in_scope, reason, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    _stable_id(f"publication-scope-review:{input_sha256}"),
+                    issue["run_id"],
+                    issue["issue_version_id"],
+                    issue["base_sha"],
+                    issue["validated_sha"],
+                    diff_sha256,
+                    input_sha256,
+                    reviewer_model,
+                    _SCOPE_REVIEW_RUBRIC_VERSION,
+                    _json(changed_files),
+                    int(decision.in_scope),
+                    reason,
+                    _utc_now(),
+                ),
+            )
+            stored = connection.execute(
+                """SELECT in_scope, reason
+                   FROM publication_scope_reviews
+                   WHERE input_sha256=?""",
+                (input_sha256,),
+            ).fetchone()
+        if stored is None:
+            raise RuntimeError("durable scope review was not recorded")
+        return ScopeDecision(
+            bool(stored["in_scope"]),
+            str(stored["reason"]),
+        )
 
     @staticmethod
     def _scope_review_issue(
@@ -765,6 +884,9 @@ class PublicationService:
                 str(context["id"]),
                 validated_sha=validated_sha,
                 issue_version_id=str(context["validated_issue_version_id"]),
+                specification_revision_id=str(
+                    context["accepted_specification_revision_id"]
+                ),
                 connection=connection,
             )
             connection.execute(
@@ -826,6 +948,9 @@ class PublicationService:
                     str(context["id"]),
                     validated_sha=validated_sha,
                     issue_version_id=str(context["validated_issue_version_id"]),
+                    specification_revision_id=str(
+                        context["accepted_specification_revision_id"]
+                    ),
                 )
                 self.gateway.push_branch(
                     checkout,
@@ -847,6 +972,9 @@ class PublicationService:
                 connection=connection,
                 validated_sha=validated_sha,
                 issue_version_id=str(context["validated_issue_version_id"]),
+                specification_revision_id=str(
+                    context["accepted_specification_revision_id"]
+                ),
             )
             connection.execute(
                 """UPDATE pull_requests SET validated_head_sha=?, remote_head_sha=?, updated_at=?
@@ -879,6 +1007,9 @@ class PublicationService:
                     str(context["id"]),
                     validated_sha=validated_sha,
                     issue_version_id=str(context["validated_issue_version_id"]),
+                    specification_revision_id=str(
+                        context["accepted_specification_revision_id"]
+                    ),
                 )
                 title = f"Resolve #{context['issue_number']}: {' '.join(str(context['issue_title']).split())}"
                 body = proof_body
@@ -928,6 +1059,9 @@ class PublicationService:
                         str(context["id"]),
                         validated_sha=validated_sha,
                         issue_version_id=str(context["validated_issue_version_id"]),
+                        specification_revision_id=str(
+                            context["accepted_specification_revision_id"]
+                        ),
                     )
                     self.gateway.update_pull_request_body(
                         owner,
@@ -947,6 +1081,9 @@ class PublicationService:
                 connection=connection,
                 validated_sha=validated_sha,
                 issue_version_id=str(context["validated_issue_version_id"]),
+                specification_revision_id=str(
+                    context["accepted_specification_revision_id"]
+                ),
             )
             connection.execute(
                 """UPDATE pull_requests
@@ -1095,19 +1232,28 @@ class PublicationService:
         *,
         validated_sha: str | None = None,
         issue_version_id: str | None = None,
+        specification_revision_id: str | None = None,
         connection: sqlite3.Connection | None = None,
     ) -> None:
-        query = """SELECT runs.state, runs.validated_sha,
-                          runs.validated_issue_version_id,
-                          issues.current_version_id
-                   FROM runs
-                   JOIN issues ON issues.id=runs.issue_id
-                   WHERE runs.id=?"""
         if connection is None:
             with self.database.connect() as active_connection:
-                row = active_connection.execute(query, (run_id,)).fetchone()
-        else:
-            row = connection.execute(query, (run_id,)).fetchone()
+                self._require_publishing(
+                    run_id,
+                    validated_sha=validated_sha,
+                    issue_version_id=issue_version_id,
+                    specification_revision_id=specification_revision_id,
+                    connection=active_connection,
+                )
+            return
+        row = connection.execute(
+            """SELECT runs.state, runs.validated_sha,
+                      runs.validated_issue_version_id,
+                      issues.current_version_id
+               FROM runs
+               JOIN issues ON issues.id=runs.issue_id
+               WHERE runs.id=?""",
+            (run_id,),
+        ).fetchone()
         if row is None:
             raise KeyError(run_id)
         if row["state"] != RunState.PUBLISHING.value:
@@ -1127,6 +1273,27 @@ class PublicationService:
             )
         if validated_sha is not None and row["validated_sha"] != validated_sha:
             raise PublicationBlocked("validated commit changed at publication boundary")
+        if specification_revision_id is None:
+            return
+        specification = connection.execute(
+            """SELECT revisions.id, reviews.verdict
+               FROM run_specification_revisions AS revisions
+               LEFT JOIN run_specification_reviews AS reviews
+                 ON reviews.specification_revision_id=revisions.id
+               WHERE revisions.run_id=?
+                 AND revisions.issue_version_id=?
+               ORDER BY revisions.revision DESC LIMIT 1""",
+            (run_id, row["validated_issue_version_id"]),
+        ).fetchone()
+        if (
+            specification is None
+            or str(specification["id"]) != specification_revision_id
+            or str(specification["verdict"] or "") != "approved"
+        ):
+            raise PublicationBlocked(
+                "issue acceptance proof does not match the approved active "
+                "specification revision"
+            )
 
     def _context(self, run_id: str) -> dict[str, object]:
         with self.database.connect() as connection:

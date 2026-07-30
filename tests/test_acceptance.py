@@ -12,6 +12,8 @@ from typing import cast
 from repogents.acceptance import (
     AcceptanceService,
     AcceptanceUnavailable,
+    _VERIFIER_RESPONSE_SCHEMA,
+    _VERIFIER_SYSTEM_PROMPT,
     load_acceptance_artifact,
     render_acceptance_markdown,
 )
@@ -19,6 +21,7 @@ from repogents.database import Database
 from repogents.execution import AgentToolExecutor, ScriptedRuntime
 from repogents.github import ActivationEvent
 from repogents.lifecycle import RunLifecycle
+from repogents.specification import SpecificationService, SpecificationUnavailable
 from repogents.sandbox import RunLayout, SandboxManager
 from repogents.team import TeamService
 
@@ -208,7 +211,7 @@ class AcceptanceServiceTests(unittest.TestCase):
                     instructions, action_timeout_seconds)
                    VALUES
                    ('lead-1', 'team-1', 'lead', 'lead',
-                    'delivery coordinator', 'Coordinate issue delivery',
+                    'repository delivery planner', 'Coordinate issue delivery',
                     '["read","git_diff","git_commit"]', 'mini-swe-agent',
                     'openai/gpt-fixture', '', 321),
                    ('implementation-1', 'team-1', 'implementation', 'implementer',
@@ -216,7 +219,7 @@ class AcceptanceServiceTests(unittest.TestCase):
                     '["read","write","run","git_diff"]', 'mini-swe-agent',
                     'openai/gpt-fixture', '', 321),
                    ('verifier-1', 'team-1', 'verification', 'verifier',
-                    'python behavior verifier',
+                    'repository behavior reviewer',
                     'Independently verify issue behavior and scope',
                     '["read","run","git_diff"]', 'mini-swe-agent',
                     'openai/gpt-verifier', '', 432)""")
@@ -272,7 +275,57 @@ class AcceptanceServiceTests(unittest.TestCase):
                    WHERE id='run-1'""",
                 (issue_version_id,),
             )
+        self.specifications = SpecificationService(self.db)
+        self.specification = self.specifications.submit(
+            run_id="run-1",
+            author_member_id="lead-1",
+            issue_version_id=issue_version_id,
+            items=self.specification_items(),
+            reason="Specify the observable issue behavior before acceptance.",
+        )
+        self.specification_review = self.specifications.record_review(
+            run_id="run-1",
+            specification_revision_id=str(self.specification["id"]),
+            reviewer_member_id="verifier-1",
+            reviewer_model="openai/gpt-verifier",
+            rubric_version=1,
+            verdict="approved",
+            summary="The issue specification is complete and independently verifiable.",
+            findings=[],
+        )
         self.tools = RecordingTools(self.db)
+
+    @staticmethod
+    def specification_items() -> list[dict[str, object]]:
+        return [
+            {
+                "key": "value-output",
+                "title": "Expose the requested value",
+                "objective": (
+                    "The repository command exposes VALUE 2 through public behavior."
+                ),
+                "acceptance_criteria": [
+                    {
+                        "key": "value-command-output",
+                        "requirement": (
+                            "Running the repository command exposes the requested value."
+                        ),
+                        "expected": (
+                            "The command exits successfully and stdout contains VALUE=2."
+                        ),
+                    }
+                ],
+                "verification": [
+                    {
+                        "key": "run-public-command",
+                        "criterion_keys": ["value-command-output"],
+                        "scenario": (
+                            "Run the repository command and inspect exit status and stdout."
+                        ),
+                    }
+                ],
+            }
+        ]
 
     @staticmethod
     def plan(*, screenshot_required: bool = False) -> dict[str, object]:
@@ -284,6 +337,7 @@ class AcceptanceServiceTests(unittest.TestCase):
                     "claim": "The repository command emits VALUE=2.",
                     "expected": "stdout contains VALUE=2",
                     "method": "run the repository command and inspect stdout",
+                    "criterion_keys": ["value-command-output"],
                 }
             ],
             "screenshot_decision": {
@@ -375,6 +429,133 @@ class AcceptanceServiceTests(unittest.TestCase):
             connection.execute("DELETE FROM acceptance_evidence")
             connection.execute("DELETE FROM acceptance_verifications")
 
+    def test_missing_current_specification_prevents_verifier_start(self) -> None:
+        with self.db.transaction() as connection:
+            connection.execute("DELETE FROM run_specification_reviews")
+            connection.execute("DELETE FROM run_specification_revisions")
+        runtime = ScriptedRuntime([self.plan()])
+        service, _ = self.service([runtime])
+
+        with self.assertRaises(SpecificationUnavailable):
+            service.verify("run-1", self.commit_sha, ("app.py",))
+
+        self.assertEqual(runtime.contexts, [])
+        with self.db.connect() as connection:
+            attempts = connection.execute(
+                "SELECT COUNT(*) FROM acceptance_verifications"
+            ).fetchone()[0]
+        self.assertEqual(attempts, 0)
+    def test_unapproved_current_specification_prevents_verifier_start(self) -> None:
+        next_items = self.specification_items()
+        next_items[0]["objective"] = (
+            "The command exposes VALUE 2 without unrelated output."
+        )
+        self.specifications.submit(
+            run_id="run-1",
+            author_member_id="lead-1",
+            issue_version_id=str(self.specification["issue_version_id"]),
+            items=next_items,
+            reason="Clarify the output boundary before acceptance.",
+        )
+        runtime = ScriptedRuntime([self.plan()])
+        service, _ = self.service([runtime])
+
+        with self.assertRaises(SpecificationUnavailable):
+            service.verify("run-1", self.commit_sha, ("app.py",))
+
+        self.assertEqual(runtime.contexts, [])
+
+
+    def test_acceptance_plan_must_cover_every_specification_criterion(self) -> None:
+        incomplete = self.plan()
+        incomplete["claims"][0]["criterion_keys"] = []  # type: ignore[index]
+        runtime = ScriptedRuntime([incomplete])
+        service, _ = self.service([runtime], max_actions=1)
+
+        with self.assertRaisesRegex(RuntimeError, "specification criteria"):
+            service.verify("run-1", self.commit_sha, ("app.py",))
+
+    def test_passing_report_maps_every_specification_criterion_to_evidence(
+        self,
+    ) -> None:
+        runtime = ScriptedRuntime(
+            [
+                self.plan(),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                self.completion(),
+            ]
+        )
+        service, _ = self.service([runtime])
+
+        report = service.verify("run-1", self.commit_sha, ("app.py",))
+
+        self.assertEqual(report["state"], "passed")
+        specification = cast(dict[str, object], report["specification"])
+        self.assertEqual(specification["id"], self.specification["id"])
+        items = cast(list[dict[str, object]], specification["items"])
+        self.assertEqual(items[0]["result"], "pass")
+        criteria = cast(
+            list[dict[str, object]],
+            items[0]["acceptance_criteria"],
+        )
+        self.assertEqual(criteria[0]["result"], "pass")
+        self.assertEqual(criteria[0]["claim_keys"], ["value-output"])
+
+    def test_new_specification_revision_invalidates_cached_pass(self) -> None:
+        first_runtime = ScriptedRuntime(
+            [
+                self.plan(),
+                {"action": "run", "argv": ["python3", "app.py"]},
+                self.completion(),
+            ]
+        )
+        first, _ = self.service([first_runtime])
+        passed = first.verify("run-1", self.commit_sha, ("app.py",))
+        next_items = self.specification_items()
+        next_items[0]["objective"] = (
+            "The repository command exposes VALUE 2 without unrelated output."
+        )
+        next_specification = self.specifications.submit(
+            run_id="run-1",
+            author_member_id="lead-1",
+            issue_version_id=str(self.specification["issue_version_id"]),
+            items=next_items,
+            reason="Clarify the required output boundary.",
+        )
+        self.specifications.record_review(
+            run_id="run-1",
+            specification_revision_id=str(next_specification["id"]),
+            reviewer_member_id="verifier-1",
+            reviewer_model="openai/gpt-verifier",
+            rubric_version=1,
+            verdict="approved",
+            summary="The clarified specification is independently verifiable.",
+            findings=[],
+        )
+        next_runtime = ScriptedRuntime([self.plan()])
+        restarted, _ = self.service([next_runtime], max_actions=1)
+
+        with self.assertRaisesRegex(RuntimeError, "without a final verdict"):
+            restarted.verify("run-1", self.commit_sha, ("app.py",))
+
+        passed_specification = cast(dict[str, object], passed["specification"])
+        self.assertNotEqual(
+            passed_specification["id"],
+            next_specification["id"],
+        )
+        prompt = json.loads(next_runtime.contexts[0])
+        self.assertEqual(
+            prompt["specification"]["id"],
+            next_specification["id"],
+        )
+        with self.db.connect() as connection:
+            states = connection.execute(
+                """SELECT state FROM acceptance_verifications
+                   ORDER BY attempt"""
+            ).fetchall()
+        self.assertEqual([row["state"] for row in states], ["superseded", "verifying"])
+
+
     def test_verifier_prompt_requires_internal_target_evidence_integrity(self) -> None:
         runtime = ScriptedRuntime([self.plan()])
         service, _ = self.service([runtime], max_actions=1)
@@ -383,6 +564,10 @@ class AcceptanceServiceTests(unittest.TestCase):
             service.verify("run-1", self.commit_sha, ("app.py",))
 
         prompt = json.loads(runtime.contexts[0])
+        self.assertEqual(
+            prompt["specification"]["review"]["verdict"],
+            "approved",
+        )
         constraints = "\n".join(cast(list[str], prompt["constraints"]))
         self.assertIn("exists", constraints)
         self.assertIn("maps to the application object under test", constraints)
@@ -390,6 +575,14 @@ class AcceptanceServiceTests(unittest.TestCase):
         self.assertIn("primary evidence", constraints)
         self.assertIn("Reconcile", constraints)
         self.assertIn("CHROME_BIN", constraints)
+        self.assertIn("dependency_services", constraints)
+        self.assertIn("/run-data/dependency-delta", constraints)
+        self.assertIn(
+            "dependency_services",
+            _VERIFIER_RESPONSE_SCHEMA["properties"],
+        )
+        self.assertIn("dependency_services", _VERIFIER_SYSTEM_PROMPT)
+        self.assertIn("/run-data/dependency-delta", _VERIFIER_SYSTEM_PROMPT)
         self.assertIn(
             "Never require production source changes solely to make an internal acceptance probe easier",
             constraints,
@@ -397,6 +590,93 @@ class AcceptanceServiceTests(unittest.TestCase):
         self.assertIn("repository-defined client/server endpoint", constraints)
         self.assertIn("probe configuration mismatch", constraints)
         self.assertIn("correct the probe and retry", constraints)
+
+    def test_verifier_receives_authoritative_unchanged_baseline_debt(self) -> None:
+        command = ["python", "-m", "unittest"]
+        findings = [
+            "unittest|fail|tests.test_proxy.ProxyTests.test_external_gateway"
+        ]
+        now = "2026-07-22T00:00:01Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO validation_commands
+                   (id, sandbox_version_id, position, command_json, source, required)
+                   VALUES ('validation-command-1', 'sandbox-1', 0, ?, 'fixture', 1)""",
+                (json.dumps(command, separators=(",", ":")),),
+            )
+            connection.execute(
+                """INSERT INTO validation_baselines
+                   (id, run_id, validation_command_id, command_json, base_sha,
+                    mode, started_at, completed_at, exit_status, log_path,
+                    findings_json)
+                   VALUES ('validation-baseline-1', 'run-1',
+                           'validation-command-1', ?, ?, 'delta', ?, ?, 1,
+                           '/tmp/baseline.log', ?)""",
+                (
+                    json.dumps(command, separators=(",", ":")),
+                    "a" * 40,
+                    now,
+                    now,
+                    json.dumps(findings, separators=(",", ":")),
+                ),
+            )
+            connection.execute(
+                """INSERT INTO validation_results
+                   (id, run_id, validation_command_id, commit_sha, command_json,
+                    started_at, completed_at, exit_status, log_path, verdict,
+                    findings_json, comparison_json)
+                   VALUES ('validation-result-1', 'run-1',
+                           'validation-command-1', ?, ?, ?, ?, 1,
+                           '/tmp/candidate.log', 'pass', ?, ?)""",
+                (
+                    self.commit_sha,
+                    json.dumps(command, separators=(",", ":")),
+                    now,
+                    now,
+                    json.dumps(findings, separators=(",", ":")),
+                    json.dumps(
+                        {
+                            "mode": "delta",
+                            "baseline_count": 1,
+                            "candidate_count": 1,
+                            "new_count": 0,
+                            "resolved_count": 0,
+                            "unchanged_count": 1,
+                            "new_findings": [],
+                            "contract_changed": [],
+                            "weakening_detected": [],
+                            "output_usable": True,
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+        runtime = ScriptedRuntime([self.plan()])
+        service, _ = self.service([runtime], max_actions=1)
+
+        with self.assertRaisesRegex(RuntimeError, "without a final verdict"):
+            service.verify("run-1", self.commit_sha, ("app.py",))
+
+        prompt = json.loads(runtime.contexts[0])
+        comparison = prompt["validation_comparison"]
+        self.assertEqual(comparison["base_sha"], "a" * 40)
+        self.assertEqual(comparison["candidate_sha"], self.commit_sha)
+        self.assertEqual(len(comparison["commands"]), 1)
+        command_comparison = comparison["commands"][0]
+        self.assertEqual(command_comparison["baseline"]["mode"], "delta")
+        self.assertEqual(command_comparison["baseline"]["findings"], findings)
+        self.assertEqual(command_comparison["candidate"]["findings"], findings)
+        self.assertEqual(command_comparison["new_findings"], [])
+        self.assertEqual(command_comparison["resolved_findings"], [])
+        self.assertEqual(command_comparison["unchanged_findings"], findings)
+        self.assertEqual(command_comparison["controller_verdict"], "pass")
+        self.assertEqual(command_comparison["weakening_detected"], [])
+        constraints = "\n".join(cast(list[str], prompt["constraints"]))
+        self.assertIn("authoritative repository regression verdict", constraints)
+        self.assertIn("unchanged baseline findings", constraints)
+        self.assertIn("must not reject", constraints)
+        self.assertIn("new findings", constraints)
+        self.assertIn("validation weakening", constraints)
 
     def test_initial_blocked_verdict_requires_remediation(self) -> None:
         blocked = self.completion(evidence=[1])
@@ -1209,6 +1489,23 @@ class AcceptanceServiceTests(unittest.TestCase):
             connection.execute("""UPDATE runs
                    SET validated_issue_version_id='issue-version-2'
                    WHERE id='run-1'""")
+        revised_specification = self.specifications.submit(
+            run_id="run-1",
+            author_member_id="lead-1",
+            issue_version_id="issue-version-2",
+            items=self.specification_items(),
+            reason="Bind acceptance to the revised issue contract.",
+        )
+        self.specifications.record_review(
+            run_id="run-1",
+            specification_revision_id=str(revised_specification["id"]),
+            reviewer_member_id="verifier-1",
+            reviewer_model="openai/gpt-verifier",
+            rubric_version=1,
+            verdict="approved",
+            summary="The revised issue specification remains complete.",
+            findings=[],
+        )
         second_runtime = ScriptedRuntime(
             [
                 self.plan(),

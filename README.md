@@ -6,14 +6,15 @@ Repogents is intentionally an orchestrator, not a general-purpose agent shell. R
 
 ## What it does
 
-1. Onboards one or more GitHub repositories and infers their toolchain, validation commands, sandbox requirements, and repository-specific agent team.
-2. Stores versioned repository environments and teams for reuse across issues and restarts.
+1. Onboards one or more GitHub repositories and records repository structure, manifests, validation commands, sandbox constraints, a repository-specific atomic agent team, and a model-designed workflow graph without generating dependency-provisioning commands.
+2. Stores versioned repository environments, teams, and workflow templates for reuse across issues and restarts.
 3. Watches onboarded repositories for GitHub events that apply `agent:ready` to an issue.
-4. Creates one durable run and isolated checkout for that activation.
-5. Uses the stored mini-SWE-agent team to inspect, implement, commit, and validate the requested change.
-6. Reviews the complete committed diff for scope and secrets before publishing one deterministic, unmerged pull request.
-7. Ingests reviews, inline review comments, and pull-request comments; resolves each version once and updates the same pull request when source changes are required.
-8. Continues polling every open application-owned pull request; a merge ends the run, while closure without merge starts one fresh run when the linked issue remains open.
+4. Creates one durable run, isolated checkout, and immutable issue graph for that activation.
+5. Requires the coordinating member to persist an issue-bound atomic specification and an independent verifier to approve that exact revision before assignment or source mutation.
+6. Advances dependency-ready agent and registered deterministic nodes, safely overlaps independent work, durably preserves node attempts and outputs, then commits and validates the requested change.
+7. Binds exact-SHA independent acceptance to the approved specification, then reviews the complete committed diff for scope and secrets before publishing one deterministic, unmerged pull request.
+8. Ingests reviews, inline review comments, and pull-request comments; reconciles changed requirements into a newly approved specification revision before source work, and updates the same pull request when source changes are required.
+9. Continues polling every open application-owned pull request; a merge ends the run, while closure without merge starts one fresh run when the linked issue remains open.
 
 Repogents never merges or closes pull requests.
 
@@ -196,10 +197,9 @@ Supported input keys are:
 - `allowed_host_paths`: explicit host mounts with `path`, optional sandbox `target`, and `mode` set to `read-only` or `writable`;
 - `allowed_services`: exact `host:port` destinations available through the restricted proxy;
 - `secret_bindings`: command-scoped secret references;
-- `provisioning_commands`: an explicit list of command argument arrays;
 - `validation_commands`: an explicit list of command argument arrays.
 
-These values are privileged configuration. Add only what a repository actually requires. Re-onboarding creates new immutable sandbox and team versions; existing runs retain the versions with which they started.
+These values are privileged configuration. Add only what a repository actually requires. Onboarding does not install repository dependencies or toolchains; agents retrieve missing dependencies inside bounded issue or acceptance actions. Re-onboarding creates new immutable sandbox and team versions; existing runs retain the versions with which they started.
 
 ### Command-scoped repository secrets
 
@@ -225,9 +225,11 @@ Secret values are command-scoped, redacted before durable output is stored, excl
 2. Apply the `agent:ready` label.
 3. Leave Repogents running, or run a single orchestration cycle with `repogents tick`.
 
-The activating label event has a stable identity. Repeated polling and application restarts reuse the same run instead of creating duplicates. Repogents snapshots the intended base branch and commit, creates an isolated checkout, and uses repository and issue evidence to decide what work is in scope.
+The activating label event has a stable identity. Repeated polling and application restarts reuse the same run instead of creating duplicates. Repogents snapshots the intended base branch and commit, creates an isolated checkout, and exposes repository and issue evidence to the coordinating member. The coordinating member persists the complete atomic issue specification; an independently modeled verifier must approve that exact revision before any implementation assignment or checkout mutation.
 
-When the exact commit passes every discovered validation command and scope review, Repogents pushes a deterministic `agent/issue-<issue-number>-<run-id>` branch and opens one pull request. The pull request remains unmerged for you to review.
+Each run graph is bound to the stored issue, team, sandbox, exact base SHA, and active specification revision. The coordinating member can assess completed node evidence and propose a bounded new graph generation; the controller validates the revision, preserves prior generations, and reuses only exact-identity outputs. Repository and run views expose the stored specification history, review provenance, acceptance mapping, topology, live states, attempts, generation deltas, reuse decisions, and assessments.
+
+When the exact commit passes every discovered validation command, the approved specification's independent acceptance, scope review, and secret scan, Repogents pushes a deterministic `agent/issue-<issue-number>-<run-id>` branch and opens one pull request. The pull request remains unmerged for you to review.
 
 ## Feedback monitoring
 

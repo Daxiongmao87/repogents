@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -11,10 +12,17 @@ from unittest import mock
 from pathlib import Path
 
 from repogents.database import Database
-from repogents.execution import ExecutionService, ScriptedRuntime
+from repogents.execution import (
+    AgentToolExecutor,
+    ExecutionService,
+    MiniSweModelRuntime,
+    ScriptedRuntime,
+)
 from repogents.lifecycle import RunLifecycle, RunState
-from repogents.sandbox import RunLayout, SandboxManager
+from repogents.sandbox import RunLayout, SandboxManager, SandboxPolicy
 from repogents.team import TeamService
+from repogents.specification import SpecificationService, SpecificationUnavailable
+from repogents.workflow import WorkflowService
 
 
 class NoActivationClient:
@@ -154,7 +162,7 @@ class ExecutionTests(unittest.TestCase):
                     instructions)
                    VALUES
                    ('lead-1', 'team-1', 'lead', 'lead',
-                    'delivery coordinator', 'Coordinate and integrate the result',
+                    'repository delivery planner', 'Coordinate and integrate the result',
                     '["read","git_diff","git_commit"]',
                     'mini-swe-agent', 'test/lead', ''),
                    ('implementation-1', 'team-1', 'implementation', 'implementer',
@@ -162,7 +170,7 @@ class ExecutionTests(unittest.TestCase):
                     '["read","write","run","git_diff"]',
                     'mini-swe-agent', 'test/implementation', ''),
                    ('verification-1', 'team-1', 'verification', 'verifier',
-                    'python behavior verifier', 'Independently verify behavior',
+                    'repository behavior reviewer', 'Independently verify behavior',
                     '["read","run","git_diff"]',
                     'mini-swe-agent', 'test/verification', '')""")
             connection.execute(
@@ -210,6 +218,49 @@ class ExecutionTests(unittest.TestCase):
             checkouts=NoCheckoutManager(),
             sandbox=self.sandbox,
         )
+        self.issue_version_id = self.lifecycle.current_issue_version("run-1")
+        self.specifications = SpecificationService(self.db)
+        self.specification = self.specifications.submit(
+            run_id="run-1",
+            author_member_id="lead-1",
+            issue_version_id=self.issue_version_id,
+            items=self.specification_items(),
+            reason="Specify the issue contract before fixture execution.",
+        )
+        self.specification_review = self.specifications.record_review(
+            run_id="run-1",
+            specification_revision_id=str(self.specification["id"]),
+            reviewer_member_id="verification-1",
+            reviewer_model="test/verification",
+            rubric_version=1,
+            verdict="approved",
+            summary="The fixture specification is complete and verifiable.",
+            findings=[],
+        )
+
+    @staticmethod
+    def specification_items() -> list[dict[str, object]]:
+        return [
+            {
+                "key": "return-two",
+                "title": "Return the requested value",
+                "objective": "The public value function returns two.",
+                "acceptance_criteria": [
+                    {
+                        "key": "value-returns-two",
+                        "requirement": "Calling value returns the requested integer.",
+                        "expected": "value() returns 2.",
+                    }
+                ],
+                "verification": [
+                    {
+                        "key": "call-value",
+                        "criterion_keys": ["value-returns-two"],
+                        "scenario": "Call value() and compare its return value with 2.",
+                    }
+                ],
+            }
+        ]
 
     def _git(self, *arguments: str) -> str:
         result = subprocess.run(
@@ -263,6 +314,658 @@ class ExecutionTests(unittest.TestCase):
             ),
             implementation_runtime,
         )
+    def test_coordinator_specification_precedes_assignment_and_source_mutation(
+        self,
+    ) -> None:
+        with self.db.transaction() as connection:
+            connection.execute(
+                "DELETE FROM run_specification_reviews WHERE run_id='run-1'"
+            )
+            connection.execute("DELETE FROM agent_assignments WHERE run_id='run-1'")
+            connection.execute("DELETE FROM run_specification_revisions")
+            connection.execute(
+                """UPDATE team_members
+                   SET permitted_tools_json='["read","write","git_diff"]'
+                   WHERE id='lead-1'"""
+            )
+        specifying = ScriptedRuntime(
+            [
+                {
+                    "action": "assign",
+                    "members": ["lead", "implementation", "verification"],
+                    "reason": "This assignment must wait for a durable specification.",
+                },
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 9",
+                    "count": 1,
+                },
+                {
+                    "action": "specify",
+                    "issue_version_id": self.issue_version_id,
+                    "items": self.specification_items(),
+                    "reason": "Define observable completion before assigning work.",
+                },
+            ]
+        )
+        unused = ScriptedRuntime([])
+
+        def first_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            return specifying if stored_model == "test/lead" else unused
+
+        first = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=first_factory,
+            max_actions=5,
+        )
+
+        self.assertIsNone(first.execute("run-1"))
+
+        self.assertIn("return 1", (self.checkout / "value.py").read_text())
+        self.assertEqual(
+            TeamService(self.db).assignments_for_run("run-1"),
+            (),
+        )
+        current = self.specifications.require_current(
+            "run-1",
+            self.issue_version_id,
+        )
+        self.assertEqual(current["revision"], 1)
+        history = (
+            self.checkout.parent / "agent-state" / "action-history.json"
+        ).read_text(encoding="utf-8")
+        self.assertIn("specification", history)
+
+        reviewing = ScriptedRuntime(
+            [
+                {
+                    "action": "review_specification",
+                    "specification_revision_id": str(current["id"]),
+                    "verdict": "approved",
+                    "findings": [],
+                },
+                {
+                    "action": "review_specification",
+                    "specification_revision_id": str(current["id"]),
+                    "verdict": "approved",
+                    "summary": (
+                        "The specification covers the issue with observable criteria."
+                    ),
+                    "findings": [],
+                }
+            ]
+        )
+
+        def review_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            return reviewing if stored_model == "test/verification" else unused
+
+        reviewer = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=review_factory,
+            max_actions=3,
+        )
+
+        self.assertIsNone(reviewer.execute("run-1"))
+        approved = self.specifications.require_approved(
+            "run-1",
+            self.issue_version_id,
+        )
+        self.assertEqual(approved["review"]["verdict"], "approved")
+        self.assertEqual(len(reviewing.contexts), 2)
+        self.assertEqual(
+            TeamService(self.db).assignments_for_run("run-1"),
+            (),
+        )
+        self.assertIn("semantic issue coverage", reviewing.contexts[0])
+        self.assertIn("repository evidence", reviewing.contexts[0])
+        self.assertIn("return 1", (self.checkout / "value.py").read_text())
+
+        assigning = ScriptedRuntime(
+            [
+                {
+                    "action": "assign",
+                    "members": ["lead", "implementation", "verification"],
+                    "reason": "The approved issue contract selects the stored delivery team.",
+                }
+            ]
+        )
+
+        def assignment_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            return assigning if stored_model == "test/lead" else unused
+
+        restarted = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=assignment_factory,
+            max_actions=3,
+        )
+
+        self.assertIsNone(restarted.execute("run-1"))
+
+        assignments = TeamService(self.db).assignments_for_run("run-1")
+        self.assertEqual(
+            [assignment.member.stable_key for assignment in assignments],
+            ["lead", "implementation", "verification"],
+        )
+        context = assigning.contexts[0]
+        self.assertIn('"atomic_specification"', context)
+        self.assertIn('"review"', context)
+        self.assertIn(
+            "Do not create planning, specification, coordination, or status files",
+            context,
+        )
+
+
+    def test_rejected_specification_review_requires_coordinator_revision(
+        self,
+    ) -> None:
+        with self.db.transaction() as connection:
+            connection.execute(
+                "DELETE FROM run_specification_reviews WHERE run_id='run-1'"
+            )
+            connection.execute("DELETE FROM agent_assignments WHERE run_id='run-1'")
+        reviewing = ScriptedRuntime(
+            [
+                {
+                    "action": "review_specification",
+                    "specification_revision_id": str(self.specification["id"]),
+                    "verdict": "rejected",
+                    "summary": "The output boundary is incomplete.",
+                    "findings": [
+                        {
+                            "key": "missing-output-boundary",
+                            "category": "coverage",
+                            "severity": "error",
+                            "summary": "Constrain unrelated output.",
+                            "item_keys": ["return-two"],
+                        }
+                    ],
+                }
+            ]
+        )
+        empty = ScriptedRuntime([])
+
+        def review_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            return reviewing if stored_model == "test/verification" else empty
+
+        service = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=review_factory,
+            max_actions=3,
+        )
+        self.assertIsNone(service.execute("run-1"))
+        with self.assertRaises(SpecificationUnavailable):
+            self.specifications.require_approved("run-1", self.issue_version_id)
+
+        next_items = self.specification_items()
+        next_items[0]["objective"] = (
+            "The public value function returns two without unrelated output."
+        )
+        revising = ScriptedRuntime(
+            [
+                {
+                    "action": "assign",
+                    "members": ["lead", "implementation", "verification"],
+                    "reason": "This must wait for a corrected specification.",
+                },
+                {
+                    "action": "specify",
+                    "issue_version_id": self.issue_version_id,
+                    "items": next_items,
+                    "reason": "Address the independent verifier finding.",
+                },
+            ]
+        )
+
+        def revision_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            return revising if stored_model == "test/lead" else empty
+
+        restarted = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=revision_factory,
+            max_actions=4,
+        )
+        self.assertIsNone(restarted.execute("run-1"))
+
+        current = self.specifications.require_current(
+            "run-1",
+            self.issue_version_id,
+        )
+        self.assertEqual(current["revision"], 2)
+        self.assertIsNone(current["review"])
+        self.assertEqual(
+            TeamService(self.db).assignments_for_run("run-1"),
+            (),
+        )
+        self.assertIn("missing-output-boundary", revising.contexts[0])
+        self.assertIn("must revise", revising.contexts[0])
+        self.assertIn("return 1", (self.checkout / "value.py").read_text())
+
+
+    def test_new_issue_version_requires_matching_specification_before_mutation(
+        self,
+    ) -> None:
+        with self.db.transaction() as connection:
+            prior = connection.execute(
+                "SELECT * FROM issue_versions WHERE id=?",
+                (self.issue_version_id,),
+            ).fetchone()
+            assert prior is not None
+            connection.execute(
+                """INSERT INTO issue_versions
+                   (id, issue_id, version, previous_version_id,
+                    github_updated_at, content_sha256, title, body,
+                    discussion_json, observed_at)
+                   VALUES ('issue-version-2', 'issue-1', 2, ?, ?,
+                           ?, 'Return three', 'Make value() return 3',
+                           '[]', ?)""",
+                (
+                    self.issue_version_id,
+                    "2026-01-02T00:00:00Z",
+                    "c" * 64,
+                    "2026-01-02T00:00:00Z",
+                ),
+            )
+            connection.execute(
+                """UPDATE issues
+                   SET current_version_id='issue-version-2',
+                       title='Return three',
+                       body='Make value() return 3',
+                       updated_at='2026-01-02T00:00:00Z'
+                   WHERE id='issue-1'"""
+            )
+        revised_items = self.specification_items()
+        revised_items[0]["objective"] = "The public value function returns three."
+        specifying = ScriptedRuntime(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 3",
+                    "count": 1,
+                },
+                {
+                    "action": "specify",
+                    "issue_version_id": "issue-version-2",
+                    "items": revised_items,
+                    "reason": "Bind the contract to the revised issue requirements.",
+                },
+            ]
+        )
+        unused = ScriptedRuntime([])
+
+        def runtime_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            return specifying if stored_model == "test/lead" else unused
+
+        service = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=runtime_factory,
+            max_actions=4,
+        )
+
+        self.assertIsNone(service.execute("run-1"))
+
+        current = self.specifications.require_current(
+            "run-1",
+            "issue-version-2",
+        )
+        self.assertEqual(current["revision"], 2)
+        self.assertIsNone(current["review"])
+        self.assertEqual(len(self.specifications.history("run-1")), 2)
+        self.assertIn("return 1", (self.checkout / "value.py").read_text())
+
+    def test_feedback_context_requires_durable_specification_reconciliation(
+        self,
+    ) -> None:
+        context = (
+            "Pull-request feedback confirms the current behavior but requires "
+            "the complete issue contract to remain authoritative."
+        )
+        reconciling = ScriptedRuntime(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 9",
+                    "count": 1,
+                },
+                {
+                    "action": "specify",
+                    "issue_version_id": self.issue_version_id,
+                    "items": self.specification_items(),
+                    "reason": (
+                        "The new feedback does not change the observable contract."
+                    ),
+                },
+            ]
+        )
+        unused = ScriptedRuntime([])
+
+        def reconciliation_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            return reconciling if stored_model == "test/lead" else unused
+
+        first = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=reconciliation_factory,
+            max_actions=4,
+        )
+
+        self.assertIsNone(first.execute("run-1", additional_context=context))
+        self.assertIn("return 1", (self.checkout / "value.py").read_text())
+        self.assertEqual(len(self.specifications.history("run-1")), 1)
+        self.assertEqual(len(self.specifications.review_history("run-1")), 1)
+        context_sha256 = hashlib.sha256(context.encode("utf-8")).hexdigest()
+        binding = self.specifications.context_binding(
+            "run-1",
+            self.issue_version_id,
+            context_sha256,
+        )
+        self.assertIsNotNone(binding)
+        self.assertEqual(
+            binding["specification_revision_id"],
+            self.specification["id"],
+        )
+        self.assertIn("reconcile", reconciling.contexts[0].lower())
+
+        with self.db.transaction() as connection:
+            connection.execute("DELETE FROM agent_assignments WHERE run_id='run-1'")
+        assigning = ScriptedRuntime(
+            [
+                {
+                    "action": "assign",
+                    "members": ["lead", "implementation", "verification"],
+                    "reason": "Use the stored team for the reconciled contract.",
+                }
+            ]
+        )
+
+        def restarted_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            return assigning if stored_model == "test/lead" else unused
+
+        restarted = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=restarted_factory,
+            max_actions=3,
+        )
+
+        self.assertIsNone(restarted.execute("run-1", additional_context=context))
+        self.assertEqual(
+            [
+                assignment.member.stable_key
+                for assignment in TeamService(self.db).assignments_for_run("run-1")
+            ],
+            ["lead", "implementation", "verification"],
+        )
+        self.assertNotIn("reconcile", assigning.contexts[0].lower())
+        self.assertEqual(len(self.specifications.history("run-1")), 1)
+        self.assertEqual(len(self.specifications.review_history("run-1")), 1)
+
+    def test_changed_feedback_specification_requires_exact_revision_approval(
+        self,
+    ) -> None:
+        context = (
+            "Review feedback adds an explicit requirement to preserve unrelated "
+            "command output."
+        )
+        revised_items = self.specification_items()
+        revised_items[0]["objective"] = (
+            "The public value function returns two and preserves unrelated output."
+        )
+        revising = ScriptedRuntime(
+            [
+                {
+                    "action": "specify",
+                    "issue_version_id": self.issue_version_id,
+                    "items": revised_items,
+                    "reason": "Incorporate the new feedback requirement.",
+                }
+            ]
+        )
+        unused = ScriptedRuntime([])
+
+        def lead_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            return revising if stored_model == "test/lead" else unused
+
+        first = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=lead_factory,
+            max_actions=3,
+        )
+        self.assertIsNone(first.execute("run-1", additional_context=context))
+        second = self.specifications.require_current(
+            "run-1",
+            self.issue_version_id,
+        )
+        self.assertEqual(second["revision"], 2)
+        self.assertIsNone(second["review"])
+        self.assertIn("return 1", (self.checkout / "value.py").read_text())
+
+        rejecting = ScriptedRuntime(
+            [
+                {
+                    "action": "review_specification",
+                    "specification_revision_id": str(second["id"]),
+                    "verdict": "rejected",
+                    "summary": "The preservation boundary is not independently observable.",
+                    "findings": [
+                        {
+                            "key": "preservation-not-observable",
+                            "category": "observability",
+                            "severity": "error",
+                            "summary": (
+                                "Add an explicit expected observation for preserved output."
+                            ),
+                            "item_keys": ["return-two"],
+                        }
+                    ],
+                }
+            ]
+        )
+
+        def rejection_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            return rejecting if stored_model == "test/verification" else unused
+
+        reviewer = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=rejection_factory,
+            max_actions=3,
+        )
+        self.assertIsNone(reviewer.execute("run-1", additional_context=context))
+        self.assertEqual(
+            self.specifications.require_current(
+                "run-1",
+                self.issue_version_id,
+            )["review"]["verdict"],
+            "rejected",
+        )
+        self.assertIn("return 1", (self.checkout / "value.py").read_text())
+
+        corrected_items = self.specification_items()
+        corrected_items[0]["objective"] = (
+            "The public value function returns two without altering other output."
+        )
+        corrected_items[0]["acceptance_criteria"][0]["expected"] = (
+            "value() returns 2 and unrelated command output is unchanged."
+        )
+        correcting = ScriptedRuntime(
+            [
+                {
+                    "action": "specify",
+                    "issue_version_id": self.issue_version_id,
+                    "items": corrected_items,
+                    "reason": "Make the feedback preservation boundary observable.",
+                }
+            ]
+        )
+
+        def correction_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            return correcting if stored_model == "test/lead" else unused
+
+        coordinator = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=correction_factory,
+            max_actions=3,
+        )
+        self.assertIsNone(coordinator.execute("run-1", additional_context=context))
+        third = self.specifications.require_current(
+            "run-1",
+            self.issue_version_id,
+        )
+        self.assertEqual(third["revision"], 3)
+        self.assertIsNone(third["review"])
+        self.assertIn("return 1", (self.checkout / "value.py").read_text())
+
+        approving = ScriptedRuntime(
+            [
+                {
+                    "action": "review_specification",
+                    "specification_revision_id": str(third["id"]),
+                    "verdict": "approved",
+                    "summary": (
+                        "The corrected specification is complete and observable."
+                    ),
+                    "findings": [],
+                }
+            ]
+        )
+
+        def approval_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            return approving if stored_model == "test/verification" else unused
+
+        approver = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=approval_factory,
+            max_actions=3,
+        )
+        self.assertIsNone(approver.execute("run-1", additional_context=context))
+        self.assertEqual(
+            self.specifications.require_approved(
+                "run-1",
+                self.issue_version_id,
+            )["id"],
+            third["id"],
+        )
+        self.assertIn("return 1", (self.checkout / "value.py").read_text())
+
+        executor, implementation = self.service(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 2",
+                    "count": 1,
+                },
+                {
+                    "action": "finish",
+                    "summary": "implemented the approved feedback revision",
+                },
+            ]
+        )
+        source_sha = executor.execute("run-1", additional_context=context)
+
+        self.assertIsNotNone(source_sha)
+        self.assertIn("return 2", (self.checkout / "value.py").read_text())
+        self.assertIn(
+            "without altering other output",
+            implementation.contexts[0],
+        )
+        context_sha256 = hashlib.sha256(context.encode("utf-8")).hexdigest()
+        self.assertEqual(
+            self.specifications.context_binding(
+                "run-1",
+                self.issue_version_id,
+                context_sha256,
+            )["specification_revision_id"],
+            third["id"],
+        )
 
     def test_durable_action_history_write_signals_activity(self) -> None:
         service, _ = self.service([])
@@ -280,6 +983,279 @@ class ExecutionTests(unittest.TestCase):
         self.assertGreater(
             self.db.wait_for_activity_change(revision, timeout=0),
             revision,
+        )
+
+    def test_workflow_node_resources_restrict_member_tools_before_sandbox_use(
+        self,
+    ) -> None:
+        member = next(
+            value
+            for value in TeamService(self.db).load("team-1").members
+            if value.stable_key == "implementation"
+        )
+        policy = SandboxPolicy(persistent_root=self.sandbox_root)
+        layout = RunLayout.create(self.data_root, "repo-1", "run-1")
+        tools = AgentToolExecutor(self.sandbox)
+        attempts = (
+            (
+                {"action": "read", "path": "value.py"},
+                ("issue:read",),
+            ),
+            (
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "1",
+                    "new": "2",
+                },
+                ("workspace:read",),
+            ),
+            (
+                {"action": "run", "argv": ["python3", "-V"]},
+                ("workspace:read",),
+            ),
+            (
+                {"action": "git_diff"},
+                ("workspace:read",),
+            ),
+        )
+        with mock.patch.object(self.sandbox, "run") as sandbox_run:
+            for action, resources in attempts:
+                with self.subTest(action=action["action"]):
+                    with self.assertRaisesRegex(
+                        PermissionError,
+                        "workflow node resource",
+                    ):
+                        tools.execute(
+                            member,
+                            policy,
+                            layout,
+                            action,
+                            workflow_resources=resources,
+                        )
+            sandbox_run.assert_not_called()
+
+    def test_workflow_diff_claim_runs_fixed_read_only_diff(self) -> None:
+        member = next(
+            value
+            for value in TeamService(self.db).load("team-1").members
+            if value.stable_key == "implementation"
+        )
+        policy = SandboxPolicy(persistent_root=self.sandbox_root)
+        layout = RunLayout.create(self.data_root, "repo-1", "run-1")
+        tools = AgentToolExecutor(self.sandbox)
+        result = mock.Mock(
+            canceled=False,
+            returncode=0,
+            stdout="diff --git a/value.py b/value.py\n",
+            stderr="",
+            timed_out=False,
+            log_path=layout.logs / "diff.json",
+        )
+        with mock.patch.object(
+            self.sandbox,
+            "run",
+            return_value=result,
+        ) as sandbox_run:
+            output = tools.execute(
+                member,
+                policy,
+                layout,
+                {"action": "git_diff"},
+                workflow_resources=("diff:read",),
+            )
+
+        self.assertIn("diff --git", output)
+        self.assertEqual(
+            sandbox_run.call_args.args[2],
+            (
+                "git",
+                "--no-pager",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--",
+            ),
+        )
+        self.assertFalse(sandbox_run.call_args.kwargs["checkout_writable"])
+
+    def test_run_action_scopes_dependency_services_to_one_command(self) -> None:
+        member = next(
+            value
+            for value in TeamService(self.db).load("team-1").members
+            if value.stable_key == "implementation"
+        )
+        policy = SandboxPolicy(
+            persistent_root=self.sandbox_root,
+            allowed_services=("pypi.org:443",),
+        )
+        layout = RunLayout.create(self.data_root, "repo-1", "run-1")
+        tools = AgentToolExecutor(self.sandbox)
+        result = mock.Mock(
+            canceled=False,
+            returncode=0,
+            stdout="dependency-ready",
+            stderr="",
+            timed_out=False,
+            log_path=layout.logs / "dependency.json",
+        )
+        with mock.patch.object(
+            self.sandbox,
+            "run",
+            return_value=result,
+        ) as sandbox_run:
+            output = tools.execute(
+                member,
+                policy,
+                layout,
+                {
+                    "action": "run",
+                    "argv": ["python3", "-V"],
+                    "dependency_services": [
+                        "cdn.playwright.dev:443",
+                        "pypi.org:443",
+                    ],
+                },
+            )
+
+        effective_policy = sandbox_run.call_args.args[0]
+        self.assertEqual(json.loads(output)["stdout"], "dependency-ready")
+        self.assertEqual(policy.allowed_services, ("pypi.org:443",))
+        self.assertEqual(
+            effective_policy.allowed_services,
+            ("pypi.org:443", "cdn.playwright.dev:443"),
+        )
+
+    def test_run_action_rejects_unsafe_dependency_services_before_execution(
+        self,
+    ) -> None:
+        member = next(
+            value
+            for value in TeamService(self.db).load("team-1").members
+            if value.stable_key == "implementation"
+        )
+        policy = SandboxPolicy(persistent_root=self.sandbox_root)
+        layout = RunLayout.create(self.data_root, "repo-1", "run-1")
+        tools = AgentToolExecutor(self.sandbox)
+        invalid_values: tuple[object, ...] = (
+            "cdn.playwright.dev:443",
+            ["*.playwright.dev:443"],
+            ["cdn.playwright.dev:22"],
+            [f"dependency-{index}.example.test:443" for index in range(17)],
+        )
+        result = mock.Mock(
+            canceled=False,
+            returncode=0,
+            stdout="",
+            stderr="",
+            timed_out=False,
+            log_path=layout.logs / "unexpected.json",
+        )
+        with mock.patch.object(
+            self.sandbox,
+            "run",
+            return_value=result,
+        ) as sandbox_run:
+            for dependency_services in invalid_values:
+                with self.subTest(dependency_services=dependency_services):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "dependency_services",
+                    ):
+                        tools.execute(
+                            member,
+                            policy,
+                            layout,
+                            {
+                                "action": "run",
+                                "argv": ["python3", "-V"],
+                                "dependency_services": dependency_services,
+                            },
+                        )
+        sandbox_run.assert_not_called()
+
+    def test_agent_prompt_exposes_run_local_dependency_retrieval(self) -> None:
+        properties = MiniSweModelRuntime._RESPONSE_SCHEMA["properties"]
+
+        self.assertIn("dependency_services", properties)
+        self.assertIn("dependency_services", MiniSweModelRuntime._SYSTEM_PROMPT)
+        self.assertIn(
+            "/run-data/dependency-delta",
+            MiniSweModelRuntime._SYSTEM_PROMPT,
+        )
+
+    def test_workflow_assessment_can_expand_assignment_and_continue(
+        self,
+    ) -> None:
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions)
+                   VALUES ('research-1', 'team-1', 'research', 'scout',
+                           'repository investigator',
+                           'Inspect the newly relevant concern',
+                           '["read","run"]', 'mini-swe-agent',
+                           'test/research', '')"""
+            )
+        runtime = ScriptedRuntime(
+            [
+                {
+                    "action": "assign",
+                    "members": [
+                        "lead",
+                        "implementation",
+                        "verification",
+                        "research",
+                    ],
+                    "reason": "Feedback requires repository investigation.",
+                },
+                {
+                    "action": "finish",
+                    "summary": "revised the workflow assignment",
+                    "output": {
+                        "outcome": "revise",
+                        "evidence": "Research is now durably assigned.",
+                    },
+                },
+            ]
+        )
+        service = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=lambda runtime, model, timeout: runtime,
+            max_actions=10,
+        )
+        team = TeamService(self.db).load("team-1")
+        lead = next(member for member in team.members if member.coordinates)
+        layout = RunLayout.create(self.data_root, "repo-1", "run-1")
+
+        outcome, yielded = service._agent_cycle(
+            runtime,
+            lead,
+            SandboxPolicy(persistent_root=self.sandbox_root),
+            layout,
+            "Assess the workflow.",
+            [],
+            (),
+            set(),
+            allow_assignment=True,
+            continue_after_assignment=True,
+        )
+
+        self.assertFalse(yielded)
+        self.assertEqual(outcome["outcome"], "revise")
+        self.assertIn(
+            "research",
+            {
+                assignment.member.stable_key
+                for assignment in TeamService(self.db).assignments_for_run(
+                    "run-1"
+                )
+            },
         )
 
     def _amend_base(self, files: dict[str, str]) -> None:
@@ -385,6 +1361,153 @@ class ExecutionTests(unittest.TestCase):
         self.assertTrue(json.loads(baseline["findings_json"]))
         self.assertEqual(len(runtime.contexts), 1)
 
+    def test_failed_exact_base_head_probe_remains_retryable(self) -> None:
+        service, _ = self.service([])
+        failure = mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr="bwrap: Can't find source path /missing/browser",
+        )
+
+        with mock.patch.object(service, "_git", return_value=failure):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "validation baseline exact-base HEAD probe failed:.*missing/browser",
+            ):
+                service.execute("run-1")
+
+        self.assertEqual(self.lifecycle.get_run("run-1")["state"], "implementing")
+
+    def test_failed_exact_base_status_probe_remains_retryable(self) -> None:
+        service, _ = self.service([])
+        head = mock.Mock(
+            returncode=0,
+            stdout=f"{self.base_sha}\n",
+            stderr="",
+        )
+        failure = mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr="bwrap: Can't find source path /missing/browser",
+        )
+
+        with mock.patch.object(service, "_git", side_effect=(head, failure)):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "validation baseline exact-base status probe failed:.*missing/browser",
+            ):
+                service.execute("run-1")
+
+        self.assertEqual(self.lifecycle.get_run("run-1")["state"], "implementing")
+
+    def test_post_baseline_probe_failure_resets_before_retry(self) -> None:
+        self._set_validation_command(
+            [
+                "python3",
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "marker = Path('/run-data/temp/mutated-once'); "
+                    "target = Path('value.py'); "
+                    "target.write_text('def value():\\n    return 99\\n', "
+                    "encoding='utf-8') if not marker.exists() else None; "
+                    "marker.touch(exist_ok=True)"
+                ),
+            ]
+        )
+        service, _ = self.service([])
+        layout = RunLayout.create(self.data_root, "repo-1", "run-1")
+        policy = SandboxPolicy(persistent_root=self.sandbox_root)
+        run = self.lifecycle.get_run("run-1")
+        original_git = service._git
+        head_calls = 0
+
+        def fail_post_command_head(
+            policy: SandboxPolicy,
+            layout: RunLayout,
+            arguments: tuple[str, ...],
+            *,
+            allow_failure: bool = False,
+        ):
+            nonlocal head_calls
+            if arguments == ("rev-parse", "HEAD"):
+                head_calls += 1
+                if head_calls == 2:
+                    return mock.Mock(
+                        returncode=1,
+                        stdout="",
+                        stderr="transient post-command probe failure",
+                    )
+            return original_git(
+                policy,
+                layout,
+                arguments,
+                allow_failure=allow_failure,
+            )
+
+        with mock.patch.object(
+            service,
+            "_git",
+            side_effect=fail_post_command_head,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "validation baseline exact-base HEAD probe failed:"
+                ".*post-command probe failure",
+            ):
+                service._ensure_validation_baselines(
+                    run,
+                    "sandbox-1",
+                    policy,
+                    layout,
+                    (),
+                    set(),
+                )
+
+        self.assertEqual(
+            self._git("status", "--porcelain", "--untracked-files=no"),
+            "",
+        )
+        self.assertEqual(self._git("rev-parse", "HEAD").strip(), self.base_sha)
+
+        service._ensure_validation_baselines(
+            run,
+            "sandbox-1",
+            policy,
+            layout,
+            (),
+            set(),
+        )
+
+        with self.db.connect() as connection:
+            baseline = connection.execute(
+                """SELECT base_sha, mode, exit_status
+                   FROM validation_baselines WHERE run_id='run-1'"""
+            ).fetchone()
+        self.assertEqual(
+            tuple(baseline),
+            (self.base_sha, "strict", 0),
+        )
+
+    def test_tracked_exact_base_change_still_blocks_missing_baseline(
+        self,
+    ) -> None:
+        (self.checkout / "value.py").write_text(
+            "def value():\n    return 99\n",
+            encoding="utf-8",
+        )
+        service, _ = self.service([])
+
+        self.assertIsNone(service.execute("run-1"))
+
+        run = self.lifecycle.get_run("run-1")
+        self.assertEqual(run["state"], "blocked")
+        self.assertEqual(
+            run["reason"],
+            "validation baseline is missing and the checkout is no longer "
+            "the clean exact run base",
+        )
+
     def test_reduced_baseline_debt_passes_with_nonzero_exit_status(self) -> None:
         self._amend_base(
             {
@@ -432,6 +1555,415 @@ class ExecutionTests(unittest.TestCase):
                 comparison["unchanged_count"],
             ),
             (0, 1, 1),
+        )
+
+    def _model_workflow_service(
+        self,
+    ) -> tuple[ExecutionService, dict[str, ScriptedRuntime]]:
+        WorkflowService(self.db).store_template(
+            "team-1",
+            {
+                "rationale": (
+                    "Implement, coordinate, and independently verify."
+                ),
+                "assessment_prompt": (
+                    "Assess evidence and retain or revise prompts, "
+                    "dependencies, joins, and specialist selection."
+                ),
+                "nodes": [
+                    {
+                        "stable_key": "implementation",
+                        "kind": "agent",
+                        "member_key": "implementation",
+                        "operation": "",
+                        "prompt": "Implement value() returning two.",
+                        "parameters": {},
+                        "bindings": {},
+                        "expected_output": {
+                            "type": "object",
+                            "required": ["summary"],
+                            "properties": {
+                                "summary": {"type": "string"}
+                            },
+                        },
+                        "resources": ["checkout:write"],
+                    },
+                    {
+                        "stable_key": "lead",
+                        "kind": "agent",
+                        "member_key": "lead",
+                        "operation": "",
+                        "prompt": "Integrate the implementation evidence.",
+                        "parameters": {},
+                        "bindings": {},
+                        "expected_output": {
+                            "type": "object",
+                            "required": ["summary"],
+                            "properties": {
+                                "summary": {"type": "string"}
+                            },
+                        },
+                        "resources": ["workspace:read"],
+                    },
+                    {
+                        "stable_key": "verification",
+                        "kind": "agent",
+                        "member_key": "verification",
+                        "operation": "",
+                        "prompt": "Independently verify value() returns two.",
+                        "parameters": {},
+                        "bindings": {},
+                        "expected_output": {
+                            "type": "object",
+                            "required": ["summary"],
+                            "properties": {
+                                "summary": {"type": "string"}
+                            },
+                        },
+                        "resources": ["workspace:read"],
+                    },
+                ],
+                "edges": [
+                    {"source": "implementation", "target": "lead"},
+                    {"source": "lead", "target": "verification"},
+                ],
+            },
+        )
+        runtimes = {
+            "test/implementation": ScriptedRuntime(
+                [
+                    {
+                        "action": "replace",
+                        "path": "value.py",
+                        "old": "return 1",
+                        "new": "return 2",
+                        "count": 1,
+                    },
+                    {
+                        "action": "finish",
+                        "summary": "implemented value two",
+                        "output": {
+                            "summary": "implemented value two"
+                        },
+                    },
+                ]
+            ),
+            "test/lead": ScriptedRuntime(
+                [
+                    {
+                        "action": "finish",
+                        "summary": "integrated the implementation",
+                        "output": {
+                            "summary": "integrated the implementation"
+                        },
+                    },
+                    {
+                        "action": "finish",
+                        "summary": "accepted graph evidence",
+                        "output": {
+                            "outcome": "accept",
+                            "evidence": (
+                                "all configured nodes completed"
+                            ),
+                        },
+                    },
+                ]
+            ),
+            "test/verification": ScriptedRuntime(
+                [
+                    {
+                        "action": "finish",
+                        "summary": "verified value two",
+                        "output": {"summary": "verified value two"},
+                    }
+                ]
+            ),
+        }
+
+        def runtime_factory(
+            _stored_runtime: str,
+            stored_model: str,
+            _stored_timeout: float,
+        ) -> ScriptedRuntime:
+            return runtimes[stored_model]
+
+        service = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=runtime_factory,
+            max_actions=10,
+        )
+        return service, runtimes
+
+    def test_initial_assignment_context_exposes_workflow_dependencies(
+        self,
+    ) -> None:
+        service, _ = self._model_workflow_service()
+        with self.db.transaction() as connection:
+            connection.execute(
+                "DELETE FROM agent_assignments WHERE run_id='run-1'"
+            )
+        assigning_lead = ScriptedRuntime(
+            [
+                {
+                    "action": "assign",
+                    "members": ["lead", "implementation", "verification"],
+                    "reason": "Select the complete workflow dependency branch.",
+                }
+            ]
+        )
+        service.runtime_factory = (
+            lambda _runtime, _model, _stored_timeout: assigning_lead
+        )
+
+        self.assertIsNone(service.execute("run-1"))
+
+        payload = json.loads(assigning_lead.contexts[0])
+        contract = payload["workflow_assignment_contract"]
+        self.assertEqual(
+            {
+                (node["stable_key"], node["member_key"])
+                for node in contract["agent_nodes"]
+            },
+            {
+                ("implementation", "implementation"),
+                ("lead", "lead"),
+                ("verification", "verification"),
+            },
+        )
+        self.assertEqual(
+            contract["edges"],
+            [
+                {"source": "implementation", "target": "lead"},
+                {"source": "lead", "target": "verification"},
+            ],
+        )
+        self.assertIn("upstream agent dependencies", contract["assignment_rule"])
+
+    def test_model_designed_workflow_drives_source_execution(self) -> None:
+        service, _ = self._model_workflow_service()
+
+        validated_sha = service.execute("run-1")
+
+        self.assertIsNotNone(validated_sha)
+        graph = service.workflows.active_run_graph("run-1")
+        self.assertEqual(graph.state, "succeeded")
+        self.assertEqual(graph.assessment["outcome"], "accept")
+        self.assertEqual(
+            [node.state for node in graph.nodes],
+            ["succeeded", "succeeded", "succeeded"],
+        )
+        self.assertEqual(
+            self.lifecycle.get_run("run-1")["state"],
+            "publishing",
+        )
+
+    def test_feedback_opens_one_restart_safe_workflow_generation(
+        self,
+    ) -> None:
+        service, runtimes = self._model_workflow_service()
+        self.assertIsNotNone(service.execute("run-1"))
+        self.lifecycle.transition(
+            "run-1",
+            RunState.WAITING_FOR_FEEDBACK,
+        )
+        self.lifecycle.transition(
+            "run-1",
+            RunState.RESOLVING_FEEDBACK,
+        )
+        current = service.workflows.active_run_graph("run-1")
+        revised_nodes = [
+            {
+                "stable_key": node.stable_key,
+                "kind": node.kind,
+                "member_key": node.member_key or "",
+                "operation": node.operation or "",
+                "prompt": (
+                    "Implement value() returning three."
+                    if node.stable_key == "implementation"
+                    else node.prompt
+                ),
+                "parameters": node.parameters,
+                "bindings": node.bindings,
+                "expected_output": node.expected_output,
+                "resources": list(node.resources),
+            }
+            for node in current.nodes
+        ]
+        revised_edges = [
+            {"source": edge.source, "target": edge.target}
+            for edge in current.edges
+        ]
+        feedback = json.dumps(
+            {
+                "feedback": [
+                    {
+                        "instruction": (
+                            "Update value() and its test to return three."
+                        )
+                    }
+                ]
+            },
+            sort_keys=True,
+        )
+        feedback_items = [
+            {
+                "key": "return-three",
+                "title": "Return the revised requested value",
+                "objective": "The public value function returns three.",
+                "acceptance_criteria": [
+                    {
+                        "key": "value-returns-three",
+                        "requirement": (
+                            "Calling value returns the revised requested integer."
+                        ),
+                        "expected": "value() returns 3.",
+                    }
+                ],
+                "verification": [
+                    {
+                        "key": "call-value-three",
+                        "criterion_keys": ["value-returns-three"],
+                        "scenario": (
+                            "Call value() and compare its return value with 3."
+                        ),
+                    }
+                ],
+            }
+        ]
+        feedback_specification = self.specifications.submit(
+            run_id="run-1",
+            author_member_id="lead-1",
+            issue_version_id=self.issue_version_id,
+            items=feedback_items,
+            reason="Reconcile the accepted feedback before workflow revision.",
+        )
+        self.specifications.record_review(
+            run_id="run-1",
+            specification_revision_id=str(feedback_specification["id"]),
+            reviewer_member_id="verification-1",
+            reviewer_model="test/verification",
+            rubric_version=1,
+            verdict="approved",
+            summary="The feedback revision is complete and observable.",
+            findings=[],
+        )
+        self.specifications.bind_context(
+            run_id="run-1",
+            issue_version_id=self.issue_version_id,
+            context_sha256=hashlib.sha256(feedback.encode("utf-8")).hexdigest(),
+            specification_revision_id=str(feedback_specification["id"]),
+        )
+        runtimes["test/lead"] = ScriptedRuntime(
+            [
+                {
+                    "action": "finish",
+                    "summary": "planned the feedback revision",
+                    "output": {
+                        "outcome": "revise",
+                        "evidence": (
+                            "the accepted graph predates new feedback"
+                        ),
+                        "reason": "apply the requested value change",
+                        "nodes": revised_nodes,
+                        "edges": revised_edges,
+                    },
+                }
+            ]
+        )
+        with mock.patch(
+            "repogents.execution.WorkflowExecutionEngine.execute",
+            side_effect=RuntimeError("interrupt after revision"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "interrupt after revision",
+            ):
+                service.execute(
+                    "run-1",
+                    additional_context=feedback,
+                )
+
+        interrupted = service.workflows.active_run_graph("run-1")
+        self.assertEqual(interrupted.generation, 2)
+        self.assertIn("controller-revision:", interrupted.reason)
+        self.assertEqual(
+            len(service.workflows.project_run("run-1")["generations"]),
+            2,
+        )
+
+        runtimes["test/implementation"] = ScriptedRuntime(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 2",
+                    "new": "return 3",
+                    "count": 1,
+                },
+                {
+                    "action": "replace",
+                    "path": "test_value.py",
+                    "old": "self.assertEqual(value(), 2)",
+                    "new": "self.assertEqual(value(), 3)",
+                    "count": 1,
+                },
+                {
+                    "action": "finish",
+                    "summary": "implemented value three",
+                    "output": {"summary": "implemented value three"},
+                },
+            ]
+        )
+        runtimes["test/lead"] = ScriptedRuntime(
+            [
+                {
+                    "action": "finish",
+                    "summary": "integrated the feedback change",
+                    "output": {
+                        "summary": "integrated the feedback change"
+                    },
+                },
+                {
+                    "action": "finish",
+                    "summary": "accepted feedback evidence",
+                    "output": {
+                        "outcome": "accept",
+                        "evidence": (
+                            "the requested value and test now return three"
+                        ),
+                    },
+                },
+            ]
+        )
+        runtimes["test/verification"] = ScriptedRuntime(
+            [
+                {
+                    "action": "finish",
+                    "summary": "verified value three",
+                    "output": {"summary": "verified value three"},
+                }
+            ]
+        )
+
+        validated_sha = service.execute(
+            "run-1",
+            additional_context=feedback,
+        )
+
+        self.assertIsNotNone(validated_sha)
+        completed = service.workflows.active_run_graph("run-1")
+        self.assertEqual(completed.generation, 2)
+        self.assertEqual(completed.state, "succeeded")
+        self.assertEqual(
+            len(service.workflows.project_run("run-1")["generations"]),
+            2,
+        )
+        self.assertIn(
+            "return 3",
+            (self.checkout / "value.py").read_text(encoding="utf-8"),
         )
 
     def test_lower_finding_count_with_a_new_finding_fails(self) -> None:
@@ -2348,10 +3880,24 @@ class ExecutionTests(unittest.TestCase):
         self.assertIsNotNone(initial_sha)
         self.lifecycle.transition("run-1", RunState.WAITING_FOR_FEEDBACK)
         self.lifecycle.transition("run-1", RunState.RESOLVING_FEEDBACK)
+        feedback_context = "Apply the accepted pull-request feedback."
+        self.specifications.bind_context(
+            run_id="run-1",
+            issue_version_id=self.issue_version_id,
+            context_sha256=hashlib.sha256(
+                feedback_context.encode("utf-8")
+            ).hexdigest(),
+            specification_revision_id=str(
+                self.specifications.require_approved(
+                    "run-1",
+                    self.issue_version_id,
+                )["id"]
+            ),
+        )
 
         revised_sha = service.execute(
             "run-1",
-            additional_context="Apply the accepted pull-request feedback.",
+            additional_context=feedback_context,
         )
 
         self.assertIsNotNone(revised_sha)

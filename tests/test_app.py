@@ -397,6 +397,84 @@ class ApplicationTests(unittest.TestCase):
                 ),
             )
 
+    def test_state_projects_repository_template_and_active_run_workflow(
+        self,
+    ) -> None:
+        now = "2026-01-01T00:00:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO team_workflow_templates
+                   (id, team_version_id, contract_version, rationale,
+                    assessment_prompt, created_at)
+                   VALUES ('template-1', 'team-1', 1,
+                           'Coordinate and verify the issue.',
+                           'Assess coordination evidence.', ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO team_workflow_nodes
+                   (id, template_id, stable_key, kind, team_member_id,
+                    operation_key, prompt, expected_output_json,
+                    resources_json, position, created_at)
+                   VALUES ('template-node-1', 'template-1', 'lead',
+                           'agent', 'lead-1', NULL, 'Own the result.',
+                           '{"summary":"string"}', '["workspace:read"]',
+                           0, ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO run_workflows
+                   (id, run_id, team_workflow_template_id, issue_version_id,
+                    generation, state, reason, assessment_json, active,
+                    created_at, updated_at)
+                   VALUES ('workflow-1', 'run-1', 'template-1', NULL, 1,
+                           'running', 'initial issue graph', ?, 1, ?, ?)""",
+                (
+                    json.dumps(
+                        {
+                            "rationale": "Coordinate and verify the issue.",
+                            "assessment_prompt": (
+                                "Assess coordination evidence."
+                            ),
+                        }
+                    ),
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO run_workflow_nodes
+                   (id, run_workflow_id, stable_key, kind, team_member_id,
+                    operation_key, prompt, expected_output_json,
+                    resources_json, state, position, reused_from_node_id,
+                    created_at, updated_at)
+                   VALUES ('run-node-1', 'workflow-1', 'lead', 'agent',
+                           'lead-1', NULL, 'Own the result.',
+                           '{"summary":"string"}', '["workspace:read"]',
+                           'running', 0, NULL, ?, ?)""",
+                (now, now),
+            )
+
+        state = ApplicationActions(
+            database=self.db,
+            onboarding=FakeOnboarding(),
+            lifecycle=FakeLifecycle(self.db),
+            scheduler=FakeScheduler(),
+        ).state()
+
+        template = state["repositories"][0]["workflow_template"]
+        self.assertEqual(
+            template["rationale"],
+            "Coordinate and verify the issue.",
+        )
+        self.assertEqual(template["nodes"][0]["column"], 0)
+        workflow = state["runs"][0]["workflow"]
+        self.assertEqual(workflow["active_generation"], 1)
+        self.assertEqual(
+            workflow["generations"][0]["nodes"][0]["state"],
+            "running",
+        )
+
     def seed_second_run(self) -> None:
         now = "2026-01-01T00:01:00Z"
         with self.db.transaction() as connection:
@@ -1310,6 +1388,8 @@ class ApplicationTests(unittest.TestCase):
             "id": "acceptance-1",
             "run_id": "run-1",
             "commit_sha": commit_sha,
+            "issue_version_id": "issue-version-ui",
+            "specification_revision_id": "spec-ui-1",
             "state": "passed",
             "summary": "Scrolling works.",
             "claims": [
@@ -1319,6 +1399,7 @@ class ApplicationTests(unittest.TestCase):
                     "result": "pass",
                     "observed": "Rows changed.",
                     "evidence": [1],
+                    "criterion_keys": ["scroll-history"],
                 }
             ],
             "scope": [],
@@ -1361,6 +1442,56 @@ class ApplicationTests(unittest.TestCase):
                    VALUES ('verifier-1', 'team-1', 'verification', 'verifier',
                            'behavior verifier', 'Verify', '["read","run"]',
                            'mini-swe-agent', 'test', '')""")
+            specification_items = [
+                {
+                    "key": "scrolling",
+                    "title": "Terminal scrolling",
+                    "objective": "Reach retained output beyond the viewport.",
+                    "acceptance_criteria": [
+                        {
+                            "key": "scroll-history",
+                            "requirement": "Wheel input navigates retained output.",
+                            "expected": "Visible terminal rows change.",
+                        }
+                    ],
+                    "verification": [
+                        {
+                            "key": "wheel-scroll",
+                            "scenario": "Wheel upward in the terminal viewport.",
+                            "criterion_keys": ["scroll-history"],
+                        }
+                    ],
+                }
+            ]
+            connection.execute(
+                """INSERT INTO run_specification_revisions
+                   (id, run_id, issue_version_id, revision, items_json,
+                    content_sha256, author_member_id, reason, created_at)
+                   VALUES ('spec-ui-1', 'run-1', 'issue-version-ui', 1,
+                           ?, ?, 'lead-1', 'Define scrolling behavior',
+                           '2026-01-01T00:00:30Z')""",
+                (
+                    json.dumps(specification_items),
+                    hashlib.sha256(
+                        json.dumps(
+                            specification_items,
+                            sort_keys=True,
+                        ).encode()
+                    ).hexdigest(),
+                ),
+            )
+            connection.execute(
+                """INSERT INTO run_specification_reviews
+                   (id, run_id, specification_revision_id,
+                    reviewer_member_id, reviewer_model, rubric_version,
+                    verdict, summary, findings_json, blocker,
+                    input_sha256, created_at)
+                   VALUES ('spec-review-ui-1', 'run-1', 'spec-ui-1',
+                           'verifier-1', 'test', 1, 'approved',
+                           'Scrolling behavior is observable.', '[]', NULL,
+                           ?, '2026-01-01T00:00:45Z')""",
+                ("e" * 64,),
+            )
             connection.execute(
                 """UPDATE runs
                    SET validated_sha=?,
@@ -1373,9 +1504,10 @@ class ApplicationTests(unittest.TestCase):
                    (id, run_id, commit_sha, issue_version_id, attempt,
                     verifier_member_id, state, claims_json,
                     screenshot_decision_json, report_json, started_at,
-                    completed_at)
+                    completed_at, specification_revision_id)
                    VALUES ('acceptance-1', 'run-1', ?, 'issue-version-ui', 1,
-                           'verifier-1', 'passed', ?, ?, ?, ?, ?)""",
+                           'verifier-1', 'passed', ?, ?, ?, ?, ?,
+                           'spec-ui-1')""",
                 (
                     commit_sha,
                     json.dumps(report["claims"]),
@@ -2283,6 +2415,186 @@ class ApplicationTests(unittest.TestCase):
 
         self.assertEqual(execution.calls, ["run-2", "run-1"])
 
+
+    def test_specification_projection_approved_with_acceptance_evidence(
+        self,
+    ) -> None:
+        now = "2026-01-01T00:00:00Z"
+        commit_sha = "b" * 40
+        items = [
+            {
+                "key": "item-1",
+                "title": "Scrolling support",
+                "objective": "Terminal can scroll beyond viewport.",
+                "acceptance_criteria": [
+                    {
+                        "key": "scroll-history",
+                        "requirement": "Wheel input navigates retained history.",
+                        "expected": "Visible rows change after wheel input.",
+                    }
+                ],
+                "verification": [
+                    {
+                        "key": "wheel-scroll",
+                        "scenario": "Wheel input scrolls retained history.",
+                        "criterion_keys": ["scroll-history"],
+                    }
+                ],
+            }
+        ]
+        specification_id = "spec-rev-1"
+        context_sha = hashlib.sha256(b"feedback context v1").hexdigest()
+        report = {
+            "id": "acceptance-1",
+            "run_id": "run-1",
+            "commit_sha": commit_sha,
+            "issue_version_id": "issue-version-1",
+            "specification_revision_id": specification_id,
+            "state": "passed",
+            "summary": "Scrolling works.",
+            "claims": [
+                {
+                    "key": "scroll-history",
+                    "claim": "Wheel input navigates history.",
+                    "result": "pass",
+                    "observed": "Visible rows changed after wheel input.",
+                    "evidence": [1],
+                    "criterion_keys": ["scroll-history"],
+                }
+            ],
+            "scope": [],
+            "screenshot_decision": {
+                "required": True,
+                "reason": "Visual issue.",
+            },
+            "artifacts": [],
+            "limitations": [],
+        }
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO issue_versions
+                   (id, issue_id, version, previous_version_id,
+                    github_updated_at, content_sha256, title, body,
+                    discussion_json, observed_at)
+                   VALUES ('issue-version-1', 'issue-1', 1, NULL, ?, ?,
+                           'Fix scrolling', 'Terminal should scroll.',
+                           '[]', ?)""",
+                (now, "c" * 64, now),
+            )
+            connection.execute(
+                """UPDATE issues SET current_version_id='issue-version-1'
+                   WHERE id='issue-1'"""
+            )
+            connection.execute(
+                """INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions)
+                   VALUES ('verifier-1', 'team-1', 'verification', 'verifier',
+                           'repository behavior reviewer', 'Review behavior',
+                           '["read"]', 'test', 'test/verifier',
+                           'Review independently.')"""
+            )
+            connection.execute(
+                """INSERT INTO run_specification_revisions
+                   (id, run_id, issue_version_id, revision, items_json,
+                    content_sha256, author_member_id, reason, created_at)
+                   VALUES (?, 'run-1', 'issue-version-1', 1, ?, ?,
+                           'lead-1', 'Initial specification', ?)""",
+                (
+                    specification_id,
+                    json.dumps(items),
+                    hashlib.sha256(
+                        json.dumps(items, sort_keys=True).encode()
+                    ).hexdigest(),
+                    now,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO run_specification_reviews
+                   (id, run_id, specification_revision_id,
+                    reviewer_member_id, reviewer_model, rubric_version,
+                    verdict, summary, findings_json, blocker,
+                    input_sha256, created_at)
+                   VALUES ('review-1', 'run-1', ?, 'verifier-1',
+                           'test/verifier', 1, 'approved',
+                           'All items approved.', '[]', NULL, ?, ?)""",
+                (specification_id, "d" * 64, now),
+            )
+            connection.execute(
+                """INSERT INTO acceptance_verifications
+                   (id, run_id, commit_sha, attempt, verifier_member_id,
+                    state, claims_json, screenshot_decision_json, report_json,
+                    started_at, completed_at, issue_version_id,
+                    specification_revision_id)
+                   VALUES ('acceptance-1', 'run-1', ?, 1, 'verifier-1',
+                           'passed', ?, ?, ?, ?, ?,
+                           'issue-version-1', ?)""",
+                (
+                    commit_sha,
+                    json.dumps(report["claims"]),
+                    json.dumps(report["screenshot_decision"]),
+                    json.dumps(report),
+                    now,
+                    now,
+                    specification_id,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO run_specification_contexts
+                   (id, run_id, issue_version_id, context_sha256,
+                    specification_revision_id, reconciled_at)
+                   VALUES ('ctx-1', 'run-1', 'issue-version-1', ?, ?, ?)""",
+                (context_sha, specification_id, now),
+            )
+            connection.execute(
+                """UPDATE runs
+                   SET validated_sha=?, validated_issue_version_id=?
+                   WHERE id='run-1'""",
+                (commit_sha, "issue-version-1"),
+            )
+
+        state = ApplicationActions(
+            database=self.db,
+            onboarding=FakeOnboarding(),
+            lifecycle=FakeLifecycle(self.db),
+            scheduler=FakeScheduler(),
+        ).state()
+        run = state["runs"][0]
+        specification = run["specification"]
+        self.assertEqual(specification["id"], specification_id)
+        self.assertEqual(specification["revision"], 1)
+        self.assertTrue(specification["implementation_ready"])
+        self.assertEqual(specification["review"]["verdict"], "approved")
+        criterion = specification["items"][0]["acceptance_criteria"][0]
+        self.assertEqual(criterion["key"], "scroll-history")
+        self.assertEqual(criterion["result"], "pass")
+        self.assertEqual(
+            criterion["evidence"][0]["evidence_refs"],
+            [1],
+        )
+        self.assertEqual(
+            specification["contexts"][0]["context_sha256"],
+            context_sha,
+        )
+        history = run["specification_revision_history"]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["items"], items)
+        self.assertEqual(
+            history[0]["contexts"][0]["context_sha256"],
+            context_sha,
+        )
+
+    def test_specification_projection_no_spec(self) -> None:
+        state = ApplicationActions(
+            database=self.db,
+            onboarding=FakeOnboarding(),
+            lifecycle=FakeLifecycle(self.db),
+            scheduler=FakeScheduler(),
+        ).state()
+        run = state["runs"][0]
+        self.assertIsNone(run["specification"])
+        self.assertEqual(run["specification_revision_history"], [])
 
 if __name__ == "__main__":
     unittest.main()

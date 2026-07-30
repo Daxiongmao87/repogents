@@ -10,9 +10,11 @@ from dataclasses import dataclass, field, replace
 from unittest import mock
 from pathlib import Path
 
+from repogents.app import Orchestrator
+
 from repogents.database import Database
 from repogents.github import PullRequestInfo
-from repogents.lifecycle import RunLifecycle
+from repogents.lifecycle import RunLifecycle, RunState
 from repogents.publication import (
     GitPublicationGateway,
     PublicationBaseChanged,
@@ -21,6 +23,7 @@ from repogents.publication import (
     ScopeDecision,
 )
 from repogents.sandbox import SandboxManager
+from repogents.specification import SpecificationService
 
 
 class NoActivationClient:
@@ -58,6 +61,7 @@ class FakeAcceptanceGate:
     summary: str = "The issue-required behavior was independently observed."
     observed: str | None = None
     issue_version_id: str = ""
+    specification_revision_id: str = ""
     calls: list[tuple[str, str, tuple[str, ...]]] = field(default_factory=list)
 
     def verify(
@@ -72,6 +76,7 @@ class FakeAcceptanceGate:
             "run_id": run_id,
             "commit_sha": commit_sha,
             "issue_version_id": self.issue_version_id,
+            "specification_revision_id": self.specification_revision_id,
             "state": self.state,
             "summary": self.summary,
             "claims": [
@@ -103,8 +108,14 @@ class FakeAcceptanceGate:
         }
 
 
-def passing_acceptance(issue_version_id: str) -> FakeAcceptanceGate:
-    return FakeAcceptanceGate(issue_version_id=issue_version_id)
+def passing_acceptance(
+    issue_version_id: str,
+    specification_revision_id: str,
+) -> FakeAcceptanceGate:
+    return FakeAcceptanceGate(
+        issue_version_id=issue_version_id,
+        specification_revision_id=specification_revision_id,
+    )
 
 
 class FakePublicationGateway:
@@ -458,6 +469,17 @@ class MiniSweScopeReviewerTests(unittest.TestCase):
             any("must not be required in the committed diff" in rule for rule in rules)
         )
         self.assertTrue(any("reject them when present" in rule for rule in rules))
+        joined_rules = "\n".join(str(rule) for rule in rules)
+        self.assertIn("issue-related", joined_rules)
+        self.assertIn("repository instructions", joined_rules)
+        self.assertIn("forbidden", joined_rules)
+        self.assertIn("unexplained", joined_rules)
+        self.assertIn("must not judge implementation completeness", joined_rules)
+        self.assertIn("must not judge test adequacy", joined_rules)
+        self.assertIn("must not judge runtime correctness", joined_rules)
+        self.assertIn("must not judge visual quality", joined_rules)
+        self.assertIn("must not judge acceptance proof", joined_rules)
+
         self.assertNotIn("changed line", observed["system_prompt"])
         self.assertLess(len(observed["system_prompt"]), 1_000)
 
@@ -612,14 +634,19 @@ class PublicationTests(unittest.TestCase):
                 (now,),
             )
             connection.execute("""INSERT INTO team_members
-                   (id, team_version_id, stable_key, role, responsibilities,
-                    permitted_tools_json, runtime, model, instructions)
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions)
                    VALUES
-                   ('lead-1', 'team-1', 'lead', 'lead', 'Own result', '[]',
+                   ('lead-1', 'team-1', 'lead', 'lead',
+                    'repository delivery planner', 'Own result', '[]',
                     'mini-swe-agent', 'openai/gpt-stored', ''),
                    ('verifier-1', 'team-1', 'verification', 'verifier',
-                    'Independently review the candidate', '["read","run","git_diff"]',
-                    'mini-swe-agent', 'openai/gpt-verifier', 'Review correctness')""")
+                    'repository behavior reviewer',
+                    'Independently review the candidate',
+                    '["read","run","git_diff"]',
+                    'mini-swe-agent', 'openai/gpt-verifier',
+                    'Review correctness')""")
             connection.execute(
                 """INSERT INTO issues
                    (id, repository_id, github_node_id, number, url, title, body,
@@ -702,7 +729,50 @@ class PublicationTests(unittest.TestCase):
                    WHERE id='run-1'""",
                 (self.issue_version_id,),
             )
-        self.acceptance = passing_acceptance(self.issue_version_id)
+        self.specifications = SpecificationService(self.db)
+        self.specification_items = [
+            {
+                "key": "value-output",
+                "title": "Expose the requested value",
+                "objective": "The repository behavior exposes VALUE 2.",
+                "acceptance_criteria": [
+                    {
+                        "key": "value-command-output",
+                        "requirement": "The public command exposes the requested value.",
+                        "expected": "The command exits successfully with VALUE=2.",
+                    }
+                ],
+                "verification": [
+                    {
+                        "key": "run-public-command",
+                        "criterion_keys": ["value-command-output"],
+                        "scenario": "Run the public command and inspect its output.",
+                    }
+                ],
+            }
+        ]
+        specification = self.specifications.submit(
+            run_id="run-1",
+            author_member_id="lead-1",
+            issue_version_id=self.issue_version_id,
+            items=self.specification_items,
+            reason="Specify the fixture issue behavior before publication.",
+        )
+        self.specifications.record_review(
+            run_id="run-1",
+            specification_revision_id=str(specification["id"]),
+            reviewer_member_id="verifier-1",
+            reviewer_model="openai/gpt-verifier",
+            rubric_version=1,
+            verdict="approved",
+            summary="The fixture specification is complete and verifiable.",
+            findings=[],
+        )
+        self.specification_revision_id = str(specification["id"])
+        self.acceptance = passing_acceptance(
+            self.issue_version_id,
+            self.specification_revision_id,
+        )
         self.service = PublicationService(
             database=self.db,
             lifecycle=self.lifecycle,
@@ -839,6 +909,97 @@ class PublicationTests(unittest.TestCase):
         self.assertIn("The requested value is observable", body)
         self.assertIn("Closes #3", body)
 
+    def test_scope_verdict_reuses_exact_input_and_invalidates_new_candidate(
+        self,
+    ) -> None:
+        first_reviewer = FakeScopeReviewer()
+        first_service = PublicationService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            gateway=self.gateway,
+            scope_reviewer=first_reviewer,
+            acceptance=self.acceptance,
+        )
+        first_pull = first_service.publish("run-1")
+        self.assertIsNotNone(first_pull)
+        self.assertEqual(len(first_reviewer.reviews), 1)
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs
+                   SET state='publishing', last_completed_state='validating',
+                       reason=NULL
+                   WHERE id='run-1'"""
+            )
+        reused_reviewer = FakeScopeReviewer(
+            decision=ScopeDecision(False, "must not be called")
+        )
+        reused_service = PublicationService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            gateway=self.gateway,
+            scope_reviewer=reused_reviewer,
+            acceptance=self.acceptance,
+        )
+
+        reused_pull = reused_service.publish("run-1")
+
+        self.assertIsNotNone(reused_pull)
+        self.assertEqual(reused_reviewer.reviews, [])
+        with self.db.connect() as connection:
+            stored = connection.execute(
+                """SELECT input_sha256, in_scope, reason
+                   FROM publication_scope_reviews
+                   WHERE run_id='run-1'"""
+            ).fetchall()
+        self.assertEqual(len(stored), 1)
+        self.assertEqual((stored[0]["in_scope"], stored[0]["reason"]), (1, first_reviewer.decision.reason))
+
+        (self.checkout / "app.py").write_text("VALUE = 3\n", encoding="utf-8")
+        self._git("add", "-A")
+        self._git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=f@example.com",
+            "commit",
+            "-qm",
+            "second candidate",
+        )
+        revised_sha = self._git("rev-parse", "HEAD").strip()
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs
+                   SET state='publishing', last_completed_state='validating',
+                       validated_sha=?, reason=NULL
+                   WHERE id='run-1'""",
+                (revised_sha,),
+            )
+            connection.execute(
+                """UPDATE validation_results SET commit_sha=?
+                   WHERE id='result-1'""",
+                (revised_sha,),
+            )
+        revised_reviewer = FakeScopeReviewer()
+        revised_service = PublicationService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            gateway=self.gateway,
+            scope_reviewer=revised_reviewer,
+            acceptance=self.acceptance,
+        )
+
+        revised_pull = revised_service.publish("run-1")
+
+        self.assertIsNotNone(revised_pull)
+        self.assertEqual(len(revised_reviewer.reviews), 1)
+        with self.db.connect() as connection:
+            review_count = connection.execute(
+                """SELECT COUNT(*) AS count FROM publication_scope_reviews
+                   WHERE run_id='run-1'"""
+            ).fetchone()["count"]
+        self.assertEqual(review_count, 2)
+
     def test_unresolved_feedback_prevents_push_at_publication_boundary(self) -> None:
         with self.db.transaction() as connection:
             connection.execute(
@@ -897,6 +1058,36 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(run["state"], "implementing")
         self.assertIn("VALUE=1", run["reason"])
         self.assertEqual(self.gateway.pushes, [])
+
+    def test_stale_specification_acceptance_blocks_before_push(self) -> None:
+        next_items = json.loads(json.dumps(self.specification_items))
+        next_items[0]["objective"] = (
+            "The repository behavior exposes VALUE 2 without unrelated output."
+        )
+        next_specification = self.specifications.submit(
+            run_id="run-1",
+            author_member_id="lead-1",
+            issue_version_id=self.issue_version_id,
+            items=next_items,
+            reason="Clarify the output boundary before publication.",
+        )
+        self.specifications.record_review(
+            run_id="run-1",
+            specification_revision_id=str(next_specification["id"]),
+            reviewer_member_id="verifier-1",
+            reviewer_model="openai/gpt-verifier",
+            rubric_version=1,
+            verdict="approved",
+            summary="The clarified specification is complete and verifiable.",
+            findings=[],
+        )
+
+        self.assertIsNone(self.service.publish("run-1"))
+
+        self.assertEqual(self.gateway.pushes, [])
+        run = self.lifecycle.get_run("run-1")
+        self.assertEqual(run["state"], "blocked")
+        self.assertIn("specification", str(run["reason"]).lower())
 
     def test_revised_sha_refreshes_existing_pull_request_proof(self) -> None:
         pull = self.service.publish("run-1")
@@ -970,7 +1161,10 @@ class PublicationTests(unittest.TestCase):
             lifecycle=self.lifecycle,
             gateway=self.gateway,
             scope_reviewer=reviewer,
-            acceptance=passing_acceptance(self.issue_version_id),
+            acceptance=passing_acceptance(
+                self.issue_version_id,
+                self.specification_revision_id,
+            ),
         )
 
         self.assertIsNone(service.publish("run-1"))
@@ -997,7 +1191,11 @@ class PublicationTests(unittest.TestCase):
                 "UPDATE sandbox_versions SET evidence_json='not-json' WHERE id='sandbox-1'"
             )
 
-        self.assertIsNone(self.service.publish("run-1"))
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "stored repository scope context is unreadable",
+        ):
+            self.service.publish("run-1")
 
         self.assertEqual(self.lifecycle.get_run("run-1")["state"], "publishing")
         self.assertEqual(self.gateway.pushes, [])
@@ -1046,11 +1244,52 @@ class PublicationTests(unittest.TestCase):
             [None, self.validated_sha],
         )
 
+    def test_publication_exception_enters_durable_controller_retry(self) -> None:
+        self.gateway.fail_before_push = True
+        feedback = mock.Mock()
+        feedback.resolve_run.return_value = 0
+        orchestrator = Orchestrator(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            execution=mock.Mock(),
+            publication=self.service,
+            feedback=feedback,
+        )
+
+        orchestrator._advance("run-1")
+
+        failed = self.lifecycle.get_run("run-1")
+        self.assertEqual(failed["state"], RunState.PUBLISHING.value)
+        self.assertEqual(failed["retry_attempt_count"], 1)
+        self.assertEqual(failed["retry_operation"], "publication")
+        self.assertIsNotNone(failed["retry_next_at"])
+        self.assertIn("connection failed before push", failed["retry_last_error"])
+        self.assertEqual(self.gateway.pushes, [])
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs SET retry_next_at='2000-01-01T00:00:00Z'
+                   WHERE id='run-1'"""
+            )
+        orchestrator._advance("run-1")
+
+        recovered = self.lifecycle.get_run("run-1")
+        self.assertEqual(recovered["state"], RunState.WAITING_FOR_FEEDBACK.value)
+        self.assertEqual(recovered["retry_attempt_count"], 0)
+        self.assertIsNone(recovered["retry_operation"])
+        self.assertIsNone(recovered["retry_next_at"])
+        self.assertIsNone(recovered["retry_last_error"])
+        self.assertEqual(self.gateway.pushes, [(self.branch, self.validated_sha)])
+
     def test_next_attempt_retries_push_that_failed_before_external_mutation(
         self,
     ) -> None:
         self.gateway.fail_before_push = True
-        self.assertIsNone(self.service.publish("run-1"))
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "connection failed before push",
+        ):
+            self.service.publish("run-1")
         self.assertEqual(self.gateway.pushes, [])
         self.assertEqual(self.lifecycle.get_run("run-1")["state"], "publishing")
 
@@ -1060,7 +1299,11 @@ class PublicationTests(unittest.TestCase):
 
     def test_next_attempt_reconciles_push_accepted_before_response_loss(self) -> None:
         self.gateway.crash_after_push = True
-        self.assertIsNone(self.service.publish("run-1"))
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "connection lost after GitHub accepted push",
+        ):
+            self.service.publish("run-1")
         self.assertEqual(self.gateway.pushes, [(self.branch, self.validated_sha)])
         self.assertEqual(self.lifecycle.get_run("run-1")["state"], "publishing")
 
@@ -1072,7 +1315,11 @@ class PublicationTests(unittest.TestCase):
         self,
     ) -> None:
         self.gateway.fail_before_create = True
-        self.assertIsNone(self.service.publish("run-1"))
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "connection failed before pull request creation",
+        ):
+            self.service.publish("run-1")
         self.assertEqual(self.gateway.pushes, [(self.branch, self.validated_sha)])
         self.assertEqual(self.gateway.create_calls, 0)
         self.assertEqual(self.lifecycle.get_run("run-1")["state"], "publishing")
@@ -1085,7 +1332,11 @@ class PublicationTests(unittest.TestCase):
         self,
     ) -> None:
         self.gateway.crash_after_create = True
-        self.assertIsNone(self.service.publish("run-1"))
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "connection lost after GitHub accepted pull request",
+        ):
+            self.service.publish("run-1")
         self.assertEqual(self.lifecycle.get_run("run-1")["state"], "publishing")
         pull = self.service.publish("run-1")
         self.assertIsNotNone(pull)
@@ -1138,7 +1389,11 @@ class PublicationTests(unittest.TestCase):
             concurrent_sha,
         )
 
-        self.assertIsNone(self.service.publish("run-1"))
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "remote branch changed before leased push",
+        ):
+            self.service.publish("run-1")
 
         self.assertEqual(self.gateway.branches[self.branch], concurrent_sha)
         self.assertEqual(
@@ -1387,7 +1642,10 @@ class PublicationTests(unittest.TestCase):
             lifecycle=self.lifecycle,
             gateway=self.gateway,
             scope_reviewer=reviewer,
-            acceptance=passing_acceptance(self.issue_version_id),
+            acceptance=passing_acceptance(
+                self.issue_version_id,
+                self.specification_revision_id,
+            ),
         )
         second_pull = resumed.publish("run-1")
 
@@ -1481,7 +1739,10 @@ class PublicationTests(unittest.TestCase):
             lifecycle=self.lifecycle,
             gateway=self.gateway,
             scope_reviewer=reviewer,
-            acceptance=passing_acceptance(self.issue_version_id),
+            acceptance=passing_acceptance(
+                self.issue_version_id,
+                self.specification_revision_id,
+            ),
         )
 
         pull = service.publish("run-1")
@@ -1551,7 +1812,10 @@ class PublicationTests(unittest.TestCase):
             lifecycle=self.lifecycle,
             gateway=self.gateway,
             scope_reviewer=reviewer,
-            acceptance=passing_acceptance(self.issue_version_id),
+            acceptance=passing_acceptance(
+                self.issue_version_id,
+                self.specification_revision_id,
+            ),
         )
 
         pull = service.publish("run-1")
@@ -1591,7 +1855,10 @@ class PublicationTests(unittest.TestCase):
             lifecycle=self.lifecycle,
             gateway=self.gateway,
             scope_reviewer=reviewer,
-            acceptance=passing_acceptance(self.issue_version_id),
+            acceptance=passing_acceptance(
+                self.issue_version_id,
+                self.specification_revision_id,
+            ),
         )
 
         pull = service.publish("run-1")
@@ -1610,7 +1877,10 @@ class PublicationTests(unittest.TestCase):
             scope_reviewer=FakeScopeReviewer(
                 ScopeDecision(False, "unrelated file changed")
             ),
-            acceptance=passing_acceptance(self.issue_version_id),
+            acceptance=passing_acceptance(
+                self.issue_version_id,
+                self.specification_revision_id,
+            ),
         )
         self.assertIsNone(service.publish("run-1"))
         run = self.lifecycle.get_run("run-1")

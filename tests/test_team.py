@@ -5,10 +5,116 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from typing import cast
 
 from repogents.database import Database
 from repogents.onboarding import RepositoryInspection
-from repogents.team import EvidenceTeamFormulator, TeamService, validate_team_members
+from repogents.team import (
+    EvidenceTeamFormulator,
+    TeamDesign,
+    TeamService,
+    validate_team_members,
+)
+
+
+def _formulator_decision(
+    *,
+    coordinator_resources: tuple[str, ...] = ("workspace:read",),
+) -> dict[str, object]:
+    expected_output = {
+        "type": "object",
+        "required": ["summary"],
+        "properties": {"summary": {"type": "string"}},
+    }
+
+    def agent_node(
+        stable_key: str,
+        member_key: str,
+        prompt: str,
+        resources: tuple[str, ...],
+    ) -> dict[str, object]:
+        return {
+            "stable_key": stable_key,
+            "kind": "agent",
+            "member_key": member_key,
+            "operation": "",
+            "prompt": prompt,
+            "parameters": {},
+            "bindings": {},
+            "resources": list(resources),
+            "expected_output": expected_output,
+        }
+
+    return {
+        "members": [
+            {
+                "stable_key": "coordination",
+                "role": "delivery coordinator",
+                "coordinates": True,
+                "independent_verifier": False,
+                "responsibilities": "Coordinate and assess completed work.",
+                "permitted_tools": ["read", "git_diff"],
+            },
+            {
+                "stable_key": "implementation",
+                "role": "Python implementation maintainer",
+                "coordinates": False,
+                "independent_verifier": False,
+                "responsibilities": "Implement bounded Python changes.",
+                "permitted_tools": ["read", "write", "run", "git_diff"],
+            },
+            {
+                "stable_key": "verification",
+                "role": "independent behavior verifier",
+                "coordinates": False,
+                "independent_verifier": True,
+                "responsibilities": "Verify completed behavior independently.",
+                "permitted_tools": ["read", "run", "git_diff"],
+            },
+        ],
+        "workflow": {
+            "rationale": "Implement, assess, and independently verify the change.",
+            "assessment_prompt": (
+                "Assess concrete handoff evidence and retain or adjust the graph."
+            ),
+            "nodes": [
+                agent_node(
+                    "implementation",
+                    "implementation",
+                    "Implement the bounded change and return exact evidence.",
+                    ("checkout:write",),
+                ),
+                agent_node(
+                    "coordination",
+                    "coordination",
+                    "Assess the implementation handoff without editing source.",
+                    coordinator_resources,
+                ),
+                agent_node(
+                    "verification",
+                    "verification",
+                    "Independently verify the result and return exact evidence.",
+                    ("workspace:read",),
+                ),
+            ],
+            "edges": [
+                {"source": "implementation", "target": "coordination"},
+                {"source": "coordination", "target": "verification"},
+            ],
+        },
+    }
+
+
+def _formulator_inspection() -> RepositoryInspection:
+    return RepositoryInspection(
+        languages=("python",),
+        manifests=("pyproject.toml",),
+        lockfiles=(),
+        instruction_files=(),
+        validation_commands=(("python3", "-m", "unittest"),),
+        file_count=10,
+        summary="small Python repository",
+    )
 
 
 class TeamTests(unittest.TestCase):
@@ -155,8 +261,89 @@ class TeamTests(unittest.TestCase):
                     ),
                     "permitted_tools": ["read", "run", "git_diff"],
                 },
-            ]
+            ],
+            "workflow": {
+                "rationale": (
+                    "Run the battle-engine specialist before coordination and "
+                    "independent schema verification."
+                ),
+                "assessment_prompt": (
+                    "Assess member evidence and revise prompts or "
+                    "dependencies when the workflow underperforms."
+                ),
+                "nodes": [
+                    {
+                        "stable_key": "battle-engine",
+                        "kind": "agent",
+                        "member_key": "battle-engine",
+                        "operation": "",
+                        "prompt": (
+                            "Implement the bounded battle-engine change "
+                            "and hand off the exact changed behavior."
+                        ),
+                        "parameters": {},
+                        "bindings": {},
+                        "resources": ["checkout:write"],
+                        "expected_output": {
+                            "type": "object",
+                            "required": ["summary"],
+                            "properties": {"summary": {"type": "string"}},
+                        },
+                    },
+                    {
+                        "stable_key": "coordination",
+                        "kind": "agent",
+                        "member_key": "coordination",
+                        "operation": "",
+                        "prompt": (
+                            "Assess the specialist result, integrate it, "
+                            "and adjust the graph when performance "
+                            "evidence requires it."
+                        ),
+                        "parameters": {},
+                        "bindings": {},
+                        "resources": ["workspace:read"],
+                        "expected_output": {
+                            "type": "object",
+                            "required": ["summary"],
+                            "properties": {"summary": {"type": "string"}},
+                        },
+                    },
+                    {
+                        "stable_key": "schema-verification",
+                        "kind": "agent",
+                        "member_key": "schema-verification",
+                        "operation": "",
+                        "prompt": (
+                            "Independently verify schema compatibility "
+                            "and report concrete evidence."
+                        ),
+                        "parameters": {},
+                        "bindings": {},
+                        "resources": ["workspace:read"],
+                        "expected_output": {
+                            "type": "object",
+                            "required": ["summary"],
+                            "properties": {"summary": {"type": "string"}},
+                        },
+                    },
+                ],
+                "edges": [
+                    {"source": "battle-engine", "target": "coordination"},
+                    {
+                        "source": "coordination",
+                        "target": "schema-verification",
+                    },
+                ],
+            },
         }
+        self.assertIsInstance(
+            TeamDesign(
+                members=(),
+                workflow={"rationale": "test", "nodes": [], "edges": []},
+            ),
+            TeamDesign,
+        )
         observed_classes: list[str] = []
 
         def resolve(execution_class: str) -> str:
@@ -183,7 +370,8 @@ class TeamTests(unittest.TestCase):
                 source_files=("src/martite/battle.py", "tests/test_battle.py"),
             )
 
-            members = formulator.formulate(inspection)
+            design = formulator.formulate(inspection)
+            members = design.members
 
         self.assertEqual(
             [member["stable_key"] for member in members],
@@ -215,6 +403,11 @@ class TeamTests(unittest.TestCase):
         self.assertTrue(
             all(member["action_timeout_seconds"] == 601 for member in members)
         )
+        self.assertEqual(
+            [node["stable_key"] for node in design.workflow["nodes"]],
+            ["battle-engine", "coordination", "schema-verification"],
+        )
+        self.assertIn("battle-engine", design.workflow["rationale"])
 
         request = inference.infer.call_args.kwargs
         packet = json.loads(request["prompt"])
@@ -230,7 +423,177 @@ class TeamTests(unittest.TestCase):
             packet["task"].lower(),
         )
         self.assertIn("role names", packet["task"].lower())
+        self.assertIn("fan-out", packet["task"].lower())
+        self.assertIn("join", packet["task"].lower())
+        self.assertIn("serialize", packet["task"].lower())
+        self.assertIn("registered deterministic", packet["task"].lower())
+        self.assertIn("node-specific", packet["task"].lower())
+        self.assertIn("expected output", packet["task"].lower())
+        self.assertIn("handoff", packet["task"].lower())
+        self.assertIn("adjust", packet["task"].lower())
+        self.assertIn("workflow", packet["response_schema"])
+        workflow_contract = packet["workflow_contract"]
+        self.assertIn("collect", workflow_contract["operations"])
+        self.assertTrue(workflow_contract["operations"]["collect"]["pure"])
+        self.assertEqual(
+            workflow_contract["resources"]["checkout:write"]["access"],
+            "exclusive",
+        )
+        self.assertIn("dependency-ready", workflow_contract["scheduling"])
+        self.assertIn(
+            "assigned issue members",
+            workflow_contract["compilation"],
+        )
+        self.assertIn("controller-owned", workflow_contract["safety"].lower())
 
+    @patch("repogents.team.MiniSweInference")
+    def test_permission_incompatible_design_gets_one_validated_correction(
+        self,
+        inference_type: object,
+    ) -> None:
+        inference = inference_type.return_value
+        inference.infer.side_effect = [
+            _formulator_decision(
+                coordinator_resources=("validation:read",),
+            ),
+            _formulator_decision(),
+        ]
+        with tempfile.TemporaryDirectory() as state_root:
+            formulator = EvidenceTeamFormulator(
+                runtime="mini-swe-agent",
+                model="openai/team-architect",
+                state_root=Path(state_root),
+            )
+
+            design = formulator.formulate(_formulator_inspection())
+
+        self.assertEqual(inference.infer.call_count, 2)
+        nodes = cast(list[dict[str, object]], design.workflow["nodes"])
+        self.assertEqual(nodes[1]["resources"], ["workspace:read"])
+        first_request = inference.infer.call_args_list[0].kwargs
+        correction_request = inference.infer.call_args_list[1].kwargs
+        first_packet = json.loads(first_request["prompt"])
+        correction_packet = json.loads(correction_request["prompt"])
+        self.assertEqual(
+            first_packet["workflow_contract"]["resource_tool_requirements"],
+            {
+                "checkout:read": "read",
+                "checkout:write": "write",
+                "diff:read": "git_diff",
+                "issue:read": "read",
+                "validation:read": "run",
+                "workspace:read": "read",
+                "workspace:write": "write",
+            },
+        )
+        self.assertEqual(
+            first_packet["workflow_contract"]["role_resource_restrictions"],
+            {
+                "coordinator": "no write resources",
+                "independent_verifier": "no write resources",
+            },
+        )
+        self.assertEqual(
+            correction_packet["repository"],
+            first_packet["repository"],
+        )
+        self.assertEqual(
+            correction_packet["correction"]["rejected_reason"],
+            (
+                "workflow node coordination resource expands stored "
+                "member permissions"
+            ),
+        )
+        self.assertIn(
+            "complete replacement",
+            correction_packet["correction"]["instruction"],
+        )
+        self.assertNotEqual(
+            correction_request["state_directory"],
+            first_request["state_directory"],
+        )
+
+
+    @patch("repogents.team.MiniSweInference")
+    def test_topology_incompatible_design_gets_exact_correction_contract(
+        self,
+        inference_type: object,
+    ) -> None:
+        invalid = _formulator_decision()
+        invalid_workflow = cast(dict[str, object], invalid["workflow"])
+        invalid_nodes = cast(
+            list[dict[str, object]],
+            invalid_workflow["nodes"],
+        )
+        invalid_edges = cast(
+            list[dict[str, str]],
+            invalid_workflow["edges"],
+        )
+        invalid_nodes.insert(
+            0,
+            dict(
+                invalid_nodes[1],
+                stable_key="pre-work-coordination",
+                prompt=(
+                    "Decompose work before implementation and return the "
+                    "bounded assignments."
+                ),
+            ),
+        )
+        invalid_edges.insert(
+            0,
+            {
+                "source": "pre-work-coordination",
+                "target": "implementation",
+            },
+        )
+        inference = inference_type.return_value
+        inference.infer.side_effect = [
+            invalid,
+            _formulator_decision(),
+        ]
+        with tempfile.TemporaryDirectory() as state_root:
+            formulator = EvidenceTeamFormulator(
+                runtime="mini-swe-agent",
+                model="openai/team-architect",
+                state_root=Path(state_root),
+            )
+
+            design = formulator.formulate(_formulator_inspection())
+
+        self.assertEqual(inference.infer.call_count, 2)
+        self.assertEqual(
+            design.workflow["edges"],
+            [
+                {"source": "implementation", "target": "coordination"},
+                {"source": "coordination", "target": "verification"},
+            ],
+        )
+        first_packet = json.loads(
+            inference.infer.call_args_list[0].kwargs["prompt"]
+        )
+        correction_packet = json.loads(
+            inference.infer.call_args_list[1].kwargs["prompt"]
+        )
+        expected_topology = {
+            "all_other_nodes_reach_coordinator": True,
+            "coordinator_agent_node_count": 1,
+            "coordinator_reaches_verifier": True,
+            "independent_verifier_agent_node_count": 1,
+            "independent_verifier_terminal": True,
+        }
+        self.assertEqual(
+            first_packet["workflow_contract"]["topology"],
+            expected_topology,
+        )
+        self.assertEqual(
+            correction_packet["workflow_contract"]["topology"],
+            expected_topology,
+        )
+        self.assertEqual(
+            correction_packet["correction"]["rejected_reason"],
+            "workflow must include exactly one coordinating member node",
+        )
     @patch("repogents.team.MiniSweInference")
     def test_invalid_or_failed_agent_design_has_no_fallback_team(
         self,
@@ -266,10 +629,13 @@ class TeamTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "coordinating member"):
                 formulator.formulate(inspection)
+            self.assertEqual(inference.infer.call_count, 2)
+            inference.infer.reset_mock()
 
             inference.infer.side_effect = RuntimeError("model unavailable")
             with self.assertRaisesRegex(RuntimeError, "model unavailable"):
                 formulator.formulate(inspection)
+            self.assertEqual(inference.infer.call_count, 1)
 
     def test_team_validation_rejects_unsupported_controller_tool(self) -> None:
         coordinator = {

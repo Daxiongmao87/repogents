@@ -493,10 +493,7 @@ class FeedbackService:
                 if self._has_review_thread_work(run_id):
                     if not self._ensure_resolving(run_id):
                         return processed
-                    try:
-                        self._resolve_review_threads(run_id)
-                    except Exception:
-                        return processed
+                    self._resolve_review_threads(run_id)
                     if self._has_review_thread_work(run_id):
                         return processed
                 self._finish_feedback_cycle(run_id)
@@ -504,36 +501,30 @@ class FeedbackService:
             if not self._ensure_resolving(run_id):
                 return processed
 
-            try:
-                for row in pending:
-                    self._decision(run_id, row)
-                    if not self._ensure_resolving(run_id):
-                        return processed
-            except Exception:
-                return processed
+            for row in pending:
+                self._decision(run_id, row)
+                if not self._ensure_resolving(run_id):
+                    return processed
 
             pending = self._pending(run_id)
             if any(row.get("decision_json") is None for row in pending):
                 continue
 
             revisions: list[dict[str, object]] = []
-            try:
-                for row in pending:
-                    decision = self._stored_decision(row)
-                    if decision.action == "revise":
-                        revisions.append(row)
-                        continue
-                    if decision.response:
-                        self._respond(run_id, row, decision.response)
-                    final_state = {
-                        "answer": "answered",
-                        "decline": "declined",
-                        "ignore": "resolved",
-                    }[decision.action]
-                    self._complete_feedback((row,), final_state)
-                    processed += 1
-            except Exception:
-                return processed
+            for row in pending:
+                decision = self._stored_decision(row)
+                if decision.action == "revise":
+                    revisions.append(row)
+                    continue
+                if decision.response:
+                    self._respond(run_id, row, decision.response)
+                final_state = {
+                    "answer": "answered",
+                    "decline": "declined",
+                    "ignore": "resolved",
+                }[decision.action]
+                self._complete_feedback((row,), final_state)
+                processed += 1
 
             self.poll_run(run_id)
             if self._pull_context(run_id)["pull_state"] != "open":
@@ -618,8 +609,6 @@ class FeedbackService:
                     )
                 except PublicationBaseChanged:
                     continue
-                except Exception:
-                    return processed
                 if source_sha is None:
                     return processed
                 with self.database.transaction() as connection:
@@ -959,7 +948,7 @@ class FeedbackService:
 
         self.poll_run(run_id)
         if not self._ensure_resolving(run_id):
-            raise RuntimeError("run stopped during feedback evaluation")
+            return decision
         with self.database.transaction() as connection:
             connection.execute(
                 """UPDATE feedback_versions

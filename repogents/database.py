@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Generator
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 22
 
 SCHEMA_V1 = r"""
 BEGIN IMMEDIATE;
@@ -886,6 +886,370 @@ SCHEMA_V18 = (
     """,
 )
 
+SCHEMA_V19 = (
+    """
+    CREATE TABLE team_workflow_templates (
+        id TEXT PRIMARY KEY,
+        team_version_id TEXT NOT NULL UNIQUE
+            REFERENCES team_versions(id) ON DELETE CASCADE,
+        contract_version INTEGER NOT NULL DEFAULT 1
+            CHECK (contract_version = 1),
+        rationale TEXT NOT NULL,
+        assessment_prompt TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE team_workflow_nodes (
+        id TEXT PRIMARY KEY,
+        template_id TEXT NOT NULL
+            REFERENCES team_workflow_templates(id) ON DELETE CASCADE,
+        stable_key TEXT NOT NULL,
+        kind TEXT NOT NULL
+            CHECK (kind IN ('agent', 'deterministic')),
+        team_member_id TEXT REFERENCES team_members(id),
+        operation_key TEXT,
+        operation_version TEXT,
+        prompt TEXT NOT NULL,
+        parameters_json TEXT NOT NULL DEFAULT '{}',
+        bindings_json TEXT NOT NULL DEFAULT '{}',
+        expected_output_json TEXT NOT NULL,
+        resources_json TEXT NOT NULL,
+        position INTEGER NOT NULL CHECK (position >= 0),
+        created_at TEXT NOT NULL,
+        UNIQUE (template_id, stable_key),
+        UNIQUE (template_id, position),
+        CHECK (
+            (kind='agent' AND team_member_id IS NOT NULL
+                          AND operation_key IS NULL
+                          AND operation_version IS NULL)
+            OR
+            (kind='deterministic' AND team_member_id IS NULL
+                                  AND operation_key IS NOT NULL
+                                  AND operation_version IS NOT NULL)
+        )
+    )
+    """,
+    """
+    CREATE TABLE team_workflow_edges (
+        id TEXT PRIMARY KEY,
+        template_id TEXT NOT NULL
+            REFERENCES team_workflow_templates(id) ON DELETE CASCADE,
+        source_node_id TEXT NOT NULL
+            REFERENCES team_workflow_nodes(id) ON DELETE CASCADE,
+        target_node_id TEXT NOT NULL
+            REFERENCES team_workflow_nodes(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL CHECK (position >= 0),
+        created_at TEXT NOT NULL,
+        CHECK (source_node_id <> target_node_id),
+        UNIQUE (template_id, source_node_id, target_node_id),
+        UNIQUE (template_id, position)
+    )
+    """,
+    """
+    CREATE TABLE run_workflows (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        team_workflow_template_id TEXT
+            REFERENCES team_workflow_templates(id),
+        issue_version_id TEXT REFERENCES issue_versions(id),
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        state TEXT NOT NULL
+            CHECK (state IN (
+                'pending', 'running', 'succeeded', 'failed',
+                'canceled', 'superseded'
+            )),
+        reason TEXT NOT NULL,
+        assessment_json TEXT,
+        active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        UNIQUE (run_id, generation)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX one_active_workflow_per_run
+    ON run_workflows(run_id)
+    WHERE active=1
+    """,
+    """
+    CREATE TABLE run_workflow_nodes (
+        id TEXT PRIMARY KEY,
+        run_workflow_id TEXT NOT NULL
+            REFERENCES run_workflows(id) ON DELETE CASCADE,
+        stable_key TEXT NOT NULL,
+        kind TEXT NOT NULL
+            CHECK (kind IN ('agent', 'deterministic')),
+        team_member_id TEXT REFERENCES team_members(id),
+        operation_key TEXT,
+        operation_version TEXT,
+        prompt TEXT NOT NULL,
+        parameters_json TEXT NOT NULL DEFAULT '{}',
+        bindings_json TEXT NOT NULL DEFAULT '{}',
+        expected_output_json TEXT NOT NULL,
+        resources_json TEXT NOT NULL,
+        state TEXT NOT NULL
+            CHECK (state IN (
+                'pending', 'ready', 'running', 'succeeded', 'failed',
+                'blocked', 'skipped', 'canceled'
+            )),
+        position INTEGER NOT NULL CHECK (position >= 0),
+        output_json TEXT,
+        error_json TEXT,
+        reused_from_node_id TEXT REFERENCES run_workflow_nodes(id),
+        resource_wait_count INTEGER NOT NULL DEFAULT 0
+            CHECK (resource_wait_count >= 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        UNIQUE (run_workflow_id, stable_key),
+        UNIQUE (run_workflow_id, position),
+        CHECK (
+            (kind='agent' AND team_member_id IS NOT NULL
+                          AND operation_key IS NULL
+                          AND operation_version IS NULL)
+            OR
+            (kind='deterministic' AND team_member_id IS NULL
+                                  AND operation_key IS NOT NULL
+                                  AND operation_version IS NOT NULL)
+        )
+    )
+    """,
+    """
+    CREATE TABLE run_workflow_edges (
+        id TEXT PRIMARY KEY,
+        run_workflow_id TEXT NOT NULL
+            REFERENCES run_workflows(id) ON DELETE CASCADE,
+        source_node_id TEXT NOT NULL
+            REFERENCES run_workflow_nodes(id) ON DELETE CASCADE,
+        target_node_id TEXT NOT NULL
+            REFERENCES run_workflow_nodes(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL CHECK (position >= 0),
+        created_at TEXT NOT NULL,
+        CHECK (source_node_id <> target_node_id),
+        UNIQUE (run_workflow_id, source_node_id, target_node_id),
+        UNIQUE (run_workflow_id, position)
+    )
+    """,
+    """
+    CREATE TABLE run_workflow_attempts (
+        id TEXT PRIMARY KEY,
+        run_workflow_node_id TEXT NOT NULL
+            REFERENCES run_workflow_nodes(id) ON DELETE CASCADE,
+        attempt INTEGER NOT NULL CHECK (attempt > 0),
+        state TEXT NOT NULL
+            CHECK (state IN (
+                'running', 'succeeded', 'failed', 'interrupted', 'canceled'
+            )),
+        input_json TEXT NOT NULL,
+        output_json TEXT,
+        error_json TEXT,
+        log_path TEXT,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        UNIQUE (run_workflow_node_id, attempt)
+    )
+    """,
+    """
+    CREATE TABLE run_workflow_resource_claims (
+        id TEXT PRIMARY KEY,
+        run_workflow_attempt_id TEXT NOT NULL
+            REFERENCES run_workflow_attempts(id) ON DELETE CASCADE,
+        resource TEXT NOT NULL,
+        access TEXT NOT NULL CHECK (access IN ('read', 'write')),
+        acquired_at TEXT NOT NULL,
+        released_at TEXT,
+        UNIQUE (run_workflow_attempt_id, resource)
+    )
+    """,
+    """
+    CREATE TABLE workflow_assessments (
+        id TEXT PRIMARY KEY,
+        run_workflow_id TEXT NOT NULL
+            REFERENCES run_workflows(id) ON DELETE CASCADE,
+        leader_team_member_id TEXT NOT NULL REFERENCES team_members(id),
+        outcome TEXT NOT NULL CHECK (outcome IN ('accept', 'revise')),
+        evidence TEXT NOT NULL,
+        proposal_json TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX run_workflow_nodes_by_state
+    ON run_workflow_nodes(run_workflow_id, state, position)
+    """,
+    """
+    CREATE INDEX run_workflow_attempts_by_node
+    ON run_workflow_attempts(run_workflow_node_id, attempt)
+    """,
+    """
+    CREATE INDEX run_workflow_resource_claims_by_attempt
+    ON run_workflow_resource_claims(run_workflow_attempt_id, released_at)
+    """,
+)
+
+
+SCHEMA_V20 = (
+    """
+    CREATE TABLE publication_scope_reviews (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        issue_version_id TEXT NOT NULL
+            REFERENCES issue_versions(id) ON DELETE RESTRICT,
+        base_sha TEXT NOT NULL CHECK (length(base_sha) = 40),
+        candidate_sha TEXT NOT NULL CHECK (length(candidate_sha) = 40),
+        diff_sha256 TEXT NOT NULL CHECK (length(diff_sha256) = 64),
+        input_sha256 TEXT NOT NULL UNIQUE CHECK (length(input_sha256) = 64),
+        reviewer_model TEXT NOT NULL CHECK (length(reviewer_model) > 0),
+        rubric_version INTEGER NOT NULL CHECK (rubric_version > 0),
+        changed_files_json TEXT NOT NULL,
+        in_scope INTEGER NOT NULL CHECK (in_scope IN (0, 1)),
+        reason TEXT NOT NULL CHECK (length(reason) > 0),
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX publication_scope_reviews_by_run
+        ON publication_scope_reviews(run_id, candidate_sha, created_at)
+    """,
+)
+
+
+SCHEMA_V21 = (
+    """
+    CREATE TABLE run_specification_revisions (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        issue_version_id TEXT NOT NULL
+            REFERENCES issue_versions(id) ON DELETE RESTRICT,
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        items_json TEXT NOT NULL CHECK (json_valid(items_json)),
+        content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+        reason TEXT NOT NULL CHECK (length(reason) > 0),
+        author_member_id TEXT NOT NULL
+            REFERENCES team_members(id) ON DELETE RESTRICT,
+        created_at TEXT NOT NULL,
+        UNIQUE (run_id, revision),
+        UNIQUE (run_id, issue_version_id, content_sha256)
+    )
+    """,
+    """
+    CREATE INDEX run_specification_revisions_current
+        ON run_specification_revisions(run_id, issue_version_id, revision DESC)
+    """,
+    """
+    CREATE TABLE run_specification_reviews (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        specification_revision_id TEXT NOT NULL UNIQUE
+            REFERENCES run_specification_revisions(id) ON DELETE CASCADE,
+        reviewer_member_id TEXT NOT NULL
+            REFERENCES team_members(id) ON DELETE RESTRICT,
+        reviewer_model TEXT NOT NULL CHECK (length(reviewer_model) > 0),
+        rubric_version INTEGER NOT NULL CHECK (rubric_version > 0),
+        verdict TEXT NOT NULL
+            CHECK (verdict IN ('approved', 'rejected', 'blocked')),
+        summary TEXT NOT NULL CHECK (length(summary) > 0),
+        findings_json TEXT NOT NULL CHECK (json_valid(findings_json)),
+        blocker TEXT,
+        input_sha256 TEXT NOT NULL UNIQUE CHECK (length(input_sha256) = 64),
+        created_at TEXT NOT NULL,
+        CHECK (
+            (verdict = 'blocked' AND blocker IS NOT NULL AND length(blocker) > 0)
+            OR (verdict <> 'blocked' AND blocker IS NULL)
+        )
+    )
+    """,
+    """
+    CREATE INDEX run_specification_reviews_by_run
+        ON run_specification_reviews(run_id, created_at)
+    """,
+    """
+    ALTER TABLE acceptance_verifications
+        ADD COLUMN specification_revision_id TEXT
+            REFERENCES run_specification_revisions(id) ON DELETE RESTRICT
+    """,
+    """
+    UPDATE repositories
+       SET inputs_json=json_remove(inputs_json, '$.provisioning_commands')
+     WHERE json_valid(inputs_json)
+       AND json_type(inputs_json, '$.provisioning_commands') IS NOT NULL
+    """,
+)
+
+
+SCHEMA_V22 = (
+    """
+    ALTER TABLE run_specification_revisions
+        RENAME TO run_specification_revisions_v21
+    """,
+    """
+    CREATE TABLE run_specification_revisions (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        issue_version_id TEXT NOT NULL
+            REFERENCES issue_versions(id) ON DELETE RESTRICT,
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        items_json TEXT NOT NULL CHECK (json_valid(items_json)),
+        content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+        reason TEXT NOT NULL CHECK (length(reason) > 0),
+        author_member_id TEXT NOT NULL
+            REFERENCES team_members(id) ON DELETE RESTRICT,
+        created_at TEXT NOT NULL,
+        UNIQUE (run_id, revision)
+    )
+    """,
+    """
+    INSERT INTO run_specification_revisions
+        (id, run_id, issue_version_id, revision, items_json,
+         content_sha256, reason, author_member_id, created_at)
+    SELECT id, run_id, issue_version_id, revision, items_json,
+           content_sha256, reason, author_member_id, created_at
+      FROM run_specification_revisions_v21
+    """,
+    """
+    DROP TABLE run_specification_revisions_v21
+    """,
+    """
+    CREATE INDEX run_specification_revisions_current
+        ON run_specification_revisions(
+            run_id,
+            issue_version_id,
+            revision DESC
+        )
+    """,
+    """
+    CREATE TABLE run_specification_contexts (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        issue_version_id TEXT NOT NULL
+            REFERENCES issue_versions(id) ON DELETE RESTRICT,
+        context_sha256 TEXT NOT NULL CHECK (length(context_sha256) = 64),
+        specification_revision_id TEXT NOT NULL
+            REFERENCES run_specification_revisions(id) ON DELETE CASCADE,
+        reconciled_at TEXT NOT NULL,
+        UNIQUE (
+            run_id,
+            issue_version_id,
+            context_sha256,
+            specification_revision_id
+        )
+    )
+    """,
+    """
+    CREATE INDEX run_specification_contexts_current
+        ON run_specification_contexts(
+            run_id,
+            issue_version_id,
+            context_sha256,
+            reconciled_at
+        )
+    """,
+)
+
+
 class Database:
     """Owns SQLite connection policy and transactional schema initialization."""
 
@@ -1103,7 +1467,72 @@ class Database:
                            18,
                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                        )""")
-            connection.commit()
+            if version < 19:
+                for statement in SCHEMA_V19:
+                    connection.execute(statement)
+                connection.execute("""INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           19,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )""")
+            if version < 20:
+                for statement in SCHEMA_V20:
+                    connection.execute(statement)
+                connection.execute("""INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           20,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )""")
+            if version < 21:
+                for statement in SCHEMA_V21:
+                    connection.execute(statement)
+                connection.execute("""INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           21,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )""")
+            if version < 22:
+                prior_violations = {
+                    tuple(row)
+                    for row in connection.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchall()
+                }
+                connection.commit()
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("PRAGMA legacy_alter_table = ON")
+                connection.execute("BEGIN IMMEDIATE")
+                current_version = int(
+                    connection.execute(
+                        "SELECT MAX(version) FROM schema_version"
+                    ).fetchone()[0]
+                )
+                if current_version < 22:
+                    for statement in SCHEMA_V22:
+                        connection.execute(statement)
+                    connection.execute(
+                        """INSERT INTO schema_version(version, applied_at)
+                           VALUES (
+                               22,
+                               strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                           )"""
+                    )
+                connection.commit()
+                connection.execute("PRAGMA legacy_alter_table = OFF")
+                connection.execute("PRAGMA foreign_keys = ON")
+                violations = {
+                    tuple(row)
+                    for row in connection.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchall()
+                }
+                introduced_violations = violations - prior_violations
+                if introduced_violations:
+                    raise RuntimeError(
+                        "schema v22 migration introduced foreign-key violations"
+                    )
+            else:
+                connection.commit()
             connection.execute("PRAGMA journal_mode = WAL")
         except BaseException:
             if connection.in_transaction:

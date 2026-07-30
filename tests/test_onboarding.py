@@ -10,7 +10,6 @@ from types import SimpleNamespace
 
 from repogents.database import Database
 from repogents.github import RepositoryInfo, parse_repository_identity
-from repogents.sandbox import Mount, RunLayout, SandboxManager, SandboxPolicy
 from repogents.onboarding import (
     GitSourceManager,
     MissingRepositoryInput,
@@ -18,9 +17,8 @@ from repogents.onboarding import (
     RepositoryInference,
     RepositoryInspection,
     RepositoryInspector,
-    SandboxEnvironmentProvisioner,
 )
-from repogents.team import EvidenceTeamFormulator
+from repogents.team import EvidenceTeamFormulator, TeamDesign
 
 
 @dataclass
@@ -53,23 +51,6 @@ class FakeSources:
         return "a" * 40
 
 
-class RecordingSandbox:
-    def __init__(self) -> None:
-        self.calls: list[tuple[object, ...]] = []
-
-    def run(
-        self,
-        policy: object,
-        layout: object,
-        command: tuple[str, ...],
-        **options: object,
-    ) -> object:
-        self.calls.append((policy, layout, command, options))
-        return SimpleNamespace(
-            returncode=0,
-            stderr="",
-            log_path=Path(getattr(layout, "logs")) / f"{len(self.calls)}.json",
-        )
 
 
 class FakeTeamFormulator:
@@ -85,7 +66,7 @@ class FakeTeamFormulator:
         self.role_prefixes = list(role_prefixes or [])
         self.inspections: list[RepositoryInspection] = []
 
-    def formulate(self, inspection: RepositoryInspection) -> list[dict[str, object]]:
+    def formulate(self, inspection: RepositoryInspection) -> TeamDesign:
         self.inspections.append(inspection)
         prefix = (
             self.role_prefixes.pop(0)
@@ -93,7 +74,7 @@ class FakeTeamFormulator:
             else (inspection.languages[0] if inspection.languages else "repository")
         )
         instructions = inspection.summary
-        return [
+        members: tuple[dict[str, object], ...] = (
             {
                 "stable_key": f"{prefix}-coordination",
                 "role": f"{prefix} delivery coordinator",
@@ -130,7 +111,81 @@ class FakeTeamFormulator:
                 "model": self.model,
                 "instructions": instructions,
             },
-        ]
+        )
+        implementation_key = f"{prefix}-implementation"
+        coordination_key = f"{prefix}-coordination"
+        verification_key = f"{prefix}-verification"
+        workflow = {
+            "rationale": (
+                "Implement the repository change, integrate its handoff, then "
+                "verify the behavior independently."
+            ),
+            "assessment_prompt": (
+                "Assess completed node evidence and retain or revise prompts, "
+                "dependencies, joins, and specialist selection."
+            ),
+            "nodes": [
+                {
+                    "stable_key": implementation_key,
+                    "kind": "agent",
+                    "member_key": implementation_key,
+                    "operation": "",
+                    "prompt": (
+                        "Implement the bounded issue change and return an exact "
+                        "handoff with changed behavior."
+                    ),
+                    "parameters": {},
+                    "bindings": {},
+                    "expected_output": {
+                        "type": "object",
+                        "required": ["summary"],
+                        "properties": {"summary": {"type": "string"}},
+                    },
+                    "resources": ["checkout:write"],
+                },
+                {
+                    "stable_key": coordination_key,
+                    "kind": "agent",
+                    "member_key": coordination_key,
+                    "operation": "",
+                    "prompt": (
+                        "Assess team performance, integrate the handoff, and "
+                        "revise the workflow only from concrete evidence."
+                    ),
+                    "parameters": {},
+                    "bindings": {},
+                    "expected_output": {
+                        "type": "object",
+                        "required": ["summary"],
+                        "properties": {"summary": {"type": "string"}},
+                    },
+                    "resources": ["workspace:read"],
+                },
+                {
+                    "stable_key": verification_key,
+                    "kind": "agent",
+                    "member_key": verification_key,
+                    "operation": "",
+                    "prompt": (
+                        "Independently verify the integrated behavior and return "
+                        "concrete evidence."
+                    ),
+                    "parameters": {},
+                    "bindings": {},
+                    "expected_output": {
+                        "type": "object",
+                        "required": ["summary"],
+                        "properties": {"summary": {"type": "string"}},
+                    },
+                    "resources": ["workspace:read"],
+                },
+            ],
+            "edges": [
+                {"source": implementation_key, "target": coordination_key},
+                {"source": coordination_key, "target": verification_key},
+            ],
+        }
+        return TeamDesign(members=members, workflow=workflow)
 
 
 class ScriptedEvidenceAnalyzer:
@@ -154,7 +209,7 @@ class ScriptedEvidenceAnalyzer:
 
 
 class MiniSweRepositoryEvidenceAnalyzerTests(unittest.TestCase):
-    def test_uses_structured_generic_evidence_and_explicit_model_endpoint(
+    def test_uses_structured_repository_evidence_without_dependency_prescription(
         self,
     ) -> None:
         from repogents.onboarding import MiniSweRepositoryEvidenceAnalyzer
@@ -172,8 +227,6 @@ class MiniSweRepositoryEvidenceAnalyzerTests(unittest.TestCase):
                 inference_type.return_value.infer.return_value = {
                     "languages": ["ruby"],
                     "manifests": ["Gemfile"],
-                    "provisioning_commands": [["bundle", "install"]],
-                    "dependency_services": ["rubygems.org:443"],
                     "validation_commands": [["bundle", "exec", "rspec"]],
                 }
 
@@ -184,86 +237,48 @@ class MiniSweRepositoryEvidenceAnalyzerTests(unittest.TestCase):
                     state_root=state_root,
                 ).analyze(
                     inspection,
-                    prior_failure=("previous provisioning failure: denied destination"),
+                    prior_failure="previous repository inference failure",
                 )
 
         self.assertEqual(inference.languages, ("ruby",))
-        self.assertEqual(inference.validation_commands, (("bundle", "exec", "rspec"),))
+        self.assertEqual(
+            inference.validation_commands,
+            (("bundle", "exec", "rspec"),),
+        )
         inference_type.assert_called_once_with(
             model="openai/gpt-stored",
             base_url="https://models.example.test/v1",
             api_key=None,
             timeout=601,
         )
-        inference_call = inference_type.return_value.infer
-        inference_call.assert_called_once()
-        inference_arguments = inference_call.call_args.kwargs
+        inference_arguments = inference_type.return_value.infer.call_args.kwargs
         inference_state = Path(inference_arguments["state_directory"])
         self.assertTrue(inference_state.is_relative_to(state_root))
         self.assertIn(
             "exactly one JSON object",
             inference_arguments["system_prompt"],
         )
-        prompt = str(inference_arguments["prompt"])
-        self.assertIn('"Gemfile"', prompt)
-        self.assertIn("gem 'rspec'", prompt)
-        self.assertIn("toolchain bootstrap", prompt)
-        self.assertIn("/repository-state/home", prompt)
-        self.assertIn("/run-data/dependency-delta", prompt)
-        self.assertIn("/workspace/node_modules is already", prompt)
-        payload = json.loads(prompt)
+        payload = json.loads(str(inference_arguments["prompt"]))
+        self.assertIn("Gemfile", payload["repository"]["files"])
         self.assertEqual(
             payload["prior_failure"],
-            "previous provisioning failure: denied destination",
+            "previous repository inference failure",
         )
         task = payload["task"]
-        self.assertIn("no root privileges", task)
-        self.assertIn("/usr, /bin, /lib, and /lib64 are read-only", task)
-        self.assertIn("/etc is an empty non-writable directory", task)
-        self.assertIn("Do not invoke system package managers", task)
-        self.assertIn("/repository-state/bin", task)
+        self.assertIn("repository evidence", task)
+        self.assertIn("validation commands", task)
+        self.assertIn("Do not return dependency-installation", task)
+        self.assertNotIn("/repository-state/bin", task)
+        schema = inference_arguments["response_schema"]
         self.assertEqual(
-            inference_arguments["response_schema"],
-            {
-                "type": "object",
-                "properties": {
-                    "languages": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "manifests": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "provisioning_commands": {
-                        "type": "array",
-                        "items": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "dependency_services": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "validation_commands": {
-                        "type": "array",
-                        "items": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                    },
-                },
-                "required": [
-                    "languages",
-                    "manifests",
-                    "provisioning_commands",
-                    "dependency_services",
-                    "validation_commands",
-                ],
-                "additionalProperties": False,
-            },
+            set(schema["properties"]),
+            {"languages", "manifests", "validation_commands"},
         )
+        self.assertEqual(
+            set(schema["required"]),
+            {"languages", "manifests", "validation_commands"},
+        )
+        self.assertFalse(schema["additionalProperties"])
 
     def test_bounds_oversized_repository_prompt_without_losing_core_evidence(
         self,
@@ -293,8 +308,6 @@ class MiniSweRepositoryEvidenceAnalyzerTests(unittest.TestCase):
                 inference_type.return_value.infer.return_value = {
                     "languages": ["python"],
                     "manifests": ["pyproject.toml"],
-                    "provisioning_commands": [],
-                    "dependency_services": [],
                     "validation_commands": [["python", "-m", "unittest"]],
                 }
 
@@ -340,7 +353,7 @@ class MiniSweRepositoryEvidenceAnalyzerTests(unittest.TestCase):
                 state_root=Path("unused"),
             )
 
-    def test_rejects_unsafe_or_malformed_structured_inference(self) -> None:
+    def test_rejects_malformed_or_dependency_prescribing_inference(self) -> None:
         from repogents.onboarding import MiniSweRepositoryEvidenceAnalyzer
 
         inspection = RepositoryInspection(
@@ -358,16 +371,19 @@ class MiniSweRepositoryEvidenceAnalyzerTests(unittest.TestCase):
             {
                 "languages": ["unknown"],
                 "manifests": ["unknown.project"],
-                "provisioning_commands": [[""]],
-                "dependency_services": [],
                 "validation_commands": [["tool", "test"]],
+                "provisioning_commands": [["tool", "install"]],
             },
             {
                 "languages": ["unknown"],
                 "manifests": ["unknown.project"],
-                "provisioning_commands": [],
-                "dependency_services": ["https://unsafe.example"],
                 "validation_commands": [["tool", "test"]],
+                "dependency_services": ["packages.example.test:443"],
+            },
+            {
+                "languages": ["unknown"],
+                "manifests": ["unknown.project"],
+                "validation_commands": [[""]],
             },
         )
         for value in invalid_values:
@@ -377,7 +393,8 @@ class MiniSweRepositoryEvidenceAnalyzerTests(unittest.TestCase):
                 ) as inference_type:
                     inference_type.return_value.infer.return_value = value
                     with self.assertRaisesRegex(
-                        RuntimeError, "invalid repository inference"
+                        RuntimeError,
+                        "invalid repository inference",
                     ):
                         MiniSweRepositoryEvidenceAnalyzer(
                             model="openai/gpt-stored",
@@ -415,6 +432,7 @@ class OnboardingTests(unittest.TestCase):
             ),
             github,
         )
+
 
     def test_repository_identity_accepts_url_and_owner_name(self) -> None:
         self.assertEqual(parse_repository_identity("example/demo"), ("example", "demo"))
@@ -525,16 +543,13 @@ class OnboardingTests(unittest.TestCase):
             ),
         )
 
-    def test_evidence_analyzer_onboards_ruby_without_manual_commands(self) -> None:
+    def test_evidence_analyzer_onboards_without_running_dependencies(self) -> None:
         inference = RepositoryInference(
             languages=("ruby",),
             manifests=("Gemfile", "Rakefile"),
-            provisioning_commands=(("bundle", "install"),),
-            dependency_services=("rubygems.org:443",),
             validation_commands=(("bundle", "exec", "rspec"),),
         )
         analyzer = ScriptedEvidenceAnalyzer([inference])
-        sandbox = RecordingSandbox()
         service = OnboardingService(
             database=self.db,
             data_root=self.root / "data",
@@ -542,17 +557,18 @@ class OnboardingTests(unittest.TestCase):
             sources=FakeSources(
                 {
                     "Gemfile": "source 'https://rubygems.org'\ngem 'rspec'\n",
-                    "Rakefile": "require 'rspec/core/rake_task'\nRSpec::Core::RakeTask.new\n",
-                    "spec/widget_spec.rb": "RSpec.describe('widget') { it { expect(1).to eq(1) } }\n",
+                    "Rakefile": (
+                        "require 'rspec/core/rake_task'\n"
+                        "RSpec::Core::RakeTask.new\n"
+                    ),
+                    "spec/widget_spec.rb": (
+                        "RSpec.describe('widget') { it { expect(1).to eq(1) } }\n"
+                    ),
                 }
             ),
             inspector=RepositoryInspector(),
             evidence_analyzer=analyzer,
             team_formulator=FakeTeamFormulator(),
-            provisioner=SandboxEnvironmentProvisioner(
-                data_root=self.root / "data",
-                sandbox=sandbox,
-            ),
         )
 
         repository_id = service.onboard("example/demo")
@@ -562,40 +578,39 @@ class OnboardingTests(unittest.TestCase):
         self.assertEqual(len(analyzer.inspections), 1)
         inspection_packet = analyzer.inspections[0]
         self.assertIn("Gemfile", inspection_packet.source_files)
-        self.assertIn(
-            ("Gemfile", "source 'https://rubygems.org'\ngem 'rspec'\n"),
-            inspection_packet.source_evidence,
-        )
-        self.assertEqual(
-            [call[2] for call in sandbox.calls],
-            [("bundle", "install")],
-        )
         with self.db.connect() as connection:
             sandbox_version = connection.execute(
-                "SELECT policy_json, evidence_json FROM sandbox_versions"
+                """SELECT root_path, policy_json, evidence_json
+                   FROM sandbox_versions"""
             ).fetchone()
             validation = connection.execute(
                 "SELECT command_json, source FROM validation_commands"
             ).fetchone()
+            workflow_count = connection.execute(
+                "SELECT COUNT(*) FROM team_workflow_templates"
+            ).fetchone()[0]
         policy = json.loads(sandbox_version["policy_json"])
         evidence = json.loads(sandbox_version["evidence_json"])
-        self.assertIn("rubygems.org:443", policy["allowed_services"])
+        dependency_root = Path(sandbox_version["root_path"]) / "dependencies"
+        self.assertEqual(policy["allowed_services"], [])
         self.assertEqual(evidence["languages"], ["ruby"])
-        self.assertEqual(evidence["provisioning_commands"], [["bundle", "install"]])
+        self.assertNotIn("provisioning_commands", evidence)
+        self.assertNotIn("dependency_services", evidence)
+        self.assertTrue(dependency_root.is_dir())
+        self.assertEqual(tuple(dependency_root.iterdir()), ())
         self.assertEqual(
             json.loads(validation["command_json"]),
             ["bundle", "exec", "rspec"],
         )
         self.assertEqual(validation["source"], "repository inference")
+        self.assertEqual(workflow_count, 1)
 
-    def test_model_cannot_remove_manifest_derived_dependency_service(
+    def test_repository_manifests_do_not_expand_sandbox_network_policy(
         self,
     ) -> None:
         inference = RepositoryInference(
             languages=("javascript",),
             manifests=("package.json",),
-            provisioning_commands=(("npm", "install"),),
-            dependency_services=("packages.example.test:443",),
             validation_commands=(("npm", "test"),),
         )
         service = OnboardingService(
@@ -616,10 +631,6 @@ class OnboardingTests(unittest.TestCase):
             inspector=RepositoryInspector(),
             evidence_analyzer=ScriptedEvidenceAnalyzer([inference]),
             team_formulator=FakeTeamFormulator(),
-            provisioner=SandboxEnvironmentProvisioner(
-                data_root=self.root / "data",
-                sandbox=RecordingSandbox(),
-            ),
         )
 
         service.onboard("example/demo")
@@ -628,22 +639,12 @@ class OnboardingTests(unittest.TestCase):
             policy_json = connection.execute(
                 "SELECT policy_json FROM sandbox_versions"
             ).fetchone()["policy_json"]
-        services = set(json.loads(policy_json)["allowed_services"])
-        self.assertEqual(
-            services,
-            {
-                "packages.example.test:443",
-                "nodejs.org:443",
-                "registry.npmjs.org:443",
-            },
-        )
+        self.assertEqual(json.loads(policy_json)["allowed_services"], [])
 
     def test_inference_failure_is_visible_and_reonboarding_retries_it(self) -> None:
         inference = RepositoryInference(
             languages=("ruby",),
             manifests=("Gemfile",),
-            provisioning_commands=(),
-            dependency_services=("rubygems.org:443",),
             validation_commands=(("ruby", "-c", "app.rb"),),
         )
         analyzer = ScriptedEvidenceAnalyzer(
@@ -682,6 +683,29 @@ class OnboardingTests(unittest.TestCase):
             [None, "repository inference unavailable"],
         )
 
+    def test_provisioning_commands_input_is_rejected_without_versions(self) -> None:
+        service, _ = self.service(
+            FakeSources({"app.py": "VALUE = 1\n", "test_app.py": ""})
+        )
+
+        repository_id = service.onboard(
+            "example/demo",
+            {
+                "provisioning_commands": [["python3", "-m", "pip", "install", "."]],
+                "validation_commands": [["python3", "-m", "unittest"]],
+            },
+        )
+
+        repository = service.get_repository(repository_id)
+        self.assertEqual(repository["onboarding_state"], "blocked")
+        self.assertIn("provisioning_commands", repository["blocking_reason"])
+        with self.db.connect() as connection:
+            version_count = connection.execute(
+                "SELECT COUNT(*) FROM sandbox_versions WHERE repository_id=?",
+                (repository_id,),
+            ).fetchone()[0]
+        self.assertEqual(version_count, 0)
+
     def test_inference_path_persists_distinct_repository_sandboxes_and_teams(
         self,
     ) -> None:
@@ -690,8 +714,6 @@ class OnboardingTests(unittest.TestCase):
                 RepositoryInference(
                     languages=("javascript", "python"),
                     manifests=("package.json", "pyproject.toml"),
-                    provisioning_commands=(("npm", "ci"),),
-                    dependency_services=("registry.npmjs.org:443",),
                     validation_commands=(
                         ("npm", "test"),
                         ("python3", "-m", "pytest"),
@@ -700,8 +722,6 @@ class OnboardingTests(unittest.TestCase):
                 RepositoryInference(
                     languages=("ruby",),
                     manifests=("Gemfile",),
-                    provisioning_commands=(("bundle", "install"),),
-                    dependency_services=("rubygems.org:443",),
                     validation_commands=(("bundle", "exec", "rspec"),),
                 ),
             ]
@@ -793,139 +813,20 @@ class OnboardingTests(unittest.TestCase):
             any("javascript" in role for role in roles_by_repository[first_id])
         )
         self.assertTrue(any("ruby" in role for role in roles_by_repository[second_id]))
-        self.assertIn(
-            "registry.npmjs.org:443",
-            json.loads(stored[first_id]["policy_json"])["allowed_services"],
-        )
-        self.assertIn(
-            "rubygems.org:443",
-            json.loads(stored[second_id]["policy_json"])["allowed_services"],
-        )
-
-    def test_environment_provisioning_derives_python_and_node_dependencies(
-        self,
-    ) -> None:
-        source = self.root / "source"
-        source.mkdir()
-        (source / "requirements.txt").write_text("Flask==2.3.2\n", encoding="utf-8")
-        (source / "package.json").write_text(
-            '{"scripts":{"build":"vite build"}}', encoding="utf-8"
-        )
-        (source / "package-lock.json").write_text(
-            '{"lockfileVersion":3}', encoding="utf-8"
-        )
-        inspection = RepositoryInspector().inspect(source)
-        sandbox_root = self.root / "sandbox" / "1"
-        sandbox_root.mkdir(parents=True)
-        sandbox = RecordingSandbox()
-        policy = SandboxPolicy(
-            persistent_root=sandbox_root,
-            mounts=(Mount(source, "/mnt/inputs/source"),),
-            allowed_services=(
-                "files.pythonhosted.org:443",
-                "pypi.org:443",
-                "registry.npmjs.org:443",
-            ),
-        )
-        evidence = SandboxEnvironmentProvisioner(
-            data_root=self.root / "data",
-            sandbox=sandbox,
-        ).provision(
-            repository_id="repo-1",
-            version=1,
-            source_path=source,
-            sandbox_path=sandbox_root,
-            inspection=inspection,
-            policy=policy,
-            provisioning_commands=(),
-        )
-        commands = [call[2] for call in sandbox.calls]
-        self.assertEqual(commands[0][:3], ("python3", "-m", "venv"))
-        self.assertIn("pip", commands[1])
-        self.assertEqual(commands[2][:2], ("npm", "ci"))
-        self.assertTrue(all(call[3]["persistent_writable"] for call in sandbox.calls))
-        self.assertTrue(all(call[3]["timeout"] == 600 for call in sandbox.calls))
-        services = set(sandbox.calls[0][0].allowed_services)
-        self.assertIn("pypi.org:443", services)
-        self.assertIn("registry.npmjs.org:443", services)
-        self.assertEqual(len(evidence["commands"]), 3)
-
-    def test_inferred_provisioning_persists_ecosystem_neutral_dependency_delta(
-        self,
-    ) -> None:
-        source = self.root / "inferred-source"
-        source.mkdir()
-        (source / "Gemfile").write_text(
-            "source 'https://rubygems.org'\ngem 'rspec'\n",
-            encoding="utf-8",
-        )
-        inspection = RepositoryInspector().inspect(source)
-        sandbox_root = self.root / "inferred-sandbox"
-        sandbox_root.mkdir()
-
-        class InstallingSandbox(RecordingSandbox):
-            def run(
-                self,
-                policy: object,
-                layout: object,
-                command: tuple[str, ...],
-                **options: object,
-            ) -> object:
-                result = super().run(policy, layout, command, **options)
-                checkout = Path(getattr(layout, "checkout"))
-                if (checkout / "Gemfile").is_file():
-                    installed = (
-                        Path(getattr(layout, "dependency_delta"))
-                        / "ruby"
-                        / "gems"
-                        / "fixture.gemspec"
-                    )
-                    installed.parent.mkdir(parents=True, exist_ok=True)
-                    installed.write_text("Gem::Specification.new\n", encoding="utf-8")
-                return result
-
-        sandbox = InstallingSandbox()
-        policy = SandboxPolicy(
-            persistent_root=sandbox_root,
-            mounts=(Mount(source, "/mnt/inputs/source"),),
-        )
-        SandboxEnvironmentProvisioner(
-            data_root=self.root / "inferred-data",
-            sandbox=sandbox,
-        ).provision(
-            repository_id="repo-1",
-            version=1,
-            source_path=source,
-            sandbox_path=sandbox_root,
-            inspection=inspection,
-            policy=policy,
-            provisioning_commands=(("bundle", "install"),),
-        )
-
-        self.assertTrue(
-            (
-                sandbox_root / "dependencies" / "ruby" / "gems" / "fixture.gemspec"
-            ).is_file()
-        )
-        later = RunLayout.create(self.root / "inferred-data", "repo-1", "run-1")
-        SandboxManager().build_command(policy, later, ("bundle", "exec", "rspec"))
-        restored = later.dependency_delta / "ruby" / "gems" / "fixture.gemspec"
-        self.assertTrue(restored.is_symlink())
         self.assertEqual(
-            str(restored.readlink()),
-            "/repository-state/dependencies/ruby/gems/fixture.gemspec",
+            json.loads(stored[first_id]["policy_json"])["allowed_services"],
+            [],
+        )
+        self.assertEqual(
+            json.loads(stored[second_id]["policy_json"])["allowed_services"],
+            [],
         )
 
-    def test_supplied_inputs_are_normalized_applied_and_stored(self) -> None:
+
+
+    def test_supplied_resource_inputs_are_normalized_and_stored(self) -> None:
         dataset = self.root / "dataset"
         dataset.mkdir()
-        sandbox = RecordingSandbox()
-        resolved_references: list[str] = []
-
-        def resolve_secret(reference: str) -> str:
-            resolved_references.append(reference)
-            return "resolved-package-token"
-
         service = OnboardingService(
             database=self.db,
             data_root=self.root / "data",
@@ -933,11 +834,6 @@ class OnboardingTests(unittest.TestCase):
             sources=FakeSources({"README.md": "Repository instructions.\n"}),
             inspector=RepositoryInspector(),
             team_formulator=FakeTeamFormulator(),
-            provisioner=SandboxEnvironmentProvisioner(
-                data_root=self.root / "data",
-                sandbox=sandbox,
-                secret_resolver=resolve_secret,
-            ),
         )
         inputs = {
             "allowed_host_paths": [
@@ -952,10 +848,9 @@ class OnboardingTests(unittest.TestCase):
                 {
                     "name": "PACKAGE_TOKEN",
                     "reference": "secret://package-token",
-                    "commands": [["python3", "provision.py"]],
+                    "commands": [["python3", "publish.py"]],
                 }
             ],
-            "provisioning_commands": [["python3", "provision.py"]],
             "validation_commands": [["python3", "-m", "unittest"]],
         }
 
@@ -963,26 +858,10 @@ class OnboardingTests(unittest.TestCase):
 
         repository = service.get_repository(repository_id)
         self.assertEqual(repository["onboarding_state"], "ready")
-        self.assertEqual(len(sandbox.calls), 1)
-        provisioning_policy, _, command, options = sandbox.calls[0]
-        self.assertEqual(command, ("python3", "provision.py"))
-        self.assertIn("packages.example.com:443", provisioning_policy.allowed_services)
-        self.assertEqual(provisioning_policy.allowed_secret_names, ("PACKAGE_TOKEN",))
-        self.assertEqual(resolved_references, ["secret://package-token"])
-        self.assertEqual(
-            options["secrets"],
-            {"PACKAGE_TOKEN": "resolved-package-token"},
-        )
-        self.assertIn(
-            (dataset.resolve(), "/mnt/inputs/dataset", False),
-            tuple(
-                (mount.host_path, mount.sandbox_path, mount.writable)
-                for mount in provisioning_policy.mounts
-            ),
-        )
         with self.db.connect() as connection:
             sandbox_version = connection.execute(
-                "SELECT policy_json, evidence_json FROM sandbox_versions WHERE repository_id=?",
+                """SELECT policy_json, evidence_json FROM sandbox_versions
+                   WHERE repository_id=?""",
                 (repository_id,),
             ).fetchone()
             validation = connection.execute(
@@ -1004,13 +883,19 @@ class OnboardingTests(unittest.TestCase):
             stored_policy["secret_bindings"],
             [
                 {
-                    "commands": [["python3", "provision.py"]],
+                    "commands": [["python3", "publish.py"]],
                     "name": "PACKAGE_TOKEN",
                     "reference": "secret://package-token",
                 }
             ],
         )
+        self.assertEqual(
+            stored_policy["allowed_services"],
+            ["packages.example.com:443"],
+        )
         stored_evidence = json.loads(sandbox_version["evidence_json"])
+        self.assertNotIn("provisioning_commands", stored_evidence)
+        self.assertNotIn("dependency_services", stored_evidence)
         self.assertEqual(
             stored_evidence["validation_commands"],
             [["python3", "-m", "unittest"]],
@@ -1020,12 +905,11 @@ class OnboardingTests(unittest.TestCase):
             [(["python3", "-m", "unittest"], "repository input override")],
         )
 
-    def test_invalid_sandbox_policy_blocks_before_provisioning(self) -> None:
+    def test_invalid_sandbox_policy_blocks_before_version_persistence(self) -> None:
         first = self.root / "first-dataset"
         second = self.root / "second-dataset"
         first.mkdir()
         second.mkdir()
-        sandbox = RecordingSandbox()
         service = OnboardingService(
             database=self.db,
             data_root=self.root / "data",
@@ -1033,10 +917,6 @@ class OnboardingTests(unittest.TestCase):
             sources=FakeSources({"README.md": "Repository instructions.\n"}),
             inspector=RepositoryInspector(),
             team_formulator=FakeTeamFormulator(),
-            provisioner=SandboxEnvironmentProvisioner(
-                data_root=self.root / "data",
-                sandbox=sandbox,
-            ),
         )
 
         repository_id = service.onboard(
@@ -1059,7 +939,6 @@ class OnboardingTests(unittest.TestCase):
         repository = service.get_repository(repository_id)
         self.assertEqual(repository["onboarding_state"], "blocked")
         self.assertIn("unique", repository["blocking_reason"])
-        self.assertEqual(sandbox.calls, [])
         with self.db.connect() as connection:
             versions = connection.execute(
                 "SELECT COUNT(*) FROM sandbox_versions WHERE repository_id=?",
@@ -1163,6 +1042,12 @@ class OnboardingTests(unittest.TestCase):
                    WHERE id=?""",
                 (record["current_team_version_id"],),
             ).fetchone()[0]
+            workflow_contract_version = connection.execute(
+                """SELECT contract_version
+                   FROM team_workflow_templates
+                   WHERE team_version_id=?""",
+                (record["current_team_version_id"],),
+            ).fetchone()[0]
         self.assertEqual(
             json.loads(commands[0]["command_json"]),
             ["python3", "-m", "pytest"],
@@ -1172,6 +1057,7 @@ class OnboardingTests(unittest.TestCase):
             ["lead", "implementer", "verifier"],
         )
         self.assertEqual(design_contract_version, 2)
+        self.assertEqual(workflow_contract_version, 1)
         self.assertEqual(
             [row["atomic_role"] for row in members],
             [

@@ -6,6 +6,8 @@ import re
 import sqlite3
 import shutil
 import uuid
+from collections import Counter
+
 from pathlib import Path
 from typing import Protocol, Sequence
 
@@ -26,6 +28,7 @@ from .lifecycle import RunLifecycle, RunState
 from .mini_swe import MINI_SWE_RUNTIME
 from .sandbox import RunLayout, SandboxManager, SandboxPolicy, redact_text
 from .team import TeamMember, TeamService
+from .specification import SpecificationService
 
 _MAX_ARTIFACT_BYTES = 20 * 1024 * 1024
 _MAX_CONTEXT_RESULT = 8_000
@@ -85,8 +88,13 @@ _CLAIM_SCHEMA: dict[str, object] = {
         "claim": {"type": "string", "minLength": 1},
         "expected": {"type": "string", "minLength": 1},
         "method": {"type": "string", "minLength": 1},
+        "criterion_keys": {
+            "type": "array",
+            "items": {"type": "string"},
+            "uniqueItems": True,
+        },
     },
-    "required": ["key", "claim", "expected", "method"],
+    "required": ["key", "claim", "expected", "method", "criterion_keys"],
     "additionalProperties": False,
 }
 
@@ -109,6 +117,12 @@ _VERIFIER_RESPONSE_SCHEMA: dict[str, object] = {
         "pattern": {"type": "string"},
         "argv": {"type": "array", "items": {"type": "string"}},
         "timeout": {"type": "number"},
+        "dependency_services": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 16,
+            "uniqueItems": True,
+        },
         "claims": {"type": "array", "items": _CLAIM_SCHEMA},
         "screenshot_decision": {
             "type": "object",
@@ -229,13 +243,14 @@ Return exactly one controller action. Inspection actions are:
 {"action":"search","path":"relative/path","pattern":"regex"}
 
 Before running an issue-behavior scenario, emit one durable plan:
-{"action":"acceptance_plan","claims":[{"key":"stable-key","claim":"observable behavior","expected":"specific observation","method":"scenario that observes it"}],"screenshot_decision":{"required":true,"reason":"why visual evidence is material"}}
+{"action":"acceptance_plan","claims":[{"key":"stable-key","claim":"observable behavior","expected":"specific observation","method":"scenario that observes it","criterion_keys":["specification-criterion-key"]}],"screenshot_decision":{"required":true,"reason":"why visual evidence is material"}}
 Use required=false for a genuinely nonvisual claim. A visual/UI claim requires screenshots when capture is possible and materially useful. Do not run behavior commands before the plan is stored.
 
 After the plan is stored, exercise every claim against the exact committed checkout using:
-{"action":"run","argv":["program","arg"],"timeout":120}
+{"action":"run","argv":["program","arg"],"timeout":120,"dependency_services":["exact-package-host.example:443"]}
 Read/search may continue. Evidence observations in later context have controller-assigned sequence numbers. Do not edit files, start publication, use GitHub credentials, or accept model prose as evidence.
 When `CHROME_BIN` is present, it is the controller-validated browser executable inside the sandbox. Prefer it over system browser discovery for headless visual scenarios and write screenshots beneath `/run-data/temp/acceptance`.
+If a required package, toolchain, or browser is missing, retrieve it yourself inside the sandbox instead of blocking. Add only its exact public HTTP/HTTPS hosts to dependency_services for that run action, install reusable files beneath /run-data/dependency-delta, and invoke them from there in later actions. The candidate checkout remains read-only; /run-data/dependency-delta and /run-data/temp are writable. The controller grants requested hosts only to that action and continues to block direct, private, wildcard, and undeclared network access.
 Before launching a browser, inspect the repository-defined client/server
 endpoint configuration and use its established port and origin. A known probe
 configuration mismatch is neither a candidate defect nor an irreducible
@@ -288,6 +303,7 @@ class AcceptanceService:
         self.database = database
         self.lifecycle = lifecycle
         self.teams = teams
+        self.specifications = SpecificationService(database)
         self.sandbox = sandbox
         self.data_root = Path(data_root).expanduser().resolve()
         self.runtime_factory = runtime_factory or _default_runtime_factory
@@ -305,10 +321,15 @@ class AcceptanceService:
         normalized_files = _changed_files(changed_files)
         context, sandbox_row, verifier = self._load_context(run_id, commit_sha)
         issue_version_id = str(context["validated_issue_version_id"])
+        specification = context["specification"]
+        if not isinstance(specification, dict):
+            raise AcceptanceUnavailable("active specification projection is invalid")
+        specification_revision_id = str(specification["id"])
         cached = self._passed_report(
             run_id,
             commit_sha,
             issue_version_id,
+            specification_revision_id,
             normalized_files,
         )
         if cached is not None:
@@ -317,6 +338,7 @@ class AcceptanceService:
             run_id,
             commit_sha,
             issue_version_id,
+            specification_revision_id,
             verifier,
         )
         verification_id = str(verification["id"])
@@ -339,7 +361,12 @@ class AcceptanceService:
         resolved_secret_values: set[str] = set()
 
         for _ in range(self.max_actions):
-            self._require_current(run_id, commit_sha, issue_version_id)
+            self._require_current(
+                run_id,
+                commit_sha,
+                issue_version_id,
+                specification_revision_id,
+            )
             prompt = self._prompt(
                 context=context,
                 commit_sha=commit_sha,
@@ -360,12 +387,13 @@ class AcceptanceService:
                     raise RuntimeError(
                         "acceptance verifier attempted to replace a durable plan"
                     )
-                claims, screenshot_decision = _validate_plan(action)
+                claims, screenshot_decision = _validate_plan(action, specification)
                 with self.database.transaction() as connection:
                     self._require_current(
                         run_id,
                         commit_sha,
                         issue_version_id,
+                        specification_revision_id,
                         connection=connection,
                     )
                     connection.execute(
@@ -392,6 +420,7 @@ class AcceptanceService:
                         claims=claims,
                         screenshot_decision=screenshot_decision,
                         observations=observations,
+                        specification=specification,
                     )
                 except RuntimeError as error:
                     recorded_at = _utc_now()
@@ -455,6 +484,7 @@ class AcceptanceService:
                     "run_id": run_id,
                     "commit_sha": commit_sha,
                     "issue_version_id": issue_version_id,
+                    "specification_revision_id": specification_revision_id,
                     "blocker": completion.get("blocker"),
                     "state": state,
                     "summary": completion["summary"],
@@ -464,11 +494,13 @@ class AcceptanceService:
                     "evidence": observations,
                     "artifacts": artifacts,
                     "limitations": completion["limitations"],
+                    "specification": completion["specification"],
                 }
                 self._complete(
                     run_id=run_id,
                     commit_sha=commit_sha,
                     issue_version_id=issue_version_id,
+                    specification_revision_id=specification_revision_id,
                     verification_id=verification_id,
                     state=state,
                     report=report,
@@ -549,6 +581,17 @@ class AcceptanceService:
         if not issue_version_id:
             raise AcceptanceUnavailable("run has no validated issue version")
         self._require_current(run_id, commit_sha, issue_version_id)
+        specification = self.specifications.require_approved(
+            run_id,
+            issue_version_id,
+        )
+        context["specification"] = specification
+        self._require_current(
+            run_id,
+            commit_sha,
+            issue_version_id,
+            str(specification["id"]),
+        )
         team = self.teams.load(str(context["team_version_id"]))
         verifiers = [member for member in team.members if member.independent_verifier]
         if len(verifiers) != 1:
@@ -575,22 +618,141 @@ class AcceptanceService:
             context["discussion_json"],
             "stored issue discussion",
         )
+        context["validation_comparison"] = self._validation_comparison(
+            run_id,
+            str(context["base_sha"]),
+            commit_sha,
+            str(context["sandbox_version_id"]),
+        )
         return context, context, verifier
+
+
+    def _validation_comparison(
+        self,
+        run_id: str,
+        base_sha: str,
+        commit_sha: str,
+        sandbox_version_id: str,
+    ) -> dict[str, object]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT
+                       validation_commands.id AS command_id,
+                       validation_commands.command_json,
+                       validation_baselines.base_sha AS baseline_base_sha,
+                       validation_baselines.mode AS baseline_mode,
+                       validation_baselines.exit_status AS baseline_exit_status,
+                       validation_baselines.findings_json AS baseline_findings_json,
+                       validation_results.commit_sha AS candidate_sha,
+                       validation_results.exit_status AS candidate_exit_status,
+                       validation_results.verdict AS candidate_verdict,
+                       validation_results.findings_json AS candidate_findings_json,
+                       validation_results.comparison_json
+                   FROM validation_commands
+                   LEFT JOIN validation_baselines
+                     ON validation_baselines.validation_command_id =
+                        validation_commands.id
+                    AND validation_baselines.run_id=?
+                   LEFT JOIN validation_results
+                     ON validation_results.validation_command_id =
+                        validation_commands.id
+                    AND validation_results.run_id=?
+                    AND validation_results.commit_sha=?
+                   WHERE validation_commands.sandbox_version_id=?
+                     AND validation_commands.required=1
+                   ORDER BY validation_commands.position,
+                            validation_commands.id""",
+                (run_id, run_id, commit_sha, sandbox_version_id),
+            ).fetchall()
+        commands: list[dict[str, object]] = []
+        complete = True
+        for row in rows:
+            baseline_available = row["baseline_base_sha"] is not None
+            candidate_available = row["candidate_sha"] is not None
+            complete = complete and baseline_available and candidate_available
+            baseline_findings = _validation_findings(
+                row["baseline_findings_json"],
+                "stored validation baseline findings",
+            )
+            candidate_findings = _validation_findings(
+                row["candidate_findings_json"],
+                "stored candidate validation findings",
+            )
+            comparison = _json_object(
+                row["comparison_json"] or "{}",
+                "stored validation comparison",
+            )
+            baseline_counts = Counter(baseline_findings)
+            candidate_counts = Counter(candidate_findings)
+            new_findings = list(
+                (candidate_counts - baseline_counts).elements()
+            )
+            resolved_findings = list(
+                (baseline_counts - candidate_counts).elements()
+            )
+            unchanged_findings = list(
+                (baseline_counts & candidate_counts).elements()
+            )
+            commands.append(
+                {
+                    "command_id": row["command_id"],
+                    "command": _json_list(
+                        row["command_json"],
+                        "stored validation command",
+                    ),
+                    "baseline": {
+                        "available": baseline_available,
+                        "base_sha": row["baseline_base_sha"],
+                        "mode": row["baseline_mode"],
+                        "exit_status": row["baseline_exit_status"],
+                        "findings": baseline_findings,
+                    },
+                    "candidate": {
+                        "available": candidate_available,
+                        "commit_sha": row["candidate_sha"],
+                        "exit_status": row["candidate_exit_status"],
+                        "findings": candidate_findings,
+                    },
+                    "controller_verdict": row["candidate_verdict"],
+                    "new_findings": new_findings,
+                    "resolved_findings": resolved_findings,
+                    "unchanged_findings": unchanged_findings,
+                    "contract_changed": comparison.get("contract_changed", []),
+                    "weakening_detected": comparison.get(
+                        "weakening_detected",
+                        [],
+                    ),
+                }
+            )
+        return {
+            "base_sha": base_sha,
+            "candidate_sha": commit_sha,
+            "complete": complete,
+            "commands": commands,
+        }
+
 
     def _passed_report(
         self,
         run_id: str,
         commit_sha: str,
         issue_version_id: str,
+        specification_revision_id: str,
         changed_files: tuple[str, ...],
     ) -> dict[str, object] | None:
         with self.database.connect() as connection:
             row = connection.execute(
                 """SELECT report_json FROM acceptance_verifications
                    WHERE run_id=? AND commit_sha=? AND issue_version_id=?
+                     AND specification_revision_id=?
                      AND state='passed'
                    ORDER BY attempt DESC LIMIT 1""",
-                (run_id, commit_sha, issue_version_id),
+                (
+                    run_id,
+                    commit_sha,
+                    issue_version_id,
+                    specification_revision_id,
+                ),
             ).fetchone()
         if row is None or row["report_json"] is None:
             return None
@@ -611,6 +773,7 @@ class AcceptanceService:
         run_id: str,
         commit_sha: str,
         issue_version_id: str,
+        specification_revision_id: str,
         verifier: TeamMember,
     ) -> tuple[dict[str, object], bool]:
         now = _utc_now()
@@ -619,6 +782,7 @@ class AcceptanceService:
                 run_id,
                 commit_sha,
                 issue_version_id,
+                specification_revision_id,
                 connection=connection,
             )
             connection.execute(
@@ -629,16 +793,29 @@ class AcceptanceService:
                      AND (
                          commit_sha<>?
                          OR issue_version_id IS NOT ?
+                         OR specification_revision_id IS NOT ?
                      )
                      AND state != 'superseded'""",
-                (now, run_id, commit_sha, issue_version_id),
+                (
+                    now,
+                    run_id,
+                    commit_sha,
+                    issue_version_id,
+                    specification_revision_id,
+                ),
             )
             active = connection.execute(
                 """SELECT * FROM acceptance_verifications
                    WHERE run_id=? AND commit_sha=? AND issue_version_id=?
+                     AND specification_revision_id=?
                      AND state='verifying'
                    ORDER BY attempt DESC LIMIT 1""",
-                (run_id, commit_sha, issue_version_id),
+                (
+                    run_id,
+                    commit_sha,
+                    issue_version_id,
+                    specification_revision_id,
+                ),
             ).fetchone()
             if active is not None:
                 return dict(active), False
@@ -651,19 +828,21 @@ class AcceptanceService:
                 ).fetchone()[0]
             )
             verification_id = _stable_id(
-                f"{run_id}:acceptance:{commit_sha}:{issue_version_id}:{attempt}"
+                f"{run_id}:acceptance:{commit_sha}:{issue_version_id}:"
+                f"{specification_revision_id}:{attempt}"
             )
             connection.execute(
                 """INSERT INTO acceptance_verifications
-                   (id, run_id, commit_sha, issue_version_id, attempt,
-                    verifier_member_id, state, claims_json,
-                    screenshot_decision_json, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'verifying', '[]', '{}', ?)""",
+                   (id, run_id, commit_sha, issue_version_id,
+                    specification_revision_id, attempt, verifier_member_id,
+                    state, claims_json, screenshot_decision_json, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'verifying', '[]', '{}', ?)""",
                 (
                     verification_id,
                     run_id,
                     commit_sha,
                     issue_version_id,
+                    specification_revision_id,
                     attempt,
                     verifier.id,
                     now,
@@ -712,10 +891,12 @@ class AcceptanceService:
                 "body": context["issue_body"],
                 "discussion": context["discussion"],
             },
+            "specification": context["specification"],
             "repository_evidence": context["repository_evidence"],
             "base_sha": context["base_sha"],
             "candidate_commit_sha": commit_sha,
             "changed_files": changed_files,
+            "validation_comparison": context["validation_comparison"],
             "screenshot_directory": "/run-data/temp/acceptance",
             "durable_plan": {
                 "claims": claims,
@@ -726,7 +907,21 @@ class AcceptanceService:
             ],
             "constraints": [
                 "The checkout is the exact candidate commit and is read-only to you.",
+                (
+                    "A passing exact-base comparison is the controller's "
+                    "authoritative repository regression verdict. You must "
+                    "not reject the candidate merely because unchanged "
+                    "baseline findings remain or an external limitation "
+                    "affected the exact base and candidate identically."
+                ),
+                (
+                    "Reject new findings, validation weakening, or a failed "
+                    "issue-specific acceptance claim. Do not reinterpret "
+                    "unchanged baseline debt as a candidate regression."
+                ),
                 "When CHROME_BIN is present, use that controller-validated browser executable for headless visual scenarios and save screenshots beneath the supplied screenshot directory.",
+                "If a required package, toolchain, or browser is missing, retrieve it with a run action that names only its exact public HTTP/HTTPS hosts in dependency_services; do not block merely because it was not preinstalled.",
+                "The candidate checkout remains read-only, while /run-data/dependency-delta and /run-data/temp are writable; install reusable dependencies under the dependency delta and invoke them there in later actions.",
                 (
                     "Before launching a browser, inspect the "
                     "repository-defined client/server endpoint configuration "
@@ -1065,6 +1260,7 @@ class AcceptanceService:
         run_id: str,
         commit_sha: str,
         issue_version_id: str,
+        specification_revision_id: str,
         verification_id: str,
         state: str,
         report: dict[str, object],
@@ -1076,6 +1272,7 @@ class AcceptanceService:
                 run_id,
                 commit_sha,
                 issue_version_id,
+                specification_revision_id,
                 connection=connection,
             )
             for row in artifact_rows:
@@ -1089,13 +1286,16 @@ class AcceptanceService:
             updated = connection.execute(
                 """UPDATE acceptance_verifications
                    SET state=?, report_json=?, completed_at=?
-                   WHERE id=? AND issue_version_id=? AND state='verifying'""",
+                   WHERE id=? AND issue_version_id=?
+                     AND specification_revision_id=?
+                     AND state='verifying'""",
                 (
                     state,
                     _json(report),
                     completed_at,
                     verification_id,
                     issue_version_id,
+                    specification_revision_id,
                 ),
             ).rowcount
             if updated != 1:
@@ -1108,30 +1308,29 @@ class AcceptanceService:
         run_id: str,
         commit_sha: str,
         issue_version_id: str,
+        specification_revision_id: str | None = None,
         *,
         connection: sqlite3.Connection | None = None,
     ) -> None:
         if connection is None:
             with self.database.connect() as owned_connection:
-                run_row = owned_connection.execute(
-                    """SELECT runs.state, runs.validated_sha,
-                              runs.validated_issue_version_id,
-                              issues.current_version_id
-                       FROM runs
-                       JOIN issues ON issues.id=runs.issue_id
-                       WHERE runs.id=?""",
-                    (run_id,),
-                ).fetchone()
-        else:
-            run_row = connection.execute(
-                """SELECT runs.state, runs.validated_sha,
-                          runs.validated_issue_version_id,
-                          issues.current_version_id
-                   FROM runs
-                   JOIN issues ON issues.id=runs.issue_id
-                   WHERE runs.id=?""",
-                (run_id,),
-            ).fetchone()
+                self._require_current(
+                    run_id,
+                    commit_sha,
+                    issue_version_id,
+                    specification_revision_id,
+                    connection=owned_connection,
+                )
+            return
+        run_row = connection.execute(
+            """SELECT runs.state, runs.validated_sha,
+                      runs.validated_issue_version_id,
+                      issues.current_version_id
+               FROM runs
+               JOIN issues ON issues.id=runs.issue_id
+               WHERE runs.id=?""",
+            (run_id,),
+        ).fetchone()
         if run_row is None:
             raise KeyError(run_id)
         run = dict(run_row)
@@ -1152,6 +1351,25 @@ class AcceptanceService:
             raise AcceptanceUnavailable(
                 "acceptance candidate does not equal the run's validated issue version"
             )
+        if specification_revision_id is None:
+            return
+        specification_row = connection.execute(
+            """SELECT revisions.id, reviews.verdict
+               FROM run_specification_revisions AS revisions
+               LEFT JOIN run_specification_reviews AS reviews
+                 ON reviews.specification_revision_id=revisions.id
+               WHERE revisions.run_id=? AND revisions.issue_version_id=?
+               ORDER BY revisions.revision DESC LIMIT 1""",
+            (run_id, issue_version_id),
+        ).fetchone()
+        if (
+            specification_row is None
+            or str(specification_row["id"]) != specification_revision_id
+            or str(specification_row["verdict"] or "") != "approved"
+        ):
+            raise AcceptanceUnavailable(
+                "acceptance specification is no longer the approved active revision"
+            )
 
 
 def current_acceptance_verification(
@@ -1164,11 +1382,24 @@ def current_acceptance_verification(
                FROM acceptance_verifications
                JOIN runs ON runs.id=acceptance_verifications.run_id
                JOIN issues ON issues.id=runs.issue_id
+               JOIN run_specification_revisions AS specifications
+                 ON specifications.id=
+                    acceptance_verifications.specification_revision_id
+               JOIN run_specification_reviews AS reviews
+                 ON reviews.specification_revision_id=specifications.id
                WHERE acceptance_verifications.run_id=?
                  AND acceptance_verifications.commit_sha=runs.validated_sha
                  AND acceptance_verifications.issue_version_id=
                      runs.validated_issue_version_id
                  AND runs.validated_issue_version_id=issues.current_version_id
+                 AND specifications.issue_version_id=issues.current_version_id
+                 AND reviews.verdict='approved'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM run_specification_revisions AS newer
+                     WHERE newer.run_id=specifications.run_id
+                       AND newer.issue_version_id=specifications.issue_version_id
+                       AND newer.revision>specifications.revision
+                 )
                ORDER BY acceptance_verifications.attempt DESC LIMIT 1""",
             (run_id,),
         ).fetchone()
@@ -1189,6 +1420,7 @@ def current_acceptance_verification(
             "run_id": run_id,
             "commit_sha": row["commit_sha"],
             "issue_version_id": row["issue_version_id"],
+            "specification_revision_id": row["specification_revision_id"],
             "state": row["state"],
             "summary": "Issue acceptance verification is in progress.",
             "claims": _json_list(row["claims_json"], "stored acceptance claims"),
@@ -1202,6 +1434,7 @@ def current_acceptance_verification(
             "limitations": [],
         }
     report["issue_version_id"] = row["issue_version_id"]
+    report["specification_revision_id"] = row["specification_revision_id"]
     report["artifacts"] = [
         {
             "id": artifact["id"],
@@ -1440,10 +1673,13 @@ def render_acceptance_failure(report: dict[str, object]) -> str:
 
 def _validate_plan(
     action: dict[str, object],
+    specification: dict[str, object],
 ) -> tuple[list[object], dict[str, object]]:
     claims = action.get("claims")
     if not isinstance(claims, list) or not claims:
         raise RuntimeError("acceptance plan must contain at least one claim")
+    specification_criteria = _specification_criterion_keys(specification)
+    covered_criteria: set[str] = set()
     normalized: list[object] = []
     keys: set[str] = set()
     for claim in claims:
@@ -1455,6 +1691,26 @@ def _validate_plan(
         if key in keys:
             raise RuntimeError(f"duplicate acceptance claim key: {key}")
         keys.add(key)
+        raw_criterion_keys = claim.get("criterion_keys")
+        if (
+            not isinstance(raw_criterion_keys, list)
+            or any(
+                not isinstance(criterion_key, str)
+                or not criterion_key
+                for criterion_key in raw_criterion_keys
+            )
+            or len(set(raw_criterion_keys)) != len(raw_criterion_keys)
+        ):
+            raise RuntimeError(
+                f"acceptance claim {key} has invalid specification criteria"
+            )
+        unknown = sorted(set(raw_criterion_keys) - specification_criteria)
+        if unknown:
+            raise RuntimeError(
+                f"acceptance claim {key} references unknown specification criteria: "
+                f"{unknown}"
+            )
+        covered_criteria.update(raw_criterion_keys)
         normalized.append(
             {
                 "key": key,
@@ -1465,7 +1721,14 @@ def _validate_plan(
                     "acceptance claim",
                 ),
                 "method": _required_string(claim, "method", "acceptance claim"),
+                "criterion_keys": list(raw_criterion_keys),
             }
+        )
+    missing = sorted(specification_criteria - covered_criteria)
+    if missing:
+        raise RuntimeError(
+            "acceptance plan does not cover specification criteria"
+            f"; missing={missing}"
         )
     screenshot = action.get("screenshot_decision")
     if not isinstance(screenshot, dict):
@@ -1516,6 +1779,7 @@ def _validate_completion(
     claims: list[object],
     screenshot_decision: dict[str, object],
     observations: list[dict[str, object]],
+    specification: dict[str, object],
 ) -> dict[str, object]:
     verdict = action.get("verdict")
     if verdict not in {"pass", "fail", "blocked"}:
@@ -1713,6 +1977,10 @@ def _validate_completion(
     for claim in claims:
         assert isinstance(claim, dict)
         merged_claims.append({**claim, **by_key[str(claim["key"])]})
+    satisfied_specification = _specification_satisfaction(
+        specification,
+        merged_claims,
+    )
     return {
         "verdict": verdict,
         "summary": summary,
@@ -1721,7 +1989,88 @@ def _validate_completion(
         "screenshots": screenshots,
         "limitations": limitations,
         "blocker": blocker,
+        "specification": satisfied_specification,
     }
+
+
+def _specification_criterion_keys(
+    specification: dict[str, object],
+) -> set[str]:
+    items = specification.get("items")
+    if not isinstance(items, list) or not items:
+        raise RuntimeError("active specification items are invalid")
+    keys: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise RuntimeError("active specification item is invalid")
+        criteria = item.get("acceptance_criteria")
+        if not isinstance(criteria, list) or not criteria:
+            raise RuntimeError("active specification criteria are invalid")
+        for criterion in criteria:
+            if not isinstance(criterion, dict):
+                raise RuntimeError("active specification criterion is invalid")
+            key = criterion.get("key")
+            if not isinstance(key, str) or not key or key in keys:
+                raise RuntimeError("active specification criterion key is invalid")
+            keys.add(key)
+    return keys
+
+
+def _specification_satisfaction(
+    specification: dict[str, object],
+    claims: list[dict[str, object]],
+) -> dict[str, object]:
+    claims_by_criterion: dict[str, list[dict[str, object]]] = {
+        key: [] for key in _specification_criterion_keys(specification)
+    }
+    for claim in claims:
+        criterion_keys = claim.get("criterion_keys")
+        if not isinstance(criterion_keys, list):
+            raise RuntimeError("stored acceptance claim criteria are invalid")
+        for criterion_key in criterion_keys:
+            if not isinstance(criterion_key, str):
+                raise RuntimeError("stored acceptance claim criterion is invalid")
+            claims_by_criterion[criterion_key].append(claim)
+    projected_items: list[dict[str, object]] = []
+    raw_items = specification["items"]
+    assert isinstance(raw_items, list)
+    for raw_item in raw_items:
+        assert isinstance(raw_item, dict)
+        raw_criteria = raw_item["acceptance_criteria"]
+        assert isinstance(raw_criteria, list)
+        projected_criteria: list[dict[str, object]] = []
+        for raw_criterion in raw_criteria:
+            assert isinstance(raw_criterion, dict)
+            criterion_key = str(raw_criterion["key"])
+            mapped_claims = claims_by_criterion[criterion_key]
+            result = (
+                "pass"
+                if mapped_claims
+                and all(claim.get("result") == "pass" for claim in mapped_claims)
+                else "fail"
+            )
+            projected_criteria.append(
+                {
+                    **raw_criterion,
+                    "result": result,
+                    "claim_keys": [str(claim["key"]) for claim in mapped_claims],
+                }
+            )
+        projected_items.append(
+            {
+                **raw_item,
+                "acceptance_criteria": projected_criteria,
+                "result": (
+                    "pass"
+                    if all(
+                        criterion["result"] == "pass"
+                        for criterion in projected_criteria
+                    )
+                    else "fail"
+                ),
+            }
+        )
+    return {**specification, "items": projected_items}
 
 
 def _reset_artifact_stage(layout: RunLayout) -> None:
@@ -2011,6 +2360,15 @@ def _json_list(value: object, label: str) -> list[object]:
     if not isinstance(parsed, list):
         raise RuntimeError(f"{label} must be a list")
     return parsed
+
+
+def _validation_findings(value: object, label: str) -> list[str]:
+    if value is None:
+        return []
+    findings = _json_list(value, label)
+    if any(not isinstance(finding, str) for finding in findings):
+        raise RuntimeError(f"{label} must contain only strings")
+    return [str(finding) for finding in findings]
 
 
 def _json_object(value: object, label: str) -> dict[str, object]:

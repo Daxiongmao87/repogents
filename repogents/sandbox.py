@@ -15,7 +15,6 @@ import threading
 import tempfile
 import urllib.parse
 import uuid
-from functools import lru_cache
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -129,6 +128,13 @@ class SandboxResult:
     completed_at: str
 
 
+@dataclass(frozen=True)
+class _DependencyRoute:
+    address: str
+    host: str
+    port: int
+
+
 class SecretScanner:
     def scan(self, text: str, known_secrets: Iterable[str] = ()) -> list[str]:
         findings: list[str] = []
@@ -227,6 +233,81 @@ class RestrictedNetworkPolicy:
         if not resolved:
             raise PermissionError("destination has no permitted resolved address")
         return resolved
+
+
+def _dependency_routes(
+    allowed_services: Sequence[str],
+) -> tuple[_DependencyRoute, ...]:
+    first_address = int(ipaddress.IPv4Address("127.64.0.1"))
+    last_address = int(ipaddress.IPv4Address("127.127.255.254"))
+    addresses: dict[str, str] = {}
+    seen: set[tuple[str, int]] = set()
+    routes: list[_DependencyRoute] = []
+    for service in allowed_services:
+        host, port = RestrictedNetworkPolicy._parse_rule(service)
+        if host.startswith("*.") or host == "localhost" or host.endswith(".localhost"):
+            continue
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            pass
+        else:
+            continue
+        key = (host, port)
+        if key in seen:
+            continue
+        seen.add(key)
+        address = addresses.get(host)
+        if address is None:
+            address_value = first_address + len(addresses)
+            if address_value > last_address:
+                raise ValueError("too many exact dependency service hosts")
+            address = str(ipaddress.IPv4Address(address_value))
+            addresses[host] = address
+        routes.append(_DependencyRoute(address=address, host=host, port=port))
+    return tuple(routes)
+
+
+def _prepare_dependency_route_files(
+    proxy_socket_host: Path,
+    routes: Sequence[_DependencyRoute],
+) -> tuple[Path, Path, Path, Path]:
+    hosts_path = proxy_socket_host.with_name("hosts")
+    nsswitch_path = proxy_socket_host.with_name("nsswitch.conf")
+    resolv_path = proxy_socket_host.with_name("resolv.conf")
+    routes_path = proxy_socket_host.with_name("dependency-routes.json")
+    hosts_path.write_text(
+        "127.0.0.1 localhost\n"
+        "::1 localhost ip6-localhost ip6-loopback\n",
+        encoding="utf-8",
+    )
+    nsswitch_path.write_text("hosts: files dns\n", encoding="utf-8")
+    resolv_path.write_text(
+        "nameserver 127.63.0.1\noptions timeout:1 attempts:1\n",
+        encoding="utf-8",
+    )
+    routes_path.write_text(
+        json.dumps(
+            {
+                "routes": [
+                    {
+                        "address": route.address,
+                        "host": route.host,
+                        "port": route.port,
+                    }
+                    for route in routes
+                ]
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    hosts_path.chmod(0o600)
+    resolv_path.chmod(0o600)
+    nsswitch_path.chmod(0o600)
+    routes_path.chmod(0o600)
+    return hosts_path, nsswitch_path, resolv_path, routes_path
 
 
 class _ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -422,7 +503,103 @@ def _workspace_node_dependency_mounts(
     return tuple(mounts)
 
 
-def _validated_browser_executable(candidate: str | Path | None) -> Path | None:
+_BROWSER_PROBE_MARKER = "repogents-browser-probe"
+
+_BROWSER_PROBE_SCRIPT = """
+import json
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+browser_path, marker = sys.argv[1:3]
+browser = subprocess.Popen(
+    [
+        browser_path,
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-background-networking",
+        "--disable-breakpad",
+        "--disable-crash-reporter",
+        "--disable-gpu",
+        "--no-first-run",
+        "--noerrdialogs",
+        "--ozone-platform=headless",
+        "--use-angle=swiftshader-webgl",
+        "--user-data-dir=/tmp/repogents-browser-probe-profile",
+        "--remote-debugging-address=127.0.0.1",
+        "--remote-debugging-port=9222",
+        "about:blank",
+    ],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+
+def fetch_json(request):
+    with urllib.request.urlopen(request, timeout=0.5) as response:
+        return json.load(response)
+
+try:
+    deadline = time.monotonic() + 10
+    last_error = None
+    while time.monotonic() < deadline:
+        if browser.poll() is not None:
+            raise RuntimeError("browser exited before DevTools became ready")
+        try:
+            version = fetch_json("http://127.0.0.1:9222/json/version")
+            break
+        except Exception as error:
+            last_error = error
+            time.sleep(0.05)
+    else:
+        raise RuntimeError("browser DevTools endpoint was unavailable") from last_error
+    product = str(version.get("Browser", "")).lower()
+    if not any(name in product for name in ("chromium", "chrome")):
+        raise RuntimeError("DevTools endpoint did not identify Chromium")
+    page_url = "data:text/html,<title>" + marker + "</title>"
+    request = urllib.request.Request(
+        "http://127.0.0.1:9222/json/new?"
+        + urllib.parse.quote(page_url, safe=""),
+        method="PUT",
+    )
+    target = fetch_json(request)
+    target_id = str(target.get("id", ""))
+    if not target_id:
+        raise RuntimeError("browser did not create the probe target")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        targets = fetch_json("http://127.0.0.1:9222/json/list")
+        if any(
+            str(item.get("id", "")) == target_id
+            and str(item.get("title", "")) == marker
+            for item in targets
+            if isinstance(item, dict)
+        ):
+            print(marker)
+            break
+        time.sleep(0.05)
+    else:
+        raise RuntimeError("browser did not render the probe target")
+finally:
+    if browser.poll() is None:
+        browser.terminate()
+        try:
+            browser.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            browser.kill()
+            browser.wait(timeout=3)
+"""
+
+
+def _validated_browser_executable(
+    candidate: str | Path | None,
+    *,
+    bwrap: str,
+) -> Path | None:
     if candidate is None:
         return None
     try:
@@ -431,47 +608,101 @@ def _validated_browser_executable(candidate: str | Path | None) -> Path | None:
         return None
     if not executable.is_file() or not os.access(executable, os.X_OK):
         return None
+    bwrap_executable = shutil.which(bwrap)
+    if bwrap_executable is None:
+        return None
+    bundle, sandbox_executable = _browser_mount(executable)
+    if sandbox_executable is None:
+        return None
+    argv = [
+        bwrap_executable,
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+        "--clearenv",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind",
+        "/bin",
+        "/bin",
+        "--ro-bind",
+        "/lib",
+        "/lib",
+        "--ro-bind",
+        "/lib64",
+        "/lib64",
+        "--dir",
+        "/etc",
+    ]
+    for source in (
+        "/etc/ssl",
+        "/etc/alternatives",
+        "/etc/ld.so.cache",
+        "/etc/localtime",
+    ):
+        if Path(source).exists():
+            argv.extend(("--ro-bind", source, source))
+    argv.extend(
+        (
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--dir",
+            "/home",
+            "--dir",
+            "/home/agent",
+        )
+    )
+    if bundle is not None:
+        argv.extend(
+            (
+                "--ro-bind",
+                str(bundle),
+                "/opt/repogents-browser",
+            )
+        )
+    argv.extend(
+        (
+            "--setenv",
+            "HOME",
+            "/tmp",
+            "--setenv",
+            "LANG",
+            "C.UTF-8",
+            "--setenv",
+            "LC_ALL",
+            "C.UTF-8",
+            "/usr/bin/python3",
+            "-c",
+            _BROWSER_PROBE_SCRIPT,
+            sandbox_executable,
+            _BROWSER_PROBE_MARKER,
+        )
+    )
     try:
         result = subprocess.run(
-            (str(executable), "--version"),
+            argv,
             check=False,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=5,
+            timeout=25,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    version = (result.stdout + "\n" + result.stderr).lower()
-    if result.returncode != 0 or not any(
-        name in version for name in ("chromium", "chrome")
+    if (
+        result.returncode != 0
+        or _BROWSER_PROBE_MARKER not in result.stdout
     ):
         return None
     return executable
 
 
-@lru_cache(maxsize=1)
-def _default_browser_executable() -> Path | None:
-    configured = os.environ.get("REPOGENTS_BROWSER_EXECUTABLE")
-    if configured is not None:
-        return _validated_browser_executable(configured)
-    cache = Path.home() / ".cache" / "ms-playwright"
-    cached: set[Path] = set()
-    for pattern in (
-        "chromium-*/chrome-linux*/chrome",
-        "chromium_headless_shell-*/chrome-linux*/headless_shell",
-    ):
-        cached.update(cache.glob(pattern))
-    for candidate in sorted(cached, reverse=True):
-        validated = _validated_browser_executable(candidate)
-        if validated is not None:
-            return validated
-    for name in ("google-chrome", "chromium", "chromium-browser"):
-        validated = _validated_browser_executable(shutil.which(name))
-        if validated is not None:
-            return validated
-    return None
 
 
 def _browser_mount(executable: Path | None) -> tuple[Path | None, str | None]:
@@ -526,18 +757,41 @@ class SandboxManager:
     ) -> None:
         self.bwrap = bwrap
         self.package_root = Path(__file__).parent.resolve()
-        self.browser_executable = (
-            _default_browser_executable()
-            if browser_executable is None
-            else _validated_browser_executable(browser_executable)
+        configured_browser = browser_executable
+        if configured_browser is None:
+            configured_browser = os.environ.get("REPOGENTS_BROWSER_EXECUTABLE")
+        self.browser_executable = _validated_browser_executable(
+            configured_browser,
+            bwrap=self.bwrap,
         )
         self.browser_bundle, self.sandbox_browser_executable = _browser_mount(
             self.browser_executable
         )
+        self._browser_lock = threading.Lock()
         self._active: dict[str, subprocess.Popen[bytes]] = {}
         self._active_lock = threading.Lock()
         if shutil.which(self.bwrap) is None:
             raise RuntimeError(f"Bubblewrap executable not found: {self.bwrap}")
+
+    def _browser_snapshot(self) -> tuple[Path | None, str | None]:
+        with self._browser_lock:
+            executable = self.browser_executable
+            bundle = self.browser_bundle
+            if executable is None:
+                return bundle, self.sandbox_browser_executable
+            if (
+                executable.is_file()
+                and os.access(executable, os.X_OK)
+                and (bundle is None or bundle.is_dir())
+            ):
+                return bundle, self.sandbox_browser_executable
+
+            executable = None
+            bundle, sandbox_executable = _browser_mount(executable)
+            self.browser_executable = executable
+            self.browser_bundle = bundle
+            self.sandbox_browser_executable = sandbox_executable
+            return bundle, sandbox_executable
 
     def build_command(
         self,
@@ -562,6 +816,7 @@ class SandboxManager:
         for name, value in secret_values.items():
             if not _ENVIRONMENT_NAME.fullmatch(name) or "\x00" in value:
                 raise ValueError("invalid secret binding")
+        browser_bundle, sandbox_browser_executable = self._browser_snapshot()
         if not persistent_writable:
             for source, target, sandbox_source in (
                 (
@@ -586,6 +841,28 @@ class SandboxManager:
         node_modules_delta = node_delta / "node_modules"
         python_delta.mkdir(parents=True, exist_ok=True)
         node_modules_delta.mkdir(parents=True, exist_ok=True)
+        dependency_routes: tuple[_DependencyRoute, ...] = ()
+        route_hosts_path: Path | None = None
+        route_nsswitch_path: Path | None = None
+        route_resolver_path: Path | None = None
+        route_config_path: Path | None = None
+        route_config_sandbox: str | None = None
+        requires_privileged_bind = False
+        if proxy_socket_host is not None:
+            if proxy_socket is None:
+                raise ValueError("proxy socket mount requires a sandbox target")
+            dependency_routes = _dependency_routes(policy.allowed_services)
+            if dependency_routes:
+                (
+                    route_hosts_path,
+                    route_nsswitch_path,
+                    route_resolver_path,
+                    route_config_path,
+                ) = _prepare_dependency_route_files(
+                    proxy_socket_host, dependency_routes
+                )
+                route_config_sandbox = "/run-data/dependency-routes.json"
+                requires_privileged_bind = True
 
         argv = [
             self.bwrap,
@@ -608,6 +885,17 @@ class SandboxManager:
             "--dir",
             "/etc",
         ]
+        if requires_privileged_bind:
+            argv[2:2] = [
+                "--uid",
+                "0",
+                "--gid",
+                "0",
+                "--cap-add",
+                "CAP_NET_BIND_SERVICE",
+                "--cap-add",
+                "CAP_SETPCAP",
+            ]
         for source in (
             "/etc/ssl",
             "/etc/alternatives",
@@ -653,13 +941,13 @@ class SandboxManager:
                 "/workspace",
             )
         )
-        if self.sandbox_browser_executable is not None:
-            _prepare_browser_launcher(layout, self.sandbox_browser_executable)
-        if self.browser_bundle is not None:
+        if sandbox_browser_executable is not None:
+            _prepare_browser_launcher(layout, sandbox_browser_executable)
+        if browser_bundle is not None:
             argv.extend(
                 (
                     "--ro-bind",
-                    str(self.browser_bundle),
+                    str(browser_bundle),
                     "/opt/repogents-browser",
                 )
             )
@@ -669,9 +957,31 @@ class SandboxManager:
         ):
             argv.extend((dependency_mount_mode, str(source), destination))
         if proxy_socket_host is not None:
-            if proxy_socket is None:
-                raise ValueError("proxy socket mount requires a sandbox target")
+            assert proxy_socket is not None
             argv.extend(("--bind", str(proxy_socket_host), proxy_socket))
+            if (
+                route_hosts_path is not None
+                and route_nsswitch_path is not None
+                and route_resolver_path is not None
+                and route_config_path is not None
+            ):
+                assert route_config_sandbox is not None
+                argv.extend(
+                    (
+                        "--ro-bind",
+                        str(route_hosts_path),
+                        "/etc/hosts",
+                        "--ro-bind",
+                        str(route_nsswitch_path),
+                        "/etc/nsswitch.conf",
+                        "--ro-bind",
+                        str(route_resolver_path),
+                        "/etc/resolv.conf",
+                        "--ro-bind",
+                        str(route_config_path),
+                        route_config_sandbox,
+                    )
+                )
         for mount in policy.mounts:
             argv.extend(
                 (
@@ -719,7 +1029,11 @@ class SandboxManager:
             ("npm_config_prefix", "/run-data/dependency-delta/node"),
         ):
             argv.extend(("--setenv", key, value))
-        if self.sandbox_browser_executable is not None:
+        if requires_privileged_bind:
+            argv.extend(
+                ("--setenv", "REPOGENTS_SANDBOX_CAPABILITY_DROP", "1")
+            )
+        if sandbox_browser_executable is not None:
             argv.extend(
                 (
                     "--setenv",
@@ -735,15 +1049,15 @@ class SandboxManager:
         if proxy_socket is None:
             argv.extend(command)
         else:
-            argv.extend(
-                (
-                    "/usr/bin/python3",
-                    "/opt/repogents/proxy_bridge.py",
-                    proxy_socket,
-                    "--",
-                    *command,
-                )
-            )
+            bridge_command = [
+                "/usr/bin/python3",
+                "/opt/repogents/proxy_bridge.py",
+                proxy_socket,
+            ]
+            if route_config_sandbox is not None:
+                bridge_command.append(route_config_sandbox)
+            bridge_command.extend(("--", *command))
+            argv.extend(bridge_command)
         environment = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": "/home/agent",

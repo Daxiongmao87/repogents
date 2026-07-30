@@ -14,14 +14,9 @@ from .controller import git_environment
 from .database import Database
 from .mini_swe import MiniSweInference
 from .github import RepositoryInfo
-from .sandbox import (
-    Mount,
-    RestrictedNetworkPolicy,
-    RunLayout,
-    SandboxManager,
-    SandboxPolicy,
-)
-from .team import DEFAULT_ACTION_TIMEOUT_SECONDS, validate_team_members
+from .sandbox import Mount, RestrictedNetworkPolicy, SandboxPolicy
+from .team import DEFAULT_ACTION_TIMEOUT_SECONDS, TeamDesign, validate_team_members
+from .workflow import WorkflowService
 
 _SKIP_DIRECTORIES = {
     ".git",
@@ -84,17 +79,12 @@ class RepositoryInspection:
     instructions: tuple[tuple[str, str], ...] = ()
     source_files: tuple[str, ...] = ()
     source_evidence: tuple[tuple[str, str], ...] = ()
-    provisioning_commands: tuple[tuple[str, ...], ...] = ()
-    dependency_services: tuple[str, ...] = ()
 
     def evidence(self) -> dict[str, Any]:
         value = asdict(self)
         value.pop("source_evidence")
         value["validation_commands"] = [
             list(command) for command in self.validation_commands
-        ]
-        value["provisioning_commands"] = [
-            list(command) for command in self.provisioning_commands
         ]
         return value
 
@@ -103,8 +93,6 @@ class RepositoryInspection:
 class RepositoryInference:
     languages: tuple[str, ...]
     manifests: tuple[str, ...]
-    provisioning_commands: tuple[tuple[str, ...], ...]
-    dependency_services: tuple[str, ...]
     validation_commands: tuple[tuple[str, ...], ...]
 
 
@@ -123,37 +111,14 @@ def _repository_inference_prompt(
     prior_failure: str | None = None,
 ) -> str:
     task = (
-        "Infer the repository's languages, operational manifests, "
-        "dependency provisioning argv commands, required outbound "
-        "dependency services, and complete validation argv commands "
-        "from the supplied repository evidence. Include idempotent, "
-        "noninteractive toolchain bootstrap commands before dependency "
-        "commands whenever evidence requires an executable that may not "
-        "exist in baseline Linux. Provisioning has no root privileges. "
-        "/usr, /bin, /lib, and /lib64 are read-only; /etc is an empty "
-        "non-writable directory. "
-        "Do not invoke system package managers or commands that write "
-        "outside /workspace, /repository-state, /repository-cache, "
-        "/run-data, and /tmp. If a required tool is absent, bootstrap a "
-        "repository-supported user-space artifact and place its "
-        "executable under /repository-state/bin. Provisioning runs from "
-        "a writable "
-        "repository snapshot at /workspace with "
-        "HOME=/repository-state/home. Direct every reusable dependency "
-        "output to /run-data/dependency-delta; its complete tree is "
-        "persisted and restored into later run checkouts. For Node "
-        "projects, /workspace/node_modules is already a writable mount "
-        "of /run-data/dependency-delta/node/node_modules; use it "
-        "directly and never replace it with a symlink. Install or link "
-        "every required executable under /repository-state/bin; "
-        "tool-specific bin directories immediately below that "
-        "persistent home are also discovered for later commands. "
-        "Include every installer and package host in "
-        "dependency_services. Do not assume a fixed language or "
-        "package-manager allowlist. If prior_failure is present, treat it "
-        "as observed execution evidence and return a complete corrected "
-        "decision without repeating the failed assumption. Return only "
-        "claims supported by the evidence."
+        "Infer the repository's languages, operational manifests, and complete "
+        "validation commands from the supplied repository evidence. "
+        "Do not return dependency-installation commands, installer hosts, "
+        "runtime setup plans, or other provisioning decisions; the issue's "
+        "selected agent team owns those decisions during execution. "
+        "If prior_failure is present, treat it as observed inference evidence "
+        "and return a complete corrected decision. Return only claims supported "
+        "by the repository evidence."
     )
     ordered_files = _ordered_inference_files(inspection)
     sampled_files = _fit_json_items(
@@ -191,8 +156,6 @@ def _repository_inference_prompt(
         "response_schema": {
             "languages": ["nonempty string"],
             "manifests": ["path present in repository.files"],
-            "provisioning_commands": [["argv", "..."]],
-            "dependency_services": ["dns-host:port"],
             "validation_commands": [["argv", "..."]],
         },
     }
@@ -325,17 +288,6 @@ class MiniSweRepositoryEvidenceAnalyzer:
                 "type": "array",
                 "items": {"type": "string"},
             },
-            "provisioning_commands": {
-                "type": "array",
-                "items": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-            },
-            "dependency_services": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
             "validation_commands": {
                 "type": "array",
                 "items": {
@@ -347,8 +299,6 @@ class MiniSweRepositoryEvidenceAnalyzer:
         "required": [
             "languages",
             "manifests",
-            "provisioning_commands",
-            "dependency_services",
             "validation_commands",
         ],
         "additionalProperties": False,
@@ -433,147 +383,12 @@ class SourceManager(Protocol):
     def prepare(self, repository: RepositoryInfo, destination: Path) -> str: ...
 
 
-ProvisioningSecretBinding = tuple[str, str, tuple[tuple[str, ...], ...]]
 
 
 class TeamFormulator(Protocol):
-    def formulate(
-        self, inspection: RepositoryInspection
-    ) -> list[dict[str, object]]: ...
+    def formulate(self, inspection: RepositoryInspection) -> TeamDesign: ...
 
 
-class EnvironmentProvisioner(Protocol):
-    def provision(
-        self,
-        *,
-        repository_id: str,
-        version: int,
-        source_path: Path,
-        sandbox_path: Path,
-        inspection: RepositoryInspection,
-        policy: SandboxPolicy,
-        provisioning_commands: tuple[tuple[str, ...], ...],
-        secret_bindings: tuple[ProvisioningSecretBinding, ...] = (),
-    ) -> dict[str, object]: ...
-
-
-class SandboxEnvironmentProvisioner:
-    """Builds reusable dependency state through the repository sandbox."""
-
-    def __init__(
-        self,
-        *,
-        data_root: Path,
-        sandbox: SandboxManager,
-        secret_resolver: Callable[[str], str] | None = None,
-    ) -> None:
-        self.data_root = Path(data_root)
-        self.sandbox = sandbox
-        self.secret_resolver = secret_resolver
-
-    def provision(
-        self,
-        *,
-        repository_id: str,
-        version: int,
-        source_path: Path,
-        sandbox_path: Path,
-        inspection: RepositoryInspection,
-        policy: SandboxPolicy,
-        provisioning_commands: tuple[tuple[str, ...], ...],
-        secret_bindings: tuple[ProvisioningSecretBinding, ...] = (),
-    ) -> dict[str, object]:
-        requirements = source_path / "requirements.txt"
-        package = source_path / "package.json"
-        package_lock = source_path / "package-lock.json"
-        layout = RunLayout.create(
-            self.data_root,
-            repository_id,
-            f"onboarding-v{version}",
-        )
-        shutil.copytree(
-            source_path,
-            layout.checkout,
-            dirs_exist_ok=True,
-            symlinks=True,
-            ignore=shutil.ignore_patterns(".git"),
-        )
-        records: list[dict[str, object]] = []
-
-        def command_secrets(command: tuple[str, ...]) -> dict[str, str] | None:
-            matched = [
-                (name, reference)
-                for name, reference, commands in secret_bindings
-                if command in commands
-            ]
-            if not matched:
-                return None
-            if self.secret_resolver is None:
-                raise RuntimeError(
-                    "environment provisioning requires a controller secret resolver"
-                )
-            return {
-                name: self.secret_resolver(reference) for name, reference in matched
-            }
-
-        def run(command: tuple[str, ...], timeout: float = 600) -> None:
-            result = self.sandbox.run(
-                policy,
-                layout,
-                command,
-                secrets=command_secrets(command),
-                timeout=timeout,
-                persistent_writable=True,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    "environment provisioning command failed: "
-                    + (result.stderr.strip() or " ".join(command))
-                )
-            records.append({"command": list(command), "log_path": str(result.log_path)})
-
-        if provisioning_commands:
-            for command in provisioning_commands:
-                run(command)
-        else:
-            if requirements.is_file():
-                run(
-                    (
-                        "python3",
-                        "-m",
-                        "venv",
-                        "/repository-state/python-venv",
-                    )
-                )
-                run(
-                    (
-                        "/repository-state/python-venv/bin/python3",
-                        "-m",
-                        "pip",
-                        "install",
-                        "--disable-pip-version-check",
-                        "--requirement",
-                        "/mnt/inputs/source/requirements.txt",
-                    )
-                )
-            if package.is_file():
-                run(
-                    (
-                        "npm",
-                        "ci" if package_lock.is_file() else "install",
-                    )
-                )
-        if any(layout.dependency_delta.iterdir()):
-            shutil.copytree(
-                layout.dependency_delta,
-                sandbox_path / "dependencies",
-                dirs_exist_ok=True,
-                symlinks=True,
-            )
-        return {
-            "commands": records,
-            "manifests": list(inspection.manifests),
-        }
 
 
 class GitSourceManager:
@@ -887,7 +702,6 @@ class OnboardingService:
         inspector: RepositoryInspector,
         team_formulator: TeamFormulator,
         evidence_analyzer: RepositoryEvidenceAnalyzer | None = None,
-        provisioner: EnvironmentProvisioner | None = None,
     ) -> None:
         self.database = database
         self.data_root = Path(data_root)
@@ -896,7 +710,7 @@ class OnboardingService:
         self.inspector = inspector
         self.evidence_analyzer = evidence_analyzer
         self.team_formulator = team_formulator
-        self.provisioner = provisioner
+        self.workflows = WorkflowService(database)
 
     def onboard(self, identity: str, inputs: dict[str, object] | None = None) -> str:
         repository = self.github.get_repository(identity)
@@ -1065,8 +879,6 @@ class OnboardingService:
                 inspection,
                 languages=inference.languages,
                 manifests=inference.manifests,
-                provisioning_commands=inference.provisioning_commands,
-                dependency_services=inference.dependency_services,
                 validation_commands=inference.validation_commands,
                 summary=_inspection_summary(
                     inspection.file_count,
@@ -1090,11 +902,7 @@ class OnboardingService:
                 inspection,
                 validation_commands=validation_commands,
             )
-        provisioning_commands = (
-            tuple(tuple(command) for command in inputs["provisioning_commands"])
-            if "provisioning_commands" in inputs
-            else inspection.provisioning_commands
-        )
+        design = self.team_formulator.formulate(inspection)
         members = [
             dict(
                 member,
@@ -1103,7 +911,7 @@ class OnboardingService:
                     DEFAULT_ACTION_TIMEOUT_SECONDS,
                 ),
             )
-            for member in self.team_formulator.formulate(inspection)
+            for member in design.members
         ]
         validate_team_members(members)
         with self.database.connect() as connection:
@@ -1133,21 +941,10 @@ class OnboardingService:
             )
             for value in inputs.get("allowed_host_paths", [])
         )
-        inferred_services = set(_dependency_services(source_path))
-        if self.evidence_analyzer is not None:
-            inferred_services.update(inspection.dependency_services)
-        allowed_services = tuple(
-            sorted(set(inputs.get("allowed_services", [])) | set(inferred_services))
+        allowed_services = tuple(sorted(inputs.get("allowed_services", [])))
+        secret_names = tuple(
+            str(value["name"]) for value in inputs.get("secret_bindings", [])
         )
-        secret_bindings: tuple[ProvisioningSecretBinding, ...] = tuple(
-            (
-                str(value["name"]),
-                str(value["reference"]),
-                tuple(tuple(command) for command in value["commands"]),
-            )
-            for value in inputs.get("secret_bindings", [])
-        )
-        secret_names = tuple(value[0] for value in secret_bindings)
         sandbox_policy = SandboxPolicy(
             persistent_root=sandbox_path,
             mounts=(
@@ -1164,20 +961,8 @@ class OnboardingService:
                    WHERE id=?""",
                 (_utc_now(), repository_id),
             )
-        provisioning = (
-            self.provisioner.provision(
-                repository_id=repository_id,
-                version=sandbox_version,
-                source_path=source_path,
-                sandbox_path=sandbox_path,
-                inspection=inspection,
-                policy=sandbox_policy,
-                provisioning_commands=provisioning_commands,
-                secret_bindings=secret_bindings,
-            )
-            if self.provisioner is not None
-            else {"commands": [], "manifests": list(inspection.manifests)}
-        )
+        dependencies_path = sandbox_path / "dependencies"
+        dependencies_path.mkdir()
         policy = {
             "version": sandbox_version,
             "base_sha": base_sha,
@@ -1186,16 +971,20 @@ class OnboardingService:
             "secret_bindings": inputs.get("secret_bindings", []),
             "persistent_root": str(sandbox_path),
         }
-        evidence = inspection.evidence() | {
-            "base_sha": base_sha,
-            "provisioning": provisioning,
-        }
+        evidence = inspection.evidence() | {"base_sha": base_sha}
         (sandbox_path / "policy.json").write_text(_json(policy), encoding="utf-8")
         (sandbox_path / "evidence.json").write_text(_json(evidence), encoding="utf-8")
         team_path = repository_root / "team"
         team_path.mkdir(parents=True, exist_ok=True)
         (team_path / f"{team_version}.json").write_text(
-            _json({"version": team_version, "evidence": evidence, "members": members}),
+            _json(
+                {
+                    "version": team_version,
+                    "evidence": evidence,
+                    "members": members,
+                    "workflow": design.workflow,
+                }
+            ),
             encoding="utf-8",
         )
         now = _utc_now()
@@ -1242,6 +1031,11 @@ class OnboardingService:
                         member["action_timeout_seconds"],
                     ),
                 )
+            self.workflows.store_template_in_transaction(
+                connection,
+                team_id,
+                design.workflow,
+            )
             validation_source = (
                 "repository input override"
                 if "validation_commands" in inputs
@@ -1328,7 +1122,6 @@ def _normalize_repository_inputs(inputs: dict[str, object]) -> dict[str, Any]:
         "allowed_host_paths",
         "allowed_services",
         "secret_bindings",
-        "provisioning_commands",
         "validation_commands",
     }
     unknown = sorted(set(inputs) - allowed_keys)
@@ -1427,17 +1220,15 @@ def _normalize_repository_inputs(inputs: dict[str, object]) -> dict[str, Any]:
             )
         normalized["secret_bindings"] = bindings
 
-    for key in ("provisioning_commands", "validation_commands"):
-        if key not in inputs:
-            continue
+    if "validation_commands" in inputs:
         commands = _normalize_commands(
-            inputs[key],
-            key,
+            inputs["validation_commands"],
+            "validation_commands",
             require_nonempty=False,
         )
-        if key == "validation_commands":
-            commands = tuple(command for command in commands if command[0].strip())
-        normalized[key] = [list(command) for command in commands]
+        normalized["validation_commands"] = [
+            list(command) for command in commands if command[0].strip()
+        ]
     return normalized
 
 
@@ -1474,8 +1265,6 @@ def _parse_repository_inference(
     fields = {
         "languages",
         "manifests",
-        "provisioning_commands",
-        "dependency_services",
         "validation_commands",
     }
     missing = sorted(fields - set(value))
@@ -1502,47 +1291,18 @@ def _parse_repository_inference(
     )
     if unknown_manifest is not None:
         raise ValueError(f"manifest is not present in repository: {unknown_manifest}")
-    provisioning_commands = _normalize_commands(
-        value["provisioning_commands"],
-        "provisioning_commands",
-        require_nonempty=False,
-    )
     validation_commands = _normalize_commands(
         value["validation_commands"],
         "validation_commands",
         require_nonempty=False,
     )
-    services: list[str] = []
-    for service in strings("dependency_services"):
-        host, port = RestrictedNetworkPolicy._parse_rule(service)
-        if (
-            re.fullmatch(
-                r"(?:\*\.)?[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?",
-                host,
-            )
-            is None
-            or ".." in host
-        ):
-            raise ValueError(f"invalid dependency service: {service}")
-        normalized = f"{host}:{port}"
-        if normalized not in services:
-            services.append(normalized)
     return RepositoryInference(
         languages=languages,
         manifests=manifests,
-        provisioning_commands=provisioning_commands,
-        dependency_services=tuple(services),
         validation_commands=validation_commands,
     )
 
 
-def _dependency_services(source_path: Path) -> tuple[str, ...]:
-    services: set[str] = set()
-    if (source_path / "requirements.txt").is_file():
-        services.update(("pypi.org:443", "files.pythonhosted.org:443"))
-    if (source_path / "package.json").is_file():
-        services.update(("nodejs.org:443", "registry.npmjs.org:443"))
-    return tuple(sorted(services))
 
 
 def _json(value: object) -> str:

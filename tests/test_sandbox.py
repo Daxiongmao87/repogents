@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import tempfile
 import threading
 import time
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -20,6 +22,62 @@ from repogents.sandbox import (
     SecretScanner,
     redact_text,
 )
+
+_BROWSER_FIXTURE = """#!/usr/bin/python3
+import http.server
+import json
+import os
+import sys
+
+marker = "repogents-browser-probe"
+if "--version" in sys.argv:
+    print("Chromium 123 fixture")
+    raise SystemExit(0)
+port_argument = next(
+    (
+        value
+        for value in sys.argv
+        if value.startswith("--remote-debugging-port=")
+    ),
+    None,
+)
+if port_argument is not None:
+    port = int(port_argument.rsplit("=", 1)[1])
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def send_json(self, value):
+            body = json.dumps(value).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/json/version":
+                self.send_json({"Browser": "Chromium fixture"})
+            elif self.path == "/json/list":
+                self.send_json([{"id": "fixture", "title": marker}])
+            else:
+                self.send_error(404)
+
+        def do_PUT(self):
+            if self.path.startswith("/json/new?"):
+                self.send_json({"id": "fixture", "title": marker})
+            else:
+                self.send_error(404)
+
+        def log_message(self, *_args):
+            return
+
+    http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+required = {"--disable-crash-reporter", "--disable-breakpad"}
+if not required.issubset(sys.argv):
+    raise SystemExit(2)
+print(os.environ["HOME"])
+print(os.environ["XDG_CONFIG_HOME"])
+print(os.environ["XDG_CACHE_HOME"])
+"""
 
 
 class SandboxPolicyTests(unittest.TestCase):
@@ -228,15 +286,7 @@ class SandboxPolicyTests(unittest.TestCase):
         bundle = cache / "chromium-123" / "chrome-linux"
         browser = bundle / "chrome"
         bundle.mkdir(parents=True)
-        browser.write_text(
-            "#!/bin/sh\n"
-            "if [ \"$1\" = \"--version\" ]; then\n"
-            "  printf 'Chromium 123 fixture'\n"
-            "  exit 0\n"
-            "fi\n"
-            "exit 1\n",
-            encoding="utf-8",
-        )
+        browser.write_text(_BROWSER_FIXTURE, encoding="utf-8")
         browser.chmod(0o755)
         policy = SandboxPolicy(persistent_root=self.persistent)
 
@@ -268,23 +318,199 @@ class SandboxPolicyTests(unittest.TestCase):
             "/run-data/temp/.repogents-browser-launcher",
         )
 
+    def test_host_only_browser_wrapper_is_not_advertised(self) -> None:
+        host_only = self.root / "host-only"
+        host_only.mkdir()
+        delegated_browser = host_only / "chromium"
+        delegated_browser.write_text(
+            "#!/bin/sh\nprintf 'Chromium host-only fixture'\n",
+            encoding="utf-8",
+        )
+        delegated_browser.chmod(0o755)
+        bundle = self.root / "browser-bundle"
+        bundle.mkdir()
+        wrapper = bundle / "chrome"
+        wrapper.write_text(
+            f'#!/bin/sh\nexec "{delegated_browser}" "$@"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        host_probe = subprocess.run(
+            (str(wrapper), "--version"),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(host_probe.returncode, 0, host_probe.stderr)
+        self.assertIn("Chromium host-only fixture", host_probe.stdout)
+        policy = SandboxPolicy(persistent_root=self.persistent)
+
+        argv, _ = SandboxManager(browser_executable=wrapper).build_command(
+            policy,
+            self.layout,
+            ("python3", "-c", "print('no-host-only-browser')"),
+        )
+        mounted_targets = {
+            argv[index + 2]
+            for index, argument in enumerate(argv[:-2])
+            if argument in {"--bind", "--ro-bind"}
+        }
+        sandbox_environment = {
+            argv[index + 1]: argv[index + 2]
+            for index, argument in enumerate(argv[:-2])
+            if argument == "--setenv"
+        }
+
+        self.assertNotIn("/opt/repogents-browser", mounted_targets)
+        self.assertNotIn("CHROME_BIN", sandbox_environment)
+
+    def test_version_only_browser_is_not_advertised(self) -> None:
+        bundle = self.root / "version-only-browser"
+        bundle.mkdir()
+        browser = bundle / "chrome"
+        browser.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${1:-}\" = \"--version\" ]; then\n"
+            "  printf 'Chromium version-only fixture'\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        browser.chmod(0o755)
+        policy = SandboxPolicy(persistent_root=self.persistent)
+
+        argv, _ = SandboxManager(browser_executable=browser).build_command(
+            policy,
+            self.layout,
+            ("python3", "-c", "print('no-version-only-browser')"),
+        )
+        sandbox_environment = {
+            argv[index + 1]: argv[index + 2]
+            for index, argument in enumerate(argv[:-2])
+            if argument == "--setenv"
+        }
+
+        self.assertNotIn("CHROME_BIN", sandbox_environment)
+
+    def test_unconfigured_manager_does_not_auto_inject_host_browser(
+        self,
+    ) -> None:
+        bundle = self.root / "discoverable-browser"
+        browser = bundle / "chrome"
+        bundle.mkdir()
+        browser.write_text(_BROWSER_FIXTURE, encoding="utf-8")
+        browser.chmod(0o755)
+        empty_home = self.root / "empty-home"
+        empty_home.mkdir()
+        real_which = shutil.which
+
+        def discover(name: str) -> str | None:
+            if name == "google-chrome":
+                return str(browser)
+            return real_which(name)
+
+        with (
+            mock.patch.dict(os.environ, {}, clear=False),
+            mock.patch("repogents.sandbox.Path.home", return_value=empty_home),
+            mock.patch("repogents.sandbox.shutil.which", side_effect=discover),
+        ):
+            os.environ.pop("REPOGENTS_BROWSER_EXECUTABLE", None)
+            manager = SandboxManager()
+
+        policy = SandboxPolicy(persistent_root=self.persistent)
+        argv, _ = manager.build_command(
+            policy,
+            self.layout,
+            ("python3", "-c", "print('agent-retrieves-browser')"),
+        )
+        sandbox_environment = {
+            argv[index + 1]: argv[index + 2]
+            for index, argument in enumerate(argv[:-2])
+            if argument == "--setenv"
+        }
+
+        self.assertIsNone(manager.browser_executable)
+        self.assertNotIn("CHROME_BIN", sandbox_environment)
+
+    def test_removed_browser_bundle_is_disabled_before_later_commands(
+        self,
+    ) -> None:
+        bundle = self.root / "browser-cache" / "chromium-123" / "chrome-linux"
+        browser = bundle / "chrome"
+        bundle.mkdir(parents=True)
+        browser.write_text(_BROWSER_FIXTURE, encoding="utf-8")
+        browser.chmod(0o755)
+        policy = SandboxPolicy(persistent_root=self.persistent)
+        manager = SandboxManager(browser_executable=browser)
+        initial, _ = manager.build_command(
+            policy,
+            self.layout,
+            ("python3", "-c", "print('initial')"),
+        )
+        self.assertIn(str(bundle.resolve()), initial)
+
+        browser.unlink()
+        bundle.rmdir()
+        barrier = threading.Barrier(3)
+        commands: list[list[str]] = []
+        failures: list[Exception] = []
+
+        def construct() -> None:
+            try:
+                barrier.wait()
+                commands.append(
+                    manager.build_command(
+                        policy,
+                        self.layout,
+                        ("python3", "-c", "print('concurrent')"),
+                    )[0]
+                )
+            except Exception as error:
+                failures.append(error)
+
+        workers = [threading.Thread(target=construct) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive())
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(commands), 2)
+        for argv in commands:
+            self.assertNotIn(str(bundle.resolve()), argv)
+            sandbox_environment = {
+                argv[index + 1]: argv[index + 2]
+                for index, argument in enumerate(argv[:-2])
+                if argument == "--setenv"
+            }
+            self.assertNotIn("CHROME_BIN", sandbox_environment)
+
+        result = manager.run(
+            policy,
+            self.layout,
+            (
+                "python3",
+                "-c",
+                "import sys; sys.stdout.write('browser-recovery-ready')",
+            ),
+            timeout=20,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "browser-recovery-ready")
+
+
     def test_browser_launcher_uses_run_writable_profile_when_home_is_read_only(
         self,
     ) -> None:
         bundle = self.root / "browser-bundle"
         browser = bundle / "chrome"
         bundle.mkdir()
-        browser.write_text(
-            "#!/bin/sh\n"
-            "if [ \"${1:-}\" = \"--version\" ]; then\n"
-            "  printf 'Chromium 123 fixture'\n"
-            "  exit 0\n"
-            "fi\n"
-            "case \" $* \" in *' --disable-crash-reporter '*) ;; *) exit 2 ;; esac\n"
-            "case \" $* \" in *' --disable-breakpad '*) ;; *) exit 3 ;; esac\n"
-            "printf '%s\\n%s\\n%s' \"$HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_CACHE_HOME\"\n",
-            encoding="utf-8",
-        )
+        browser.write_text(_BROWSER_FIXTURE, encoding="utf-8")
         browser.chmod(0o755)
         policy = SandboxPolicy(persistent_root=self.persistent)
 
@@ -414,6 +640,91 @@ class SandboxPolicyTests(unittest.TestCase):
         ):
             self.assertFalse(policy.address_allowed(address), address)
         self.assertTrue(policy.address_allowed("140.82.112.5"))
+
+    def test_exact_services_prepare_runtime_agnostic_routes(self) -> None:
+        proxy_directory = self.root / "proxy"
+        proxy_directory.mkdir()
+        policy = SandboxPolicy(
+            persistent_root=self.persistent,
+            allowed_services=(
+                "api.github.com:443",
+                "api.github.com:8443",
+                "*.python.org:443",
+                "localhost:443",
+            ),
+        )
+        argv, _environment = SandboxManager().build_command(
+            policy,
+            self.layout,
+            ("python3", "-c", "print('ok')"),
+            proxy_socket="/run-data/temp/restricted-proxy.sock",
+            proxy_socket_host=proxy_directory / "proxy.sock",
+        )
+
+        hosts_target = argv.index("/etc/hosts")
+        self.assertEqual(argv[hosts_target - 2], "--ro-bind")
+        hosts = Path(argv[hosts_target - 1]).read_text(encoding="utf-8")
+        self.assertIn("127.0.0.1 localhost", hosts)
+        self.assertNotIn("api.github.com", hosts)
+        self.assertNotIn("python.org", hosts)
+
+        resolv_target = argv.index("/etc/resolv.conf")
+        self.assertEqual(argv[resolv_target - 2], "--ro-bind")
+        resolv = Path(argv[resolv_target - 1]).read_text(encoding="utf-8")
+        self.assertEqual(
+            resolv,
+            "nameserver 127.63.0.1\noptions timeout:1 attempts:1\n",
+        )
+
+        nsswitch_target = argv.index("/etc/nsswitch.conf")
+        self.assertEqual(argv[nsswitch_target - 2], "--ro-bind")
+        nsswitch = Path(argv[nsswitch_target - 1]).read_text(encoding="utf-8")
+        self.assertEqual(nsswitch, "hosts: files dns\n")
+
+        routes_target = argv.index("/run-data/dependency-routes.json")
+        self.assertEqual(argv[routes_target - 2], "--ro-bind")
+        routes = json.loads(
+            Path(argv[routes_target - 1]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            routes,
+            {
+                "routes": [
+                    {
+                        "address": "127.64.0.1",
+                        "host": "api.github.com",
+                        "port": 443,
+                    },
+                    {
+                        "address": "127.64.0.1",
+                        "host": "api.github.com",
+                        "port": 8443,
+                    },
+                ]
+            },
+        )
+        self.assertEqual(
+            argv[2:10],
+            [
+                "--uid",
+                "0",
+                "--gid",
+                "0",
+                "--cap-add",
+                "CAP_NET_BIND_SERVICE",
+                "--cap-add",
+                "CAP_SETPCAP",
+            ],
+        )
+        bridge = argv.index("/opt/repogents/proxy_bridge.py")
+        self.assertEqual(
+            argv[bridge + 1 : bridge + 4],
+            [
+                "/run-data/temp/restricted-proxy.sock",
+                "/run-data/dependency-routes.json",
+                "--",
+            ],
+        )
 
     def test_restricted_proxy_forwards_post_body_coalesced_with_headers(self) -> None:
         listener = socket.socket()
@@ -655,6 +966,116 @@ class SandboxPolicyTests(unittest.TestCase):
             )
         )
         self.assertTrue(all("payload" not in event for event in events))
+
+    def test_proxy_ignorant_tcp_uses_exact_allowlisted_route(self) -> None:
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(5)
+        self.addCleanup(listener.close)
+        upstream_port = listener.getsockname()[1]
+        payload = b"runtime-agnostic route"
+        response = b"restricted proxy response"
+        received: list[bytes] = []
+        upstream_errors: list[BaseException] = []
+
+        def serve() -> None:
+            try:
+                connection, _address = listener.accept()
+                with connection:
+                    connection.settimeout(5)
+                    received.append(connection.recv(8192))
+                    connection.sendall(response)
+            except BaseException as error:
+                upstream_errors.append(error)
+
+        upstream = threading.Thread(target=serve, daemon=True)
+        upstream.start()
+
+        def resolve(
+            _policy: RestrictedNetworkPolicy, host: str, port: int
+        ) -> list[tuple[int, tuple[object, ...], str]]:
+            if (host, port) != ("allowed.test", 443):
+                raise PermissionError(f"unexpected destination: {host}:{port}")
+            return [
+                (
+                    socket.AF_INET,
+                    ("127.0.0.1", upstream_port),
+                    "93.184.216.34",
+                )
+            ]
+
+        script = f"""
+import json
+import socket
+
+connection = socket.create_connection(("allowed.test", 443), timeout=5)
+connection.sendall({payload!r})
+allowed_response = connection.recv(8192).decode("ascii")
+connection.close()
+
+try:
+    socket.getaddrinfo("undeclared.test", 443, type=socket.SOCK_STREAM)
+    undeclared_denied = False
+except socket.gaierror:
+    undeclared_denied = True
+
+try:
+    socket.create_connection(("93.184.216.34", 443), timeout=1)
+    direct_denied = False
+except OSError:
+    direct_denied = True
+
+capabilities = next(
+    line.split()[1]
+    for line in open("/proc/self/status", encoding="utf-8")
+    if line.startswith("CapEff:")
+)
+
+print(json.dumps({{
+    "allowed_response": allowed_response,
+    "undeclared_denied": undeclared_denied,
+    "direct_denied": direct_denied,
+    "effective_capabilities": capabilities,
+}}))
+"""
+        policy = SandboxPolicy(
+            persistent_root=self.persistent,
+            allowed_services=("allowed.test:443",),
+        )
+        with mock.patch.object(
+            RestrictedNetworkPolicy,
+            "resolve",
+            autospec=True,
+            side_effect=resolve,
+        ):
+            result = SandboxManager().run(
+                policy,
+                self.layout,
+                ("python3", "-c", script),
+                timeout=30,
+            )
+
+        upstream.join(6)
+        self.assertFalse(upstream_errors)
+        self.assertFalse(upstream.is_alive())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(received, [payload])
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "allowed_response": response.decode("ascii"),
+                "undeclared_denied": True,
+                "direct_denied": True,
+                "effective_capabilities": "0000000000000000",
+            },
+        )
+        events = [
+            json.loads(line)
+            for line in result.network_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(events[0]["host"], "allowed.test")
+        self.assertEqual(events[0]["decision"], "allowed")
 
     def test_restricted_proxy_supports_long_durable_run_paths(self) -> None:
         long_root = self.root / ("durable-" + "x" * 100)

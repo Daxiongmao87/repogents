@@ -700,6 +700,182 @@ dialog::backdrop { background: rgba(10, 15, 25, .62); backdrop-filter: blur(2px)
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.workflow-preview { margin-top: 1rem; }
+.workflow-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .8rem;
+  margin-bottom: .7rem;
+}
+.workflow-toolbar label { display: flex; align-items: center; gap: .5rem; }
+.workflow-grid {
+  position: relative;
+  min-height: 24rem;
+  height: min(32rem, 62vh);
+  max-height: 32rem;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: .7rem;
+  background:
+    linear-gradient(90deg, var(--line) 1px, transparent 1px),
+    linear-gradient(var(--line) 1px, transparent 1px),
+    var(--page);
+  background-size: 2rem 2rem;
+  cursor: grab;
+  isolation: isolate;
+  touch-action: none;
+}
+.workflow-grid.dragging { cursor: grabbing; }
+.workflow-scene {
+  position: absolute;
+  inset: 0 auto auto 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+.workflow-canvas { position: relative; }
+.workflow-canvas svg {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+.workflow-viewport-controls {
+  position: absolute;
+  z-index: 20;
+  top: .6rem;
+  right: .6rem;
+  display: flex;
+  gap: .3rem;
+  padding: .3rem;
+  border: 1px solid var(--line);
+  border-radius: .6rem;
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  box-shadow: var(--shadow);
+}
+.workflow-viewport-controls .button {
+  min-width: 2.35rem;
+  padding: .4rem .55rem;
+}
+.workflow-edge {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+.workflow-edge-dependency { stroke: var(--muted); opacity: .72; }
+.workflow-edge-lifecycle {
+  stroke: var(--accent);
+  stroke-dasharray: 7 5;
+  opacity: .62;
+}
+.workflow-lifecycle-label {
+  fill: var(--text);
+  font-size: .68rem;
+  font-weight: 650;
+  paint-order: stroke;
+  stroke: var(--page);
+  stroke-linejoin: round;
+  stroke-width: 5px;
+}
+.workflow-node {
+  position: absolute;
+  z-index: 2;
+  width: 11rem;
+  height: 4.8rem;
+  padding: .55rem .6rem;
+  overflow: hidden;
+  border: 2px solid var(--line);
+  border-radius: .7rem;
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  box-shadow: var(--shadow);
+}
+.workflow-node:hover, .workflow-node:focus-visible {
+  z-index: 3;
+  border-color: var(--accent);
+  outline: 3px solid var(--accent-soft);
+}
+.workflow-node strong {
+  display: -webkit-box;
+  overflow: hidden;
+  line-height: 1.15;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.workflow-node small {
+  display: block;
+  margin-top: .25rem;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workflow-node.running { border-color: var(--accent); }
+.workflow-node.succeeded { border-color: var(--success); }
+.workflow-node.failed, .workflow-node.canceled { border-color: var(--danger); }
+.workflow-node.ready { border-style: dashed; border-color: var(--accent); }
+.workflow-node.blocked { border-style: double; border-color: var(--danger); }
+.workflow-kind-deterministic { border-radius: .2rem; }
+.workflow-kind-controller {
+  border-style: double;
+  background: var(--surface-subtle);
+}
+.workflow-boundary-coordinator { border-left-width: .5rem; }
+.workflow-boundary-independent-verifier { border-right-width: .5rem; }
+.workflow-boundary-controller-owned {
+  box-shadow: inset 0 0 0 2px var(--accent-soft);
+}
+.workflow-boundary-system-origin {
+  border-width: 3px;
+  background: var(--accent-soft);
+}
+.workflow-boundary-system-terminal {
+  border-style: double;
+  border-color: var(--muted);
+}
+.workflow-edge-key::before {
+  content: "";
+  display: inline-block;
+  width: 1.8rem;
+  margin-right: .4rem;
+  border-top: 2px solid var(--muted);
+  vertical-align: middle;
+}
+.workflow-edge-key.lifecycle::before {
+  border-color: var(--accent);
+  border-top-style: dashed;
+}
+.workflow-scroll-hint {
+  margin: .25rem 0 .5rem;
+  font-size: .78rem;
+  color: var(--muted);
+}
+.workflow-kind-agent { border-radius: .7rem; }
+.controller-boundary { border: 2px double var(--accent); }
+.workflow-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .45rem;
+  margin: .5rem 0;
+}
+.workflow-legend-item {
+  padding: .25rem .45rem;
+  background: var(--surface-subtle);
+}
+.workflow-lifecycle-table { margin-top: .8rem; }
+.workflow-node-details { margin-top: .7rem; }
+.workflow-table-wrap { overflow-x: auto; margin-top: .8rem; }
+.workflow-table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+.workflow-table th, .workflow-table td {
+  padding: .5rem;
+  border: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+.workflow-table th { background: var(--surface-subtle); }
 .log {
   height: 25rem;
   overflow: auto;
@@ -775,6 +951,9 @@ details > summary { cursor: pointer; }
   .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .settings-grid { grid-template-columns: 1fr; }
   .settings-field.wide { grid-column: auto; }
+  .workflow-toolbar { align-items: flex-start; flex-direction: column; }
+  .workflow-toolbar label, .workflow-toolbar select { width: 100%; }
+  .workflow-grid { max-height: 28rem; }
 }
 @media (max-width: 560px) {
   .shell { padding: .7rem; }
@@ -890,9 +1069,22 @@ let runActivityStream = null;
 let runActivityStreamRunId = null;
 let selectedRunId = null;
 let draggedRunId = null;
+let selectedWorkflowGeneration = null;
+let selectedWorkflowNode = null;
 let suppressRunClick = false;
 let modelCatalog = {available:false, reason:'Not loaded', models:[]};
 const displayInputs = new Map();
+const WORKFLOW_NODE_WIDTH = 176;
+const WORKFLOW_NODE_HEIGHT = 77;
+const WORKFLOW_COLUMN_GAP = 112;
+const WORKFLOW_ROW_GAP = 36;
+const WORKFLOW_PADDING_X = 56;
+const WORKFLOW_PADDING_Y = 64;
+const WORKFLOW_EDGE_CLEARANCE = 14;
+const WORKFLOW_MIN_ZOOM = .08;
+const WORKFLOW_MAX_ZOOM = 2;
+const workflowViewportStates = new Map();
+let workflowViewportResizeObserver = null;
 const error = document.querySelector('#error');
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const boundedMessage = value => {
@@ -926,6 +1118,100 @@ const acceptanceEvidence = a => {
   const limitations = (a.limitations || []).map(item => `<li>${esc(item)}</li>`).join('') || '<li>None recorded.</li>';
   return `<details><summary>Issue acceptance — ${esc(a.state)}</summary><p>Commit <code>${short(a.commit_sha)}</code><br>${esc(a.summary)}</p><h3>Claims</h3><ul>${claims}</ul><h3>Controller observations</h3><ul>${observations}</ul><h3>Changed-file scope</h3><ul>${scope}</ul><h3>Visual decision</h3><p>${a.screenshot_decision?.required ? 'Screenshots required' : 'Screenshots not required'}: ${esc(a.screenshot_decision?.reason || '')}</p><ul>${artifacts}</ul><h3>Limitations</h3><ul>${limitations}</ul></details>`;
 };
+const specVerdictBadge = verdict => {
+  if (verdict === 'approved') return '<span class="badge success">Approved</span>';
+  if (verdict === 'rejected') return '<span class="badge danger">Rejected</span>';
+  if (verdict === 'blocked') return '<span class="badge warning">Blocked</span>';
+  return '<span class="badge">Pending review</span>';
+};
+const specCriterionResultBadge = result => {
+  if (result === 'pass') return '<span class="badge success">Pass</span>';
+  if (result === 'fail') return '<span class="badge danger">Fail</span>';
+  if (result === 'blocked') return '<span class="badge warning">Blocked</span>';
+  return '<span class="badge warning">Pending</span>';
+};
+const specEvidence = c => {
+  if (!Array.isArray(c.evidence) || c.evidence.length === 0) return '';
+  const items = c.evidence.map(e => `<li>${esc(e.claim_key)}: ${esc(e.result || 'unknown')}${e.observed ? ' — ' + esc(e.observed) : ''}
+    ${Array.isArray(e.evidence_refs) && e.evidence_refs.length > 0 ? '<br>Evidence: ' + e.evidence_refs.map(ref => '#' + esc(String(ref))).join(', ') : ''}</li>`).join('');
+  return `<details><summary>Evidence</summary><ul>${items}</ul></details>`;
+};
+const specContexts = contexts => {
+  if (!Array.isArray(contexts) || contexts.length === 0) return '';
+  const items = contexts.map(c => `<li>Context <code>${esc((c.context_sha256 || '').slice(0, 16))}</code> → Spec rev ${esc(c.specification_revision_id || 'unknown')} · Reconciled: ${esc(c.reconciled_at || '')}</li>`).join('');
+  return `<details><summary>Reconciled contexts (${contexts.length})</summary><ul>${items}</ul></details>`;
+};
+const specVerification = v => {
+  const criterionLinks = (v.criterion_keys || []).map(k => `<code>${esc(k)}</code>`).join(', ');
+  return `<li>${esc(v.scenario || '')} · Criteria: ${criterionLinks}</li>`;
+};
+const specCriterion = c => `<li>${specCriterionResultBadge(c.result)} ${esc(c.requirement || '')}
+    <br><span class="muted">Expected: ${esc(c.expected || '')}</span>
+    ${c.claim_keys && c.claim_keys.length > 0 ? `<br>Claims: ${(c.claim_keys || []).map(k => esc(k)).join(', ')}` : ''}
+    ${specEvidence(c)}</li>`;
+const specItem = item => {
+  const criteria = (item.acceptance_criteria || []).map(specCriterion).join('') || '<li>No criteria.</li>';
+  const verifications = (item.verification || []).map(specVerification).join('') || '<li>None.</li>';
+  return `<details class="spec-item"><summary>${esc(item.title || item.key || 'Untitled')} <code>${esc(item.key || '')}</code></summary>
+    <p>${esc(item.objective || '')}</p>
+    <h4>Acceptance criteria</h4><ul>${criteria}</ul>
+    <h4>Verification</h4><ul>${verifications}</ul></details>`;
+};
+const specReviewEntry = (rev, idx) => {
+  const reviews = (rev.reviews || []);
+  const reviewDetails = reviews.map(r => `<details><summary>${specVerdictBadge(r.verdict)} ${esc(r.summary || '')} · ${esc(r.created_at || '')}</summary>
+    ${r.findings && r.findings.length > 0 ? `<ul>${r.findings.map(f => `<li>${esc(f.severity || '')}: ${esc(f.category || '')} / ${esc(f.key || '')} — ${esc(f.summary || '')}<br><span class="muted">Items: ${esc((f.item_keys || []).join(', '))}</span></li>`).join('')}</ul>` : ''}
+    ${r.blocker ? `<p class="error">Blocker: ${esc(r.blocker)}</p>` : ''}
+    <p class="muted">${esc(r.reviewer_model || '')} · rubric v${esc(r.rubric_version)}</p>
+    </details>`).join('') || '<p class="muted">No reviews yet.</p>';
+  const contextsHtml = specContexts(rev.contexts || []);
+  const itemsHtml = (rev.items || []).map(specItem).join('') || '<p class="muted">No items.</p>';
+  return `<li><strong>Revision ${esc(rev.revision)}</strong> (v${esc(rev.issue_version_id)}) — ${esc(rev.created_at || '')}
+    <details><summary>Details</summary><pre class="prompt">${esc(rev.reason || 'No reason')}</pre>
+    <p class="muted">Author: ${esc(rev.author_member_id || 'unknown')} · SHA: <code>${esc((rev.content_sha256 || '').slice(0, 16))}</code></p>
+    ${reviewDetails}${contextsHtml}
+    <h4>Specification items</h4>${itemsHtml}
+    </details></li>`;
+};
+const issueSpecification = run => {
+  const spec = run.specification;
+  const history = run.specification_revision_history || [];
+  if (!spec && history.length === 0) {
+    return '<details><summary>Issue specification</summary><p class="muted">No specification persisted for this run.</p></details>';
+  }
+
+  // Active spec section
+  let activeSection = '';
+  if (spec) {
+    const reviewStatus = spec.review
+      ? specVerdictBadge(spec.review.verdict) + ' ' + esc(spec.review.summary || '')
+      : '<span class="badge">Pending review</span>';
+    const readinessBadge = spec.implementation_ready
+      ? '<span class="badge success">Implementation ready</span>'
+      : '<span class="badge warning">Not ready for implementation</span>';
+    const itemsHtml = (spec.items || []).map(specItem).join('') || '<p class="muted">No items in this revision.</p>';
+    const contextsHtml = specContexts(spec.contexts || []);
+    activeSection = `<div class="row">
+      <div><h3>Active specification</h3><p>Revision ${esc(spec.revision)} for issue v${esc(spec.issue_version_id || '')} · ${esc(spec.created_at || '')}
+      <br>${reviewStatus} · ${readinessBadge}</p></div>
+    </div>
+    ${contextsHtml}
+    ${itemsHtml}`;
+  } else {
+    activeSection = '<p class="muted">No specification for the current issue version.</p>';
+  }
+
+  // Revision history section
+  const historyHtml = history.length
+    ? `<details><summary>Revision history (${history.length} revision${history.length === 1 ? '' : 's'})</summary>
+      <ol>${history.map((rev, idx) => specReviewEntry(rev, idx)).join('')}</ol></details>`
+    : '';
+
+  return `<details open><summary>Issue specification</summary>
+    ${activeSection}
+    ${historyHtml}
+  </details>`;
+};
 const stateBadge = r => {
   if (!r.enabled) return '<span class="badge warning">Paused</span>';
   if (r.active) return '<span class="badge success">Active</span>';
@@ -933,6 +1219,1626 @@ const stateBadge = r => {
 };
 const teamMember = m => `<details class="team-member"><summary>${esc(m.stable_key)} <span class="badge">${esc(m.role)}</span></summary><p>${esc(m.responsibilities)}</p><p class="muted">${esc(m.runtime)} · ${esc(m.model)}</p><h4>Role prompt</h4><pre class="prompt">${esc(m.instructions)}</pre></details>`;
 const retainedInputs = r => esc(JSON.stringify(r.display_inputs, null, 2));
+const workflowNumericColumn = node => {
+  const column = Number(node.column);
+  return Number.isFinite(column) ? column : 0;
+};
+const workflowNumericRow = (node, fallback = 0) => {
+  const row = Number(node.row);
+  return Number.isFinite(row) ? row : fallback;
+};
+function workflowLayeredLayout(nodes, dependencyEdges) {
+  const stableIndex = new Map(
+    nodes.map((node, index) => [String(node.stable_key), index])
+  );
+  const groups = new Map();
+  for (const node of nodes) {
+    const column = workflowNumericColumn(node);
+    if (!groups.has(column)) groups.set(column, []);
+    groups.get(column).push(node);
+  }
+  const columns = [...groups.keys()].sort((first, second) => first - second);
+  for (const group of groups.values()) {
+    group.sort((first, second) => (
+      workflowNumericRow(first, stableIndex.get(String(first.stable_key)))
+      - workflowNumericRow(second, stableIndex.get(String(second.stable_key)))
+      || stableIndex.get(String(first.stable_key))
+      - stableIndex.get(String(second.stable_key))
+    ));
+  }
+  const incoming = new Map(
+    nodes.map(node => [String(node.stable_key), []])
+  );
+  const outgoing = new Map(
+    nodes.map(node => [String(node.stable_key), []])
+  );
+  for (const edge of dependencyEdges) {
+    const source = String(edge.source);
+    const target = String(edge.target);
+    if (incoming.has(target) && outgoing.has(source)) {
+      incoming.get(target).push(source);
+      outgoing.get(source).push(target);
+    }
+  }
+  const ranks = () => {
+    const result = new Map();
+    for (const column of columns) {
+      groups.get(column).forEach((node, index) => {
+        result.set(String(node.stable_key), index);
+      });
+    }
+    return result;
+  };
+  const neighborScore = (node, neighbors, rank) => {
+    const values = (neighbors.get(String(node.stable_key)) || [])
+      .filter(key => rank.has(key))
+      .map(key => rank.get(key));
+    return values.length
+      ? values.reduce((total, value) => total + value, 0) / values.length
+      : null;
+  };
+  const reorder = (column, neighbors, rank) => {
+    groups.get(column).sort((first, second) => {
+      const firstScore = neighborScore(first, neighbors, rank);
+      const secondScore = neighborScore(second, neighbors, rank);
+      if (firstScore != null && secondScore != null && firstScore !== secondScore) {
+        return firstScore - secondScore;
+      }
+      if (firstScore != null && secondScore == null) return -1;
+      if (firstScore == null && secondScore != null) return 1;
+      return (
+        workflowNumericRow(first, stableIndex.get(String(first.stable_key)))
+        - workflowNumericRow(second, stableIndex.get(String(second.stable_key)))
+        || stableIndex.get(String(first.stable_key))
+        - stableIndex.get(String(second.stable_key))
+      );
+    });
+  };
+  for (let pass = 0; pass < 3; pass += 1) {
+    let rank = ranks();
+    for (const column of columns.slice(1)) {
+      reorder(column, incoming, rank);
+      rank = ranks();
+    }
+    rank = ranks();
+    for (const column of columns.slice(0, -1).reverse()) {
+      reorder(column, outgoing, rank);
+      rank = ranks();
+    }
+  }
+  const maxCount = Math.max(
+    1,
+    ...columns.map(column => groups.get(column).length)
+  );
+  const coreHeight = (
+    maxCount * WORKFLOW_NODE_HEIGHT
+    + Math.max(0, maxCount - 1) * WORKFLOW_ROW_GAP
+  );
+  const coreTop = WORKFLOW_PADDING_Y;
+  const positioned = [];
+  const byKey = new Map();
+  columns.forEach((column, columnIndex) => {
+    const group = groups.get(column);
+    const groupHeight = (
+      group.length * WORKFLOW_NODE_HEIGHT
+      + Math.max(0, group.length - 1) * WORKFLOW_ROW_GAP
+    );
+    const groupTop = coreTop + (coreHeight - groupHeight) / 2;
+    group.forEach((node, rowIndex) => {
+      const left = (
+        WORKFLOW_PADDING_X
+        + columnIndex * (WORKFLOW_NODE_WIDTH + WORKFLOW_COLUMN_GAP)
+      );
+      const top = groupTop + rowIndex * (
+        WORKFLOW_NODE_HEIGHT + WORKFLOW_ROW_GAP
+      );
+      const placed = {
+        node,
+        key: String(node.stable_key),
+        column,
+        row: rowIndex,
+        left,
+        top,
+        right: left + WORKFLOW_NODE_WIDTH,
+        bottom: top + WORKFLOW_NODE_HEIGHT,
+        centerX: left + WORKFLOW_NODE_WIDTH / 2,
+        centerY: top + WORKFLOW_NODE_HEIGHT / 2,
+      };
+      positioned.push(placed);
+      byKey.set(placed.key, placed);
+    });
+  });
+  const width = (
+    WORKFLOW_PADDING_X * 2
+    + columns.length * WORKFLOW_NODE_WIDTH
+    + Math.max(0, columns.length - 1) * WORKFLOW_COLUMN_GAP
+  );
+  const height = coreTop + coreHeight + WORKFLOW_PADDING_Y;
+  const horizontalLanes = [
+    WORKFLOW_PADDING_Y / 2,
+    ...Array.from({length: Math.max(0, maxCount - 1)}, (_, index) => (
+      coreTop
+      + (index + 1) * WORKFLOW_NODE_HEIGHT
+      + index * WORKFLOW_ROW_GAP
+      + WORKFLOW_ROW_GAP / 2
+    )),
+    height - WORKFLOW_PADDING_Y / 2,
+  ];
+  return {
+    nodes: positioned,
+    byKey,
+    columns,
+    width,
+    height,
+    coreTop,
+    coreBottom: coreTop + coreHeight,
+    horizontalLanes,
+  };
+}
+function workflowSegmentIntersectsNode(
+  start,
+  end,
+  node,
+  clearance = WORKFLOW_EDGE_CLEARANCE
+) {
+  const left = node.left - clearance;
+  const right = node.right + clearance;
+  const top = node.top - clearance;
+  const bottom = node.bottom + clearance;
+  if (Math.abs(start.y - end.y) < .01) {
+    return (
+      start.y > top
+      && start.y < bottom
+      && Math.max(start.x, end.x) > left
+      && Math.min(start.x, end.x) < right
+    );
+  }
+  if (Math.abs(start.x - end.x) < .01) {
+    return (
+      start.x > left
+      && start.x < right
+      && Math.max(start.y, end.y) > top
+      && Math.min(start.y, end.y) < bottom
+    );
+  }
+  return true;
+}
+const workflowOrthogonalSegments = points => points.slice(1).map(
+  (point, index) => ({start: points[index], end: point})
+);
+function workflowSimplifyRoute(points) {
+  const unique = [];
+  for (const point of points) {
+    const previous = unique[unique.length - 1];
+    if (!previous || previous.x !== point.x || previous.y !== point.y) {
+      unique.push(point);
+    }
+  }
+  const simplified = [];
+  for (const point of unique) {
+    const first = simplified[simplified.length - 2];
+    const second = simplified[simplified.length - 1];
+    if (
+      first
+      && second
+      && (
+        (first.x === second.x && second.x === point.x)
+        || (first.y === second.y && second.y === point.y)
+      )
+    ) {
+      simplified[simplified.length - 1] = point;
+    } else {
+      simplified.push(point);
+    }
+  }
+  return simplified;
+}
+function workflowRouteIsClear(points, obstacles) {
+  return workflowOrthogonalSegments(points).every(segment => (
+    obstacles.every(node => !workflowSegmentIntersectsNode(
+      segment.start,
+      segment.end,
+      node
+    ))
+  ));
+}
+function workflowRouteConflictPenalty(points, usedSegments) {
+  let penalty = 0;
+  for (const segment of workflowOrthogonalSegments(points)) {
+    const horizontal = segment.start.y === segment.end.y;
+    for (const used of usedSegments) {
+      const usedHorizontal = used.start.y === used.end.y;
+      if (horizontal === usedHorizontal) {
+        if (
+          horizontal
+          && segment.start.y === used.start.y
+        ) {
+          const overlap = Math.min(
+            Math.max(segment.start.x, segment.end.x),
+            Math.max(used.start.x, used.end.x)
+          ) - Math.max(
+            Math.min(segment.start.x, segment.end.x),
+            Math.min(used.start.x, used.end.x)
+          );
+          penalty += Math.max(0, overlap) * 4;
+        } else if (
+          !horizontal
+          && segment.start.x === used.start.x
+        ) {
+          const overlap = Math.min(
+            Math.max(segment.start.y, segment.end.y),
+            Math.max(used.start.y, used.end.y)
+          ) - Math.max(
+            Math.min(segment.start.y, segment.end.y),
+            Math.min(used.start.y, used.end.y)
+          );
+          penalty += Math.max(0, overlap) * 4;
+        }
+      } else {
+        const horizontalSegment = horizontal ? segment : used;
+        const verticalSegment = horizontal ? used : segment;
+        const crosses = (
+          verticalSegment.start.x > Math.min(
+            horizontalSegment.start.x,
+            horizontalSegment.end.x
+          )
+          && verticalSegment.start.x < Math.max(
+            horizontalSegment.start.x,
+            horizontalSegment.end.x
+          )
+          && horizontalSegment.start.y > Math.min(
+            verticalSegment.start.y,
+            verticalSegment.end.y
+          )
+          && horizontalSegment.start.y < Math.max(
+            verticalSegment.start.y,
+            verticalSegment.end.y
+          )
+        );
+        if (crosses) penalty += 180;
+      }
+    }
+  }
+  return penalty;
+}
+const workflowRouteLength = points => workflowOrthogonalSegments(points)
+  .reduce((total, segment) => (
+    total
+    + Math.abs(segment.start.x - segment.end.x)
+    + Math.abs(segment.start.y - segment.end.y)
+  ), 0);
+function workflowEdgePortY(node, edge, layout, edgeSet, direction) {
+  const nodeKey = node.key;
+  const matches = direction === 'outgoing'
+    ? candidate => String(candidate.source) === nodeKey
+    : candidate => String(candidate.target) === nodeKey;
+  const oppositeKey = candidate => String(
+    direction === 'outgoing' ? candidate.target : candidate.source
+  );
+  const peers = edgeSet.filter(matches).sort((first, second) => {
+    const firstNode = layout.byKey.get(oppositeKey(first));
+    const secondNode = layout.byKey.get(oppositeKey(second));
+    return (
+      (firstNode?.centerY ?? node.centerY)
+      - (secondNode?.centerY ?? node.centerY)
+    );
+  });
+  if (peers.length <= 1) return node.centerY;
+  const index = Math.max(0, peers.indexOf(edge));
+  const inset = 12;
+  return (
+    node.top
+    + inset
+    + index * (WORKFLOW_NODE_HEIGHT - inset * 2) / (peers.length - 1)
+  );
+}
+function workflowEdgePortX(node, edge, layout, edgeSet, direction) {
+  const nodeKey = node.key;
+  const matches = direction === 'outgoing'
+    ? candidate => String(candidate.source) === nodeKey
+    : candidate => String(candidate.target) === nodeKey;
+  const oppositeKey = candidate => String(
+    direction === 'outgoing' ? candidate.target : candidate.source
+  );
+  const peers = edgeSet.filter(matches).sort((first, second) => {
+    const firstNode = layout.byKey.get(oppositeKey(first));
+    const secondNode = layout.byKey.get(oppositeKey(second));
+    return (
+      (firstNode?.centerX ?? node.centerX)
+      - (secondNode?.centerX ?? node.centerX)
+    );
+  });
+  if (peers.length <= 1) return node.centerX;
+  const index = Math.max(0, peers.indexOf(edge));
+  const inset = 24;
+  return (
+    node.left
+    + inset
+    + index * (WORKFLOW_NODE_WIDTH - inset * 2) / (peers.length - 1)
+  );
+}
+function workflowRouteEdge(edge, layout, options = {}) {
+  const source = layout.byKey.get(String(edge.source));
+  const target = layout.byKey.get(String(edge.target));
+  if (!source || !target) return null;
+  const usedSegments = options.usedSegments || [];
+  const laneIndex = Number(options.laneIndex) || 0;
+  const edgeSet = options.edges || [edge];
+  const sourcePortY = workflowEdgePortY(
+    source,
+    edge,
+    layout,
+    edgeSet,
+    'outgoing'
+  );
+  const targetPortY = workflowEdgePortY(
+    target,
+    edge,
+    layout,
+    edgeSet,
+    'incoming'
+  );
+  let points;
+  if (options.outerLaneY != null) {
+    const outerEdges = options.outerEdges || edgeSet;
+    let startX = workflowEdgePortX(
+      source,
+      edge,
+      layout,
+      outerEdges,
+      'outgoing'
+    );
+    let endX = workflowEdgePortX(
+      target,
+      edge,
+      layout,
+      outerEdges,
+      'incoming'
+    );
+    if (source.key === target.key) {
+      startX = source.centerX + 24;
+      endX = target.centerX - 24;
+    }
+    const hasNodeBelow = node => layout.nodes.some(other => (
+      other.key !== node.key
+      && other.column === node.column
+      && other.top >= node.bottom
+    ));
+    const sourceClearsBelow = !hasNodeBelow(source);
+    const targetClearsBelow = !hasNodeBelow(target);
+    const forward = target.centerX >= source.centerX;
+    const sourceSide = source.key === target.key ? 1 : (forward ? 1 : -1);
+    const targetSide = source.key === target.key ? -1 : (forward ? -1 : 1);
+    const start = sourceClearsBelow
+      ? {x: startX, y: source.bottom}
+      : {
+          x: sourceSide > 0 ? source.right : source.left,
+          y: sourcePortY,
+        };
+    const end = targetClearsBelow
+      ? {x: endX, y: target.bottom}
+      : {
+          x: targetSide > 0 ? target.right : target.left,
+          y: targetPortY,
+        };
+    const sourceRailX = sourceClearsBelow
+      ? start.x
+      : start.x + sourceSide * WORKFLOW_EDGE_CLEARANCE;
+    const targetRailX = targetClearsBelow
+      ? end.x
+      : end.x + targetSide * WORKFLOW_EDGE_CLEARANCE;
+    points = workflowSimplifyRoute([
+      start,
+      {x: sourceRailX, y: start.y},
+      {x: sourceRailX, y: options.outerLaneY},
+      {x: targetRailX, y: options.outerLaneY},
+      {x: targetRailX, y: end.y},
+      end,
+    ]);
+  } else if (source.key === target.key) {
+    const laneY = Math.max(
+      16,
+      source.top - WORKFLOW_EDGE_CLEARANCE * 3
+    );
+    points = workflowSimplifyRoute([
+      {x: source.right, y: source.centerY - 12},
+      {
+        x: source.right + WORKFLOW_EDGE_CLEARANCE * 2,
+        y: source.centerY - 12,
+      },
+      {
+        x: source.right + WORKFLOW_EDGE_CLEARANCE * 2,
+        y: laneY,
+      },
+      {
+        x: source.left - WORKFLOW_EDGE_CLEARANCE * 2,
+        y: laneY,
+      },
+      {
+        x: source.left - WORKFLOW_EDGE_CLEARANCE * 2,
+        y: source.centerY + 12,
+      },
+      {x: source.left, y: source.centerY + 12},
+    ]);
+  } else {
+    const forward = target.centerX >= source.centerX;
+    const direction = forward ? 1 : -1;
+    const start = {
+      x: forward ? source.right : source.left,
+      y: sourcePortY,
+    };
+    const end = {
+      x: forward ? target.left : target.right,
+      y: targetPortY,
+    };
+    const obstacles = layout.nodes.filter(
+      node => node.key !== source.key && node.key !== target.key
+    );
+    const candidates = [];
+    const middleXs = [
+      (start.x + end.x) / 2,
+      start.x + direction * WORKFLOW_EDGE_CLEARANCE,
+      end.x - direction * WORKFLOW_EDGE_CLEARANCE,
+    ];
+    for (const middleX of middleXs) {
+      candidates.push(workflowSimplifyRoute([
+        start,
+        {x: middleX, y: start.y},
+        {x: middleX, y: end.y},
+        end,
+      ]));
+    }
+    const laneShift = (laneIndex % 3 - 1) * 6;
+    for (const lane of layout.horizontalLanes) {
+      const laneY = lane + laneShift;
+      candidates.push(workflowSimplifyRoute([
+        start,
+        {
+          x: start.x + direction * WORKFLOW_EDGE_CLEARANCE,
+          y: start.y,
+        },
+        {
+          x: start.x + direction * WORKFLOW_EDGE_CLEARANCE,
+          y: laneY,
+        },
+        {
+          x: end.x - direction * WORKFLOW_EDGE_CLEARANCE,
+          y: laneY,
+        },
+        {
+          x: end.x - direction * WORKFLOW_EDGE_CLEARANCE,
+          y: end.y,
+        },
+        end,
+      ]));
+    }
+    const clear = candidates.filter(
+      candidate => workflowRouteIsClear(candidate, obstacles)
+    );
+    const available = clear.length ? clear : candidates;
+    points = available.sort((first, second) => {
+      const firstScore = (
+        workflowRouteLength(first)
+        + workflowRouteConflictPenalty(first, usedSegments)
+        + first.length * 12
+      );
+      const secondScore = (
+        workflowRouteLength(second)
+        + workflowRouteConflictPenalty(second, usedSegments)
+        + second.length * 12
+      );
+      return firstScore - secondScore;
+    })[0];
+  }
+  const segments = workflowOrthogonalSegments(points);
+  usedSegments.push(...segments);
+  return {
+    source,
+    target,
+    points,
+    path: points.map((point, index) => (
+      `${index ? 'L' : 'M'} ${point.x} ${point.y}`
+    )).join(' '),
+  };
+}
+function workflowRouteLabelPoint(points) {
+  const segments = workflowOrthogonalSegments(points);
+  const horizontal = segments
+    .filter(segment => segment.start.y === segment.end.y)
+    .sort((first, second) => (
+      Math.abs(second.start.x - second.end.x)
+      - Math.abs(first.start.x - first.end.x)
+    ))[0];
+  const segment = horizontal || segments[0];
+  return segment
+    ? {
+        x: (segment.start.x + segment.end.x) / 2,
+        y: (segment.start.y + segment.end.y) / 2 - 7,
+      }
+    : {x: 0, y: 0};
+}
+const workflowClamp = (value, minimum, maximum) => (
+  Math.min(maximum, Math.max(minimum, value))
+);
+function workflowViewportState(context) {
+  const key = String(context);
+  if (!workflowViewportStates.has(key)) {
+    workflowViewportStates.set(key, {
+      x: 0,
+      y: 0,
+      scale: 1,
+      mode: 'fit',
+    });
+  }
+  return workflowViewportStates.get(key);
+}
+function workflowBoundViewport(viewport, bounds, state) {
+  const scaledWidth = bounds.width * state.scale;
+  const scaledHeight = bounds.height * state.scale;
+  const minimumX = 48 - scaledWidth;
+  const maximumX = viewport.clientWidth - 48;
+  const minimumY = 48 - scaledHeight;
+  const maximumY = viewport.clientHeight - 48;
+  state.x = minimumX > maximumX
+    ? (viewport.clientWidth - scaledWidth) / 2
+    : workflowClamp(state.x, minimumX, maximumX);
+  state.y = minimumY > maximumY
+    ? (viewport.clientHeight - scaledHeight) / 2
+    : workflowClamp(state.y, minimumY, maximumY);
+}
+function workflowApplyViewport(viewport, scene, bounds, state) {
+  state.scale = workflowClamp(
+    state.scale,
+    WORKFLOW_MIN_ZOOM,
+    WORKFLOW_MAX_ZOOM
+  );
+  workflowBoundViewport(viewport, bounds, state);
+  scene.style.transform = [
+    `translate(${state.x}px, ${state.y}px)`,
+    `scale(${state.scale})`,
+  ].join(' ');
+  viewport.dataset.workflowScale = state.scale.toFixed(3);
+  const status = viewport.querySelector('[data-workflow-zoom-status]');
+  if (status) status.textContent = `${Math.round(state.scale * 100)}%`;
+}
+function workflowFitViewport(viewport, scene, bounds, context) {
+  const state = workflowViewportState(context);
+  const padding = 24;
+  const scale = workflowClamp(
+    Math.min(
+      (viewport.clientWidth - padding * 2) / bounds.width,
+      (viewport.clientHeight - padding * 2) / bounds.height
+    ),
+    WORKFLOW_MIN_ZOOM,
+    1
+  );
+  state.scale = scale;
+  state.x = (viewport.clientWidth - bounds.width * scale) / 2;
+  state.y = (viewport.clientHeight - bounds.height * scale) / 2;
+  state.mode = 'fit';
+  workflowApplyViewport(viewport, scene, bounds, state);
+  return state;
+}
+function workflowZoomViewport(
+  viewport,
+  scene,
+  bounds,
+  context,
+  factor,
+  clientX = null,
+  clientY = null
+) {
+  const state = workflowViewportState(context);
+  const rectangle = viewport.getBoundingClientRect();
+  const originX = clientX == null
+    ? viewport.clientWidth / 2
+    : clientX - rectangle.left;
+  const originY = clientY == null
+    ? viewport.clientHeight / 2
+    : clientY - rectangle.top;
+  const graphX = (originX - state.x) / state.scale;
+  const graphY = (originY - state.y) / state.scale;
+  const scale = workflowClamp(
+    state.scale * factor,
+    WORKFLOW_MIN_ZOOM,
+    WORKFLOW_MAX_ZOOM
+  );
+  state.scale = scale;
+  state.x = originX - graphX * scale;
+  state.y = originY - graphY * scale;
+  state.mode = 'manual';
+  workflowApplyViewport(viewport, scene, bounds, state);
+}
+function workflowInstallViewport(viewport, scene, bounds, context) {
+  const state = workflowViewportState(context);
+  const apply = () => workflowApplyViewport(
+    viewport,
+    scene,
+    bounds,
+    state
+  );
+  const fit = () => workflowFitViewport(
+    viewport,
+    scene,
+    bounds,
+    context
+  );
+  viewport.querySelector('[data-workflow-viewport-control="zoom-in"]')
+    ?.addEventListener('click', () => workflowZoomViewport(
+      viewport,
+      scene,
+      bounds,
+      context,
+      1.2
+    ));
+  viewport.querySelector('[data-workflow-viewport-control="zoom-out"]')
+    ?.addEventListener('click', () => workflowZoomViewport(
+      viewport,
+      scene,
+      bounds,
+      context,
+      1 / 1.2
+    ));
+  viewport.querySelector('[data-workflow-viewport-control="fit"]')
+    ?.addEventListener('click', fit);
+  viewport.querySelector('[data-workflow-viewport-control="reset"]')
+    ?.addEventListener('click', () => {
+      state.scale = 1;
+      state.x = (viewport.clientWidth - bounds.width) / 2;
+      state.y = (viewport.clientHeight - bounds.height) / 2;
+      state.mode = 'manual';
+      apply();
+    });
+  viewport.addEventListener('wheel', event => {
+    event.preventDefault();
+    workflowZoomViewport(
+      viewport,
+      scene,
+      bounds,
+      context,
+      Math.exp(-event.deltaY * .0015),
+      event.clientX,
+      event.clientY
+    );
+  }, {passive: false});
+  let drag = null;
+  viewport.addEventListener('pointerdown', event => {
+    if (
+      event.button !== 0
+      || event.target.closest(
+        'button, select, a, [data-workflow-node]'
+      )
+    ) return;
+    drag = {
+      pointerId: event.pointerId,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      x: state.x,
+      y: state.y,
+    };
+    state.mode = 'manual';
+    viewport.classList.add('dragging');
+    viewport.setPointerCapture(event.pointerId);
+  });
+  viewport.addEventListener('pointermove', event => {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    state.x = drag.x + event.clientX - drag.clientX;
+    state.y = drag.y + event.clientY - drag.clientY;
+    apply();
+  });
+  const stopDrag = event => {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    drag = null;
+    viewport.classList.remove('dragging');
+    if (viewport.hasPointerCapture(event.pointerId)) {
+      viewport.releasePointerCapture(event.pointerId);
+    }
+  };
+  viewport.addEventListener('pointerup', stopDrag);
+  viewport.addEventListener('pointercancel', stopDrag);
+  viewport.addEventListener('keydown', event => {
+    if (event.target !== viewport) return;
+    if (event.key === '+' || event.key === '=') {
+      event.preventDefault();
+      workflowZoomViewport(
+        viewport,
+        scene,
+        bounds,
+        context,
+        1.2
+      );
+    } else if (event.key === '-') {
+      event.preventDefault();
+      workflowZoomViewport(
+        viewport,
+        scene,
+        bounds,
+        context,
+        1 / 1.2
+      );
+    } else if (event.key === '0' || event.key.toLowerCase() === 'f') {
+      event.preventDefault();
+      fit();
+    } else if (
+      ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(
+        event.key
+      )
+    ) {
+      event.preventDefault();
+      state.mode = 'manual';
+      if (event.key === 'ArrowLeft') state.x += 48;
+      if (event.key === 'ArrowRight') state.x -= 48;
+      if (event.key === 'ArrowUp') state.y += 48;
+      if (event.key === 'ArrowDown') state.y -= 48;
+      apply();
+    }
+  });
+  requestAnimationFrame(() => {
+    if (state.mode === 'fit') fit();
+    else apply();
+  });
+  workflowViewportResizeObserver?.disconnect();
+  workflowViewportResizeObserver = null;
+  if ('ResizeObserver' in window) {
+    workflowViewportResizeObserver = new ResizeObserver(() => {
+      if (state.mode === 'fit') fit();
+      else apply();
+    });
+    workflowViewportResizeObserver.observe(viewport);
+  }
+}
+const workflowStateClass = state => ({
+  running: 'running',
+  succeeded: 'succeeded',
+  failed: 'failed',
+  canceled: 'canceled',
+})[state] || '';
+const workflowControllerTransitions = graph => [
+  ...(graph.controller_edges || []),
+  ...(graph.lifecycle_edges || []),
+];
+const workflowLifecycleTypeLabel = type => ({
+  activation: 'Issue activation',
+  retry: 'Retry failed node',
+  revision: 'Coordinator revision',
+  'validation-remediation': 'Validation remediation',
+  'acceptance-remediation': 'Acceptance remediation',
+  feedback: 'Feedback generation',
+  termination: 'Terminal outcome',
+  validation: 'Exact-SHA validation',
+  acceptance: 'Independent acceptance',
+  publication: 'Controller publication',
+  'feedback-monitoring': 'Feedback monitoring',
+})[type] || String(type || 'Controller transition');
+function workflowSelection(repository) {
+  const repositoryRuns = allRuns().filter(
+    run => String(run.repository_id) === String(repository.id)
+      && run.workflow
+  );
+  const explicitlySelected = repositoryRuns.find(
+    run => String(run.id) === String(selectedRunId)
+  );
+  const run = explicitlySelected || repositoryRuns[0];
+  if (run?.workflow?.generations?.length) {
+    const generations = run.workflow.generations;
+    const defaultGeneration = run.workflow.active_generation
+      ?? generations[generations.length - 1].generation;
+    const requestedGeneration = Number(selectedWorkflowGeneration);
+    const generationNumber = generations.some(
+      item => Number(item.generation) === requestedGeneration
+    ) ? requestedGeneration : Number(defaultGeneration);
+    const graph = generations.find(
+      item => Number(item.generation) === generationNumber
+    );
+    selectedWorkflowGeneration = generationNumber;
+    return {
+      run,
+      graph,
+      generations,
+      title: `Issue #${run.issue_number} workflow`,
+      source: 'run',
+    };
+  }
+  if (!repository.workflow_template) return null;
+  const template = repository.workflow_template;
+  return {
+    run: null,
+    graph: {
+      generation: null,
+      active: false,
+      state: 'template',
+      reason: 'Repository team template',
+      rationale: template.rationale,
+      assessment_prompt: template.assessment_prompt,
+      assessment: null,
+      nodes: template.nodes || [],
+      edges: template.edges || [],
+      controller_boundaries: template.controller_boundaries || [],
+      controller_edges: template.controller_edges || [],
+      system_boundaries: template.system_boundaries || [],
+      lifecycle_edges: template.lifecycle_edges || [],
+    },
+    generations: [],
+    title: 'Repository workflow template',
+    source: 'template',
+  };
+}
+function workflowDependencies(graph, stableKey) {
+  return (graph.edges || [])
+    .filter(edge => String(edge.target) === String(stableKey))
+    .map(edge => edge.source);
+}
+function renderWorkflowNodeDetails(node, graph) {
+  const detail = document.querySelector('#workflow-node-details');
+  if (!detail) return;
+  if (!node) {
+    detail.innerHTML = [
+      '<p class="muted">',
+      'Select a node to inspect its prompt, dependencies, resources, ',
+      'and attempts.</p>',
+    ].join('');
+    return;
+  }
+  const attempts = (node.attempts || []).map(attempt => {
+    const claims = (attempt.resource_claims || []).map(claim => {
+      const release = claim.released_at ? ', released' : ', active';
+      return `${claim.resource} (${claim.access}${release})`;
+    }).join(', ');
+    const attemptInput = `<details>
+      <summary>Attempt input</summary>
+      <pre class="prompt">${esc(JSON.stringify(
+        attempt.input || {},
+        null,
+        2
+      ))}</pre>
+    </details>`;
+    const completed = attempt.completed_at
+      ? ` · <strong>Completed:</strong> ${esc(date(
+        attempt.completed_at
+      ))}`
+      : ' · In progress';
+    const timing = `<div>
+      <strong>Started:</strong> ${esc(date(attempt.started_at))}
+      ${completed}
+    </div>`;
+    const attemptError = attempt.error
+      ? `<pre class="prompt">${esc(JSON.stringify(
+        attempt.error,
+        null,
+        2
+      ))}</pre>`
+      : '';
+    const attemptOutput = attempt.output
+      ? `<pre class="prompt">${esc(JSON.stringify(
+        attempt.output,
+        null,
+        2
+      ))}</pre>`
+      : '';
+    const log = attempt.log_path
+      ? ` · log <code>${esc(attempt.log_path)}</code>`
+      : '';
+    const claimDetail = claims
+      ? `<div><strong>Claims:</strong> ${esc(claims)}</div>`
+      : '';
+    return [
+      `<li>Attempt ${esc(attempt.attempt)} · `,
+      `<strong>${esc(attempt.state)}</strong>${log}`,
+      timing,
+      attemptInput,
+      claimDetail,
+      attemptError,
+      attemptOutput,
+      '</li>',
+    ].join('');
+  }).join('') || '<li>No attempts recorded.</li>';
+  const dependencies = workflowDependencies(graph, node.stable_key);
+  const metadata = [
+    node.kind,
+    node.role,
+    node.operation,
+  ].filter(Boolean).join(' · ');
+  const resources = (node.resources || []).join(', ') || 'None';
+  const operationVersion = node.operation_version
+    ? `<p><strong>Operation version:</strong> <code>${esc(
+      String(node.operation_version).slice(0, 12)
+    )}</code></p>`
+    : '';
+  const resourceWaits = node.resource_wait_count
+    ? `<p><strong>Resource waits:</strong> ${esc(
+      node.resource_wait_count
+    )}</p>`
+    : '';
+  const reused = node.reused
+    ? '<p><span class="badge success">Reused output</span></p>'
+    : '';
+  const relatedTransitions = workflowControllerTransitions(graph).filter(
+    edge => (
+      String(edge.source) === String(node.stable_key)
+      || String(edge.target) === String(node.stable_key)
+    )
+  );
+  const lifecycleDetail = relatedTransitions.length
+    ? `<h4>Controller lifecycle transitions</h4><ul>${
+        relatedTransitions.map(edge => {
+          const direction = String(edge.source) === String(node.stable_key)
+            ? `to ${edge.target}`
+            : `from ${edge.source}`;
+          return `<li><strong>${esc(
+            edge.label || workflowLifecycleTypeLabel(edge.type)
+          )}</strong> ${esc(direction)}<br><span class="muted">${
+            esc(edge.trigger || 'controller-owned transition')
+          } · Next durable unit: ${esc(edge.next_unit || 'not applicable')}
+          </span></li>`;
+        }).join('')
+      }</ul>`
+    : '';
+  const contractLabels = {
+    mode: 'Projection',
+    run_id: 'Run',
+    issue_version_id: 'Issue version',
+    team_version_id: 'Team version',
+    sandbox_version_id: 'Sandbox version',
+    base_sha: 'Exact base SHA',
+    generation: 'Generation',
+  };
+  const contractDetail = node.contract
+    ? `<h4>Immutable run contract</h4><dl>${
+        Object.entries(contractLabels).map(([key, label]) => {
+          const value = node.contract[key];
+          const shown = value == null ? 'Bound at issue activation' : value;
+          return `<dt>${esc(label)}</dt><dd><code>${esc(shown)}</code></dd>`;
+        }).join('')
+      }</dl>`
+    : '';
+  const terminalDetail = Array.isArray(node.outcomes)
+    ? `<p><strong>Terminal durable states:</strong> ${esc(
+        node.outcomes.join(', ')
+      )}</p>`
+    : '';
+  const expectedOutput = esc(JSON.stringify(
+    node.expected_output || {},
+    null,
+    2
+  ));
+  const parametersAndBindings = esc(JSON.stringify(
+    {
+      parameters: node.parameters || {},
+      bindings: node.bindings || {},
+    },
+    null,
+    2
+  ));
+  const output = node.output
+    ? `<details><summary>Output</summary><pre class="prompt">${esc(
+      JSON.stringify(node.output, null, 2)
+    )}</pre></details>`
+    : '';
+  const error = node.error
+    ? `<details open><summary>Error</summary><pre class="prompt">${esc(
+      JSON.stringify(node.error, null, 2)
+    )}</pre></details>`
+    : '';
+  detail.innerHTML = `
+    <div class="row">
+      <h4>${esc(node.title || node.stable_key)}</h4>
+      <span class="badge">
+        ${esc(node.status_label || node.state || 'Template')}
+      </span>
+    </div>
+    <p>${esc(metadata)}</p>
+    <p>
+      <strong>Dependencies:</strong>
+      ${dependencies.length ? esc(dependencies.join(', ')) : 'None'}
+    </p>
+    <p><strong>Resources:</strong> ${esc(resources)}</p>
+    ${operationVersion}
+    ${resourceWaits}
+    ${reused}
+    ${contractDetail}
+    ${terminalDetail}
+    ${lifecycleDetail}
+    <h4>Prompt</h4>
+    <pre class="prompt">${esc(node.prompt || '')}</pre>
+    <details>
+      <summary>Parameters and bindings</summary>
+      <pre class="prompt">${parametersAndBindings}</pre>
+    </details>
+    <details>
+      <summary>Expected output</summary>
+      <pre class="prompt">${expectedOutput}</pre>
+    </details>
+    ${output}
+    ${error}
+    <details>
+      <summary>Attempts</summary>
+      <ol>${attempts}</ol>
+    </details>`;
+}
+function workflowGenerationDelta(selection) {
+  if (selection.source !== 'run' || selection.generations.length < 2) {
+    return '';
+  }
+  const generations = [...selection.generations].sort(
+    (first, second) => Number(first.generation) - Number(second.generation)
+  );
+  const index = generations.findIndex(
+    item => Number(item.generation) === Number(selection.graph.generation)
+  );
+  if (index <= 0) {
+    return `<details>
+      <summary>Generation delta</summary>
+      <p class="muted">This is the first immutable generation.</p>
+    </details>`;
+  }
+  const previous = generations[index - 1];
+  const current = selection.graph;
+  const previousNodes = new Map(
+    (previous.nodes || []).map(node => [String(node.stable_key), node])
+  );
+  const currentNodes = new Map(
+    (current.nodes || []).map(node => [String(node.stable_key), node])
+  );
+  const incoming = (graph, key) => (graph.edges || [])
+    .filter(edge => String(edge.target) === String(key))
+    .map(edge => String(edge.source))
+    .sort();
+  const canonical = value => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.keys(value)
+          .sort()
+          .map(key => [key, canonical(value[key])])
+      );
+    }
+    return value;
+  };
+  const encoded = value => JSON.stringify(canonical(value ?? null));
+  const added = [...currentNodes.keys()].filter(
+    key => !previousNodes.has(key)
+  );
+  const removed = [...previousNodes.keys()].filter(
+    key => !currentNodes.has(key)
+  );
+  const changed = [...currentNodes.entries()].flatMap(([key, node]) => {
+    const prior = previousNodes.get(key);
+    if (!prior) return [];
+    const fields = [];
+    if (encoded(node.prompt) !== encoded(prior.prompt)) {
+      fields.push('prompt');
+    }
+    if (
+      encoded(node.parameters) !== encoded(prior.parameters)
+      || encoded(node.bindings) !== encoded(prior.bindings)
+    ) {
+      fields.push('parameters or bindings');
+    }
+    if (encoded(node.expected_output) !== encoded(prior.expected_output)) {
+      fields.push('expected output');
+    }
+    if (
+      encoded([
+        node.kind,
+        node.member_key,
+        node.role,
+        node.operation,
+        node.operation_version,
+        node.resources,
+      ]) !== encoded([
+        prior.kind,
+        prior.member_key,
+        prior.role,
+        prior.operation,
+        prior.operation_version,
+        prior.resources,
+      ])
+    ) {
+      fields.push('definition or resources');
+    }
+    if (
+      encoded(incoming(current, key))
+      !== encoded(incoming(previous, key))
+    ) {
+      fields.push('dependencies');
+    }
+    return fields.length ? [`${key} (${fields.join(', ')})`] : [];
+  });
+  const reused = (current.nodes || [])
+    .filter(node => node.reused)
+    .map(node => String(node.stable_key));
+  const rerun = (current.nodes || [])
+    .filter(node => {
+      const prior = previousNodes.get(String(node.stable_key));
+      return prior && prior.state === 'succeeded' && !node.reused;
+    })
+    .map(node => String(node.stable_key));
+  const value = items => items.length
+    ? esc(items.join(', '))
+    : '<span class="muted">None</span>';
+  return `<details>
+    <summary>Generation delta from ${esc(previous.generation)}</summary>
+    <dl>
+      <dt>Added nodes</dt><dd>${value(added)}</dd>
+      <dt>Removed nodes</dt><dd>${value(removed)}</dd>
+      <dt>Changed nodes</dt><dd>${value(changed)}</dd>
+      <dt>Reused outputs</dt><dd>${value(reused)}</dd>
+      <dt>Rerun nodes</dt><dd>${value(rerun)}</dd>
+    </dl>
+  </details>`;
+}
+function renderWorkflowGraph(repository, preferredNode = null) {
+  const host = document.querySelector('#workflow-preview');
+  if (!host) return;
+  const selection = workflowSelection(repository);
+  if (!selection) {
+    host.innerHTML = [
+      '<h3 id="workflow-heading">Workflow</h3>',
+      '<p class="muted">',
+      'No stored workflow template exists yet.',
+      '</p>',
+    ].join('');
+    return;
+  }
+  const graph = selection.graph;
+  host.dataset.workflowContext = [
+    String(repository.id),
+    selection.run ? String(selection.run.id) : 'template',
+    graph.generation == null
+      ? 'template'
+      : String(graph.generation),
+  ].join(':');
+  const systemBoundaries = graph.system_boundaries || [];
+  const nodes = [
+    ...systemBoundaries.slice(0, 1),
+    ...(graph.nodes || []),
+    ...(graph.controller_boundaries || []),
+    ...systemBoundaries.slice(1),
+  ];
+  const dependencyEdges = graph.edges || [];
+  const lifecycleEdges = workflowControllerTransitions(graph);
+  const iterativeTypes = new Set([
+    'retry',
+    'revision',
+    'validation-remediation',
+    'acceptance-remediation',
+    'feedback',
+  ]);
+  const edges = [
+    ...dependencyEdges,
+    ...lifecycleEdges.filter(edge => !iterativeTypes.has(edge.type)),
+  ];
+  const byKey = new Map(
+    nodes.map(node => [String(node.stable_key), node])
+  );
+  const layout = workflowLayeredLayout(nodes, dependencyEdges);
+  const isLoopEdge = edge => {
+    const source = layout.byKey.get(String(edge.source));
+    const target = layout.byKey.get(String(edge.target));
+    if (!source || !target) return false;
+    return source.column >= target.column || (
+      edge.type === 'termination'
+      && String(edge.source) === 'controller:run-contract'
+    );
+  };
+  const loopEdges = lifecycleEdges.filter(isLoopEdge);
+  const width = Math.max(640, layout.width);
+  const loopRailStart = layout.height + 28;
+  const height = layout.height + (
+    loopEdges.length ? 48 + loopEdges.length * 36 : 0
+  );
+  const bounds = {width, height};
+  const usedSegments = [];
+  const routingEdges = [...dependencyEdges, ...lifecycleEdges];
+  const dependencyPaths = dependencyEdges.map((edge, index) => {
+    const route = workflowRouteEdge(edge, layout, {
+      laneIndex: index,
+      edges: routingEdges,
+      usedSegments,
+    });
+    if (!route) return '';
+    return `<path class="workflow-edge workflow-edge-dependency"
+      d="${route.path}" marker-end="url(#workflow-arrow)"
+      data-workflow-route="dependency"
+      data-edge-source="${esc(edge.source)}"
+      data-edge-target="${esc(edge.target)}"
+      data-route-points="${esc(JSON.stringify(route.points))}"></path>`;
+  }).join('');
+  const activationEdges = lifecycleEdges.filter(
+    edge => edge.type === 'activation'
+  );
+  const lifecyclePaths = lifecycleEdges.map((edge, index) => {
+    const loopIndex = loopEdges.indexOf(edge);
+    const route = workflowRouteEdge(edge, layout, {
+      laneIndex: index,
+      edges: routingEdges,
+      outerEdges: loopEdges,
+      usedSegments,
+      outerLaneY: loopIndex >= 0
+        ? loopRailStart + loopIndex * 36
+        : null,
+    });
+    if (!route) return '';
+    const activationIndex = activationEdges.indexOf(edge);
+    const label = edge.label || workflowLifecycleTypeLabel(edge.type);
+    let visualLabel = '';
+    if (loopIndex >= 0) {
+      if (edge.type === 'retry') {
+        visualLabel = `Retry · ${edge.next_unit || 'attempt N+1'}`;
+      } else if (String(edge.target) === 'controller:run-contract') {
+        visualLabel = `${label} → run contract`;
+      } else if (edge.type === 'termination') {
+        visualLabel = 'Cancel → terminal';
+      }
+    } else if (activationIndex === 0) {
+      visualLabel = 'Activate';
+    } else if (edge.type === 'termination') {
+      visualLabel = 'Close';
+    }
+    const description = [
+      label,
+      edge.trigger,
+      edge.next_unit
+        ? `Next durable unit: ${edge.next_unit}`
+        : null,
+    ].filter(Boolean).join(' — ');
+    const labelPoint = workflowRouteLabelPoint(route.points);
+    const visualText = visualLabel
+      ? `<text class="workflow-lifecycle-label"
+          x="${labelPoint.x}" y="${labelPoint.y}" text-anchor="middle">
+          ${esc(visualLabel)}
+        </text>`
+      : '';
+    return `<path class="workflow-edge workflow-edge-lifecycle"
+      d="${route.path}" marker-end="url(#workflow-lifecycle-arrow)"
+      data-workflow-route="lifecycle"
+      data-edge-type="${esc(edge.type)}"
+      data-edge-source="${esc(edge.source)}"
+      data-edge-target="${esc(edge.target)}"
+      data-route-points="${esc(JSON.stringify(route.points))}">
+      <title>${esc(description)}</title>
+    </path>${visualText}`;
+  }).join('');
+  const lines = dependencyPaths + lifecyclePaths;
+  const nodeButtons = layout.nodes.map(placed => {
+    const node = placed.node;
+    const status = node.status_label || node.state || 'Template';
+    const classes = [
+      'workflow-node',
+      workflowStateClass(node.state),
+      `workflow-kind-${esc(node.kind)}`,
+      `workflow-boundary-${esc(node.boundary || 'specialist')}`,
+    ].join(' ');
+    const metadata = [
+      status,
+      node.role || node.operation || node.kind,
+      node.reused ? 'Reused output' : null,
+    ].filter(Boolean).join(' · ');
+    return `<button type="button"
+      class="${classes}"
+      style="left:${placed.left}px;top:${placed.top}px"
+      data-workflow-node="${esc(node.stable_key)}"
+      data-workflow-column="${placed.column}"
+      data-workflow-row="${placed.row}"
+      aria-label="${esc(node.title || node.stable_key)}: ${esc(metadata)}">
+      <strong>${esc(node.title || node.stable_key)}</strong>
+      <small>${esc(metadata)}</small>
+    </button>`;
+  }).join('');
+  const dependencyRows = nodes.map(node => {
+    const dependencies = workflowDependencies(
+      graph,
+      node.stable_key
+    ).join(', ') || 'None';
+    const resources = (node.resources || []).join(', ') || 'None';
+    const status = node.status_label || node.state || 'Template';
+    return `
+      <tr>
+        <th scope="row">${esc(node.stable_key)}</th>
+        <td>${esc(node.kind)}</td>
+        <td>${esc(node.role || node.operation || '—')}</td>
+        <td>${esc(dependencies)}</td>
+        <td>${esc(status)}</td>
+        <td>${esc(resources)}</td>
+        <td>${node.reused ? 'Reused output' : 'No'}</td>
+      </tr>`;
+  }).join('');
+  const lifecycleRows = lifecycleEdges.map(edge => {
+    const source = byKey.get(String(edge.source));
+    const target = byKey.get(String(edge.target));
+    const label = edge.label || workflowLifecycleTypeLabel(edge.type);
+    return `
+      <tr>
+        <th scope="row">${esc(label)}</th>
+        <td>${esc(workflowLifecycleTypeLabel(edge.type))}</td>
+        <td>${esc(edge.trigger || 'Controller-owned transition')}</td>
+        <td>${esc(source?.title || edge.source)}</td>
+        <td>${esc(target?.title || edge.target)}</td>
+        <td>${esc(edge.next_unit || 'Not applicable')}</td>
+      </tr>`;
+  }).join('');
+  const generationOptions = selection.generations.map(item => {
+    const selected = Number(item.generation) === Number(graph.generation)
+      ? ' selected'
+      : '';
+    const active = item.active ? ' · active' : '';
+    return `<option value="${esc(item.generation)}"${selected}>
+      Generation ${esc(item.generation)} · ${esc(item.state)}${active}
+    </option>`;
+  }).join('');
+  const generationControl = selection.generations.length
+    ? `<label>Graph generation
+        <select id="workflow-generation">
+          ${generationOptions}
+        </select>
+      </label>`
+    : '<span class="badge">Graph generation · template</span>';
+  const assessments = Array.isArray(graph.assessments)
+    ? graph.assessments
+    : graph.assessment
+      ? [graph.assessment]
+      : [];
+  const assessment = assessments.length
+    ? `<ol>${assessments.map(item => `
+        <li>
+          <strong>${esc(item.outcome)}</strong>:
+          ${esc(item.evidence)}
+          ${item.created_at
+            ? `<span class="muted"> · ${esc(item.created_at)}</span>`
+            : ''}
+        </li>`).join('')}</ol>`
+    : [
+      '<p class="muted">',
+      'No assessment has been recorded for this graph generation.',
+      '</p>',
+    ].join('');
+  const generationDelta = workflowGenerationDelta(selection);
+  host.innerHTML = `
+    <div class="workflow-toolbar">
+      <div>
+        <h3 id="workflow-heading">${esc(selection.title)}</h3>
+        <p class="muted">${esc(graph.reason || '')}</p>
+      </div>
+      ${generationControl}
+    </div>
+    <p>${esc(graph.rationale || '')}</p>
+    ${generationDelta}
+    <details>
+      <summary>Legend and controller semantics</summary>
+      <div class="workflow-legend" aria-label="Workflow graph semantics">
+        <span class="workflow-legend-item workflow-kind-agent">
+          Agent
+        </span>
+        <span class="workflow-legend-item workflow-kind-deterministic">
+          Deterministic
+        </span>
+        <span class="workflow-legend-item controller-boundary">
+          Run contract / issue activation
+        </span>
+        <span class="workflow-legend-item controller-boundary">
+          Exact-SHA validation
+        </span>
+        <span class="workflow-legend-item controller-boundary">
+          Independent acceptance
+        </span>
+        <span class="workflow-legend-item controller-boundary">
+          Controller publication
+        </span>
+        <span class="workflow-legend-item controller-boundary">
+          Terminal outcomes
+        </span>
+        <span class="workflow-legend-item workflow-edge-key">
+          Solid executable dependency
+        </span>
+        <span class="workflow-legend-item workflow-edge-key lifecycle">
+          Controller lifecycle (projection only)
+        </span>
+      </div>
+    </details>
+    <p id="workflow-navigation-help" class="workflow-scroll-hint">
+      The whole graph is fitted initially. Use the controls or wheel to zoom;
+      drag empty space or use arrow keys to pan. Select a node for
+      durable details. Solid arrows are executable dependencies; dashed
+      arrows are controller transitions and can return for attempt N+1 or
+      generation N+1. The tables are the accessible equivalent.
+    </p>
+    <div id="workflow-graph" class="workflow-grid" role="group" tabindex="0"
+      aria-describedby="workflow-navigation-help"
+      aria-label="Interactive workflow dependency graph">
+      <div class="workflow-viewport-controls" role="toolbar"
+        aria-label="Workflow graph viewport controls">
+        <button type="button"
+          data-workflow-viewport-control="zoom-out"
+          aria-label="Zoom out">−</button>
+        <button type="button"
+          data-workflow-viewport-control="zoom-in"
+          aria-label="Zoom in">+</button>
+        <button type="button" aria-label="Fit workflow graph"
+          data-workflow-viewport-control="fit">Fit graph</button>
+        <button type="button" aria-label="Reset workflow graph zoom"
+          data-workflow-viewport-control="reset">100%</button>
+        <output data-workflow-zoom-status aria-live="polite">100%</output>
+      </div>
+      <div class="workflow-scene"
+        style="width:${width}px;height:${height}px">
+        <svg width="${width}" height="${height}"
+          viewBox="0 0 ${width} ${height}" role="img"
+          aria-label="Workflow dependency graph">
+          <defs>
+            <marker id="workflow-arrow" viewBox="0 0 10 10"
+              refX="8" refY="5" markerWidth="6" markerHeight="6"
+              orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z"
+                fill="var(--muted)"></path>
+            </marker>
+            <marker id="workflow-lifecycle-arrow" viewBox="0 0 10 10"
+              refX="8" refY="5" markerWidth="6" markerHeight="6"
+              orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z"
+                fill="var(--accent)"></path>
+            </marker>
+          </defs>
+          ${lines}
+        </svg>
+        ${nodeButtons}
+      </div>
+    </div>
+    <div id="workflow-node-details"
+      class="subpanel workflow-node-details"
+      aria-live="polite"></div>
+    <details>
+      <summary>Performance assessments</summary>
+      ${assessment}
+      <p>
+        <strong>Assessment prompt:</strong>
+        ${esc(graph.assessment_prompt || 'Not recorded')}
+      </p>
+    </details>
+    <div class="workflow-table-wrap">
+      <table id="workflow-table" class="workflow-table">
+        <caption>Workflow nodes and executable dependency status</caption>
+        <thead>
+          <tr>
+            <th>Node</th>
+            <th>Type</th>
+            <th>Role or operation</th>
+            <th>Executable dependencies</th>
+            <th>Status</th>
+            <th>Resources</th>
+            <th>Reused</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${dependencyRows || (
+            '<tr><td colspan="7">No nodes stored.</td></tr>'
+          )}
+        </tbody>
+      </table>
+    </div>
+    <div class="workflow-table-wrap workflow-lifecycle-table">
+      <table id="workflow-lifecycle-table" class="workflow-table">
+        <caption>Lifecycle transitions (projection only)</caption>
+        <thead>
+          <tr>
+            <th>Transition</th>
+            <th>Type</th>
+            <th>Trigger</th>
+            <th>Source</th>
+            <th>Target</th>
+            <th>Next durable unit</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${lifecycleRows || (
+            '<tr><td colspan="6">No lifecycle transitions projected.</td></tr>'
+          )}
+        </tbody>
+      </table>
+    </div>`;
+  const workflowViewport = host.querySelector('#workflow-graph');
+  const workflowScene = host.querySelector('.workflow-scene');
+  if (workflowViewport && workflowScene) {
+    workflowInstallViewport(
+      workflowViewport,
+      workflowScene,
+      bounds,
+      host.dataset.workflowContext
+    );
+  }
+  const generation = document.querySelector('#workflow-generation');
+  if (generation) {
+    generation.addEventListener('change', event => {
+      selectedWorkflowGeneration = Number(event.target.value);
+      selectedWorkflowNode = null;
+      renderWorkflowGraph(repository);
+    });
+  }
+  const selectNode = (key, focus = false) => {
+    const node = byKey.get(String(key));
+    if (!node) return;
+    selectedWorkflowNode = String(key);
+    renderWorkflowNodeDetails(node, graph);
+    if (focus) {
+      const selector = [
+        '[data-workflow-node="',
+        CSS.escape(String(key)),
+        '"]',
+      ].join('');
+      document.querySelector(selector)?.focus();
+    }
+  };
+  const buttons = [
+    ...host.querySelectorAll('[data-workflow-node]'),
+  ];
+  for (const button of buttons) {
+    button.addEventListener(
+      'click',
+      () => selectNode(button.dataset.workflowNode)
+    );
+    button.addEventListener(
+      'focus',
+      () => selectNode(button.dataset.workflowNode)
+    );
+    button.addEventListener('keydown', event => {
+      const current = byKey.get(
+        String(button.dataset.workflowNode)
+      );
+      if (!current) return;
+      let target = null;
+      if (event.key === 'ArrowRight') {
+        target = edges.find(
+          edge => String(edge.source) === String(current.stable_key)
+        )?.target;
+      } else if (event.key === 'ArrowLeft') {
+        target = edges.find(
+          edge => String(edge.target) === String(current.stable_key)
+        )?.source;
+      } else if (
+        event.key === 'ArrowUp'
+        || event.key === 'ArrowDown'
+      ) {
+        const direction = event.key === 'ArrowUp' ? -1 : 1;
+        target = nodes
+          .filter(node => (
+            Number(node.column) === Number(current.column)
+            && direction * (
+              Number(node.row) - Number(current.row)
+            ) > 0
+          ))
+          .sort((first, second) => (
+            Math.abs(Number(first.row) - Number(current.row))
+            - Math.abs(Number(second.row) - Number(current.row))
+          ))[0]?.stable_key;
+      } else if (event.key === 'Home') {
+        target = nodes[0]?.stable_key;
+      } else if (event.key === 'End') {
+        target = nodes[nodes.length - 1]?.stable_key;
+      }
+      if (target == null) return;
+      event.preventDefault();
+      selectNode(target, true);
+    });
+  }
+  const requested = preferredNode || selectedWorkflowNode;
+  const initialNode = byKey.has(String(requested))
+    ? String(requested)
+    : (nodes[0] ? String(nodes[0].stable_key) : null);
+  if (initialNode) {
+    selectNode(initialNode);
+    if (preferredNode) {
+      requestAnimationFrame(() => {
+        const selector = [
+          '[data-workflow-node="',
+          CSS.escape(initialNode),
+          '"]',
+        ].join('');
+        document.querySelector(selector)?.focus({preventScroll: true});
+      });
+    }
+  } else {
+    renderWorkflowNodeDetails(null, graph);
+  }
+}
 async function mutate(path, payload) {
   const response = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
   const result = await response.json();
@@ -1047,6 +2953,18 @@ function blockingError(value) {
 }
 function renderRepositoryDetail() {
   const detail = document.querySelector('#repository-detail');
+  const focusedWorkflowNode = document.activeElement?.dataset?.workflowNode || null;
+  const previousWorkflow = detail.querySelector('#workflow-preview');
+  const previousContext = previousWorkflow?.dataset.workflowContext;
+  const previousViewportState = previousContext
+    ? workflowViewportStates.get(previousContext)
+    : null;
+  const workflowViewportSnapshot = previousContext && previousViewportState
+    ? {
+        context: previousContext,
+        state: {...previousViewportState},
+      }
+    : null;
   const repository = currentState.repositories.find(item => String(item.id) === selectedRepositoryId);
   if (!repository) {
     detail.innerHTML = '<div class="empty"><div><h2>Select a repository</h2><p>Choose an inventory item to view status and team.</p></div></div>';
@@ -1069,7 +2987,34 @@ function renderRepositoryDetail() {
       <div class="row"><h3>Team</h3>${team ? `<span class="badge">v${esc(team.version)}</span>` : ''}</div>
       ${team ? (team.members || []).map(teamMember).join('') || '<p class="muted">No members stored.</p>' : '<p class="muted">No team exists yet.</p>'}
       <details><summary>Retained inputs</summary><pre class="prompt">${retainedInputs(repository)}</pre></details>
-    </section>`;
+    </section>
+    <section id="workflow-preview" class="subpanel workflow-preview" aria-labelledby="workflow-heading"></section>`;
+  renderWorkflowGraph(repository, focusedWorkflowNode);
+  const refreshedWorkflow = detail.querySelector('#workflow-preview');
+  const refreshedGraph = refreshedWorkflow?.querySelector('#workflow-graph');
+  const refreshedScene = refreshedWorkflow?.querySelector('.workflow-scene');
+  if (
+    workflowViewportSnapshot
+    && refreshedWorkflow
+    && refreshedGraph
+    && refreshedScene
+    && workflowViewportSnapshot.context
+      === refreshedWorkflow.dataset.workflowContext
+  ) {
+    const restoredState = workflowViewportState(
+      workflowViewportSnapshot.context
+    );
+    Object.assign(restoredState, workflowViewportSnapshot.state);
+    workflowApplyViewport(
+      refreshedGraph,
+      refreshedScene,
+      {
+        width: Number.parseFloat(refreshedScene.style.width),
+        height: Number.parseFloat(refreshedScene.style.height),
+      },
+      restoredState
+    );
+  }
 }
 function renderReadyIssues() {
   const inventory = document.querySelector('#ready-issues');
@@ -1175,7 +3120,8 @@ function renderIssueLogDetails() {
       </div>
     </div>
     ${evidence(run)}
-    ${acceptanceEvidence(run.acceptance_verification)}`;
+    ${acceptanceEvidence(run.acceptance_verification)}
+    ${issueSpecification(run)}`;
 }
 function renderRunLogSnapshot(snapshot, runId) {
   if (runId !== selectedRunId) return;
@@ -1228,6 +3174,9 @@ function selectRun(runId) {
   const run = allRuns().find(item => String(item.id) === normalized);
   if (!run) return;
   selectedRunId = normalized;
+  selectedWorkflowGeneration = null;
+  selectedWorkflowNode = null;
+  renderRepositoryDetail();
   renderRuns();
   document.querySelector('#issue-live-log').textContent = 'Loading issue activity…';
   connectRunActivityStream(normalized);
@@ -1247,6 +3196,8 @@ async function refresh() {
       && !allRuns().some(run => String(run.id) === selectedRunId)
     ) {
       selectedRunId = null;
+      selectedWorkflowGeneration = null;
+      selectedWorkflowNode = null;
       closeRunActivityStream();
       document.querySelector('#issue-live-log').textContent = 'Select an issue to view its activity.';
     }
@@ -1272,6 +3223,9 @@ async function action(fn) {
 }
 function selectRepository(repositoryId) {
   selectedRepositoryId = String(repositoryId);
+  selectedRunId = null;
+  selectedWorkflowGeneration = null;
+  selectedWorkflowNode = null;
   renderRepositoryList();
   renderRepositoryDetail();
   renderReadyIssues();

@@ -5,10 +5,15 @@ import re
 import uuid
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 from .database import Database
 from .mini_swe import MINI_SWE_RUNTIME, MiniSweInference
+from .workflow import (
+    DeterministicOperationRegistry,
+    validate_workflow_design,
+    workflow_resource_tool_requirements,
+)
 
 DEFAULT_ACTION_TIMEOUT_SECONDS = 600.0
 _TEAM_DESIGN_PROMPT_LIMIT_BYTES = 96_000
@@ -55,6 +60,16 @@ class StoredTeam:
     version: int
     evidence: dict[str, object]
     members: tuple[TeamMember, ...]
+
+
+@dataclass(frozen=True)
+class TeamDesign:
+    members: tuple[dict[str, object], ...]
+    workflow: dict[str, object]
+
+
+class _InvalidTeamDesign(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -310,9 +325,100 @@ class EvidenceTeamFormulator:
                     ],
                     "additionalProperties": False,
                 },
-            }
+            },
+            "workflow": {
+                "type": "object",
+                "properties": {
+                    "rationale": {"type": "string", "minLength": 1},
+                    "assessment_prompt": {"type": "string", "minLength": 1},
+                    "nodes": {
+                        "type": "array",
+                        "minItems": 3,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "stable_key": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 64,
+                                    "pattern": "^[a-z][a-z0-9-]*$",
+                                },
+                                "kind": {
+                                    "enum": ["agent", "deterministic"],
+                                },
+                                "member_key": {"type": "string"},
+                                "operation": {
+                                    "enum": ["", "collect"],
+                                },
+                                "prompt": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                },
+                                "parameters": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                },
+                                "bindings": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                },
+                                "expected_output": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                },
+                                "resources": {
+                                    "type": "array",
+                                    "uniqueItems": True,
+                                    "items": {
+                                        "enum": [
+                                            "checkout:read",
+                                            "checkout:write",
+                                            "diff:read",
+                                            "issue:read",
+                                            "validation:read",
+                                            "workspace:read",
+                                            "workspace:write",
+                                        ]
+                                    },
+                                },
+                            },
+                            "required": [
+                                "stable_key",
+                                "kind",
+                                "member_key",
+                                "operation",
+                                "prompt",
+                                "parameters",
+                                "bindings",
+                                "expected_output",
+                                "resources",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "edges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "source": {"type": "string"},
+                                "target": {"type": "string"},
+                            },
+                            "required": ["source", "target"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": [
+                    "rationale",
+                    "assessment_prompt",
+                    "nodes",
+                    "edges",
+                ],
+                "additionalProperties": False,
+            },
         },
-        "required": ["members"],
+        "required": ["members", "workflow"],
         "additionalProperties": False,
     }
 
@@ -353,7 +459,7 @@ class EvidenceTeamFormulator:
         self.timeout = timeout
         self.action_timeout_seconds = action_timeout_seconds
 
-    def formulate(self, inspection: InspectionEvidence) -> list[dict[str, object]]:
+    def formulate(self, inspection: InspectionEvidence) -> TeamDesign:
         prompt = _team_design_prompt(inspection)
         model = self.model
         base_url = self.base_url
@@ -368,79 +474,130 @@ class EvidenceTeamFormulator:
             api_key=api_key,
             timeout=self.timeout,
         )
-        state_directory = (
-            self.state_root
-            / uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                prompt,
-            ).hex
-        )
-        value = inference.infer(
-            system_prompt=(
-                "Return exactly one JSON object matching the requested schema "
-                "and no prose."
-            ),
-            prompt=prompt,
-            response_schema=self._RESPONSE_SCHEMA,
-            state_directory=state_directory,
-        )
-        if not isinstance(value, dict) or not isinstance(value.get("members"), list):
-            raise ValueError("repository team design must contain a members array")
-        instruction_text = _team_instruction_text(inspection)
-        members: list[dict[str, object]] = []
-        for value_member in value["members"]:
-            if not isinstance(value_member, dict):
-                raise ValueError("repository team member design must be an object")
-            role = value_member.get("role")
-            if not isinstance(role, str):
-                raise ValueError("repository team member role must be a string")
-            stable_key = value_member.get("stable_key")
-            responsibilities = value_member.get("responsibilities")
-            tools = value_member.get("permitted_tools")
-            coordinates = value_member.get("coordinates")
-            independent_verifier = value_member.get("independent_verifier")
-            if not isinstance(stable_key, str) or not stable_key.strip():
-                raise ValueError("repository team member stable_key must be nonempty")
-            if not isinstance(responsibilities, str) or not responsibilities.strip():
-                raise ValueError(
-                    "repository team member responsibilities must be nonempty"
-                )
-            if not isinstance(tools, list):
-                raise ValueError(
-                    "repository team member permitted_tools must be an array"
-                )
-            if not isinstance(coordinates, bool) or not isinstance(
-                independent_verifier,
-                bool,
-            ):
-                raise ValueError(
-                    "repository team coordination markers must be booleans"
-                )
-            execution_class = _member_execution_class(
-                coordinates=coordinates,
-                independent_verifier=independent_verifier,
-                permitted_tools=tools,
+        for attempt in range(2):
+            state_directory = (
+                self.state_root
+                / uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    prompt,
+                ).hex
             )
-            members.append(
-                {
-                    "stable_key": stable_key.strip(),
-                    "role": role.strip(),
-                    "execution_class": execution_class,
-                    "coordinates": coordinates,
-                    "independent_verifier": independent_verifier,
-                    "responsibilities": responsibilities.strip(),
-                    "permitted_tools": list(tools),
-                    "runtime": self.runtime,
-                    "model": self._model_for_execution_class(
-                        execution_class,
-                        model,
-                    ),
-                    "instructions": instruction_text,
-                    "action_timeout_seconds": self.action_timeout_seconds,
-                }
+            value = inference.infer(
+                system_prompt=(
+                    "Return exactly one JSON object matching the requested "
+                    "schema and no prose."
+                ),
+                prompt=prompt,
+                response_schema=self._RESPONSE_SCHEMA,
+                state_directory=state_directory,
             )
-        validate_team_members(members)
-        return members
+            try:
+                return self._design_from_value(value, inspection, model)
+            except _InvalidTeamDesign as error:
+                if attempt == 1:
+                    raise
+                prompt = _team_design_correction_prompt(prompt, error)
+        raise AssertionError("unreachable team formulation attempt")
+
+    def _design_from_value(
+        self,
+        value: object,
+        inspection: InspectionEvidence,
+        model: str,
+    ) -> TeamDesign:
+        try:
+            if not isinstance(value, dict):
+                raise ValueError("repository team design must be an object")
+            raw_members = value.get("members")
+            if not isinstance(raw_members, list):
+                raise ValueError(
+                    "repository team design must contain a members array"
+                )
+            instruction_text = _team_instruction_text(inspection)
+            members: list[dict[str, object]] = []
+            for value_member in raw_members:
+                if not isinstance(value_member, dict):
+                    raise ValueError(
+                        "repository team member design must be an object"
+                    )
+                role = value_member.get("role")
+                if not isinstance(role, str):
+                    raise ValueError(
+                        "repository team member role must be a string"
+                    )
+                stable_key = value_member.get("stable_key")
+                responsibilities = value_member.get("responsibilities")
+                tools = value_member.get("permitted_tools")
+                coordinates = value_member.get("coordinates")
+                independent_verifier = value_member.get("independent_verifier")
+                if not isinstance(stable_key, str) or not stable_key.strip():
+                    raise ValueError(
+                        "repository team member stable_key must be nonempty"
+                    )
+                if (
+                    not isinstance(responsibilities, str)
+                    or not responsibilities.strip()
+                ):
+                    raise ValueError(
+                        "repository team member responsibilities must be "
+                        "nonempty"
+                    )
+                if not isinstance(tools, list):
+                    raise ValueError(
+                        "repository team member permitted_tools must be an "
+                        "array"
+                    )
+                if not isinstance(coordinates, bool) or not isinstance(
+                    independent_verifier,
+                    bool,
+                ):
+                    raise ValueError(
+                        "repository team coordination markers must be booleans"
+                    )
+                execution_class = _member_execution_class(
+                    coordinates=coordinates,
+                    independent_verifier=independent_verifier,
+                    permitted_tools=tools,
+                )
+                members.append(
+                    {
+                        "stable_key": stable_key.strip(),
+                        "role": role.strip(),
+                        "execution_class": execution_class,
+                        "coordinates": coordinates,
+                        "independent_verifier": independent_verifier,
+                        "responsibilities": responsibilities.strip(),
+                        "permitted_tools": list(tools),
+                        "runtime": self.runtime,
+                        "model": model.strip(),
+                        "instructions": instruction_text,
+                        "action_timeout_seconds": self.action_timeout_seconds,
+                    }
+                )
+            validate_team_members(members)
+            workflow_value = value.get("workflow")
+            if not isinstance(workflow_value, Mapping):
+                raise ValueError(
+                    "repository team design must contain a workflow object"
+                )
+            workflow = validate_workflow_design(
+                workflow_value,
+                members,
+                DeterministicOperationRegistry.with_defaults().catalog(),
+            )
+        except ValueError as error:
+            raise _InvalidTeamDesign(str(error)) from error
+        resolved_members = tuple(
+            dict(
+                member,
+                model=self._model_for_execution_class(
+                    str(member["execution_class"]),
+                    model,
+                ),
+            )
+            for member in members
+        )
+        return TeamDesign(members=resolved_members, workflow=workflow)
 
     def _model_for_execution_class(
         self,
@@ -461,31 +618,60 @@ class EvidenceTeamFormulator:
 
 def _team_design_prompt(inspection: InspectionEvidence) -> str:
     task = (
-        "Design the complete persistent development team for this repository "
-        "from the supplied evidence. Design repository-specific atomic role "
-        "names: each member owns one bounded concern, and you choose how many "
-        "members are warranted, their stable identities, role names, "
-        "responsibilities, and controller-tool permissions. Do not choose "
-        "from a controller-authored role taxonomy. Mark exactly one member as "
-        "coordinates=true. That coordinating member decomposes work, assigns "
-        "members, coordinates dependencies, integrates their outputs, and "
-        "decides readiness; it must not implement or verify repository "
-        "changes. Mark exactly one different member as "
-        "independent_verifier=true. Keep implementation and independent "
-        "verification in separate roles. Include actual development capacity "
-        "even for a small repository; never return only a coordinator and "
-        "verifier. This is a reusable repository team, not an assignment for "
-        "one issue. Choose permitted tools only from read, write, run, "
-        "git_diff, and git_commit. Return only roles and specialization "
-        "supported by the repository evidence."
+        "Design the complete persistent development team and reusable "
+        "workflow graph for this repository from the supplied evidence. "
+        "Design repository-specific atomic role names: each member owns "
+        "one bounded concern, and you choose how many members are "
+        "warranted, their stable identities, role names, responsibilities, "
+        "and controller-tool permissions. Do not choose from a "
+        "controller-authored role taxonomy. Mark exactly one member as "
+        "coordinates=true and give that member exactly one workflow node. "
+        "Every other non-verifier node must reach that coordinating node, "
+        "which must then reach the terminal independent-verifier node. Do "
+        "not emit a separate pre-work coordinator node; issue-member "
+        "selection is controller-owned. The coordinator integrates outputs "
+        "and assesses team performance; it must not implement or verify "
+        "repository changes. Mark exactly one different member as "
+        "independent_verifier=true, "
+        "and make its workflow node terminal. Keep implementation and "
+        "independent verification in separate roles. Include actual "
+        "development capacity even for a small repository. Design an "
+        "acyclic node graph rather than a serial role list. Use fan-out "
+        "for independent work, explicit join nodes for multi-input "
+        "handoffs, and serialize only real dependencies or conflicting "
+        "writes. Every agent node needs a node-specific objective, "
+        "expected output schema, handoff bindings, and least-authority "
+        "resources. Agent nodes must reference stored member stable keys. "
+        "Every agent resource claim must match a tool held by its stored "
+        "member through workflow_contract.resource_tool_requirements. "
+        "Coordinators and independent verifiers must follow "
+        "workflow_contract.role_resource_restrictions. "
+        "Registered deterministic nodes may use only operations from "
+        "workflow_contract.operations; never emit executable source, "
+        "shell expressions, environment or secret values. The "
+        "coordinator's assessment prompt must require evidence-based "
+        "retain or adjust decisions for prompts, dependencies, joins, and "
+        "specialist selection. This is a reusable repository team and "
+        "orchestration template, not one issue's implementation plan. "
+        "Choose member tools only from read, write, run, git_diff, and "
+        "git_commit. Keep prompts concrete and bounded: name the "
+        "repository evidence to inspect, the typed result to return, and "
+        "the downstream handoff. The compiled issue graph includes only "
+        "assigned issue members, the mandatory coordinator and verifier, "
+        "and connecting deterministic nodes."
     )
     repository = {
         "languages": list(getattr(inspection, "languages", ())),
         "manifests": list(getattr(inspection, "manifests", ())),
         "lockfiles": list(getattr(inspection, "lockfiles", ())),
-        "instruction_files": list(getattr(inspection, "instruction_files", ())),
+        "instruction_files": list(
+            getattr(inspection, "instruction_files", ())
+        ),
         "validation_commands": [
-            list(command) for command in getattr(inspection, "validation_commands", ())
+            list(command)
+            for command in getattr(
+                inspection, "validation_commands", ()
+            )
         ],
         "file_count": inspection.file_count,
         "summary": _bounded_text(inspection.summary, 8_000),
@@ -493,12 +679,73 @@ def _team_design_prompt(inspection: InspectionEvidence) -> str:
             getattr(inspection, "source_files", ()),
             _TEAM_SOURCE_FILE_LIMIT_BYTES,
         ),
-        "instructions": _bounded_instructions(getattr(inspection, "instructions", ())),
+        "instructions": _bounded_instructions(
+            getattr(inspection, "instructions", ())
+        ),
     }
     prompt = json.dumps(
         {
             "task": task,
             "repository": repository,
+            "workflow_contract": {
+                "contract_version": 1,
+                "operations": (
+                    DeterministicOperationRegistry.with_defaults().catalog()
+                ),
+                "resources": {
+                    resource: {
+                        "access": "exclusive"
+                        if resource.endswith(":write")
+                        else "shared"
+                    }
+                    for resource in (
+                        "checkout:read",
+                        "checkout:write",
+                        "diff:read",
+                        "issue:read",
+                        "validation:read",
+                        "workspace:read",
+                        "workspace:write",
+                    )
+                },
+                "resource_tool_requirements": (
+                    workflow_resource_tool_requirements()
+                ),
+                "role_resource_restrictions": {
+                    "coordinator": "no write resources",
+                    "independent_verifier": "no write resources",
+                },
+                "topology": {
+                    "all_other_nodes_reach_coordinator": True,
+                    "coordinator_agent_node_count": 1,
+                    "coordinator_reaches_verifier": True,
+                    "independent_verifier_agent_node_count": 1,
+                    "independent_verifier_terminal": True,
+                },
+                "scheduling": (
+                    "dependency-ready nodes may run concurrently when their "
+                    "declared resource claims do not conflict. Writes are "
+                    "serialized only against overlapping reads or writes."
+                ),
+                "compilation": (
+                    "The controller compiles assigned issue members plus the "
+                    "mandatory coordinator and independent verifier into an "
+                    "immutable exact issue-version graph."
+                ),
+                "safety": (
+                    "Execution is controller-owned. Node prompts and "
+                    "parameters contain no executable code or secrets; "
+                    "member tools and node resource claims both authorize "
+                    "every action."
+                ),
+                "controller_boundaries": [
+                    "source graph",
+                    "exact-SHA validation",
+                    "independent acceptance",
+                    "publication",
+                    "feedback resolution",
+                ],
+            },
             "response_schema": {
                 "members": [
                     {
@@ -507,9 +754,31 @@ def _team_design_prompt(inspection: InspectionEvidence) -> str:
                         "coordinates": "boolean",
                         "independent_verifier": "boolean",
                         "responsibilities": "one bounded responsibility",
-                        "permitted_tools": ["read|write|run|git_diff|git_commit"],
+                        "permitted_tools": [
+                            "read|write|run|git_diff|git_commit"
+                        ],
                     }
-                ]
+                ],
+                "workflow": {
+                    "rationale": "why this topology fits the repository",
+                    "assessment_prompt": (
+                        "how the coordinator assesses and adjusts"
+                    ),
+                    "nodes": [
+                        {
+                            "stable_key": "node identity",
+                            "kind": "agent|deterministic",
+                            "member_key": "stored member key or empty",
+                            "operation": "collect or empty",
+                            "prompt": "node-specific objective and handoff",
+                            "parameters": {},
+                            "bindings": {},
+                            "expected_output": {"type": "object"},
+                            "resources": ["workspace:read"],
+                        }
+                    ],
+                    "edges": [{"source": "node", "target": "node"}],
+                },
             },
         },
         ensure_ascii=False,
@@ -517,8 +786,37 @@ def _team_design_prompt(inspection: InspectionEvidence) -> str:
         sort_keys=True,
     )
     if len(prompt.encode("utf-8")) > _TEAM_DESIGN_PROMPT_LIMIT_BYTES:
-        raise RuntimeError("fixed repository team-design context exceeds prompt limit")
+        raise RuntimeError(
+            "fixed repository team-design context exceeds prompt limit"
+        )
     return prompt
+
+
+def _team_design_correction_prompt(prompt: str, error: ValueError) -> str:
+    packet = json.loads(prompt)
+    if not isinstance(packet, dict):
+        raise AssertionError("team design prompt must be an object")
+    packet["correction"] = {
+        "attempt": 2,
+        "rejected_reason": _bounded_text(str(error), 1_000),
+        "instruction": (
+            "The prior response was rejected by the controller. Return one "
+            "complete replacement team and workflow matching the full "
+            "contract. Do not patch the prior response, expand member "
+            "permissions, or omit required work."
+        ),
+    }
+    corrected = json.dumps(
+        packet,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if len(corrected.encode("utf-8")) > _TEAM_DESIGN_PROMPT_LIMIT_BYTES:
+        raise RuntimeError(
+            "corrected repository team-design context exceeds prompt limit"
+        )
+    return corrected
 
 
 def _team_instruction_text(inspection: InspectionEvidence) -> str:

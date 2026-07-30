@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 from .controller import RunProcessSupervisor
 from .database import Database
@@ -12,13 +14,24 @@ from .lifecycle import RunLifecycle, RunState
 from .mini_swe import MINI_SWE_RUNTIME, MiniSweInference
 from .sandbox import (
     Mount,
+    RestrictedNetworkPolicy,
     RunLayout,
     SandboxManager,
     SandboxPolicy,
     SecretScanner,
     redact_text,
 )
+from .specification import SpecificationService
 from .team import Assignment, StoredTeam, TeamMember, TeamService
+from .workflow import (
+    DeterministicOperationRegistry,
+    WorkflowCanceled,
+    WorkflowExecutionEngine,
+    WorkflowExecutionError,
+    WorkflowNodeContext,
+    WorkflowTemplate,
+    WorkflowService,
+)
 from .validation import compare_findings, extract_findings
 
 _ACTION_HISTORY_LIMIT = 2_000
@@ -54,6 +67,7 @@ _ACTION_FIELD_ORDER = (
     "action",
     "path",
     "argv",
+    "dependency_services",
     "start",
     "end",
     "pattern",
@@ -61,6 +75,7 @@ _ACTION_FIELD_ORDER = (
     "members",
     "reason",
     "summary",
+    "output",
     "old",
     "new",
     "content",
@@ -69,6 +84,7 @@ _ACTION_STRING_LIMITS = {
     "action": 64,
     "path": 1_024,
     "argv": 96,
+    "dependency_services": 253,
     "pattern": 512,
     "reason": 512,
     "summary": 512,
@@ -434,11 +450,15 @@ class MiniSweModelRuntime:
 {"action":"search","path":"relative/path","pattern":"regex"}
 {"action":"write","path":"relative/file","content":"complete UTF-8 content"}
 {"action":"replace","path":"relative/file","old":"exact text","new":"replacement","count":1}
-{"action":"run","argv":["program","arg"],"timeout":120}
+{"action":"run","argv":["program","arg"],"timeout":120,"dependency_services":["exact-package-host.example:443"]}
+If a required package, toolchain, or browser is missing, retrieve it yourself inside the sandbox. Add only its exact public HTTP/HTTPS hosts to dependency_services for that run action, install reusable files beneath /run-data/dependency-delta, and invoke them from there in later actions. The controller grants those hosts only to that action; direct, private, wildcard, and undeclared network access remains blocked. Do not block merely because a dependency was not preinstalled.
+{"action":"git_diff"}
 {"action":"assign","members":["lead","member-key"],"reason":"why these stored members are needed"}
+{"action":"specify","issue_version_id":"immutable issue version id","items":[{"key":"stable-key","title":"concise title","objective":"bounded behavior","acceptance_criteria":[{"key":"criterion-key","requirement":"required observable behavior","expected":"specific expected observation"}],"verification":[{"key":"verification-key","criterion_keys":["criterion-key"],"scenario":"scenario that observes the criteria"}]}],"reason":"why this specification matches the issue"} (lead only; required before assignment or source mutation)
+{"action":"review_specification","specification_revision_id":"immutable revision id","verdict":"approved|rejected|blocked","summary":"concise semantic conclusion","findings":[{"key":"finding-key","category":"coverage|clarity|observability|feasibility|consistency|repository-alignment|scope","severity":"warning|error","summary":"specific semantic finding","item_keys":["specification-item-key"]}],"blocker":"required only for an irreducible blocked verdict"} (independent verifier only)
 {"action":"revise","members":["member-key"],"reason":"why these assigned implementers must run again"}
 {"action":"note","summary":"concise findings and exact next action"}
-{"action":"finish","summary":"implemented behavior and why it satisfies the issue"}
+{"action":"finish","summary":"concise result","output":{"field":"typed node result"}} (workflow nodes must include output matching their expected schema)
 {"action":"block","reason":"specific irreducible missing or contradictory prerequisite"} (lead only; non-leads finish with blocker evidence for the lead)
 Read before editing. Do not reread evidence already present in action history unless its result was incomplete or the source changed. Once inspection supports a decision, persist one concise note with the findings and exact next action, then execute that action instead of continuing to inspect. After a note, the next decision must execute the stated action; the controller rejects another note until a repository write or replacement succeeds. Only the stored lead may assign or request a targeted revision. Before issue work begins, the lead must select the initial assignment. If a later issue revision, feedback item, or base conflict requires stored-team responsibilities or permissions outside the current assignment, the lead may expand it by emitting the complete strict superset of selected member keys; never remove or replace an assigned member. If later work instead requires one or more already-assigned implementers to run again, the lead may request those exact members with a revise action; never select the lead, verifier, unassigned members, or duplicate keys. A note neither finishes nor blocks the work. Keep changes strictly in issue scope. Do not create or retain plans, specification ledgers, coordination files, agent instructions, or other process artifacts in the repository; change only product source, repository-required tests, and directly required configuration. Never publish, merge, close, push, expose credentials, or invent missing external resources."""
     _RESPONSE_SCHEMA: dict[str, object] = {
@@ -452,7 +472,10 @@ Read before editing. Do not reread evidence already present in action history un
                     "write",
                     "replace",
                     "run",
+                    "git_diff",
                     "assign",
+                    "specify",
+                    "review_specification",
                     "revise",
                     "note",
                     "finish",
@@ -472,12 +495,36 @@ Read before editing. Do not reread evidence already present in action history un
                 "items": {"type": "string"},
             },
             "timeout": {"type": "number"},
+            "dependency_services": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 16,
+                "uniqueItems": True,
+            },
             "members": {
                 "type": "array",
                 "items": {"type": "string"},
             },
             "reason": {"type": "string"},
+            "issue_version_id": {"type": "string"},
+            "specification_revision_id": {"type": "string"},
+            "items": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": True},
+            },
+            "verdict": {
+                "enum": ["approved", "rejected", "blocked"],
+            },
+            "findings": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": True},
+            },
+            "blocker": {"type": "string"},
             "summary": {"type": "string"},
+            "output": {
+                "type": "object",
+                "additionalProperties": True,
+            },
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -607,6 +654,54 @@ def _probe_runtime_environment(
     return {environment_name: environment_value}
 
 
+_MAX_ACTION_DEPENDENCY_SERVICES = 16
+_DEPENDENCY_SERVICE_PORTS = frozenset((80, 443))
+
+
+def _action_dependency_services(
+    action: Mapping[str, object],
+) -> tuple[str, ...]:
+    value = action.get("dependency_services")
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("run action dependency_services must be a list")
+    if len(value) > _MAX_ACTION_DEPENDENCY_SERVICES:
+        raise ValueError(
+            "run action dependency_services exceeds the 16-service limit"
+        )
+    services: list[str] = []
+    for index, item in enumerate(value):
+        if (
+            not isinstance(item, str)
+            or not item
+            or len(item) > 253
+        ):
+            raise ValueError(
+                f"dependency_services[{index}] must be a bounded host:port"
+            )
+        try:
+            host, port = RestrictedNetworkPolicy._parse_rule(item)
+        except (UnicodeError, ValueError) as error:
+            raise ValueError(
+                f"dependency_services[{index}] must be an exact public "
+                "HTTP or HTTPS host:port"
+            ) from error
+        if (
+            host.startswith("*.")
+            or port not in _DEPENDENCY_SERVICE_PORTS
+            or any(character in host for character in "/@?#[]:")
+        ):
+            raise ValueError(
+                f"dependency_services[{index}] must be an exact public "
+                "HTTP or HTTPS host:port"
+            )
+        service = f"{host}:{port}"
+        if service not in services:
+            services.append(service)
+    return tuple(services)
+
+
 class AgentToolExecutor:
     _TOOL_PERMISSION = {
         "list": "read",
@@ -615,6 +710,7 @@ class AgentToolExecutor:
         "write": "write",
         "replace": "write",
         "run": "run",
+        "git_diff": "git_diff",
     }
 
     def __init__(self, sandbox: SandboxManager) -> None:
@@ -628,6 +724,7 @@ class AgentToolExecutor:
         action: dict[str, object],
         secrets: dict[str, str] | None = None,
         checkout_writable: bool = True,
+        workflow_resources: tuple[str, ...] | None = None,
     ) -> str:
         name = action.get("action")
         if not isinstance(name, str) or name not in self._TOOL_PERMISSION:
@@ -635,22 +732,60 @@ class AgentToolExecutor:
         permission = self._TOOL_PERMISSION[name]
         if permission not in member.permitted_tools:
             raise PermissionError(
-                f"stored team member {member.stable_key} is not permitted to use {permission}"
+                f"stored team member {member.stable_key} is not "
+                f"permitted to use {permission}"
             )
+        if workflow_resources is not None:
+            claims = set(workflow_resources)
+            readable = bool(
+                claims
+                & {
+                    "checkout:read",
+                    "checkout:write",
+                    "workspace:read",
+                    "workspace:write",
+                }
+            )
+            writable = bool(
+                claims & {"checkout:write", "workspace:write"}
+            )
+            runnable = writable or "validation:read" in claims
+            diffable = "diff:read" in claims
+            authorized = (
+                readable
+                if name in {"list", "read", "search"}
+                else writable
+                if name in {"write", "replace"}
+                else diffable
+                if name == "git_diff"
+                else runnable
+            )
+            if not authorized:
+                raise PermissionError(
+                    "workflow node resources do not permit agent action "
+                    f"{name}"
+                )
+            checkout_writable = checkout_writable and writable
         if name == "run":
             argv = action.get("argv")
             if (
                 not isinstance(argv, list)
                 or not argv
-                or not all(isinstance(argument, str) and argument for argument in argv)
+                or not all(
+                    isinstance(argument, str) and argument
+                    for argument in argv
+                )
             ):
-                raise ValueError("run action argv must be a nonempty string array")
+                raise ValueError(
+                    "run action argv must be a nonempty string array"
+                )
             timeout_value = action.get("timeout", 120)
             if isinstance(timeout_value, bool) or not isinstance(
                 timeout_value, (int, float)
             ):
                 raise ValueError("run action timeout must be a number")
             timeout = min(max(float(timeout_value), 1), 300)
+            dependency_services = _action_dependency_services(action)
             runtime_environment = _probe_runtime_environment(action)
             command = tuple(argv)
             if runtime_environment is not None:
@@ -663,8 +798,18 @@ class AgentToolExecutor:
                     f"{environment_name}={environment_value}",
                     *command,
                 )
+            effective_policy = policy
+            if dependency_services:
+                effective_policy = replace(
+                    policy,
+                    allowed_services=tuple(
+                        dict.fromkeys(
+                            (*policy.allowed_services, *dependency_services)
+                        )
+                    ),
+                )
             result = self.sandbox.run(
-                policy,
+                effective_policy,
                 layout,
                 command,
                 timeout=timeout,
@@ -682,13 +827,46 @@ class AgentToolExecutor:
             }
             if runtime_environment is not None:
                 payload["configured_environment"] = runtime_environment
+            if dependency_services:
+                payload["dependency_services"] = list(dependency_services)
             return json.dumps(
                 payload,
                 sort_keys=True,
                 separators=(",", ":"),
             )
+        if name == "git_diff":
+            result = self.sandbox.run(
+                policy,
+                layout,
+                (
+                    "git",
+                    "--no-pager",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--",
+                ),
+                timeout=60,
+                secrets=secrets,
+                checkout_writable=False,
+            )
+            if result.canceled:
+                raise _RunCanceled(layout.run_id)
+            return json.dumps(
+                {
+                    "returncode": result.returncode,
+                    "stdout": result.stdout[-32_000:],
+                    "stderr": result.stderr[-32_000:],
+                    "timed_out": result.timed_out,
+                    "log_path": str(result.log_path),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         encoded = base64.urlsafe_b64encode(
-            json.dumps(action, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            json.dumps(
+                action, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
         ).rstrip(b"=")
         result = self.sandbox.run(
             policy,
@@ -764,7 +942,15 @@ class ExecutionService:
         self.secret_resolver = secret_resolver
         self.process_supervisor = process_supervisor
         self.tools = AgentToolExecutor(sandbox)
+        self.workflow_operations = (
+            DeterministicOperationRegistry.with_defaults()
+        )
+        self.workflows = WorkflowService(
+            database,
+            registry=self.workflow_operations,
+        )
         self.scanner = SecretScanner()
+        self.specifications = SpecificationService(database)
 
     def execute(
         self,
@@ -821,6 +1007,117 @@ class ExecutionService:
             return None
         transcript = self._load_transcript(layout)
         assignments = self.teams.assignments_for_run(run_id)
+        try:
+            workflow_template = self.workflows.load_template(
+                str(run["team_version_id"])
+            )
+        except KeyError:
+            workflow_template = None
+        workflow_assignment_contract = (
+            self._workflow_assignment_contract(workflow_template)
+            if workflow_template is not None
+            else None
+        )
+        specification = self.specifications.current(run_id, issue_version_id)
+        specification_context_sha256 = (
+            hashlib.sha256(additional_context.encode("utf-8")).hexdigest()
+            if additional_context
+            else None
+        )
+        base_context = self._base_prompt(
+            run,
+            issue,
+            sandbox_row,
+            team,
+            assignments,
+            additional_context,
+            workflow_assignment_contract,
+            specification,
+        )
+        context_binding = (
+            self.specifications.context_binding(
+                run_id,
+                issue_version_id,
+                specification_context_sha256,
+            )
+            if specification_context_sha256 is not None
+            else None
+        )
+        context_requires_reconciliation = (
+            specification_context_sha256 is not None
+            and (
+                specification is None
+                or context_binding is None
+                or context_binding["specification_revision_id"]
+                != specification["id"]
+            )
+        )
+        if specification is None or context_requires_reconciliation:
+            specification_prompt = base_context
+            if specification_context_sha256 is not None:
+                specification_prompt = self._specification_reconciliation_prompt(
+                    base_context,
+                    specification,
+                )
+            self._agent_cycle(
+                self._runtime(lead, run_id),
+                lead,
+                policy,
+                layout,
+                specification_prompt,
+                transcript,
+                secret_bindings,
+                resolved_secret_values,
+                require_specification=True,
+                specification_context_sha256=specification_context_sha256,
+                checkout_writable=False,
+            )
+            return None
+        review = specification.get("review")
+        if not isinstance(review, dict):
+            verifier = next(
+                member for member in team.members if member.independent_verifier
+            )
+            self._agent_cycle(
+                self._runtime(verifier, run_id),
+                verifier,
+                policy,
+                layout,
+                self._specification_review_prompt(base_context, specification),
+                transcript,
+                secret_bindings,
+                resolved_secret_values,
+                require_specification_review=True,
+                checkout_writable=False,
+            )
+            return None
+        review_verdict = str(review.get("verdict") or "")
+        if review_verdict == "rejected":
+            self._agent_cycle(
+                self._runtime(lead, run_id),
+                lead,
+                policy,
+                layout,
+                base_context,
+                transcript,
+                secret_bindings,
+                resolved_secret_values,
+                require_specification=True,
+                supersede_specification_id=str(specification["id"]),
+                specification_context_sha256=specification_context_sha256,
+                checkout_writable=False,
+            )
+            return None
+        if review_verdict == "blocked":
+            blocker = str(review.get("blocker") or "specification review blocked")
+            self.lifecycle.transition(
+                run_id,
+                RunState.BLOCKED,
+                reason=blocker,
+            )
+            return None
+        if review_verdict != "approved":
+            raise RuntimeError("stored specification review verdict is invalid")
         if assignments and not any(
             assignment.member.independent_verifier for assignment in assignments
         ):
@@ -836,9 +1133,16 @@ class ExecutionService:
                 "Complete the existing assignment with mandatory independent review.",
             )
             assignments = self.teams.assignments_for_run(run_id)
-        base_context = self._base_prompt(
-            run, issue, sandbox_row, team, assignments, additional_context
-        )
+            base_context = self._base_prompt(
+                run,
+                issue,
+                sandbox_row,
+                team,
+                assignments,
+                additional_context,
+                workflow_assignment_contract,
+                specification,
+            )
         if not assignments:
             self._agent_cycle(
                 self._runtime(lead, run_id),
@@ -853,6 +1157,23 @@ class ExecutionService:
                 require_assignment=True,
             )
             return None
+        if workflow_template is not None:
+            return self._execute_workflow(
+                run=run,
+                issue=issue,
+                sandbox_row=sandbox_row,
+                team=team,
+                lead=lead,
+                policy=policy,
+                layout=layout,
+                base_context=base_context,
+                secret_bindings=secret_bindings,
+                resolved_secret_values=resolved_secret_values,
+                revision_context=additional_context,
+                source_base_sha=source_base_sha,
+                issue_version_id=issue_version_id,
+                resume_validation=resume_validation,
+            )
         runtime = self._runtime(lead, run_id)
         for cycle in range(self.max_revision_cycles):
             if not (resume_validation and cycle == 0):
@@ -1008,6 +1329,555 @@ class ExecutionService:
             self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
         raise AssertionError("unreachable revision loop")
 
+    def _execute_workflow(
+        self,
+        *,
+        run: dict[str, object],
+        issue: dict[str, object],
+        sandbox_row: dict[str, object],
+        team: StoredTeam,
+        lead: TeamMember,
+        policy: SandboxPolicy,
+        layout: RunLayout,
+        base_context: str,
+        secret_bindings: tuple[SecretBinding, ...],
+        resolved_secret_values: set[str],
+        revision_context: str | None,
+        source_base_sha: str,
+        issue_version_id: str,
+        resume_validation: bool,
+    ) -> str | None:
+        del sandbox_row
+        run_id = str(run["id"])
+        members = {member.stable_key: member for member in team.members}
+        self.workflows.compile_run(run_id, issue_version_id)
+        if revision_context:
+            self._revise_workflow_from_feedback(
+                run_id=run_id,
+                lead=lead,
+                policy=policy,
+                layout=layout,
+                base_context=base_context,
+                feedback=revision_context,
+                secret_bindings=secret_bindings,
+                resolved_secret_values=resolved_secret_values,
+            )
+
+        def agent_runner(context: WorkflowNodeContext) -> Mapping[str, object]:
+            if context.member_key is None or context.member_key not in members:
+                raise WorkflowExecutionError(
+                    f"workflow node {context.stable_key} has no stored member"
+                )
+            member = members[context.member_key]
+            node_layout = self._workflow_layout(
+                layout,
+                f"node-{context.node_id}",
+            )
+            transcript = self._load_transcript(node_layout)
+            outcome, yielded = self._agent_cycle(
+                self._runtime(member, run_id),
+                member,
+                policy,
+                node_layout,
+                self._workflow_node_prompt(base_context, member, context),
+                transcript,
+                secret_bindings,
+                resolved_secret_values,
+                workflow_resources=context.resources,
+            )
+            if yielded:
+                raise WorkflowExecutionError(
+                    f"workflow node {context.stable_key} exhausted its "
+                    "action quantum"
+                )
+            if outcome is None:
+                raise WorkflowExecutionError(
+                    f"workflow node {context.stable_key} did not produce "
+                    "an output"
+                )
+            if isinstance(outcome, Mapping):
+                return dict(outcome)
+            return {"summary": outcome}
+
+        def assessment_runner(
+            payload: dict[str, object],
+        ) -> Mapping[str, object]:
+            return self._run_workflow_assessment(
+                run_id=run_id,
+                lead=lead,
+                policy=policy,
+                layout=layout,
+                base_context=base_context,
+                payload=payload,
+                secret_bindings=secret_bindings,
+                resolved_secret_values=resolved_secret_values,
+            )
+
+        engine = WorkflowExecutionEngine(
+            database=self.database,
+            workflow=self.workflows,
+            agent_runner=agent_runner,
+            operations=self.workflow_operations,
+            assessment_runner=assessment_runner,
+            cancellation_check=self._is_canceled,
+            known_secret_values=lambda _run_id: tuple(resolved_secret_values),
+            max_workers=4,
+            max_generations=max(2, self.max_revision_cycles + 1),
+        )
+        for cycle in range(self.max_revision_cycles):
+            if not (resume_validation and cycle == 0):
+                graph = self.workflows.active_run_graph(run_id)
+                accepted = (
+                    graph.state == "succeeded"
+                    and isinstance(graph.assessment, Mapping)
+                    and graph.assessment.get("outcome") == "accept"
+                )
+                if not accepted:
+                    try:
+                        engine.execute(run_id)
+                    except WorkflowCanceled:
+                        return None
+            try:
+                self._ensure_not_canceled(run_id)
+                state = RunState(str(self.lifecycle.get_run(run_id)["state"]))
+                if state in {
+                    RunState.IMPLEMENTING,
+                    RunState.RESOLVING_FEEDBACK,
+                }:
+                    self.lifecycle.transition(
+                        run_id,
+                        RunState.VALIDATING,
+                    )
+                self._ensure_not_canceled(run_id)
+                commit_sha = self._commit(
+                    run,
+                    issue,
+                    policy,
+                    layout,
+                    resolved_secret_values,
+                    source_base_sha,
+                )
+            except _RunCanceled:
+                return None
+            except RevisionRequired as error:
+                if self._is_canceled(run_id):
+                    return None
+                feedback = redact_text(str(error), resolved_secret_values)
+                self.lifecycle.transition(
+                    run_id,
+                    RunState.IMPLEMENTING,
+                    reason=(
+                        "continuing automatically after workflow commit "
+                        "preparation feedback"
+                    ),
+                )
+                self._revise_workflow_from_feedback(
+                    run_id=run_id,
+                    lead=lead,
+                    policy=policy,
+                    layout=layout,
+                    base_context=base_context,
+                    feedback=(
+                        "Commit preparation rejected the candidate:\n"
+                        + feedback
+                    ),
+                    secret_bindings=secret_bindings,
+                    resolved_secret_values=resolved_secret_values,
+                )
+                if cycle + 1 >= self.max_revision_cycles:
+                    return None
+                continue
+            try:
+                passed, validation_feedback = self._validate(
+                    run_id,
+                    commit_sha,
+                    str(run["sandbox_version_id"]),
+                    policy,
+                    layout,
+                    secret_bindings,
+                    resolved_secret_values,
+                    source_base_sha,
+                )
+            except _RunCanceled:
+                return None
+            except (MissingValidationCommands, BaselineUnavailable) as error:
+                if self._is_canceled(run_id):
+                    return None
+                self.lifecycle.transition(
+                    run_id,
+                    RunState.BLOCKED,
+                    reason=str(error),
+                )
+                return None
+            except Exception:
+                if self._is_canceled(run_id):
+                    return None
+                raise
+            if self._is_canceled(run_id):
+                return None
+            if passed:
+                self._ensure_not_canceled(run_id)
+                if not self.lifecycle.record_validated_revision(
+                    run_id,
+                    commit_sha,
+                    issue_version_id,
+                ):
+                    return None
+                self._clear_transcript(layout)
+                return commit_sha
+            self.lifecycle.transition(
+                run_id,
+                RunState.IMPLEMENTING,
+                reason=(
+                    "continuing automatically after workflow validation "
+                    "feedback"
+                ),
+            )
+            self._revise_workflow_from_feedback(
+                run_id=run_id,
+                lead=lead,
+                policy=policy,
+                layout=layout,
+                base_context=base_context,
+                feedback=(
+                    f"Repository validation rejected commit {commit_sha}:\n"
+                    + validation_feedback
+                ),
+                secret_bindings=secret_bindings,
+                resolved_secret_values=resolved_secret_values,
+            )
+            if cycle + 1 >= self.max_revision_cycles:
+                return None
+        raise AssertionError("unreachable workflow revision loop")
+
+    @staticmethod
+    def _workflow_layout(layout: RunLayout, key: str) -> RunLayout:
+        agent_state = layout.agent_state / "workflow" / key
+        agent_state.mkdir(parents=True, exist_ok=True)
+        return RunLayout(
+            repository_id=layout.repository_id,
+            run_id=layout.run_id,
+            root=layout.root,
+            checkout=layout.checkout,
+            agent_state=agent_state,
+            logs=layout.logs,
+            temp=layout.temp,
+            validation=layout.validation,
+            dependency_delta=layout.dependency_delta,
+            build=layout.build,
+        )
+
+    @staticmethod
+    def _workflow_node_prompt(
+        base_context: str,
+        member: TeamMember,
+        context: WorkflowNodeContext,
+    ) -> str:
+        return (
+            base_context
+            + "\n\nCurrent model-designed workflow node:\n"
+            + json.dumps(
+                {
+                    "generation": context.generation,
+                    "stable_key": context.stable_key,
+                    "member": {
+                        "stable_key": member.stable_key,
+                        "role": member.role,
+                        "responsibilities": member.responsibilities,
+                        "permitted_tools": member.permitted_tools,
+                        "instructions": member.instructions,
+                    },
+                    "objective": context.prompt,
+                    "inputs": context.inputs,
+                    "dependency_outputs": context.dependency_outputs,
+                    "expected_output": context.expected_output,
+                    "resources": list(context.resources),
+                    "completion_contract": (
+                        "Complete only this node objective. Finish with a "
+                        "concise summary and an output object matching "
+                        "expected_output. Do not assign members or alter "
+                        "the outer graph. Report recoverable concerns in "
+                        "the typed output rather than blocking the "
+                        "repository."
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+            )
+        )
+
+    def _run_workflow_assessment(
+        self,
+        *,
+        run_id: str,
+        lead: TeamMember,
+        policy: SandboxPolicy,
+        layout: RunLayout,
+        base_context: str,
+        payload: Mapping[str, object],
+        secret_bindings: tuple[SecretBinding, ...],
+        resolved_secret_values: set[str],
+    ) -> Mapping[str, object]:
+        generation = payload.get("generation", "unknown")
+        assessment_layout = self._workflow_layout(
+            layout,
+            f"assessment-{generation}",
+        )
+        transcript = self._load_transcript(assessment_layout)
+        prompt = (
+            base_context
+            + "\n\nWorkflow coordination assessment:\n"
+            + json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+            )
+            + (
+                "\n\nAssess actual node outputs and graph performance. "
+                "Finish with an output object. To retain the graph, return "
+                '{"outcome":"accept","evidence":"specific evidence"}. '
+                "To adapt it, return outcome=revise, evidence, reason, and "
+                "complete nodes and edges arrays. A revision must change "
+                "at least one relevant prompt, parameter, dependency, "
+                "join, resource, or selected specialist. Never return "
+                "executable source, shell expressions, environment "
+                "values, or secrets."
+            )
+        )
+        outcome, yielded = self._agent_cycle(
+            self._runtime(lead, run_id),
+            lead,
+            policy,
+            assessment_layout,
+            prompt,
+            transcript,
+            secret_bindings,
+            resolved_secret_values,
+            allow_assignment=True,
+            continue_after_assignment=True,
+        )
+        if yielded:
+            raise WorkflowExecutionError(
+                "workflow assessment exhausted its action quantum"
+            )
+        if not isinstance(outcome, Mapping):
+            raise WorkflowExecutionError(
+                "workflow assessment must finish with a structured output"
+            )
+        return dict(outcome)
+
+    def _revise_workflow_from_feedback(
+        self,
+        *,
+        run_id: str,
+        lead: TeamMember,
+        policy: SandboxPolicy,
+        layout: RunLayout,
+        base_context: str,
+        feedback: str,
+        secret_bindings: tuple[SecretBinding, ...],
+        resolved_secret_values: set[str],
+    ) -> None:
+        revision_marker = (
+            "controller-revision:"
+            + hashlib.sha256(feedback.encode("utf-8")).hexdigest()[:16]
+        )
+        graph = self.workflows.active_run_graph(run_id)
+        if revision_marker in graph.reason:
+            return
+        payload = {
+            "run_id": run_id,
+            "generation": graph.generation,
+            "assessment_prompt": graph.assessment_prompt,
+            "rationale": graph.rationale,
+            "required_revision_feedback": feedback,
+            "nodes": [
+                {
+                    "stable_key": node.stable_key,
+                    "kind": node.kind,
+                    "member_key": node.member_key or "",
+                    "operation": node.operation or "",
+                    "prompt": node.prompt,
+                    "parameters": node.parameters,
+                    "bindings": node.bindings,
+                    "expected_output": node.expected_output,
+                    "resources": list(node.resources),
+                    "state": node.state,
+                    "output": node.output,
+                    "reused": node.reused_from_node_id is not None,
+                }
+                for node in graph.nodes
+            ],
+            "edges": [
+                {"source": edge.source, "target": edge.target}
+                for edge in graph.edges
+            ],
+        }
+        assessment = dict(
+            self._run_workflow_assessment(
+                run_id=run_id,
+                lead=lead,
+                policy=policy,
+                layout=layout,
+                base_context=base_context,
+                payload=payload,
+                secret_bindings=secret_bindings,
+                resolved_secret_values=resolved_secret_values,
+            )
+        )
+        if assessment.get("outcome") != "revise":
+            raise WorkflowExecutionError(
+                "controller feedback requires a workflow revision"
+            )
+        nodes = assessment.get("nodes")
+        edges = assessment.get("edges")
+        if not isinstance(nodes, list) or not isinstance(edges, list):
+            raise WorkflowExecutionError(
+                "workflow revision must include complete nodes and edges"
+            )
+        reason = assessment.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise WorkflowExecutionError(
+                "workflow revision must include a specific reason"
+            )
+        self.workflows.revise(
+            run_id,
+            reason=f"{reason} [{revision_marker}]",
+            assessment=assessment,
+            design={
+                "rationale": graph.rationale,
+                "assessment_prompt": graph.assessment_prompt,
+                "nodes": nodes,
+                "edges": edges,
+            },
+        )
+
+    def _handle_specification_action(
+        self,
+        action: dict[str, object],
+        member: TeamMember,
+        layout: RunLayout,
+        transcript: list[str],
+        resolved_secret_values: set[str],
+        *,
+        require_specification: bool,
+        supersede_specification_id: str | None,
+        specification_context_sha256: str | None,
+    ) -> None:
+        if not require_specification or not member.coordinates:
+            raise ValueError(
+                "only the stored lead may specify the issue contract "
+                "at the specification boundary"
+            )
+        specified_issue_version_id = action.get("issue_version_id")
+        items = action.get("items")
+        reason = action.get("reason")
+        if (
+            not isinstance(specified_issue_version_id, str)
+            or not isinstance(items, list)
+            or not isinstance(reason, str)
+            or not reason.strip()
+        ):
+            raise ValueError(
+                "specify action requires an issue version, atomic "
+                "items, and specific reasoning"
+            )
+        revision = self.specifications.submit(
+            run_id=layout.run_id,
+            author_member_id=member.id,
+            issue_version_id=specified_issue_version_id,
+            items=items,
+            reason=reason,
+        )
+        if specification_context_sha256 is not None:
+            self.specifications.bind_context(
+                run_id=layout.run_id,
+                issue_version_id=specified_issue_version_id,
+                context_sha256=specification_context_sha256,
+                specification_revision_id=str(revision["id"]),
+            )
+        if (
+            supersede_specification_id is not None
+            and revision["id"] == supersede_specification_id
+        ):
+            raise ValueError(
+                "a rejected specification must be materially revised"
+            )
+        safe_reason = _bounded_redacted_text(
+            reason,
+            resolved_secret_values,
+        )
+        transcript.append(
+            "Lead specified revision "
+            + str(revision["revision"])
+            + ": "
+            + safe_reason
+        )
+        self._store_transcript(layout, transcript)
+
+    def _handle_specification_review_action(
+        self,
+        action: dict[str, object],
+        member: TeamMember,
+        layout: RunLayout,
+        transcript: list[str],
+        *,
+        require_specification_review: bool,
+    ) -> None:
+        if (
+            not require_specification_review
+            or not member.independent_verifier
+        ):
+            raise ValueError(
+                "only the stored independent verifier may review "
+                "the active issue specification"
+            )
+        specification_revision_id = action.get(
+            "specification_revision_id"
+        )
+        verdict = action.get("verdict")
+        findings = action.get("findings")
+        blocker = action.get("blocker")
+        summary = action.get("summary")
+        if (
+            not isinstance(specification_revision_id, str)
+            or not isinstance(verdict, str)
+            or not isinstance(findings, list)
+            or not isinstance(summary, str)
+            or not summary.strip()
+            or (blocker is not None and not isinstance(blocker, str))
+        ):
+            raise ValueError(
+                "review_specification requires a revision, verdict, "
+                "summary, and structured findings"
+            )
+        stored_review = self.specifications.record_review(
+            run_id=layout.run_id,
+            specification_revision_id=specification_revision_id,
+            reviewer_member_id=member.id,
+            reviewer_model=member.model,
+            rubric_version=1,
+            verdict=verdict,
+            summary=summary,
+            findings=findings,
+            blocker=blocker,
+        )
+        transcript.append(
+            "Independent verifier reviewed specification revision "
+            + str(stored_review["specification_revision_id"])
+            + ": "
+            + str(stored_review["verdict"])
+        )
+        self._store_transcript(layout, transcript)
+        if stored_review["verdict"] == "blocked":
+            self.lifecycle.transition(
+                layout.run_id,
+                RunState.BLOCKED,
+                reason=str(stored_review["blocker"]),
+            )
+
     def _agent_cycle(
         self,
         runtime: ModelRuntime,
@@ -1021,7 +1891,14 @@ class ExecutionService:
         *,
         allow_assignment: bool = False,
         require_assignment: bool = False,
-    ) -> tuple[str | None, bool]:
+        continue_after_assignment: bool = False,
+        workflow_resources: tuple[str, ...] | None = None,
+        require_specification: bool = False,
+        supersede_specification_id: str | None = None,
+        specification_context_sha256: str | None = None,
+        require_specification_review: bool = False,
+        checkout_writable: bool = True,
+    ) -> tuple[str | dict[str, object] | None, bool]:
         for _ in range(self.max_actions):
             context = base_context
             model_history = self._bounded_transcript(transcript)
@@ -1038,6 +1915,56 @@ class ExecutionService:
             try:
                 self._ensure_not_canceled(layout.run_id)
                 name = action.get("action")
+                if require_specification and name not in {
+                    "list",
+                    "read",
+                    "search",
+                    "git_diff",
+                    "note",
+                    "block",
+                    "specify",
+                }:
+                    raise ValueError(
+                        "the coordinator must persist the issue specification "
+                        "before assignment or source mutation"
+                    )
+                if require_specification_review and name not in {
+                    "list",
+                    "read",
+                    "search",
+                    "git_diff",
+                    "note",
+                    "review_specification",
+                }:
+                    raise ValueError(
+                        "the independent verifier must review the specification "
+                        "before assignment or source mutation"
+                    )
+                if name == "specify":
+                    self._handle_specification_action(
+                        action,
+                        member,
+                        layout,
+                        transcript,
+                        resolved_secret_values,
+                        require_specification=require_specification,
+                        supersede_specification_id=supersede_specification_id,
+                        specification_context_sha256=(
+                            specification_context_sha256
+                        ),
+                    )
+                    return None, False
+                if name == "review_specification":
+                    self._handle_specification_review_action(
+                        action,
+                        member,
+                        layout,
+                        transcript,
+                        require_specification_review=(
+                            require_specification_review
+                        ),
+                    )
+                    return None, False
                 if name == "assign":
                     if not allow_assignment:
                         raise ValueError("only the stored lead may assign issue members")
@@ -1071,6 +1998,8 @@ class ExecutionService:
                         label = "Lead expanded assignment to "
                     transcript.append(label + ", ".join(members) + ": " + safe_reason)
                     self._store_transcript(layout, transcript)
+                    if continue_after_assignment:
+                        continue
                     return None, False
                 if name == "revise":
                     if not allow_assignment or not member.coordinates:
@@ -1165,6 +2094,9 @@ class ExecutionService:
                     summary = action.get("summary")
                     if not isinstance(summary, str) or not summary.strip():
                         raise ValueError("finish action requires a nonempty summary")
+                    output = action.get("output")
+                    if output is not None and not isinstance(output, dict):
+                        raise ValueError("finish output must be an object")
                     label = (
                         "Lead" if member.coordinates else f"Member {member.stable_key}"
                     )
@@ -1178,6 +2110,22 @@ class ExecutionService:
                     )
                     transcript.append(f"{label} finished: {safe_summary}")
                     self._store_transcript(layout, transcript)
+                    if isinstance(output, dict):
+                        encoded_output = json.dumps(
+                            output,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        redacted_output = redact_text(
+                            encoded_output,
+                            resolved_secret_values,
+                        )
+                        if redacted_output != encoded_output:
+                            raise PermissionError(
+                                "workflow output contains a resolved "
+                                "secret value"
+                            )
+                        return dict(output), False
                     return safe_summary, False
                 if name == "block":
                     reason = action.get("reason")
@@ -1212,7 +2160,13 @@ class ExecutionService:
                     )
                 self._ensure_not_canceled(layout.run_id)
                 result = self.tools.execute(
-                    member, policy, layout, action, secrets=secrets
+                    member,
+                    policy,
+                    layout,
+                    action,
+                    secrets=secrets,
+                    workflow_resources=workflow_resources,
+                    checkout_writable=checkout_writable,
                 )
                 self._ensure_not_canceled(layout.run_id)
                 serialized_action = _serialize_action_for_history(
@@ -1505,18 +2459,15 @@ class ExecutionService:
             ("rev-parse", "HEAD"),
             allow_failure=True,
         )
+        head_sha = self._git_probe_output(head, "HEAD")
         status = self._git(
             policy,
             layout,
             ("status", "--porcelain", "--untracked-files=no"),
             allow_failure=True,
         )
-        if (
-            head.returncode != 0
-            or head.stdout.strip() != base_sha
-            or status.returncode != 0
-            or bool(status.stdout.strip())
-        ):
+        status_output = self._git_probe_output(status, "status")
+        if head_sha != base_sha or status_output:
             raise BaselineUnavailable(
                 "validation baseline is missing and the checkout is no longer "
                 "the clean exact run base"
@@ -1547,24 +2498,40 @@ class ExecutionService:
             if result.canceled:
                 raise _RunCanceled(run_id)
             self._ensure_not_canceled(run_id)
-            checked_head = self._git(
-                policy,
-                layout,
-                ("rev-parse", "HEAD"),
-                allow_failure=True,
-            )
-            checked_status = self._git(
-                policy,
-                layout,
-                ("status", "--porcelain", "--untracked-files=no"),
-                allow_failure=True,
-            )
-            if (
-                checked_head.returncode != 0
-                or checked_head.stdout.strip() != base_sha
-                or checked_status.returncode != 0
-                or bool(checked_status.stdout.strip())
-            ):
+            try:
+                checked_head = self._git(
+                    policy,
+                    layout,
+                    ("rev-parse", "HEAD"),
+                    allow_failure=True,
+                )
+                checked_head_sha = self._git_probe_output(checked_head, "HEAD")
+                checked_status = self._git(
+                    policy,
+                    layout,
+                    ("status", "--porcelain", "--untracked-files=no"),
+                    allow_failure=True,
+                )
+                checked_status_output = self._git_probe_output(
+                    checked_status,
+                    "status",
+                )
+            except _RunCanceled:
+                raise
+            except Exception:
+                try:
+                    self._git(
+                        policy,
+                        layout,
+                        ("reset", "--hard", base_sha),
+                        allow_failure=True,
+                    )
+                except _RunCanceled:
+                    raise
+                except Exception:
+                    pass
+                raise
+            if checked_head_sha != base_sha or checked_status_output:
                 self._git(
                     policy,
                     layout,
@@ -1875,6 +2842,15 @@ class ExecutionService:
             )
         return not failures, "\n\n".join(failures)
 
+    @staticmethod
+    def _git_probe_output(result, probe: str) -> str:
+        if result.returncode == 0:
+            return result.stdout.strip()
+        detail = result.stderr.strip() or result.stdout.strip() or "git command failed"
+        raise RuntimeError(
+            f"validation baseline exact-base {probe} probe failed: {detail}"
+        )
+
     def _git(
         self,
         policy: SandboxPolicy,
@@ -2046,6 +3022,40 @@ class ExecutionService:
         return run, issue, dict(sandbox_row)
 
     @staticmethod
+    def _workflow_assignment_contract(
+        template: WorkflowTemplate,
+    ) -> dict[str, object]:
+        return {
+            "agent_nodes": [
+                {
+                    "stable_key": node.stable_key,
+                    "member_key": node.member_key,
+                    "execution_class": node.execution_class,
+                }
+                for node in template.nodes
+                if node.kind == "agent"
+            ],
+            "deterministic_nodes": [
+                {
+                    "stable_key": node.stable_key,
+                    "operation": node.operation,
+                }
+                for node in template.nodes
+                if node.kind == "deterministic"
+            ],
+            "edges": [
+                {"source": edge.source, "target": edge.target}
+                for edge in template.edges
+            ],
+            "assignment_rule": (
+                "Select the full issue-relevant branch. Every selected "
+                "specialist must include all upstream agent dependencies "
+                "required by its path, plus the coordinating member and "
+                "independent verifier."
+            ),
+        }
+
+    @staticmethod
     def _base_prompt(
         run: dict[str, object],
         issue: dict[str, object],
@@ -2053,12 +3063,19 @@ class ExecutionService:
         team: StoredTeam,
         assignments: Sequence[Assignment],
         additional_context: str | None,
+        workflow_assignment_contract: Mapping[str, object] | None = None,
+        atomic_specification: Mapping[str, object] | None = None,
     ) -> str:
         evidence = json.loads(str(sandbox_row["evidence_json"]))
         payload = {
             "task": "Implement and validate the GitHub issue in the isolated checkout",
             "repository_evidence": evidence,
             "issue": issue,
+            "atomic_specification": (
+                dict(atomic_specification)
+                if atomic_specification is not None
+                else None
+            ),
             "base_sha": run["base_sha"],
             "stored_team": [
                 {
@@ -2088,13 +3105,112 @@ class ExecutionService:
                 "Change only what the issue requires.",
                 "Use only controller actions; all repository operations are sandboxed.",
                 "Do not publish, push, merge, close, or access credentials.",
+                "Do not create planning, specification, coordination, or status files in the checkout; persist controller-owned records through controller actions.",
+                "Assignment and source mutation require the active atomic specification to have an approved independent semantic review.",
+                "Derive specification behavior from the issue and repository evidence, not from a proposed implementation.",
+                "Resolve fixable ambiguity through read-only inspection; block only for an irreducible unmet external prerequisite.",
+                "Each specification criterion must state independently observable behavior and map to a concrete verification scenario.",
             ],
         }
+        if atomic_specification is None:
+            payload["specification_gate"] = (
+                "The coordinator must persist the atomic issue specification "
+                "before assignment or source mutation."
+            )
+        else:
+            review = atomic_specification.get("review")
+            verdict = review.get("verdict") if isinstance(review, Mapping) else None
+            if verdict == "rejected":
+                payload["specification_gate"] = (
+                    "The coordinator must revise the rejected specification "
+                    "before assignment or source mutation."
+                )
+            elif verdict == "approved":
+                payload["specification_gate"] = (
+                    "The active specification has approved independent review."
+                )
+            else:
+                payload["specification_gate"] = (
+                    "The independent verifier must review the active "
+                    "specification before assignment or source mutation."
+                )
+        if workflow_assignment_contract is not None:
+            payload["workflow_assignment_contract"] = dict(
+                workflow_assignment_contract
+            )
         if run.get("reason"):
             payload["revision_feedback"] = run["reason"]
         if additional_context:
             payload["additional_context"] = additional_context
         return json.dumps(payload, sort_keys=True, indent=2)
+
+    @staticmethod
+    def _specification_reconciliation_prompt(
+        base_context: str,
+        specification: Mapping[str, object] | None,
+    ) -> str:
+        reconciliation_contract = {
+            "task": (
+                "Reconcile the complete atomic issue specification against "
+                "the new feedback or information context"
+            ),
+            "current_specification_revision_id": (
+                specification.get("id") if specification is not None else None
+            ),
+            "required_action": "specify",
+            "decision_rules": [
+                (
+                    "If the new context does not change required observable "
+                    "behavior, resubmit every current specification item unchanged."
+                ),
+                (
+                    "If requirements changed, submit one complete corrected "
+                    "revision containing every retained and new requirement."
+                ),
+            ],
+            "constraints": [
+                "Do not assign work or mutate the checkout before reconciliation.",
+                "Do not submit implementation plans or implementation-derived criteria.",
+                "Preserve stable item and criterion keys for unchanged behavior.",
+            ],
+        }
+        return (
+            base_context
+            + "\n\n"
+            + json.dumps(reconciliation_contract, sort_keys=True, indent=2)
+        )
+
+
+    @staticmethod
+    def _specification_review_prompt(
+        base_context: str,
+        specification: Mapping[str, object],
+    ) -> str:
+        review_contract = {
+            "task": "Independently review the active atomic issue specification",
+            "specification_revision_id": specification["id"],
+            "required_action": "review_specification",
+            "rubric": [
+                "semantic issue coverage",
+                "behavioral clarity and independently observable acceptance criteria",
+                "verification feasibility against repository evidence",
+                "internal consistency, repository alignment, and issue scope discipline",
+            ],
+            "constraints": [
+                "Use read-only repository evidence.",
+                "Do not authorize or perform assignment or source mutation.",
+                "Approve only complete and internally consistent issue behavior.",
+                "Reject criteria coupled to a proposed implementation instead of observable behavior.",
+                "Verify that every criterion is covered by a feasible verification scenario.",
+                "Reject fixable gaps with structured findings; block only an irreducible external prerequisite.",
+            ],
+        }
+        return (
+            base_context
+            + "\n\n"
+            + json.dumps(review_contract, sort_keys=True, indent=2)
+        )
+
 
 
 def _sandbox_policy(row: dict[str, object]) -> SandboxPolicy:

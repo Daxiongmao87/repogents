@@ -70,7 +70,6 @@ The local interface allows the user to add GitHub repositories.
 Adding a repository accepts its GitHub identity and any repository-specific inputs that cannot be derived safely from source inspection, including, when applicable:
 
 - explicitly allowed host paths and whether each is read-only or writable;
-- repository provisioning commands or environment definitions;
 - licensed or proprietary dependency locations;
 - fixtures or dataset locations;
 - sandbox-scoped secret references;
@@ -92,12 +91,12 @@ When a repository is added:
    - build configuration;
    - test configuration; and
    - repository-defined validation commands.
-4. The sandbox is provisioned with the required environment using discovered information and supplied repository inputs.
+4. It persists the sandbox isolation policy, explicit resource bindings, and an initially empty reusable dependency area without running repository dependency commands.
 5. The lead formulates the repository-specific agent team from repository evidence.
-6. The application stores versioned sandbox and team records with the repository.
-7. The repository enters `ready` only after its stored environment and team can be loaded successfully.
+6. The application stores versioned sandbox, team, and workflow records with the repository.
+7. The repository enters `ready` only after its stored sandbox, team, and workflow versions can be loaded successfully.
 
-If a required license, credential reference, host path, dataset, external service, or provisioning input cannot be derived, onboarding enters `needs_input` and identifies the missing input. If provisioning or inspection fails for another reason, onboarding enters `blocked` and records the failure.
+If a required license, credential reference, host path, dataset, or explicit external-service boundary is unavailable, onboarding enters `needs_input` and identifies the missing input. If inspection, inference, or durable version storage fails for another reason, onboarding enters `blocked` and records the failure.
 
 ### 2.3 Inventory contents
 
@@ -122,36 +121,33 @@ The stored sandbox and team are not reconstructed for each issue. They remain au
 
 Each repository has persistent sandbox filesystem state and Bubblewrap launch configuration containing or referencing its required:
 
-- development tools;
-- baseline project dependencies;
-- licensed or proprietary dependencies;
+- explicit host-path, resource, secret-binding, and network boundaries;
 - environment-specific configuration;
+- licensed or proprietary resources;
 - fixtures and datasets;
-- generated files;
-- caches; and
-- sandbox-scoped sensitive-value bindings.
+- generated files and caches; and
+- a reusable dependency area that starts empty for each newly onboarded sandbox version.
 
-Bubblewrap processes are instantiated from this stored state for onboarding, issue work, validation, and feedback handling. The stored repository environment is reused for later issues and is not reprovisioned for every issue.
+Onboarding persists this state without running repository dependency or toolchain setup. Bubblewrap processes use the stored policy for issue work, validation, acceptance, and feedback handling. Existing immutable sandbox versions and runs retain any dependency state with which they were created.
 
 ### 3.2 Storage layers
 
 The sandbox separates three kinds of state:
 
-1. **Persistent repository state** — toolchains, baseline project dependencies, proprietary dependencies, fixtures, datasets, and stored environment configuration.
-2. **Persistent shared caches** — package downloads, language package stores, compiler caches, and other concurrency-safe reusable caches.
-3. **Issue-run state** — the isolated checkout, writable dependency deltas, build output, temporary diagnostic tools, agent state, coordination data, logs, and temporary files.
+1. **Persistent repository state** — isolation policy, explicit resources, fixtures, datasets, stored environment configuration, and immutable historical dependency state.
+2. **Persistent shared caches** — controller-managed concurrency-safe caches that contain no run checkout or writable dependency state.
+3. **Issue-run state** — the isolated checkout, writable dependency delta, build output, temporary diagnostic tools, agent state, coordination data, logs, and temporary files.
 
-Each issue receives its own isolated checkout and run storage. It may reuse persistent repository dependencies and caches without reinstalling unchanged dependencies.
+Each issue receives its own isolated checkout and run storage. It may read compatible persistent state without modifying the immutable sandbox version.
 
-Issue-specific dependency installation is incremental:
+Issue and acceptance agents determine required dependencies from the current issue, checkout, and repository evidence:
 
-- missing or changed dependencies are installed into the issue-run writable layer;
-- unchanged repository dependencies and cached artifacts are reused;
-- temporary diagnostic dependencies may be discarded with the run;
-- a dependency introduced by an unmerged branch is not promoted into the repository baseline merely because that branch was tested; and
-- a later run based on a default branch containing that dependency may reconcile the stored environment incrementally.
+- an action may request bounded access to exact public HTTP or HTTPS services;
+- missing dependencies and reusable retrieval results are written only to the issue-run dependency layer;
+- temporary diagnostic dependencies may be discarded with the run; and
+- issue-run dependencies are not promoted automatically into repository state or another run.
 
-Parallel issue runs must not share writable checkout, build-output, dependency-delta, log, or agent-state directories. Shared caches must use the package manager's or cache implementation's concurrency controls.
+Parallel issue runs must not share writable checkout, build-output, dependency-delta, log, or agent-state directories.
 
 ### 3.3 Filesystem and process isolation
 
@@ -191,15 +187,15 @@ The isolated checkout is the only version-controlled working tree. Plans, coordi
 
 Sandboxed processes have no unrestricted route to the host network.
 
-Required repository-command traffic passes through an application-managed, repository-specific egress proxy or equivalent restricted network path. The network policy must:
+Required repository-command traffic passes through an application-managed restricted egress path. The network policy must:
 
-- allow only external services stored in the repository's sandbox inputs;
+- allow exact services explicitly stored in the repository inputs and bounded exact public HTTP or HTTPS services authorized for the current action;
 - resolve allowed hostnames through the controlled path;
 - reject loopback, private-LAN, link-local, multicast, and metadata-service destinations after address resolution;
 - reject access to host services; and
 - record connection metadata without recording credentials or sensitive payloads.
 
-Application-owned GitHub and model operations occur outside the repository command sandbox. Package-manager and other repository-command traffic uses the restricted egress path. If a required protocol cannot use that path, onboarding enters `needs_input` or `blocked` rather than granting unrestricted network access.
+Application-owned GitHub and model operations occur outside the repository command sandbox. Issue and acceptance agents request action-scoped dependency access from current evidence; onboarding does not infer ecosystem allowlists. If required traffic cannot use the restricted path, the affected action fails or blocks rather than receiving unrestricted network access.
 
 ### 3.5 Sensitive values
 
@@ -224,7 +220,7 @@ Commands may have wall-clock timeouts so a stuck command cannot run forever. Can
 
 ## 4. Stored Repository Agent Team
 
-Every repository has one versioned, stored agent-team composition based on repository evidence.
+Every repository has one versioned, stored agent-team composition and one model-designed workflow template based on repository evidence.
 
 The team always contains one lead responsible for the final result. It may also contain repository-appropriate:
 
@@ -241,6 +237,8 @@ For each stored member, the application records:
 - configured model/runtime selection; and
 - repository-specific instructions.
 
+The workflow template records agent nodes, controller-registered deterministic operations, typed parameters and outputs, directed dependencies, bounded node prompts, and resource claims. It is stored with the immutable team version. It cannot contain executable operation payloads, secrets, or authority that bypasses controller-owned validation, acceptance, publication, and feedback boundaries.
+
 The team composition:
 
 - is formulated during repository onboarding;
@@ -250,13 +248,15 @@ The team composition:
 - is not derived from a mandatory permanent global team composition; and
 - changes only through explicit repository re-onboarding.
 
-Issue-specific assignment may vary:
+Issue-specific assignment and execution may vary:
 
-- small issues may engage only the stored lead;
-- larger issues may engage additional stored members;
-- the lead records which stored members it assigns and why;
-- agents work sequentially unless the assigned work is genuinely independent; and
-- the lead integrates all work and owns the final implementation and validation decision.
+- the stored lead selects only the atomic members needed for the issue and records why;
+- the controller compiles the selected branches, required joins, coordinating node, and independent verifier into an immutable run graph bound to the run's issue, team, sandbox, and exact base SHA;
+- readiness follows persisted dependencies rather than a fixed role sequence;
+- independent read-only or pure nodes may run concurrently, while conflicting checkout writes remain serialized;
+- each node attempt, resource claim, validated output, and failure is durable, so restart and retry repeat only incomplete work;
+- the coordinating member assesses completed node evidence and may retain the graph or propose a bounded new immutable generation with changed topology, prompts, parameters, or newly assigned stored members; and
+- the controller validates every revision, preserves prior generations and assessments, reuses only exact-identity completed outputs, and keeps final validation, acceptance, publication, and feedback handling outside model authority.
 
 ## 5. Issue Activation and Run Lifecycle
 
@@ -330,16 +330,18 @@ Canceled runs remain in issue history. **Restart issue** on a canceled run creat
 
 ## 6. Autonomous Implementation and Validation
 
-For each activated issue, the stored lead and any stored team members it assigns:
+For each activated issue, the controller advances the run's compiled workflow graph through its assigned stored members and registered deterministic operations. The stored lead remains responsible for coordination, and an independent stored verifier remains mandatory. Together they:
 
 - inspect the issue and its discussion;
 - inspect repository instructions and relevant current source;
 - determine the requested behavior and scope;
 - modify only the isolated issue checkout;
-- reuse stored project dependencies and caches;
-- install only missing issue-specific dependency deltas inside the sandbox;
+- determine the dependencies and tools required by the current issue and checkout;
+- retrieve only missing issue-specific dependencies into the run-local dependency layer through bounded action-scoped services;
 - run repository-required tests and validation inside the sandbox; and
 - revise the implementation until the requested behavior is implemented and required validation passes or the run must become blocked.
+
+Successful graph execution returns the candidate to the existing exact-SHA commit and validation boundary. Node or validation evidence may cause the coordinator to create a bounded revised graph generation; invalid revisions fail atomically without erasing the last executable generation or its evidence.
 
 The lead remains responsible for deciding whether the implementation satisfies the issue and repository instructions.
 
@@ -488,6 +490,7 @@ The application provides one local interface that allows the user to:
 - retry a blocked run or pending automatic retry;
 - restart a canceled open issue as a fresh run;
 - cancel a blocked or active run as applicable;
+- inspect the repository workflow template and each run's exact compiled graph, immutable generations, node attempts, dependencies, resource claims, reuse decisions, and coordinator assessments through a read-only two-dimensional preview with an equivalent accessible table;
 - open issue links on GitHub;
 - open pull-request links on GitHub.
 

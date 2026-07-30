@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -10,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
 from unittest import mock
+
+from repogents.app import Orchestrator
 
 from repogents.database import Database
 from repogents.execution import ExecutionService, ScriptedRuntime
@@ -23,6 +26,7 @@ from repogents.lifecycle import RunLifecycle, RunState
 from repogents.team import TeamService
 from repogents.publication import PublicationBaseChanged
 from repogents.sandbox import RunLayout, SandboxManager
+from repogents.specification import SpecificationService
 
 
 class NoActivationClient:
@@ -1150,7 +1154,11 @@ class FeedbackTests(unittest.TestCase):
         ]
         self.gateway.crash_after_thread_resolution = True
 
-        self.assertEqual(self.service.resolve_run("run-1"), 1)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "connection dropped after thread was resolved",
+        ):
+            self.service.resolve_run("run-1")
 
         with self.db.connect() as connection:
             first = connection.execute(
@@ -1271,7 +1279,11 @@ class FeedbackTests(unittest.TestCase):
         ]
         self.gateway.fail_before_thread_resolution = True
 
-        self.assertEqual(self.service.resolve_run("run-1"), 1)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "connection dropped before thread was resolved",
+        ):
+            self.service.resolve_run("run-1")
         self.assertEqual(self.gateway.resolve_thread_calls, ["THREAD-RETRY"])
         self.assertEqual(self.lifecycle.get_run("run-1")["state"], "resolving_feedback")
         self.assertEqual(len(self.executor.calls), 1)
@@ -2019,6 +2031,29 @@ class FeedbackTests(unittest.TestCase):
         now = "2026-01-01T00:00:00Z"
         with self.db.transaction() as connection:
             connection.execute(
+                """INSERT INTO issue_versions
+                   (id, issue_id, version, previous_version_id,
+                    github_updated_at, content_sha256, title, body,
+                    discussion_json, observed_at)
+                   VALUES ('issue-version-1', 'issue-1', 1, NULL, ?, ?,
+                           'Issue', 'Body', '[]', ?)""",
+                (now, "f" * 64, now),
+            )
+            connection.execute(
+                """UPDATE issues SET current_version_id='issue-version-1'
+                   WHERE id='issue-1'"""
+            )
+            connection.execute(
+                """UPDATE activation_events
+                   SET issue_version_id='issue-version-1'
+                   WHERE id='activation-1'"""
+            )
+            connection.execute(
+                """UPDATE runs
+                   SET validated_issue_version_id='issue-version-1'
+                   WHERE id='run-1'"""
+            )
+            connection.execute(
                 """UPDATE sandbox_versions SET policy_json=?
                    WHERE id='sandbox-1'""",
                 (json.dumps(policy),),
@@ -2155,6 +2190,75 @@ class FeedbackTests(unittest.TestCase):
             head_sha=prior_validated_sha,
             base_sha=current_base_sha,
             mergeable=False,
+        )
+
+        first_service.poll_run("run-1")
+        pending = first_service._pending("run-1")
+        for row in pending:
+            first_service._decision("run-1", row)
+        pending = first_service._pending("run-1")
+        revision_context, _ = first_service._revision_context(
+            "run-1",
+            pending,
+        )
+        first_publisher.prepared_bases.clear()
+        specifications = SpecificationService(self.db)
+        current_specification = specifications.submit(
+            "run-1",
+            "lead-1",
+            "issue-version-1",
+            [
+                {
+                    "key": "conflict-resolution",
+                    "title": "Resolve the current base conflict",
+                    "objective": (
+                        "Preserve the issue behavior while integrating "
+                        "the fetched base."
+                    ),
+                    "acceptance_criteria": [
+                        {
+                            "key": "merged-behavior",
+                            "requirement": (
+                                "The current base and issue behavior are "
+                                "both retained."
+                            ),
+                            "expected": (
+                                "Validation passes on a commit containing "
+                                "both histories."
+                            ),
+                        }
+                    ],
+                    "verification": [
+                        {
+                            "key": "validate-merge",
+                            "scenario": (
+                                "Validate the resolved commit and inspect "
+                                "its ancestry."
+                            ),
+                            "criterion_keys": ["merged-behavior"],
+                        }
+                    ],
+                }
+            ],
+            "Define the conflict-resolution behavior before revising source.",
+        )
+        specifications.record_review(
+            "run-1",
+            str(current_specification["id"]),
+            "verification-1",
+            "test/verification",
+            1,
+            "approved",
+            "The conflict behavior and verification are observable.",
+            [],
+        )
+        specifications.bind_context(
+            run_id="run-1",
+            issue_version_id="issue-version-1",
+            context_sha256=hashlib.sha256(
+                revision_context.encode("utf-8")
+            ).hexdigest(),
+            specification_revision_id=str(current_specification["id"]),
         )
 
         self.assertEqual(first_service.resolve_run("run-1"), 0)
@@ -2368,19 +2472,32 @@ class FeedbackTests(unittest.TestCase):
         self.assertIn("line 10 corrected implementation", source["content"])
         self.assertNotIn("mutable working tree", source["content"])
 
-    def test_context_collection_failure_leaves_feedback_pending_for_next_cycle(
+    def test_context_collection_failure_uses_durable_controller_retry(
         self,
     ) -> None:
         self.gateway.items = [
             self.item("comment", "context-retry", "v1", "Why is this correct?")
         ]
+        orchestrator = Orchestrator(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            execution=self.executor,
+            publication=self.publisher,
+            feedback=self.service,
+        )
         with mock.patch.object(
             self.service,
             "_evaluation_context",
             side_effect=RuntimeError("temporary git read failure"),
         ):
-            self.assertEqual(self.service.resolve_run("run-1"), 0)
+            orchestrator._advance("run-1")
 
+        run = self.lifecycle.get_run("run-1")
+        self.assertEqual(run["state"], RunState.RESOLVING_FEEDBACK.value)
+        self.assertEqual(run["retry_attempt_count"], 1)
+        self.assertEqual(run["retry_operation"], "feedback_resolution")
+        self.assertIsNotNone(run["retry_next_at"])
+        self.assertIn("temporary git read failure", run["retry_last_error"])
         with self.db.connect() as connection:
             pending = connection.execute(
                 "SELECT state, decision_json, processed_at FROM feedback_versions"
@@ -2388,7 +2505,19 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(tuple(pending), ("pending", None, None))
         self.assertEqual(self.gateway.post_calls, 0)
 
-        self.assertEqual(self.service.resolve_run("run-1"), 1)
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs SET retry_next_at='2000-01-01T00:00:00Z'
+                   WHERE id='run-1'"""
+            )
+        orchestrator._advance("run-1")
+
+        recovered = self.lifecycle.get_run("run-1")
+        self.assertEqual(recovered["state"], RunState.WAITING_FOR_FEEDBACK.value)
+        self.assertEqual(recovered["retry_attempt_count"], 0)
+        self.assertIsNone(recovered["retry_operation"])
+        self.assertIsNone(recovered["retry_next_at"])
+        self.assertIsNone(recovered["retry_last_error"])
         self.assertEqual(self.gateway.post_calls, 1)
 
     def test_inline_context_handles_untrusted_deleted_and_binary_paths(self) -> None:
@@ -2523,7 +2652,11 @@ class FeedbackTests(unittest.TestCase):
     ) -> None:
         self.gateway.items = [self.item("comment", "question-1", "v1", "Why?")]
         self.gateway.crash_after_post = True
-        self.assertEqual(self.service.resolve_run("run-1"), 0)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "connection dropped after response was accepted",
+        ):
+            self.service.resolve_run("run-1")
         self.assertEqual(self.lifecycle.get_run("run-1")["state"], "resolving_feedback")
         output = self.gateway.outputs[0]
         self.gateway.items.append(

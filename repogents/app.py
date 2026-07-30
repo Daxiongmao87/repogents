@@ -29,7 +29,6 @@ from .onboarding import (
     OnboardingService,
     MiniSweRepositoryEvidenceAnalyzer,
     RepositoryInspector,
-    SandboxEnvironmentProvisioner,
 )
 from .publication import (
     GitPublicationGateway,
@@ -38,6 +37,7 @@ from .publication import (
 )
 from .sandbox import SandboxManager, redact_text
 from .team import EvidenceTeamFormulator, TeamService
+from .workflow import WorkflowService
 
 _TERMINAL_RUN_STATES = {
     RunState.CANCELED.value,
@@ -632,6 +632,7 @@ class ApplicationActions:
         self.scheduler = scheduler
         self.model_configuration = model_configuration
         self.known_secret_values = known_secret_values or (lambda _run_id: ())
+        self.workflows = WorkflowService(database)
 
     def state(self) -> dict[str, object]:
         with self.database.connect() as connection:
@@ -824,6 +825,12 @@ class ApplicationActions:
             run["validation_baselines"] = baseline_by_run.get(run_id, [])
             run["validation_results"] = validation_by_run.get(run_id, [])
             run["assignments"] = assignments_by_run.get(run_id, [])
+            projected_workflow = self.workflows.project_run(run_id)
+            run["workflow"] = (
+                projected_workflow
+                if projected_workflow["generations"]
+                else None
+            )
             acceptance = current_acceptance_verification(
                 self.database,
                 run_id,
@@ -833,6 +840,41 @@ class ApplicationActions:
                 if acceptance is not None
                 else None
             )
+            # Specification projection for selected-run detail
+            current_spec = _current_spec_revision(self.database, run_id)
+            spec_reviews = _all_spec_reviews(self.database, run_id)
+            spec_contexts = _current_spec_contexts(self.database, run_id)
+            # Group contexts by specification_revision_id
+            contexts_by_rev: dict[str, list[dict[str, object]]] = {}
+            for ctx in spec_contexts:
+                rev_id = ctx["specification_revision_id"]
+                contexts_by_rev.setdefault(rev_id, []).append({
+                    "id": ctx["id"],
+                    "issue_version_id": ctx["issue_version_id"],
+                    "context_sha256": ctx["context_sha256"],
+                    "specification_revision_id": ctx["specification_revision_id"],
+                    "reconciled_at": ctx["reconciled_at"],
+                })
+            # Active spec contexts for current revision
+            active_contexts = contexts_by_rev.get(current_spec["id"], []) if current_spec else []
+            projected_spec = _project_spec_with_acceptance(
+                current_spec, spec_reviews, acceptance, active_contexts,
+            )
+            run["specification"] = projected_spec
+            # Build revision history with all reviews and contexts per revision
+            all_revisions = _spec_revision_history(self.database, run_id)
+            # Group reviews by spec_revision_id (ordered by created_at, id)
+            reviews_by_rev: dict[str, list[dict[str, object]]] = {}
+            for r in spec_reviews:
+                rev_id = r["specification_revision_id"]
+                reviews_by_rev.setdefault(rev_id, []).append(_project_spec_review(r))
+            run["specification_revision_history"] = [
+                _display_spec_revision(
+                    rev, reviews_by_rev.get(rev["id"], []),
+                    contexts_by_rev.get(rev["id"], []),
+                )
+                for rev in all_revisions
+            ]
             runs_by_repository.setdefault(repository_id, []).append(run)
             if run_state in _TERMINAL_RUN_STATES:
                 history_run_values.append(run)
@@ -910,7 +952,16 @@ class ApplicationActions:
                 str(latest_run["state"]) if latest_run is not None else None
             )
             value["latest_activity_at"] = max(activity_times)
-            value["team"] = teams_by_repository.get(repository_id)
+            team = teams_by_repository.get(repository_id)
+            value["team"] = team
+            value["workflow_template"] = None
+            if team is not None:
+                try:
+                    value["workflow_template"] = (
+                        self.workflows.project_template(str(team["id"]))
+                    )
+                except KeyError:
+                    pass
             value["display_inputs"] = _display_repository_inputs(
                 str(value.pop("inputs_json"))
             )
@@ -1464,11 +1515,6 @@ def build_runtime(
             ),
             state_root=model_state_root / "teams",
         ),
-        provisioner=SandboxEnvironmentProvisioner(
-            data_root=root,
-            sandbox=sandbox,
-            secret_resolver=secret_resolver,
-        ),
     )
     onboarding.recover_interrupted()
     lifecycle = RunLifecycle(
@@ -1655,7 +1701,6 @@ def _display_repository_inputs(raw: str) -> dict[str, object]:
     for key in (
         "allowed_host_paths",
         "allowed_services",
-        "provisioning_commands",
         "validation_commands",
     ):
         if key in payload:
@@ -1672,6 +1717,250 @@ def _display_repository_inputs(raw: str) -> dict[str, object]:
             if isinstance(value, dict)
         ]
     return display
+
+
+def _current_spec_revision(
+    database: Database,
+    run_id: str,
+) -> dict[str, object] | None:
+    """Return the latest specification revision for the current issue version, or None."""
+    with database.connect() as connection:
+        row = connection.execute(
+            """SELECT run_specification_revisions.id,
+                          run_specification_revisions.run_id,
+                          run_specification_revisions.issue_version_id,
+                          run_specification_revisions.revision,
+                          run_specification_revisions.items_json,
+                          run_specification_revisions.content_sha256,
+                          run_specification_revisions.author_member_id,
+                          run_specification_revisions.reason,
+                          run_specification_revisions.created_at
+               FROM run_specification_revisions
+               JOIN runs ON runs.id=run_specification_revisions.run_id
+               JOIN issues ON issues.id=runs.issue_id
+               WHERE run_specification_revisions.run_id=?
+                 AND run_specification_revisions.issue_version_id=
+                     issues.current_version_id
+               ORDER BY run_specification_revisions.revision DESC
+               LIMIT 1""",
+            (run_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _all_spec_reviews(
+    database: Database,
+    run_id: str,
+) -> tuple[dict[str, object], ...]:
+    """Return all specification reviews for a run in chronological order."""
+    with database.connect() as connection:
+        rows = connection.execute(
+            """SELECT run_specification_reviews.id,
+                          run_specification_reviews.run_id,
+                          run_specification_reviews.specification_revision_id,
+                          run_specification_reviews.reviewer_member_id,
+                          run_specification_reviews.reviewer_model,
+                          run_specification_reviews.rubric_version,
+                          run_specification_reviews.verdict,
+                          run_specification_reviews.summary,
+                          run_specification_reviews.findings_json,
+                          run_specification_reviews.blocker,
+                          run_specification_reviews.input_sha256,
+                          run_specification_reviews.created_at
+               FROM run_specification_reviews
+               WHERE run_specification_reviews.run_id=?
+               ORDER BY run_specification_reviews.created_at ASC, run_specification_reviews.id ASC""",
+            (run_id,),
+        ).fetchall()
+    return tuple(dict(r) for r in rows)
+
+
+def _project_spec_review(
+    row: dict[str, object],
+) -> dict[str, object]:
+    """Project a raw spec review row into a stable display shape."""
+    return {
+        "id": row["id"],
+        "verdict": row["verdict"],
+        "summary": row["summary"],
+        "findings": json.loads(row["findings_json"]) if row["findings_json"] else [],
+        "blocker": row.get("blocker"),
+        "reviewer_member_id": row["reviewer_member_id"],
+        "reviewer_model": row["reviewer_model"],
+        "rubric_version": row["rubric_version"],
+        "created_at": row["created_at"],
+    }
+
+def _project_spec_with_acceptance(
+    current_spec: dict[str, object] | None,
+    reviews: tuple[dict[str, object], ...],
+    acceptance: dict[str, object] | None,
+    contexts: list[dict[str, object]] | None = None,
+) -> dict[str, object] | None:
+    """Project spec with acceptance evidence mapped to criteria."""
+    if current_spec is None:
+        return None
+
+    items = json.loads(current_spec["items_json"])
+
+    # Group all reviews by specification_revision_id (ordered by created_at)
+    reviews_by_rev: dict[str, list[dict[str, object]]] = {}
+    for r in reviews:
+        rev_id = r["specification_revision_id"]
+        reviews_by_rev.setdefault(rev_id, []).append(_project_spec_review(r))
+
+    # Current review: the latest review for the current spec revision
+    current_review_list = reviews_by_rev.get(current_spec["id"], [])
+    current_review: dict[str, object] | None = (
+        current_review_list[-1] if current_review_list else None
+    )
+
+    # Map acceptance claims to spec criteria — only from the exact current report
+    # Gate: acceptance must have matching specification_revision_id
+    claims_by_criterion: dict[str, list[dict[str, object]]] = {}
+    has_exact_acceptance = False
+    if acceptance is not None:
+        spec_rev_id = acceptance.get("specification_revision_id")
+        if spec_rev_id == current_spec["id"]:
+            has_exact_acceptance = True
+            raw_claims = acceptance.get("claims", [])
+            for claim in raw_claims:
+                if not isinstance(claim, dict):
+                    continue
+                criterion_keys = claim.get("criterion_keys", [])
+                if isinstance(criterion_keys, list):
+                    for ck in criterion_keys:
+                        if isinstance(ck, str):
+                            claims_by_criterion.setdefault(ck, []).append(claim)
+
+    projected_items: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            projected_items.append(item)
+            continue
+
+        criteria = item.get("acceptance_criteria", [])
+        projected_criteria: list[dict[str, object]] = []
+        for criterion in criteria:
+            if not isinstance(criterion, dict):
+                projected_criteria.append(criterion)
+                continue
+
+            ck = criterion.get("key", "")
+            mapped_claims = claims_by_criterion.get(ck, [])
+            if mapped_claims and has_exact_acceptance:
+                if all(c.get("result") == "pass" for c in mapped_claims):
+                    result = "pass"
+                elif any(c.get("result") == "blocked" for c in mapped_claims):
+                    result = "blocked"
+                else:
+                    result = "fail"
+                # Include full claim evidence: observed text + evidence references
+                evidence = [
+                    {
+                        "claim_key": str(c.get("key", "")),
+                        "result": c.get("result"),
+                        "observed": c.get("observed"),
+                        "evidence_refs": c.get("evidence", []),
+                    }
+                    for c in mapped_claims
+                ]
+            else:
+                result = "pending"
+                evidence = []
+
+            projected_criteria.append({
+                **criterion,
+                "result": result,
+                "claim_keys": [str(c.get("key", "")) for c in mapped_claims],
+                "evidence": evidence,
+            })
+
+        projected_items.append({
+            **item,
+            "acceptance_criteria": projected_criteria,
+        })
+
+    return {
+        "id": current_spec["id"],
+        "issue_version_id": current_spec["issue_version_id"],
+        "revision": current_spec["revision"],
+        "items": projected_items,
+        "content_sha256": current_spec["content_sha256"],
+        "author_member_id": current_spec["author_member_id"],
+        "reason": current_spec["reason"],
+        "created_at": current_spec["created_at"],
+        "review": current_review,
+        "implementation_ready": current_review is not None and current_review["verdict"] == "approved",
+        "contexts": contexts or [],
+    }
+
+
+def _spec_revision_history(
+    database: Database,
+    run_id: str,
+) -> tuple[dict[str, object], ...]:
+    """Return all specification revisions and their reviews in revision order."""
+    with database.connect() as connection:
+        rows = connection.execute(
+            """SELECT run_specification_revisions.id,
+                          run_specification_revisions.run_id,
+                          run_specification_revisions.issue_version_id,
+                          run_specification_revisions.revision,
+                          run_specification_revisions.items_json,
+                          run_specification_revisions.content_sha256,
+                          run_specification_revisions.author_member_id,
+                          run_specification_revisions.reason,
+                          run_specification_revisions.created_at
+               FROM run_specification_revisions
+               WHERE run_specification_revisions.run_id=?
+               ORDER BY run_specification_revisions.revision ASC""",
+            (run_id,),
+        ).fetchall()
+    return tuple(dict(r) for r in rows)
+
+
+def _current_spec_contexts(
+    database: Database,
+    run_id: str,
+) -> tuple[dict[str, object], ...]:
+    """Return reconciled specification contexts for a run."""
+    with database.connect() as connection:
+        rows = connection.execute(
+            """SELECT run_specification_contexts.id,
+                          run_specification_contexts.run_id,
+                          run_specification_contexts.issue_version_id,
+                          run_specification_contexts.context_sha256,
+                          run_specification_contexts.specification_revision_id,
+                          run_specification_contexts.reconciled_at
+               FROM run_specification_contexts
+               WHERE run_specification_contexts.run_id=?
+               ORDER BY run_specification_contexts.reconciled_at ASC""",
+            (run_id,),
+        ).fetchall()
+    return tuple(dict(r) for r in rows)
+
+
+def _display_spec_revision(
+    rev: dict[str, object],
+    reviews: list[dict[str, object]],
+    contexts: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Project a single spec revision entry with full items, reviews, and contexts."""
+    result: dict[str, object] = {
+        "id": rev["id"],
+        "issue_version_id": rev["issue_version_id"],
+        "revision": rev["revision"],
+        "content_sha256": rev["content_sha256"],
+        "author_member_id": rev["author_member_id"],
+        "reason": rev["reason"],
+        "created_at": rev["created_at"],
+        "items": json.loads(rev["items_json"]) if "items_json" in rev else [],
+        "reviews": reviews,
+        "contexts": contexts or [],
+    }
+    return result
+
 
 
 def _run_secret_values(

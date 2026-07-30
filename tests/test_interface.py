@@ -27,6 +27,8 @@ class FakeActions:
         }
         self.run_reason: str | None = None
         self.run_reason_truncated = False
+        self.spec_data: dict[str, object] | None = None
+        self.history_data: list[dict[str, object]] = []
         self.activity_entries: list[dict[str, object]] = [
             {
                 "kind": "transition",
@@ -100,6 +102,33 @@ class FakeActions:
                             },
                         ],
                     },
+                    "workflow_template": {
+                        "id": "template-1",
+                        "rationale": "Investigate, coordinate, and verify.",
+                        "nodes": [
+                            {
+                                "stable_key": "lead",
+                                "kind": "agent",
+                                "role": "lead",
+                                "prompt": "Integrate the specialist handoff.",
+                                "resources": ["workspace:read"],
+                                "column": 1,
+                                "row": 0,
+                            },
+                            {
+                                "stable_key": "verification",
+                                "kind": "agent",
+                                "role": "verifier",
+                                "prompt": "Verify observable behavior.",
+                                "resources": ["workspace:read"],
+                                "column": 2,
+                                "row": 0,
+                            },
+                        ],
+                        "edges": [
+                            {"source": "lead", "target": "verification"},
+                        ],
+                    },
                     "display_inputs": {
                         "host_paths": ["/srv/fixtures"],
                         "secret_references": {"API_TOKEN": "configured"},
@@ -159,6 +188,292 @@ class FakeActions:
                             }
                         ],
                         "limitations": [],
+                    },
+                    "specification": self.spec_data,
+                    "specification_revision_history": self.history_data,
+                    "workflow": {
+                        "active_generation": 2,
+                        "generations": [
+                            {
+                                "generation": 1,
+                                "active": False,
+                                "reason": "initial issue graph",
+                                "assessment": None,
+                                "assessments": [],
+                                "nodes": [
+                                    {
+                                        "stable_key": "specialist-1",
+                                        "kind": "agent",
+                                        "role": "scout",
+                                        "prompt": "Inspect concern 1.",
+                                        "resources": ["workspace:read"],
+                                        "state": "succeeded",
+                                        "status_label": "Succeeded",
+                                        "column": 0,
+                                        "row": 0,
+                                        "attempts": [],
+                                        "reused": False,
+                                    },
+                                    {
+                                        "stable_key": "lead",
+                                        "kind": "agent",
+                                        "role": "lead",
+                                        "prompt": "Integrate the initial handoff.",
+                                        "resources": ["workspace:read"],
+                                        "state": "succeeded",
+                                        "status_label": "Succeeded",
+                                        "column": 1,
+                                        "row": 0,
+                                        "attempts": [],
+                                        "reused": False,
+                                    },
+                                ],
+                                "edges": [
+                                    {
+                                        "source": "specialist-1",
+                                        "target": "lead",
+                                    }
+                                ],
+                            },
+                            {
+                                "generation": 2,
+                                "active": True,
+                                "reason": "specialist handoff lacked evidence",
+                                "assessment": {
+                                    "outcome": "revise",
+                                    "evidence": "Missing source locations.",
+                                },
+                                "assessments": [
+                                    {
+                                        "outcome": "accept",
+                                        "evidence": (
+                                            "The initial graph completed but "
+                                            "needed a narrower follow-up."
+                                        ),
+                                        "created_at": (
+                                            "2026-07-27T12:00:00.000Z"
+                                        ),
+                                    },
+                                    {
+                                        "outcome": "revise",
+                                        "evidence": (
+                                            "Missing source locations."
+                                        ),
+                                        "created_at": (
+                                            "2026-07-27T12:05:00.000Z"
+                                        ),
+                                    },
+                                ],
+                                "nodes": [
+                                    *[
+                                        {
+                                            "stable_key": f"specialist-{index}",
+                                            "kind": "agent",
+                                            "role": "scout",
+                                            "prompt": (
+                                                f"Inspect concern {index}."
+                                            ),
+                                            "resources": ["workspace:read"],
+                                            "state": "succeeded",
+                                            "status_label": "Succeeded",
+                                            "column": 0,
+                                            "row": index - 1,
+                                            "attempts": [],
+                                            "reused": index == 1,
+                                        }
+                                        for index in range(1, 7)
+                                    ],
+                                    {
+                                        "stable_key": "evidence-join",
+                                        "kind": "deterministic",
+                                        "operation": "collect",
+                                        "prompt": (
+                                            "Collect typed specialist handoffs."
+                                        ),
+                                        "parameters": {},
+                                        "bindings": {
+                                            "items": {
+                                                "nodes": [
+                                                    f"specialist-{index}"
+                                                    for index in range(1, 7)
+                                                ],
+                                                "path": "summary",
+                                            }
+                                        },
+                                        "expected_output": {
+                                            "type": "object",
+                                            "required": ["items"],
+                                        },
+                                        "resources": [],
+                                        "state": "succeeded",
+                                        "status_label": "Succeeded",
+                                        "column": 1,
+                                        "row": 0,
+                                        "attempts": [],
+                                        "reused": False,
+                                    },
+                                    {
+                                        "stable_key": "lead",
+                                        "kind": "agent",
+                                        "role": "lead",
+                                        "prompt": (
+                                            "Integrate the corrected handoff."
+                                        ),
+                                        "parameters": {"mode": "integration"},
+                                        "bindings": {
+                                            "handoff": {
+                                                "node": "evidence-join",
+                                                "path": "summary",
+                                            }
+                                        },
+                                        "expected_output": {
+                                            "type": "object",
+                                            "required": ["summary"],
+                                        },
+                                        "resources": ["workspace:read"],
+                                        "state": "running",
+                                        "status_label": "Running",
+                                        "column": 2,
+                                        "row": 0,
+                                        "attempts": [
+                                            {
+                                                "attempt": 1,
+                                                "state": "running",
+                                                "input": {
+                                                    "handoff": "exact evidence"
+                                                },
+                                                "started_at": (
+                                                    "2026-01-01T00:00:00Z"
+                                                ),
+                                                "completed_at": None,
+                                                "resource_claims": [
+                                                    {
+                                                        "resource": (
+                                                            "workspace:read"
+                                                        ),
+                                                        "access": "read",
+                                                        "released_at": None,
+                                                    }
+                                                ],
+                                            }
+                                        ],
+                                        "reused": False,
+                                    },
+                                    {
+                                        "stable_key": "verification",
+                                        "kind": "agent",
+                                        "role": "verifier",
+                                        "prompt": (
+                                            "Verify observable behavior."
+                                        ),
+                                        "resources": ["workspace:read"],
+                                        "state": "pending",
+                                        "status_label": "Pending",
+                                        "column": 3,
+                                        "row": 0,
+                                        "attempts": [],
+                                        "reused": False,
+                                    },
+                                ],
+                                "edges": [
+                                    *[
+                                        {
+                                            "source": f"specialist-{index}",
+                                            "target": "evidence-join",
+                                        }
+                                        for index in range(1, 7)
+                                    ],
+                                    {
+                                        "source": "evidence-join",
+                                        "target": "lead",
+                                    },
+                                    {
+                                        "source": "lead",
+                                        "target": "verification",
+                                    },
+                                ],
+                                "controller_boundaries": [
+                                    {
+                                        "stable_key": "exact-sha-validation",
+                                        "title": "Exact-SHA validation",
+                                        "kind": "deterministic",
+                                        "role": "Exact-SHA validation",
+                                        "prompt": "Run stored validation.",
+                                        "resources": ["validation:read"],
+                                        "state": "boundary",
+                                        "status_label": "Controller boundary",
+                                        "column": 4,
+                                        "row": 0,
+                                        "boundary": "controller-owned",
+                                        "virtual": True,
+                                        "attempts": [],
+                                    },
+                                    {
+                                        "stable_key": "independent-acceptance",
+                                        "title": "Independent acceptance",
+                                        "kind": "controller",
+                                        "role": "Independent acceptance",
+                                        "prompt": "Check every issue claim.",
+                                        "resources": ["validation:read"],
+                                        "state": "boundary",
+                                        "status_label": "Controller boundary",
+                                        "column": 5,
+                                        "row": 0,
+                                        "boundary": "controller-owned",
+                                        "virtual": True,
+                                        "attempts": [],
+                                    },
+                                    {
+                                        "stable_key": "controller-publication",
+                                        "title": "Controller publication",
+                                        "kind": "controller",
+                                        "role": "Controller publication",
+                                        "prompt": "Review scope and publish.",
+                                        "resources": ["workspace:read"],
+                                        "state": "boundary",
+                                        "status_label": "Controller boundary",
+                                        "column": 6,
+                                        "row": 0,
+                                        "boundary": "controller-owned",
+                                        "virtual": True,
+                                        "attempts": [],
+                                    },
+                                    {
+                                        "stable_key": "feedback-resolution",
+                                        "title": "Feedback resolution",
+                                        "kind": "controller",
+                                        "role": "Feedback resolution",
+                                        "prompt": "Compile persisted feedback.",
+                                        "resources": ["issue:read"],
+                                        "state": "boundary",
+                                        "status_label": "Controller boundary",
+                                        "column": 7,
+                                        "row": 0,
+                                        "boundary": "controller-owned",
+                                        "virtual": True,
+                                        "attempts": [],
+                                    },
+                                ],
+                                "controller_edges": [
+                                    {
+                                        "source": "verification",
+                                        "target": "exact-sha-validation",
+                                    },
+                                    {
+                                        "source": "exact-sha-validation",
+                                        "target": "independent-acceptance",
+                                    },
+                                    {
+                                        "source": "independent-acceptance",
+                                        "target": "controller-publication",
+                                    },
+                                    {
+                                        "source": "controller-publication",
+                                        "target": "feedback-resolution",
+                                    },
+                                ],
+                            },
+                        ],
                     },
                 }
             ],
@@ -509,6 +824,96 @@ class InterfaceTests(unittest.TestCase):
         self.assertIn("/events", dashboard)
         self.assertNotIn("setInterval(refreshLog", dashboard)
         self.assertIn("/api/runs/", dashboard)
+
+    def test_dashboard_contains_accessible_two_dimensional_workflow_preview(
+        self,
+    ) -> None:
+        status, _, body = self.request("GET", "/")
+
+        self.assertEqual(status, 200)
+        dashboard = body.decode("utf-8")
+        for expected in (
+            'id="workflow-preview"',
+            'id="workflow-graph"',
+            'id="workflow-generation"',
+            'id="workflow-node-details"',
+            'id="workflow-table"',
+            'aria-label="Workflow dependency graph"',
+            "max-height: 32rem",
+            'role="img"',
+            "renderWorkflowGraph",
+            "workflow-grid",
+            "workflow-edge",
+            "data-workflow-node",
+            "Graph generation",
+            "Performance assessment",
+            "Reused output",
+            "Generation delta",
+            "Added nodes",
+            "Changed nodes",
+            "Expected output",
+            "Resources",
+            "Dependencies",
+            "Parameters and bindings",
+            "Attempt input",
+            "Started",
+            "workflowViewportSnapshot",
+            "workflowContext",
+            "Exact-SHA validation",
+            "Independent acceptance",
+            "Controller publication",
+            "controller-boundary",
+            "workflow-kind-agent",
+            "workflow-kind-deterministic",
+            "workflow-edge-dependency",
+            "workflow-edge-lifecycle",
+            "stroke-dasharray",
+            "Controller lifecycle (projection only)",
+            "Run contract / issue activation",
+            "Retry failed node",
+            "Coordinator revision",
+            "Validation remediation",
+            "Acceptance remediation",
+            "Feedback generation",
+            "Terminal outcomes",
+            "Lifecycle transitions",
+            "Next durable unit",
+            "generation N+1",
+        ):
+            self.assertIn(expected, dashboard)
+        self.assertIn("<svg", dashboard)
+        self.assertIn("<table", dashboard)
+        self.assertNotIn("workflow-reorder", dashboard)
+        self.assertNotIn("workflow-edit", dashboard)
+
+    def test_dashboard_exposes_accessible_workflow_viewport_controls(
+        self,
+    ) -> None:
+        status, _, body = self.request("GET", "/")
+
+        self.assertEqual(status, 200)
+        dashboard = body.decode("utf-8")
+        for expected in (
+            'id="workflow-graph"',
+            'role="group" tabindex="0"',
+            'role="toolbar"',
+            'data-workflow-viewport-control="zoom-in"',
+            'data-workflow-viewport-control="zoom-out"',
+            'data-workflow-viewport-control="fit"',
+            'data-workflow-viewport-control="reset"',
+            'aria-label="Zoom in"',
+            'aria-label="Zoom out"',
+            'aria-label="Fit workflow graph"',
+            'aria-label="Reset workflow graph zoom"',
+            "workflow-viewport-controls",
+            "workflow-scene",
+            "The whole graph is fitted initially.",
+            "drag empty space or use arrow keys to pan",
+        ):
+            self.assertIn(expected, dashboard)
+        self.assertNotIn("Scroll in both directions", dashboard)
+        self.assertNotIn("workflow-reorder", dashboard)
+        self.assertNotIn("workflow-edit", dashboard)
 
     def test_dashboard_contains_modal_write_only_model_configuration(self) -> None:
         status, _, body = self.request("GET", "/")
@@ -937,6 +1342,176 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertIn("error", json.loads(body))
         self.assertEqual(self.actions.calls, calls_before)
+
+
+    def test_spec_section_projects_approved_spec_with_evidence(self) -> None:
+        self.actions.spec_data = {
+            "id": "spec-rev-1",
+            "issue_version_id": "issue-v1",
+            "revision": 1,
+            "implementation_ready": True,
+            "review": {
+                "verdict": "approved",
+                "summary": "All items approved.",
+            },
+            "items": [
+                {
+                    "key": "item-1",
+                    "title": "Scrolling support",
+                    "objective": "Terminal can scroll.",
+                    "acceptance_criteria": [
+                        {
+                            "key": "scroll-history",
+                            "requirement": "Wheel navigates history.",
+                            "expected": "Visible rows change.",
+                            "result": "pass",
+                            "claim_keys": ["scroll-history"],
+                            "evidence": [
+                                {
+                                    "claim_key": "scroll-history",
+                                    "result": "pass",
+                                    "observed": "Rows changed.",
+                                    "evidence_refs": [1],
+                                }
+                            ],
+                        }
+                    ],
+                    "verification": [
+                        {
+                            "scenario": "Wheel scrolls history.",
+                            "criterion_keys": ["scroll-history"],
+                        }
+                    ],
+                }
+            ],
+            "contexts": [
+                {
+                    "context_sha256": "a" * 64,
+                    "specification_revision_id": "spec-rev-1",
+                    "reconciled_at": "2026-01-01T00:04:00Z",
+                }
+            ],
+        }
+        self.actions.history_data = [
+            {
+                "id": "spec-rev-1",
+                "revision": 1,
+                "issue_version_id": "issue-v1",
+                "items": self.actions.spec_data["items"],
+                "reviews": [
+                    {
+                        "verdict": "approved",
+                        "summary": "All items approved.",
+                    }
+                ],
+                "contexts": self.actions.spec_data["contexts"],
+            }
+        ]
+
+        status, _, body = self.request("GET", "/api/state")
+        self.assertEqual(status, 200)
+        run = json.loads(body)["runs"][0]
+        self.assertTrue(run["specification"]["implementation_ready"])
+        self.assertEqual(
+            run["specification"]["review"]["verdict"],
+            "approved",
+        )
+        self.assertEqual(
+            run["specification"]["items"][0]["acceptance_criteria"][0][
+                "evidence"
+            ][0]["evidence_refs"],
+            [1],
+        )
+        status, _, dashboard = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"issueSpecification", dashboard)
+        self.assertIn(b"Implementation ready", dashboard)
+        self.assertIn(b"Reconciled contexts", dashboard)
+        self.assertIn(b"Revision history", dashboard)
+
+    def test_spec_section_projects_no_spec(self) -> None:
+        status, _, body = self.request("GET", "/api/state")
+        self.assertEqual(status, 200)
+        run = json.loads(body)["runs"][0]
+        self.assertIsNone(run["specification"])
+        self.assertEqual(run["specification_revision_history"], [])
+        status, _, dashboard = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"No specification persisted for this run.", dashboard)
+
+    def test_spec_section_projects_rejection_and_blocked_criterion(self) -> None:
+        finding = {
+            "key": "missing-failure-path",
+            "category": "observability",
+            "severity": "error",
+            "summary": "Define the observable failure-path result.",
+            "item_keys": ["item-1"],
+        }
+        self.actions.spec_data = {
+            "id": "spec-rev-2",
+            "issue_version_id": "issue-v1",
+            "revision": 2,
+            "implementation_ready": False,
+            "review": {
+                "verdict": "rejected",
+                "summary": "The contract is incomplete.",
+            },
+            "items": [
+                {
+                    "key": "item-1",
+                    "title": "Failure handling",
+                    "objective": "Expose the failure result.",
+                    "acceptance_criteria": [
+                        {
+                            "key": "failure-result",
+                            "requirement": "The failure is observable.",
+                            "expected": "A durable error is visible.",
+                            "result": "blocked",
+                            "claim_keys": ["failure-result"],
+                            "evidence": [],
+                        }
+                    ],
+                    "verification": [],
+                }
+            ],
+            "contexts": [],
+        }
+        self.actions.history_data = [
+            {
+                "id": "spec-rev-2",
+                "revision": 2,
+                "issue_version_id": "issue-v1",
+                "items": self.actions.spec_data["items"],
+                "reviews": [
+                    {
+                        "verdict": "rejected",
+                        "summary": "The contract is incomplete.",
+                        "findings": [finding],
+                    }
+                ],
+                "contexts": [],
+            }
+        ]
+
+        status, _, body = self.request("GET", "/api/state")
+        self.assertEqual(status, 200)
+        specification = json.loads(body)["runs"][0]["specification"]
+        self.assertFalse(specification["implementation_ready"])
+        self.assertEqual(
+            specification["items"][0]["acceptance_criteria"][0]["result"],
+            "blocked",
+        )
+        self.assertEqual(
+            self.actions.history_data[0]["reviews"][0]["findings"][0][
+                "summary"
+            ],
+            "Define the observable failure-path result.",
+        )
+        status, _, dashboard = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Not ready for implementation", dashboard)
+        self.assertIn(b"f.summary", dashboard)
+        self.assertIn(b"f.item_keys", dashboard)
 
 
 if __name__ == "__main__":

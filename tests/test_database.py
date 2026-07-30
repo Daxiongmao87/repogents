@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import tempfile
@@ -26,6 +27,11 @@ from repogents.database import (
     SCHEMA_V15,
     SCHEMA_V16,
     SCHEMA_V17,
+    SCHEMA_V18,
+    SCHEMA_V19,
+    SCHEMA_V20,
+    SCHEMA_V21,
+    SCHEMA_V22,
 )
 
 
@@ -56,6 +62,10 @@ class DatabaseTests(unittest.TestCase):
             15: SCHEMA_V15,
             16: SCHEMA_V16,
             17: SCHEMA_V17,
+            18: SCHEMA_V18,
+            19: SCHEMA_V19,
+            20: SCHEMA_V20,
+            21: SCHEMA_V21,
         }
         with sqlite3.connect(path) as connection:
             connection.executescript(SCHEMA_V1)
@@ -172,7 +182,7 @@ class DatabaseTests(unittest.TestCase):
             version = connection.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
-            self.assertEqual(version, 18)
+            self.assertEqual(version, 22)
 
     def test_activity_revision_advances_only_after_durable_change(self) -> None:
         initial = self.db.activity_revision
@@ -296,7 +306,7 @@ class DatabaseTests(unittest.TestCase):
             )
         self.assertEqual(tuple(member), (300, "lead"))
         self.assertEqual(contract_version, 1)
-        self.assertEqual(versions, tuple(range(1, 19)))
+        self.assertEqual(versions, tuple(range(1, 23)))
 
     def test_concurrent_schema_v1_migration_converges_once(self) -> None:
         legacy_path = Path(self.tempdir.name) / "concurrent-legacy.sqlite3"
@@ -349,7 +359,7 @@ class DatabaseTests(unittest.TestCase):
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(team_members)")
             )
-        self.assertEqual(versions, tuple(range(1, 19)))
+        self.assertEqual(versions, tuple(range(1, 23)))
         self.assertEqual(columns.count("action_timeout_seconds"), 1)
         self.assertEqual(columns.count("atomic_role"), 1)
         with Database(legacy_path).connect() as connection:
@@ -786,7 +796,7 @@ class DatabaseTests(unittest.TestCase):
                    WHERE id='pull-1'"""
             ).fetchone()[0]
 
-        self.assertEqual(version, 18)
+        self.assertEqual(version, 22)
         self.assertEqual(issue_version["version"], 1)
         self.assertEqual(issue_version["title"], "Issue")
         self.assertEqual(issue_version["body"], "Body")
@@ -873,7 +883,7 @@ class DatabaseTests(unittest.TestCase):
                      (SELECT COUNT(*) FROM pull_requests
                        WHERE id='pull-legacy' AND run_id='run-1')""").fetchone()
 
-        self.assertEqual(schema_version, 18)
+        self.assertEqual(schema_version, 22)
         self.assertEqual(run["state"], "implementing")
         self.assertIn("legacy issue snapshot", run["reason"])
         self.assertEqual(run["validated_sha"], "b" * 40)
@@ -973,7 +983,7 @@ class DatabaseTests(unittest.TestCase):
                      AND to_state='waiting_for_feedback'"""
             ).fetchone()[0]
 
-        self.assertEqual(schema_version, 18)
+        self.assertEqual(schema_version, 22)
         self.assertEqual(run["state"], "waiting_for_feedback")
         self.assertEqual(run["last_completed_state"], "waiting_for_feedback")
         self.assertIsNone(run["reason"])
@@ -1038,7 +1048,7 @@ class DatabaseTests(unittest.TestCase):
                    FROM feedback_versions WHERE id='feedback-legacy'"""
             ).fetchone()
 
-        self.assertEqual(schema_version, 18)
+        self.assertEqual(schema_version, 22)
         self.assertTrue(
             {"review_thread_id", "review_thread_resolved"}.issubset(columns)
         )
@@ -1120,7 +1130,7 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()
             integrity = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-        self.assertEqual(schema_version, 18)
+        self.assertEqual(schema_version, 22)
         self.assertTrue(
             {"superseded_at", "superseded_by_feedback_id"}.issubset(columns)
         )
@@ -1256,8 +1266,263 @@ class DatabaseTests(unittest.TestCase):
                           retry_next_at, retry_last_error
                    FROM runs WHERE id='run-1'"""
             ).fetchone()
-        self.assertEqual(version, 18)
+        self.assertEqual(version, 22)
         self.assertEqual(tuple(retry_state), (0, None, None, None))
+
+    def test_schema_v19_adds_durable_workflow_graph_state(self) -> None:
+        migrated = self.legacy_database("schema-v18.sqlite3", 18)
+        self.seed_repository_run(database=migrated)
+
+        migrated.initialize()
+
+        with migrated.connect() as connection:
+            version = connection.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()[0]
+            tables = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            contract_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='team_workflow_templates'"
+            ).fetchone()[0]
+            foreign_key_violations = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+
+        self.assertEqual(version, 22)
+        self.assertTrue(
+            {
+                "team_workflow_templates",
+                "team_workflow_nodes",
+                "team_workflow_edges",
+                "run_workflows",
+                "run_workflow_nodes",
+                "run_workflow_edges",
+                "run_workflow_attempts",
+                "run_workflow_resource_claims",
+                "workflow_assessments",
+            }.issubset(tables)
+        )
+        self.assertIn("contract_version = 1", contract_sql)
+        self.assertEqual(foreign_key_violations, [])
+
+    def test_schema_v20_adds_durable_publication_scope_reviews(self) -> None:
+        migrated = self.legacy_database("schema-v19.sqlite3", 19)
+
+        migrated.initialize()
+
+        with migrated.connect() as connection:
+            version = connection.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()[0]
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(publication_scope_reviews)"
+                )
+            }
+            foreign_key_violations = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+
+        self.assertEqual(version, 22)
+        self.assertTrue(
+            {
+                "id",
+                "run_id",
+                "issue_version_id",
+                "base_sha",
+                "candidate_sha",
+                "diff_sha256",
+                "input_sha256",
+                "reviewer_model",
+                "rubric_version",
+                "changed_files_json",
+                "in_scope",
+                "reason",
+                "created_at",
+            }.issubset(columns)
+        )
+        self.assertEqual(foreign_key_violations, [])
+
+    def test_schema_v21_adds_issue_specifications_and_removes_provisioning_input(
+        self,
+    ) -> None:
+        migrated = self.legacy_database("schema-v20.sqlite3", 20)
+        self.seed_repository_run(database=migrated)
+        with migrated.transaction() as connection:
+            connection.execute(
+                """UPDATE repositories SET inputs_json=?
+                   WHERE id='repo-1'""",
+                (
+                    '{"allowed_services":["api.example.test:443"],'
+                    '"provisioning_commands":[["npm","ci"]],'
+                    '"validation_commands":[["npm","test"]]}',
+                ),
+            )
+
+        migrated.initialize()
+
+        with migrated.connect() as connection:
+            version = connection.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()[0]
+            specification_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(run_specification_revisions)"
+                )
+            }
+            acceptance_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(acceptance_verifications)"
+                )
+            }
+            inputs = json.loads(
+                connection.execute(
+                    "SELECT inputs_json FROM repositories WHERE id='repo-1'"
+                ).fetchone()["inputs_json"]
+            )
+            foreign_key_violations = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+
+        self.assertEqual(version, 22)
+        self.assertTrue(
+            {
+                "id",
+                "run_id",
+                "issue_version_id",
+                "revision",
+                "items_json",
+                "content_sha256",
+                "reason",
+                "author_member_id",
+                "created_at",
+            }.issubset(specification_columns)
+        )
+        self.assertIn("specification_revision_id", acceptance_columns)
+        self.assertEqual(
+            inputs,
+            {
+                "allowed_services": ["api.example.test:443"],
+                "validation_commands": [["npm", "test"]],
+            },
+        )
+        self.assertEqual(foreign_key_violations, [])
+
+    def test_schema_v22_adds_durable_specification_context_reconciliation(
+        self,
+    ) -> None:
+        migrated = self.legacy_database("schema-v21.sqlite3", 21)
+        self.seed_repository_run(database=migrated)
+        now = "2026-01-01T00:00:00Z"
+        with migrated.transaction() as connection:
+            connection.execute(
+                """INSERT INTO issue_versions
+                   (id, issue_id, version, github_updated_at, content_sha256,
+                    title, body, discussion_json, observed_at)
+                   VALUES ('issue-version-1', 'issue-1', 1, ?, ?,
+                           'Issue', 'Body', '[]', ?)""",
+                (now, "a" * 64, now),
+            )
+            connection.execute(
+                """UPDATE issues SET current_version_id='issue-version-1'
+                   WHERE id='issue-1'"""
+            )
+            connection.execute(
+                """INSERT INTO team_members
+                   (id, team_version_id, stable_key, role, atomic_role,
+                    responsibilities, permitted_tools_json, runtime, model,
+                    instructions)
+                   VALUES ('verifier-1', 'team-1', 'verification', 'verifier',
+                           'repository behavior reviewer', 'Review behavior',
+                           '["read"]', 'test', 'test/verifier', '')"""
+            )
+            connection.execute(
+                """INSERT INTO run_specification_revisions
+                   (id, run_id, issue_version_id, revision, items_json,
+                    content_sha256, reason, author_member_id, created_at)
+                   VALUES ('spec-1', 'run-1', 'issue-version-1', 1, '[]',
+                           ?, 'Existing specification', 'member-1', ?)""",
+                ("b" * 64, now),
+            )
+            connection.execute(
+                """INSERT INTO run_specification_reviews
+                   (id, run_id, specification_revision_id,
+                    reviewer_member_id, reviewer_model, rubric_version,
+                    verdict, summary, findings_json, blocker,
+                    input_sha256, created_at)
+                   VALUES ('review-1', 'run-1', 'spec-1', 'verifier-1',
+                           'test/verifier', 1, 'approved',
+                           'Existing approval', '[]', NULL, ?, ?)""",
+                ("c" * 64, now),
+            )
+            connection.execute(
+                """INSERT INTO acceptance_verifications
+                   (id, run_id, commit_sha, attempt, verifier_member_id,
+                    state, claims_json, screenshot_decision_json,
+                    started_at, issue_version_id, specification_revision_id)
+                   VALUES ('acceptance-1', 'run-1', ?, 1, 'verifier-1',
+                           'passed', '[]', '{}', ?,
+                           'issue-version-1', 'spec-1')""",
+                ("d" * 40, now),
+            )
+            connection.execute(
+                """INSERT INTO acceptance_evidence
+                   (id, verification_id, sequence, action_json, result_json,
+                    started_at, completed_at)
+                   VALUES ('evidence-1', 'acceptance-1', 1, '{}', '{}', ?, ?)""",
+                (now, now),
+            )
+
+
+        migrated.initialize()
+
+        with migrated.connect() as connection:
+            version = connection.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()[0]
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(run_specification_contexts)"
+                )
+            }
+            foreign_key_violations = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+            preserved = tuple(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+                for table in (
+                    "run_specification_revisions",
+                    "run_specification_reviews",
+                    "acceptance_verifications",
+                    "acceptance_evidence",
+                )
+            )
+
+        self.assertEqual(version, 22)
+        self.assertTrue(
+            {
+                "id",
+                "run_id",
+                "issue_version_id",
+                "context_sha256",
+                "specification_revision_id",
+                "reconciled_at",
+            }.issubset(columns)
+        )
+        self.assertEqual(preserved, (1, 1, 1, 1))
+        self.assertEqual(foreign_key_violations, [])
+
 
 
 if __name__ == "__main__":
