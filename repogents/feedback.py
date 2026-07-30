@@ -1315,7 +1315,7 @@ class FeedbackService:
         run_id: str,
     ) -> None:
         row = connection.execute(
-            """SELECT runs.state,
+            """SELECT runs.state, runs.resume_state,
                       repositories.enabled AS repository_enabled,
                       repositories.removed_at AS repository_removed_at,
                       EXISTS (
@@ -1334,26 +1334,22 @@ class FeedbackService:
         if row is None:
             raise KeyError(run_id)
         state = RunState(str(row["state"]))
+        is_waiting = state == RunState.WAITING_FOR_FEEDBACK
+        is_queued_for_feedback = (
+            state == RunState.QUEUED
+            and row["resume_state"] == RunState.RESOLVING_FEEDBACK.value
+        )
         if (
             not bool(row["has_pending"])
             or not bool(row["repository_enabled"])
             or row["repository_removed_at"] is not None
-            or state != RunState.WAITING_FOR_FEEDBACK
+            or not (is_waiting or is_queued_for_feedback)
         ):
             return
-        now = _utc_now()
-        connection.execute(
-            """UPDATE runs
-               SET state='resolving_feedback', last_completed_state=?,
-                   reason=NULL, updated_at=?
-               WHERE id=?""",
-            (state.value, now, run_id),
-        )
-        connection.execute(
-            """INSERT INTO run_transitions
-               (run_id, from_state, to_state, occurred_at)
-               VALUES (?, ?, 'resolving_feedback', ?)""",
-            (run_id, state.value, now),
+        self.lifecycle.request_repository_lane(
+            connection,
+            run_id,
+            RunState.RESOLVING_FEEDBACK,
         )
 
     def _ensure_resolving(self, run_id: str) -> bool:
@@ -1365,6 +1361,14 @@ class FeedbackService:
             RunState.CLOSED,
         }:
             return False
+        if (
+            state == RunState.QUEUED
+            and run.get("resume_state") == RunState.RESOLVING_FEEDBACK.value
+        ):
+            return (
+                self.lifecycle.resume_suspended(run_id)
+                == RunState.RESOLVING_FEEDBACK.value
+            )
         if state == RunState.WAITING_FOR_FEEDBACK:
             self.lifecycle.transition(run_id, RunState.RESOLVING_FEEDBACK)
             return True

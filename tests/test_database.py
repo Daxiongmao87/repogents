@@ -32,6 +32,7 @@ from repogents.database import (
     SCHEMA_V20,
     SCHEMA_V21,
     SCHEMA_V22,
+    SCHEMA_V23,
 )
 
 
@@ -66,6 +67,7 @@ class DatabaseTests(unittest.TestCase):
             19: SCHEMA_V19,
             20: SCHEMA_V20,
             21: SCHEMA_V21,
+            22: SCHEMA_V22,
         }
         with sqlite3.connect(path) as connection:
             connection.executescript(SCHEMA_V1)
@@ -172,6 +174,60 @@ class DatabaseTests(unittest.TestCase):
                 ),
             )
 
+    def seed_active_run_conflict(
+        self,
+        database: Database,
+        *,
+        forced_run_id: str | None = None,
+    ) -> None:
+        now = "2026-01-01T00:01:00Z"
+        forced_at = "2026-01-01T00:02:00Z"
+        with database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO issues
+                   (id, repository_id, github_node_id, number, url, title, body,
+                    discussion_json, updated_at)
+                   VALUES ('issue-2', 'repo-1', 'I_node_2', 4,
+                           'https://github.com/owner/repo/issues/4',
+                           'Second issue', 'Body', '[]', ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO activation_events
+                   (id, repository_id, issue_id, github_event_id, applied_at)
+                   VALUES ('activation-2', 'repo-1', 'issue-2', 'event-2', ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO runs
+                   (id, repository_id, issue_id, activation_event_id,
+                    sandbox_version_id, team_version_id, intended_base_branch,
+                    base_sha, state, priority, force_requested_at,
+                    created_at, updated_at)
+                   VALUES ('run-2', 'repo-1', 'issue-2', 'activation-2',
+                           'sandbox-1', 'team-1', 'main', ?, 'validating',
+                           0, ?, ?, ?)""",
+                (
+                    "a" * 40,
+                    forced_at if forced_run_id == "run-2" else None,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """UPDATE runs
+                   SET state='implementing', priority=10, force_requested_at=?
+                   WHERE id='run-1'""",
+                (forced_at if forced_run_id == "run-1" else None,),
+            )
+            connection.execute(
+                """INSERT INTO run_transitions
+                   (run_id, from_state, to_state, reason, occurred_at)
+                   VALUES ('run-1', 'queued', 'implementing', 'fixture', ?),
+                          ('run-2', 'queued', 'validating', 'fixture', ?)""",
+                (now, now),
+            )
+
     def test_initialization_is_idempotent_and_enables_integrity_modes(self) -> None:
         self.db.initialize()
         with self.db.connect() as connection:
@@ -182,7 +238,7 @@ class DatabaseTests(unittest.TestCase):
             version = connection.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
-            self.assertEqual(version, 22)
+            self.assertEqual(version, 23)
 
     def test_activity_revision_advances_only_after_durable_change(self) -> None:
         initial = self.db.activity_revision
@@ -306,7 +362,7 @@ class DatabaseTests(unittest.TestCase):
             )
         self.assertEqual(tuple(member), (300, "lead"))
         self.assertEqual(contract_version, 1)
-        self.assertEqual(versions, tuple(range(1, 23)))
+        self.assertEqual(versions, tuple(range(1, 24)))
 
     def test_concurrent_schema_v1_migration_converges_once(self) -> None:
         legacy_path = Path(self.tempdir.name) / "concurrent-legacy.sqlite3"
@@ -359,7 +415,7 @@ class DatabaseTests(unittest.TestCase):
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(team_members)")
             )
-        self.assertEqual(versions, tuple(range(1, 23)))
+        self.assertEqual(versions, tuple(range(1, 24)))
         self.assertEqual(columns.count("action_timeout_seconds"), 1)
         self.assertEqual(columns.count("atomic_role"), 1)
         with Database(legacy_path).connect() as connection:
@@ -796,7 +852,7 @@ class DatabaseTests(unittest.TestCase):
                    WHERE id='pull-1'"""
             ).fetchone()[0]
 
-        self.assertEqual(version, 22)
+        self.assertEqual(version, 23)
         self.assertEqual(issue_version["version"], 1)
         self.assertEqual(issue_version["title"], "Issue")
         self.assertEqual(issue_version["body"], "Body")
@@ -883,7 +939,7 @@ class DatabaseTests(unittest.TestCase):
                      (SELECT COUNT(*) FROM pull_requests
                        WHERE id='pull-legacy' AND run_id='run-1')""").fetchone()
 
-        self.assertEqual(schema_version, 22)
+        self.assertEqual(schema_version, 23)
         self.assertEqual(run["state"], "implementing")
         self.assertIn("legacy issue snapshot", run["reason"])
         self.assertEqual(run["validated_sha"], "b" * 40)
@@ -983,7 +1039,7 @@ class DatabaseTests(unittest.TestCase):
                      AND to_state='waiting_for_feedback'"""
             ).fetchone()[0]
 
-        self.assertEqual(schema_version, 22)
+        self.assertEqual(schema_version, 23)
         self.assertEqual(run["state"], "waiting_for_feedback")
         self.assertEqual(run["last_completed_state"], "waiting_for_feedback")
         self.assertIsNone(run["reason"])
@@ -1048,7 +1104,7 @@ class DatabaseTests(unittest.TestCase):
                    FROM feedback_versions WHERE id='feedback-legacy'"""
             ).fetchone()
 
-        self.assertEqual(schema_version, 22)
+        self.assertEqual(schema_version, 23)
         self.assertTrue(
             {"review_thread_id", "review_thread_resolved"}.issubset(columns)
         )
@@ -1130,7 +1186,7 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()
             integrity = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-        self.assertEqual(schema_version, 22)
+        self.assertEqual(schema_version, 23)
         self.assertTrue(
             {"superseded_at", "superseded_by_feedback_id"}.issubset(columns)
         )
@@ -1266,7 +1322,7 @@ class DatabaseTests(unittest.TestCase):
                           retry_next_at, retry_last_error
                    FROM runs WHERE id='run-1'"""
             ).fetchone()
-        self.assertEqual(version, 22)
+        self.assertEqual(version, 23)
         self.assertEqual(tuple(retry_state), (0, None, None, None))
 
     def test_schema_v19_adds_durable_workflow_graph_state(self) -> None:
@@ -1293,7 +1349,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 22)
+        self.assertEqual(version, 23)
         self.assertTrue(
             {
                 "team_workflow_templates",
@@ -1329,7 +1385,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 22)
+        self.assertEqual(version, 23)
         self.assertTrue(
             {
                 "id",
@@ -1392,7 +1448,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 22)
+        self.assertEqual(version, 23)
         self.assertTrue(
             {
                 "id",
@@ -1509,7 +1565,7 @@ class DatabaseTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(version, 22)
+        self.assertEqual(version, 23)
         self.assertTrue(
             {
                 "id",
@@ -1523,6 +1579,75 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(preserved, (1, 1, 1, 1))
         self.assertEqual(foreign_key_violations, [])
 
+
+    def test_schema_v23_enforces_one_active_run_per_repository(self) -> None:
+        migrated = self.legacy_database("schema-v22-active-runs.sqlite3", 22)
+        self.seed_repository_run(database=migrated)
+        self.seed_active_run_conflict(migrated, forced_run_id="run-1")
+
+        migrated.initialize()
+
+        with migrated.connect() as connection:
+            version = connection.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()[0]
+            runs = connection.execute(
+                """SELECT id, state, resume_state, force_requested_at
+                   FROM runs ORDER BY id"""
+            ).fetchall()
+            transitions = connection.execute(
+                "SELECT COUNT(*) FROM run_transitions"
+            ).fetchone()[0]
+            indexes = {
+                row["name"]: row["sql"]
+                for row in connection.execute(
+                    """SELECT name, sql FROM sqlite_master
+                       WHERE type='index' AND tbl_name='runs'"""
+                )
+            }
+            foreign_key_violations = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+
+        self.assertEqual(version, 23)
+        self.assertEqual(
+            [tuple(row) for row in runs],
+            [
+                ("run-1", "implementing", None, "2026-01-01T00:02:00Z"),
+                ("run-2", "queued", "validating", None),
+            ],
+        )
+        self.assertEqual(transitions, 3)
+        self.assertIn("one_active_run_per_repository", indexes)
+        self.assertEqual(foreign_key_violations, [])
+        with self.assertRaises(sqlite3.IntegrityError):
+            with migrated.transaction() as connection:
+                connection.execute(
+                    "UPDATE runs SET state='implementing' WHERE id='run-2'"
+                )
+
+    def test_schema_v23_migration_uses_priority_without_force(self) -> None:
+        migrated = self.legacy_database(
+            "schema-v22-active-run-priority.sqlite3",
+            22,
+        )
+        self.seed_repository_run(database=migrated)
+        self.seed_active_run_conflict(migrated)
+
+        migrated.initialize()
+
+        with migrated.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, state, resume_state
+                   FROM runs ORDER BY id"""
+            ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                ("run-1", "queued", "implementing"),
+                ("run-2", "validating", None),
+            ],
+        )
 
 
 if __name__ == "__main__":

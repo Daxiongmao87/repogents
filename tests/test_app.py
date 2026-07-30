@@ -72,6 +72,73 @@ class FakeLifecycle:
             connection.execute(
                 "UPDATE runs SET state=?, reason=? WHERE id=?", (value, reason, run_id)
             )
+    def suspend_for_preemption(self, run_id: str) -> str:
+        self.calls.append(("suspend_for_preemption", run_id))
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT state FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            state = str(row["state"])
+            connection.execute(
+                """UPDATE runs
+                   SET state='queued', resume_state=?, reason=?
+                   WHERE id=?""",
+                (state, "preempted by forced sibling run", run_id),
+            )
+        return state
+
+    def resume_suspended(self, run_id: str) -> str | None:
+        self.calls.append(("resume_suspended", run_id))
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT resume_state FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            resume_state = row["resume_state"]
+            if resume_state is not None:
+                connection.execute(
+                    """UPDATE runs
+                       SET state=?, resume_state=NULL, reason=NULL
+                       WHERE id=?""",
+                    (resume_state, run_id),
+                )
+        return None if resume_state is None else str(resume_state)
+
+    def activate_queued(self, run_id: str) -> bool:
+        self.calls.append(("activate_queued", run_id))
+        with self.database.transaction() as connection:
+            run = connection.execute(
+                "SELECT repository_id FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if run is None:
+                raise KeyError(run_id)
+            sibling = connection.execute(
+                """SELECT 1 FROM runs
+                   WHERE repository_id=? AND id!=?
+                     AND state IN (
+                         'implementing', 'validating', 'publishing',
+                         'resolving_feedback'
+                     )""",
+                (run["repository_id"], run_id),
+            ).fetchone()
+            if sibling is not None:
+                connection.execute(
+                    """UPDATE runs SET resume_state='implementing'
+                       WHERE id=?""",
+                    (run_id,),
+                )
+                return False
+            connection.execute(
+                """UPDATE runs
+                   SET state='implementing', resume_state=NULL
+                   WHERE id=?""",
+                (run_id,),
+            )
+        return True
+
 
     def cancel(self, run_id: str, reason: str) -> None:
         self.calls.append(("cancel", run_id, reason))
@@ -116,6 +183,24 @@ class FakeExecution:
             )
         return "b" * 40
 
+class YieldingExecution:
+    def __init__(self, database: Database, *, activate_queued: bool = False) -> None:
+        self.database = database
+        self.activate_queued = activate_queued
+        self.calls: list[str] = []
+
+    def execute(self, run_id: str) -> str:
+        self.calls.append(run_id)
+        if self.activate_queued:
+            with self.database.transaction() as connection:
+                connection.execute(
+                    """UPDATE runs SET state='implementing'
+                       WHERE id=? AND state='queued'""",
+                    (run_id,),
+                )
+        return "b" * 40
+
+
 
 class BlockingExecution:
     def __init__(self) -> None:
@@ -155,12 +240,11 @@ class ControlledExecution:
         if run_id in self.blocked_runs:
             if not self._releases[run_id].wait(timeout=5):
                 raise RuntimeError(f"test did not release {run_id}")
-        else:
-            with self.database.transaction() as connection:
-                connection.execute(
-                    "UPDATE runs SET state='blocked' WHERE id=?",
-                    (run_id,),
-                )
+        with self.database.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET state='blocked' WHERE id=?",
+                (run_id,),
+            )
         with self._condition:
             self._completed.add(run_id)
             self._condition.notify_all()
@@ -660,11 +744,123 @@ class ApplicationTests(unittest.TestCase):
                 ("reconcile",),
                 ("recover_blocked",),
                 ("poll_repository", "repo-1"),
+                ("activate_queued", "run-1"),
             ],
         )
         self.assertEqual(execution.calls, ["run-1"])
         self.assertEqual(publication.calls, ["run-1"])
         self.assertEqual(feedback.calls, ["run-1"])
+
+    def test_repository_lane_owner_survives_yield_and_retry_delay(self) -> None:
+        self.seed_second_run()
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs SET state='implementing', priority=0
+                   WHERE id='run-1'"""
+            )
+            connection.execute(
+                "UPDATE runs SET state='queued', priority=1 WHERE id='run-2'"
+            )
+        lifecycle = FakeLifecycle(self.db)
+        execution = YieldingExecution(self.db, activate_queued=True)
+        orchestrator = Orchestrator(
+            database=self.db,
+            lifecycle=lifecycle,
+            execution=execution,
+            publication=FakePublication(self.db),
+            feedback=FakeFeedback(self.db),
+        )
+
+        orchestrator.advance_repository("repo-1")
+        self.assertEqual(execution.calls, ["run-1"])
+        orchestrator.advance_repository("repo-1")
+        self.assertEqual(execution.calls, ["run-1", "run-1"])
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs
+                   SET retry_attempt_count=1,
+                       retry_operation='execution',
+                       retry_next_at='2099-01-01T00:00:00Z'
+                   WHERE id='run-1'"""
+            )
+        orchestrator.advance_repository("repo-1")
+        self.assertEqual(execution.calls, ["run-1", "run-1"])
+        with self.db.connect() as connection:
+            sibling_state = connection.execute(
+                "SELECT state FROM runs WHERE id='run-2'"
+            ).fetchone()[0]
+        self.assertEqual(sibling_state, "queued")
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs
+                   SET state='waiting_for_feedback',
+                       retry_attempt_count=0,
+                       retry_operation=NULL,
+                       retry_next_at=NULL
+                   WHERE id='run-1'"""
+            )
+        orchestrator.advance_repository("repo-1")
+        self.assertIn("run-2", execution.calls)
+        with self.db.connect() as connection:
+            sibling_state = connection.execute(
+                "SELECT state FROM runs WHERE id='run-2'"
+            ).fetchone()[0]
+        self.assertEqual(sibling_state, "implementing")
+
+    def test_forced_sibling_preempts_and_resumes_at_safe_boundary(self) -> None:
+        self.seed_second_run()
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs SET state='implementing', priority=0
+                   WHERE id='run-1'"""
+            )
+            connection.execute(
+                """UPDATE runs
+                   SET state='queued', priority=1,
+                       force_requested_at='2026-01-01T00:03:00Z'
+                   WHERE id='run-2'"""
+            )
+        lifecycle = FakeLifecycle(self.db)
+        execution = YieldingExecution(self.db, activate_queued=True)
+        orchestrator = Orchestrator(
+            database=self.db,
+            lifecycle=lifecycle,
+            execution=execution,
+            publication=FakePublication(self.db),
+            feedback=FakeFeedback(self.db),
+        )
+
+        orchestrator.advance_repository("repo-1")
+
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, state, resume_state, checkout_path
+                   FROM runs ORDER BY id"""
+            ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["state"], row["resume_state"]) for row in rows],
+            [
+                ("run-1", "queued", "implementing"),
+                ("run-2", "implementing", None),
+            ],
+        )
+        self.assertTrue(all(row["checkout_path"] for row in rows))
+        self.assertEqual(execution.calls, ["run-2"])
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs
+                   SET state='waiting_for_feedback', force_requested_at=NULL
+                   WHERE id='run-2'"""
+            )
+        orchestrator.advance_repository("repo-1")
+        with self.db.connect() as connection:
+            resumed = connection.execute(
+                "SELECT state, resume_state FROM runs WHERE id='run-1'"
+            ).fetchone()
+        self.assertEqual(tuple(resumed), ("implementing", None))
+        self.assertEqual(execution.calls[-1], "run-1")
 
     def test_scheduler_keeps_polling_while_issue_execution_is_active(self) -> None:
         lifecycle = SignalingLifecycle(self.db)
@@ -1216,6 +1412,31 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(short_run["reason"], "short failure")
         self.assertIs(short_run["reason_truncated"], False)
 
+    def test_state_projects_only_the_repository_lane_owner_as_active(self) -> None:
+        self.seed_second_run()
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET state='implementing' WHERE id='run-1'"
+            )
+            connection.execute(
+                "UPDATE runs SET state='queued' WHERE id='run-2'"
+            )
+        actions = ApplicationActions(
+            database=self.db,
+            onboarding=FakeOnboarding(),
+            lifecycle=FakeLifecycle(self.db),
+            scheduler=FakeScheduler(),
+        )
+
+        state = actions.state()
+        repository = state["repositories"][0]
+        runs = {run["id"]: run for run in state["runs"]}
+
+        self.assertIs(repository["active"], True)
+        self.assertEqual(repository["active_run_count"], 1)
+        self.assertEqual(runs["run-1"]["state"], "implementing")
+        self.assertEqual(runs["run-2"]["state"], "queued")
+
     def test_state_exposes_activity_team_and_bounded_live_log(self) -> None:
         agent_state = self.root / "run" / "agent-state"
         agent_state.mkdir(parents=True)
@@ -1252,8 +1473,8 @@ class ApplicationTests(unittest.TestCase):
         repository = state["repositories"][0]
 
         self.assertIs(repository["enabled"], True)
-        self.assertIs(repository["active"], True)
-        self.assertEqual(repository["active_run_count"], 1)
+        self.assertIs(repository["active"], False)
+        self.assertEqual(repository["active_run_count"], 0)
         self.assertEqual(repository["latest_run_state"], "queued")
         self.assertEqual(repository["latest_activity_at"], "2026-01-01T00:03:24Z")
         self.assertEqual(state["runs"][0]["repository_id"], "repo-1")
@@ -2309,7 +2530,7 @@ class ApplicationTests(unittest.TestCase):
         self.assertIs(state["run_history"][0]["can_restart"], False)
         repository = state["repositories"][0]
         self.assertEqual(repository["latest_run_state"], "queued")
-        self.assertIs(repository["active"], True)
+        self.assertIs(repository["active"], False)
         with self.db.connect() as connection:
             closed = connection.execute(
                 "SELECT state, reason, priority FROM runs WHERE id='run-1'"
@@ -2399,7 +2620,7 @@ class ApplicationTests(unittest.TestCase):
 
         orchestrator.tick()
 
-        self.assertEqual(execution.calls, ["run-1"])
+        self.assertEqual(execution.calls, ["run-1", "run-2"])
         with self.db.connect() as connection:
             forced = connection.execute(
                 "SELECT force_requested_at FROM runs WHERE id='run-1'"
