@@ -1760,6 +1760,155 @@ class ExecutionTests(unittest.TestCase):
             "publishing",
         )
 
+    def test_invalid_workflow_finish_output_is_corrected_in_same_attempt(
+        self,
+    ) -> None:
+        service, runtimes = self._model_workflow_service()
+        runtimes["test/implementation"] = ScriptedRuntime(
+            [
+                {
+                    "action": "replace",
+                    "path": "value.py",
+                    "old": "return 1",
+                    "new": "return 2",
+                    "count": 1,
+                },
+                {
+                    "action": "finish",
+                    "summary": "invalid command evidence",
+                    "output": {
+                        "summary": "implemented value two",
+                        "tests": [
+                            {
+                                "command": "python -m unittest test_value -v",
+                                "result": "passed",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "action": "finish",
+                    "summary": "corrected passive test evidence",
+                    "output": {
+                        "summary": "implemented value two",
+                        "tests": [
+                            {
+                                "scenario": "Run the focused value test.",
+                                "result": "passed",
+                            }
+                        ],
+                    },
+                },
+            ]
+        )
+
+        validated_sha = service.execute("run-1")
+
+        self.assertIsNotNone(validated_sha)
+        graph = service.workflows.active_run_graph("run-1")
+        implementation = next(
+            node for node in graph.nodes if node.stable_key == "implementation"
+        )
+        self.assertEqual(implementation.state, "succeeded")
+        self.assertEqual(
+            implementation.output,
+            {
+                "summary": "implemented value two",
+                "tests": [
+                    {
+                        "scenario": "Run the focused value test.",
+                        "result": "passed",
+                    }
+                ],
+            },
+        )
+        projected = service.workflows.project_run("run-1")
+        projected_implementation = next(
+            node
+            for node in projected["generations"][0]["nodes"]
+            if node["stable_key"] == "implementation"
+        )
+        self.assertEqual(
+            [attempt["state"] for attempt in projected_implementation["attempts"]],
+            ["succeeded"],
+        )
+        history = (
+            self.checkout.parent
+            / "agent-state"
+            / "workflow"
+            / f"node-{implementation.id}"
+            / "action-history.json"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "Rejected safely; correct it and continue: "
+            "workflow node output.tests[0].command cannot contain "
+            "executable or secret configuration",
+            history,
+        )
+        self.assertNotIn("finished: invalid command evidence", history)
+        self.assertEqual(len(runtimes["test/implementation"].contexts), 3)
+
+    def test_invalid_workflow_output_secret_is_redacted_during_correction(
+        self,
+    ) -> None:
+        fixture_secret = 'workflow-"canary"\\line\nvalue'
+        runtime = ScriptedRuntime(
+            [
+                {
+                    "action": "finish",
+                    "summary": f"accidentally reported {fixture_secret}",
+                    "output": {"summary": fixture_secret},
+                },
+                {
+                    "action": "finish",
+                    "summary": "reported only passive evidence",
+                    "output": {"summary": "safe evidence"},
+                },
+            ]
+        )
+        service = ExecutionService(
+            database=self.db,
+            lifecycle=self.lifecycle,
+            teams=TeamService(self.db),
+            sandbox=self.sandbox,
+            runtime_factory=lambda _runtime, _model, _timeout: runtime,
+            max_actions=3,
+        )
+        member = next(
+            member
+            for member in TeamService(self.db).load("team-1").members
+            if member.stable_key == "implementation"
+        )
+        layout = RunLayout.create(self.data_root, "repo-1", "run-1")
+
+        outcome, yielded = service._agent_cycle(
+            runtime,
+            member,
+            SandboxPolicy(persistent_root=self.sandbox_root),
+            layout,
+            "Complete the workflow node.",
+            [],
+            (),
+            {fixture_secret},
+            workflow_expected_output={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+                "additionalProperties": False,
+            },
+        )
+
+        self.assertFalse(yielded)
+        self.assertEqual(outcome, {"summary": "safe evidence"})
+        history = (layout.agent_state / "action-history.json").read_text(
+            encoding="utf-8"
+        )
+        observed = history + "\n" + "\n".join(runtime.contexts)
+        self.assertIn("[REDACTED]", observed)
+        self.assertNotIn(fixture_secret, observed)
+        self.assertNotIn(json.dumps(fixture_secret)[1:-1], observed)
+        self.assertNotIn("finished: accidentally reported", history)
+
     def test_feedback_opens_one_restart_safe_workflow_generation(
         self,
     ) -> None:

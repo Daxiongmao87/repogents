@@ -236,6 +236,14 @@ def _validate_schema(
             raise ValueError(f"{label} is shorter than {minimum}")
 
 
+def validate_workflow_output(
+    output: Mapping[str, object],
+    schema: Mapping[str, object],
+) -> None:
+    _validate_schema(output, schema, "workflow node output")
+    _validate_safe_value(output, path="workflow node output")
+
+
 def _normalize_schema(value: object, label: str) -> dict[str, object]:
     schema = _mapping(value, label)
     schema_type = schema.get("type")
