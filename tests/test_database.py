@@ -33,6 +33,8 @@ from repogents.database import (
     SCHEMA_V21,
     SCHEMA_V22,
     SCHEMA_V23,
+    SCHEMA_V24,
+    SCHEMA_V25,
 )
 
 
@@ -68,6 +70,9 @@ class DatabaseTests(unittest.TestCase):
             20: SCHEMA_V20,
             21: SCHEMA_V21,
             22: SCHEMA_V22,
+            23: SCHEMA_V23,
+            24: SCHEMA_V24,
+            25: SCHEMA_V25,
         }
         with sqlite3.connect(path) as connection:
             connection.executescript(SCHEMA_V1)
@@ -238,7 +243,7 @@ class DatabaseTests(unittest.TestCase):
             version = connection.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
-            self.assertEqual(version, 23)
+            self.assertEqual(version, 25)
 
     def test_activity_revision_advances_only_after_durable_change(self) -> None:
         initial = self.db.activity_revision
@@ -338,6 +343,134 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(autonomous_mode, 0)
 
+    def test_schema_v25_seeds_legacy_autonomous_activation_once(self) -> None:
+        legacy = self.legacy_database("legacy-v24.sqlite3", 24)
+        self.seed_repository_run(
+            database=legacy,
+            event_id="autonomous:I_node:open",
+        )
+
+        legacy.initialize()
+        legacy.initialize()
+
+        with legacy.connect() as connection:
+            version = connection.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()[0]
+            rows = connection.execute(
+                """SELECT repository_id, github_node_id, issue_id,
+                          issue_number, observed_state, open_generation,
+                          first_observed_at, last_observed_at, closed_observed_at
+                   FROM autonomous_issue_observations"""
+            ).fetchall()
+        self.assertEqual(version, 25)
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                (
+                    "repo-1",
+                    "I_node",
+                    "issue-1",
+                    3,
+                    "open",
+                    1,
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                    None,
+                )
+            ],
+        )
+
+    def test_autonomous_observation_persists_and_reopens_once(self) -> None:
+        self.seed_repository_run()
+        first = "2026-01-01T00:00:00Z"
+        closed = "2026-01-02T00:00:00Z"
+        reopened = "2026-01-03T00:00:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO autonomous_issue_observations
+                   (repository_id, github_node_id, issue_id, issue_number,
+                    observed_state, open_generation, first_observed_at,
+                    last_observed_at, closed_observed_at)
+                   VALUES ('repo-1', 'I_node', 'issue-1', 3, 'open', 1,
+                           ?, ?, NULL)""",
+                (first, first),
+            )
+
+        reopened_database = Database(self.path)
+        reopened_database.initialize()
+        with reopened_database.transaction() as connection:
+            closed_count = connection.execute(
+                """UPDATE autonomous_issue_observations
+                   SET observed_state='closed', last_observed_at=?,
+                       closed_observed_at=?
+                   WHERE repository_id='repo-1'
+                     AND github_node_id='I_node'
+                     AND observed_state='open'""",
+                (closed, closed),
+            ).rowcount
+        self.assertEqual(closed_count, 1)
+
+        reopen_counts = []
+        for _ in range(2):
+            with Database(self.path).transaction() as connection:
+                reopen_counts.append(
+                    connection.execute(
+                        """UPDATE autonomous_issue_observations
+                           SET observed_state='open',
+                               open_generation=open_generation + 1,
+                               last_observed_at=?, closed_observed_at=NULL
+                           WHERE repository_id='repo-1'
+                             AND github_node_id='I_node'
+                             AND observed_state='closed'""",
+                        (reopened,),
+                    ).rowcount
+                )
+
+        with Database(self.path).connect() as connection:
+            observation = connection.execute(
+                """SELECT observed_state, open_generation,
+                          first_observed_at, last_observed_at, closed_observed_at
+                   FROM autonomous_issue_observations
+                   WHERE repository_id='repo-1' AND github_node_id='I_node'"""
+            ).fetchone()
+        self.assertEqual(reopen_counts, [1, 0])
+        self.assertEqual(
+            tuple(observation),
+            ("open", 2, first, reopened, None),
+        )
+
+    def test_autonomous_observation_cascades_with_repository(self) -> None:
+        now = "2026-01-01T00:00:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO repositories
+                   (id, github_node_id, owner, name, url, default_branch,
+                    onboarding_state, created_at, updated_at)
+                   VALUES ('cascade-repo', 'cascade-repo-node', 'owner',
+                           'cascade', 'https://github.com/owner/cascade',
+                           'main', 'ready', ?, ?)""",
+                (now, now),
+            )
+            connection.execute(
+                """INSERT INTO autonomous_issue_observations
+                   (repository_id, github_node_id, issue_id, issue_number,
+                    observed_state, open_generation, first_observed_at,
+                    last_observed_at, closed_observed_at)
+                   VALUES ('cascade-repo', 'cascade-issue-node', NULL, 8,
+                           'closed', 3, ?, ?, ?)""",
+                (now, now, now),
+            )
+            connection.execute(
+                "DELETE FROM repositories WHERE id='cascade-repo'"
+            )
+        with self.db.connect() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM autonomous_issue_observations "
+                "WHERE repository_id='cascade-repo'"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
     def test_repository_autonomous_mode_persists_across_reopen(self) -> None:
         now = "2026-01-01T00:00:00Z"
         with self.db.transaction() as connection:
@@ -414,7 +547,7 @@ class DatabaseTests(unittest.TestCase):
             )
         self.assertEqual(tuple(member), (300, "lead"))
         self.assertEqual(contract_version, 1)
-        self.assertEqual(versions, tuple(range(1, 24)))
+        self.assertEqual(versions, tuple(range(1, 26)))
 
     def test_concurrent_schema_v1_migration_converges_once(self) -> None:
         legacy_path = Path(self.tempdir.name) / "concurrent-legacy.sqlite3"
@@ -471,7 +604,7 @@ class DatabaseTests(unittest.TestCase):
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(repositories)")
             )
-        self.assertEqual(versions, tuple(range(1, 24)))
+        self.assertEqual(versions, tuple(range(1, 26)))
         self.assertEqual(member_columns.count("action_timeout_seconds"), 1)
         self.assertEqual(member_columns.count("atomic_role"), 1)
         self.assertEqual(repository_columns.count("autonomous_mode"), 1)
@@ -909,7 +1042,7 @@ class DatabaseTests(unittest.TestCase):
                    WHERE id='pull-1'"""
             ).fetchone()[0]
 
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 25)
         self.assertEqual(issue_version["version"], 1)
         self.assertEqual(issue_version["title"], "Issue")
         self.assertEqual(issue_version["body"], "Body")
@@ -996,7 +1129,7 @@ class DatabaseTests(unittest.TestCase):
                      (SELECT COUNT(*) FROM pull_requests
                        WHERE id='pull-legacy' AND run_id='run-1')""").fetchone()
 
-        self.assertEqual(schema_version, 23)
+        self.assertEqual(schema_version, 25)
         self.assertEqual(run["state"], "implementing")
         self.assertIn("legacy issue snapshot", run["reason"])
         self.assertEqual(run["validated_sha"], "b" * 40)
@@ -1096,7 +1229,7 @@ class DatabaseTests(unittest.TestCase):
                      AND to_state='waiting_for_feedback'"""
             ).fetchone()[0]
 
-        self.assertEqual(schema_version, 23)
+        self.assertEqual(schema_version, 25)
         self.assertEqual(run["state"], "waiting_for_feedback")
         self.assertEqual(run["last_completed_state"], "waiting_for_feedback")
         self.assertIsNone(run["reason"])
@@ -1161,7 +1294,7 @@ class DatabaseTests(unittest.TestCase):
                    FROM feedback_versions WHERE id='feedback-legacy'"""
             ).fetchone()
 
-        self.assertEqual(schema_version, 23)
+        self.assertEqual(schema_version, 25)
         self.assertTrue(
             {"review_thread_id", "review_thread_resolved"}.issubset(columns)
         )
@@ -1243,7 +1376,7 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()
             integrity = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-        self.assertEqual(schema_version, 23)
+        self.assertEqual(schema_version, 25)
         self.assertTrue(
             {"superseded_at", "superseded_by_feedback_id"}.issubset(columns)
         )
@@ -1379,7 +1512,7 @@ class DatabaseTests(unittest.TestCase):
                           retry_next_at, retry_last_error
                    FROM runs WHERE id='run-1'"""
             ).fetchone()
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 25)
         self.assertEqual(tuple(retry_state), (0, None, None, None))
 
     def test_schema_v19_adds_durable_workflow_graph_state(self) -> None:
@@ -1406,7 +1539,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 25)
         self.assertTrue(
             {
                 "team_workflow_templates",
@@ -1442,7 +1575,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 25)
         self.assertTrue(
             {
                 "id",
@@ -1505,7 +1638,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 25)
         self.assertTrue(
             {
                 "id",
@@ -1622,7 +1755,7 @@ class DatabaseTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 25)
         self.assertTrue(
             {
                 "id",
@@ -1666,7 +1799,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 25)
         self.assertEqual(
             [tuple(row) for row in runs],
             [
@@ -1682,6 +1815,98 @@ class DatabaseTests(unittest.TestCase):
                 connection.execute(
                     "UPDATE runs SET state='implementing' WHERE id='run-2'"
                 )
+
+    def test_schema_v23_through_v25_publish_atomically(self) -> None:
+        migrated = self.legacy_database(
+            "schema-v22-concurrent-autonomy.sqlite3",
+            22,
+        )
+        real_connect = sqlite3.connect
+        first_connection = True
+        connection_lock = threading.Lock()
+        v24_reached = threading.Event()
+        release_v24 = threading.Event()
+        second_finished = threading.Event()
+        errors: list[BaseException] = []
+
+        def synchronized_connect(
+            *args: object, **kwargs: object
+        ) -> sqlite3.Connection:
+            nonlocal first_connection
+            connection = real_connect(*args, **kwargs)
+            with connection_lock:
+                synchronize = first_connection
+                first_connection = False
+            if synchronize:
+                def trace(statement: str) -> None:
+                    if (
+                        "ALTER TABLE repositories" in statement
+                        and "autonomous_mode" in statement
+                    ):
+                        v24_reached.set()
+                        release_v24.wait(timeout=5)
+
+                connection.set_trace_callback(trace)
+            return connection
+
+        def initialize(*, finished: threading.Event | None = None) -> None:
+            try:
+                migrated.initialize()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                if finished is not None:
+                    finished.set()
+
+        with mock.patch(
+            "repogents.database.sqlite3.connect",
+            side_effect=synchronized_connect,
+        ):
+            first = threading.Thread(target=initialize)
+            first.start()
+            self.assertTrue(v24_reached.wait(timeout=5))
+            second = threading.Thread(
+                target=initialize,
+                kwargs={"finished": second_finished},
+            )
+            second.start()
+            self.assertFalse(second_finished.wait(timeout=0.2))
+            release_v24.set()
+            first.join(timeout=10)
+            second.join(timeout=10)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        with migrated.connect() as connection:
+            versions = tuple(
+                row[0]
+                for row in connection.execute(
+                    "SELECT version FROM schema_version WHERE version >= 23 ORDER BY version"
+                )
+            )
+            repository_columns = tuple(
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(repositories)"
+                )
+            )
+            observation_table_sql = connection.execute(
+                """SELECT sql FROM sqlite_master
+                   WHERE type='table'
+                     AND name='autonomous_issue_observations'"""
+            ).fetchone()[0]
+            observation_indexes = connection.execute(
+                "PRAGMA index_list(autonomous_issue_observations)"
+            ).fetchall()
+
+        self.assertEqual(versions, (23, 24, 25))
+        self.assertEqual(repository_columns.count("autonomous_mode"), 1)
+        self.assertIn(
+            "PRIMARY KEY (REPOSITORY_ID, GITHUB_NODE_ID)",
+            observation_table_sql.upper(),
+        )
+        self.assertTrue(any(row["unique"] for row in observation_indexes))
 
     def test_schema_v23_migration_uses_priority_without_force(self) -> None:
         migrated = self.legacy_database(

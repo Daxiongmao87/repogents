@@ -358,16 +358,68 @@ class RunLifecycle:
         owner = str(repository["owner"])
         name = str(repository["name"])
         if bool(repository["autonomous_mode"]):
-            issues = self.github.list_open_issues(owner, name)
-            events = [
-                ActivationEvent(
-                    event_id=f"autonomous:{issue.node_id}:open",
-                    applied_at=issue.updated_at,
-                    issue=issue,
+            self._record_ready_issue_autonomous_inactive(repository_id)
+            candidates = self.github.list_open_issues(owner, name)
+            hydrated: dict[str, IssueInfo] = {}
+            hydrate = getattr(self.github, "hydrate_open_issue_candidate", None)
+            for candidate in candidates:
+                if candidate.state != "open":
+                    continue
+                try:
+                    if callable(hydrate):
+                        issue = hydrate(owner, name, candidate)
+                    else:
+                        issue = self.github.get_issue(owner, name, candidate.number)
+                        if (
+                            issue.state != "open"
+                            or issue.number != candidate.number
+                            or issue.node_id != candidate.node_id
+                        ):
+                            issue = None
+                except GitHubError:
+                    issue = None
+                if issue is not None:
+                    hydrated[issue.node_id] = issue
+
+            with self.database.connect() as connection:
+                tracked = connection.execute(
+                    """SELECT github_node_id, issue_number
+                       FROM autonomous_issue_observations
+                       WHERE repository_id=?""",
+                    (repository_id,),
+                ).fetchall()
+            for observation in tracked:
+                node_id = str(observation["github_node_id"])
+                if node_id in hydrated:
+                    continue
+                try:
+                    issue = self.github.get_issue(
+                        owner, name, int(observation["issue_number"])
+                    )
+                except GitHubError:
+                    continue
+                if issue.node_id != node_id:
+                    continue
+                if issue.state == "closed":
+                    self._observe_autonomous_issue(repository_id, issue, "closed")
+                elif issue.state == "open":
+                    hydrated[node_id] = issue
+
+            events: list[ActivationEvent] = []
+            for issue in sorted(hydrated.values(), key=lambda value: value.number):
+                generation = self._observe_autonomous_issue(
+                    repository_id, issue, "open"
                 )
-                for issue in issues
-                if issue.state == "open"
-            ]
+                if generation is None:
+                    continue
+                suffix = "" if generation == 1 else f":{generation}"
+                events.append(
+                    ActivationEvent(
+                        event_id=f"autonomous:{issue.node_id}:open{suffix}",
+                        applied_at=issue.updated_at,
+                        issue=issue,
+                    )
+                )
         else:
             list_ready_issues = getattr(self.github, "list_ready_issues", None)
             if callable(list_ready_issues):
@@ -388,6 +440,92 @@ class RunLifecycle:
             if run_id is not None:
                 created.append(run_id)
         return tuple(created)
+
+    def _record_ready_issue_autonomous_inactive(self, repository_id: str) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                """UPDATE ready_issue_discovery
+                   SET status=CASE
+                         WHEN last_success_at IS NULL THEN 'unavailable'
+                         ELSE 'stale'
+                       END,
+                       last_attempt_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                       error='autonomous mode enabled'
+                   WHERE repository_id=?
+                     AND EXISTS (
+                         SELECT 1 FROM repositories
+                         WHERE repositories.id=?
+                           AND repositories.autonomous_mode=1
+                     )""",
+                (repository_id, repository_id),
+            )
+
+    def _observe_autonomous_issue(
+        self, repository_id: str, issue: IssueInfo, state: str
+    ) -> int | None:
+        now = _utc_now()
+        with self.database.transaction() as connection:
+            repository = connection.execute(
+                """SELECT autonomous_mode FROM repositories
+                   WHERE id=? AND enabled=1 AND removed_at IS NULL
+                     AND onboarding_state='ready'""",
+                (repository_id,),
+            ).fetchone()
+            if repository is None or not bool(repository["autonomous_mode"]):
+                return None
+            stored_issue = connection.execute(
+                """SELECT id FROM issues
+                   WHERE repository_id=? AND number=?""",
+                (repository_id, issue.number),
+            ).fetchone()
+            observation = connection.execute(
+                """SELECT observed_state, open_generation
+                   FROM autonomous_issue_observations
+                   WHERE repository_id=? AND github_node_id=?""",
+                (repository_id, issue.node_id),
+            ).fetchone()
+            issue_id = None if stored_issue is None else str(stored_issue["id"])
+            if observation is None:
+                generation = 1
+                connection.execute(
+                    """INSERT INTO autonomous_issue_observations
+                       (repository_id, github_node_id, issue_id, issue_number,
+                        observed_state, open_generation, first_observed_at,
+                        last_observed_at, closed_observed_at)
+                       VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+                    (
+                        repository_id,
+                        issue.node_id,
+                        issue_id,
+                        issue.number,
+                        state,
+                        now,
+                        now,
+                        now if state == "closed" else None,
+                    ),
+                )
+                return generation if state == "open" else None
+            generation = int(observation["open_generation"])
+            if state == "open" and str(observation["observed_state"]) == "closed":
+                generation += 1
+            connection.execute(
+                """UPDATE autonomous_issue_observations
+                   SET issue_id=COALESCE(?, issue_id), issue_number=?,
+                       observed_state=?, open_generation=?, last_observed_at=?,
+                       closed_observed_at=?
+                   WHERE repository_id=? AND github_node_id=?""",
+                (
+                    issue_id,
+                    issue.number,
+                    state,
+                    generation,
+                    now,
+                    now if state == "closed" else None,
+                    repository_id,
+                    issue.node_id,
+                ),
+            )
+            return generation if state == "open" else None
 
     def _record_ready_issue_success(
         self, repository_id: str, ready_issue_generation: int, issues: list[IssueInfo]
@@ -1179,12 +1317,21 @@ class RunLifecycle:
             )
         )
         with self.database.transaction() as connection:
-            eligible = connection.execute(
-                """SELECT 1 FROM repositories
-                   WHERE id=? AND enabled=1 AND removed_at IS NULL""",
+            snapshot = connection.execute(
+                """SELECT * FROM repositories
+                   WHERE id=?
+                     AND enabled=1
+                     AND removed_at IS NULL
+                     AND onboarding_state='ready'
+                     AND current_sandbox_version_id IS NOT NULL
+                     AND current_team_version_id IS NOT NULL""",
                 (repository_id,),
             ).fetchone()
-            if eligible is None:
+            if snapshot is None:
+                return None
+            if event.event_id.startswith("autonomous:") and not bool(
+                snapshot["autonomous_mode"]
+            ):
                 return None
             already_processed = connection.execute(
                 """SELECT 1 FROM activation_events
@@ -1214,9 +1361,9 @@ class RunLifecycle:
             )
 
         base_sha = self.github.get_branch_head(
-            str(repository["owner"]),  # type: ignore[index]
-            str(repository["name"]),  # type: ignore[index]
-            str(repository["default_branch"]),  # type: ignore[index]
+            str(snapshot["owner"]),
+            str(snapshot["name"]),
+            str(snapshot["default_branch"]),
         )
         run_id = str(
             uuid.uuid5(
@@ -1237,9 +1384,19 @@ class RunLifecycle:
                          AND enabled=1
                          AND removed_at IS NULL
                          AND onboarding_state='ready'
-                         AND current_sandbox_version_id IS NOT NULL
-                         AND current_team_version_id IS NOT NULL""",
-                    (repository_id,),
+                         AND owner=?
+                         AND name=?
+                         AND default_branch=?
+                         AND current_sandbox_version_id=?
+                         AND current_team_version_id=?""",
+                    (
+                        repository_id,
+                        snapshot["owner"],
+                        snapshot["name"],
+                        snapshot["default_branch"],
+                        snapshot["current_sandbox_version_id"],
+                        snapshot["current_team_version_id"],
+                    ),
                 ).fetchone()
                 if eligible is None:
                     return None

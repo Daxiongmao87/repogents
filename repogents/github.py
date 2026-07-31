@@ -554,6 +554,22 @@ class GitHubClient:
         issues.sort(key=lambda issue: issue.number)
         return issues
 
+    def hydrate_open_issue_candidate(
+        self, owner: str, name: str, candidate: IssueInfo
+    ) -> IssueInfo | None:
+        """Return the current full snapshot for an autonomous issue candidate."""
+        try:
+            issue = self.get_issue(owner, name, candidate.number)
+        except GitHubNotFound:
+            return None
+        if (
+            issue.state != "open"
+            or issue.number != candidate.number
+            or issue.node_id != candidate.node_id
+        ):
+            return None
+        return issue
+
     def get_branch_head(self, owner: str, name: str, branch: str) -> str:
         encoded_branch = urllib.parse.quote(branch, safe="")
         payload, _ = self._request(

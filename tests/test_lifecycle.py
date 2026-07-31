@@ -47,7 +47,13 @@ class FakeActivationClient:
 
     def get_issue(self, owner: str, name: str, number: int) -> IssueInfo:
         self.issue_polls += 1
-        issue = self.current_issue or self.events[-1].issue
+        if self.current_issue is not None:
+            issue = self.current_issue
+        else:
+            candidates = self.open_issues or [event.issue for event in self.events]
+            issue = next((candidate for candidate in candidates if candidate.number == number), None)
+            if issue is None:
+                raise AssertionError(f"unexpected issue number {number}")
         if issue.number != number:
             raise AssertionError(f"unexpected issue number {number}")
         return issue
@@ -429,6 +435,213 @@ class RunLifecycleTests(unittest.TestCase):
                 connection.execute("SELECT COUNT(*) FROM activation_events").fetchone()[0],
                 0,
             )
+
+    def test_autonomous_first_issue_version_contains_hydrated_discussion(self) -> None:
+        self.github.events.clear()
+        discussed = IssueInfo(
+            node_id=self.event.issue.node_id,
+            number=self.event.issue.number,
+            url=self.event.issue.url,
+            title=self.event.issue.title,
+            body="",
+            discussion=(
+                {
+                    "author": "maintainer",
+                    "body": "The required behavior exists only in this comment.",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "url": f"{self.event.issue.url}#issuecomment-1",
+                },
+            ),
+            updated_at="2026-01-01T00:00:00Z",
+            state="open",
+        )
+        self.github.open_issues = [
+            IssueInfo(
+                node_id=discussed.node_id,
+                number=discussed.number,
+                url=discussed.url,
+                title=discussed.title,
+                body=discussed.body,
+                discussion=(),
+                updated_at=discussed.updated_at,
+                state="open",
+            )
+        ]
+        self.github.current_issue = discussed
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET autonomous_mode=1 WHERE id='repo-1'"
+            )
+
+        created = self.lifecycle.poll_repository("repo-1")
+
+        self.assertEqual(len(created), 1)
+        with self.db.connect() as connection:
+            stored = connection.execute(
+                """SELECT issue_versions.discussion_json
+                   FROM runs
+                   JOIN activation_events
+                     ON activation_events.id=runs.activation_event_id
+                   JOIN issue_versions
+                     ON issue_versions.id=activation_events.issue_version_id
+                   WHERE runs.id=?""",
+                (created[0],),
+            ).fetchone()
+        self.assertIsNotNone(stored)
+        self.assertIn(
+            "The required behavior exists only in this comment.",
+            str(stored["discussion_json"]),
+        )
+
+    def test_autonomous_mode_hides_and_label_mode_restores_ready_inventory(self) -> None:
+        self.github.events.clear()
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO ready_issue_discovery
+                   (repository_id, status, issues_json, last_success_at,
+                    last_attempt_at, error)
+                   VALUES ('repo-1', 'available', '[{\"number\": 99}]',
+                           '2026-01-01T00:00:00Z',
+                           '2026-01-01T00:00:00Z', NULL)"""
+            )
+            connection.execute(
+                "UPDATE repositories SET autonomous_mode=1 WHERE id='repo-1'"
+            )
+        self.github.open_issues = []
+
+        self.assertEqual(self.lifecycle.poll_repository("repo-1"), ())
+        with self.db.connect() as connection:
+            inactive = connection.execute(
+                "SELECT status, error FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(inactive["status"], "stale")
+        self.assertEqual(inactive["error"], "autonomous mode enabled")
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET autonomous_mode=0 WHERE id='repo-1'"
+            )
+        with patch.object(
+            self.github, "list_ready_issues", return_value=[self.event.issue]
+        ):
+            self.assertEqual(self.lifecycle.poll_repository("repo-1"), ())
+        with self.db.connect() as connection:
+            restored = connection.execute(
+                "SELECT status, issues_json, error FROM ready_issue_discovery WHERE repository_id='repo-1'"
+            ).fetchone()
+        self.assertEqual(restored["status"], "available")
+        self.assertIsNone(restored["error"])
+        self.assertIn('\"number\": 3', restored["issues_json"])
+        self.assertNotIn('\"number\": 99', restored["issues_json"])
+
+    def test_activation_rejects_default_branch_change_during_head_lookup(self) -> None:
+        self.github.events.clear()
+        self.github.open_issues = [self.event.issue]
+        self.github.current_issue = self.event.issue
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET autonomous_mode=1 WHERE id='repo-1'"
+            )
+
+        def change_branch_during_lookup(owner: str, name: str, branch: str) -> str:
+            self.assertEqual(branch, "main")
+            with self.db.transaction() as connection:
+                connection.execute(
+                    "UPDATE repositories SET default_branch='next' WHERE id='repo-1'"
+                )
+            return "main-head"
+
+        with patch.object(
+            self.github, "get_branch_head", side_effect=change_branch_during_lookup
+        ):
+            self.assertEqual(self.lifecycle.poll_repository("repo-1"), ())
+        with self.db.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM activation_events").fetchone()[0],
+                0,
+            )
+
+        with patch.object(self.github, "get_branch_head", return_value="next-head"):
+            created = self.lifecycle.poll_repository("repo-1")
+        self.assertEqual(len(created), 1)
+        with self.db.connect() as connection:
+            run = connection.execute(
+                "SELECT intended_base_branch, base_sha FROM runs WHERE id=?",
+                (created[0],),
+            ).fetchone()
+        self.assertEqual(run["intended_base_branch"], "next")
+        self.assertEqual(run["base_sha"], "next-head")
+
+    def test_autonomous_observed_closure_and_restart_create_one_reopen_run(self) -> None:
+        self.github.events.clear()
+        open_issue = self.event.issue
+        self.github.open_issues = [open_issue]
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET autonomous_mode=1 WHERE id='repo-1'"
+            )
+
+        first = self.lifecycle.poll_repository("repo-1")
+        self.assertEqual(len(first), 1)
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET state='closed' WHERE id=?", (first[0],)
+            )
+
+        closed_issue = IssueInfo(
+            node_id=open_issue.node_id,
+            number=open_issue.number,
+            url=open_issue.url,
+            title=open_issue.title,
+            body=open_issue.body,
+            discussion=open_issue.discussion,
+            updated_at="2026-01-02T00:00:00Z",
+            state="closed",
+        )
+        self.github.open_issues = []
+        self.github.current_issue = closed_issue
+        self.assertEqual(self.lifecycle.poll_repository("repo-1"), ())
+
+        restarted = RunLifecycle(
+            database=Database(self.root / "db.sqlite3"),
+            data_root=self.data_root,
+            github=self.github,
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+        )
+        restarted.database.initialize()
+        reopened_issue = IssueInfo(
+            node_id=open_issue.node_id,
+            number=open_issue.number,
+            url=open_issue.url,
+            title=open_issue.title,
+            body=open_issue.body,
+            discussion=open_issue.discussion,
+            updated_at="2026-01-03T00:00:00Z",
+            state="open",
+        )
+        self.github.open_issues = [reopened_issue]
+        self.github.current_issue = reopened_issue
+        reopened = restarted.poll_repository("repo-1")
+        self.assertEqual(len(reopened), 1)
+        self.assertEqual(restarted.poll_repository("repo-1"), ())
+        with self.db.connect() as connection:
+            activation_ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT github_event_id FROM activation_events ORDER BY applied_at"
+                ).fetchall()
+            ]
+            run_count = connection.execute(
+                "SELECT COUNT(*) FROM runs WHERE issue_id=(SELECT id FROM issues WHERE number=3)"
+            ).fetchone()[0]
+        self.assertEqual(
+            activation_ids,
+            ["autonomous:I3:open", "autonomous:I3:open:2"],
+        )
+        self.assertEqual(run_count, 2)
 
     def test_repeated_poll_and_restart_create_exactly_one_run(self) -> None:
         first = self.lifecycle.poll_repository("repo-1")

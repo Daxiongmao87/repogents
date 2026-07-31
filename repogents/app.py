@@ -1033,13 +1033,19 @@ class ApplicationActions:
             repository_values.append(value)
             discovery = discovery_by_repository.get(repository_id)
             repository_ready = str(value["onboarding_state"]) == "ready"
-            repository_discoverable = repository_ready and bool(value["enabled"])
+            repository_discoverable = (
+                repository_ready
+                and bool(value["enabled"])
+                and not bool(value["autonomous_mode"])
+            )
             if not repository_ready:
                 discovery_unavailable_error = (
                     f"Repository onboarding is {value['onboarding_state']}"
                 )
             elif not value["enabled"]:
                 discovery_unavailable_error = "Repository is paused"
+            elif value["autonomous_mode"]:
+                discovery_unavailable_error = "Autonomous mode enabled"
             else:
                 discovery_unavailable_error = "Ready-issue discovery has not run yet"
             if discovery is None:

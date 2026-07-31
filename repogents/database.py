@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Generator
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 25
 
 SCHEMA_V1 = r"""
 BEGIN IMMEDIATE;
@@ -1249,11 +1249,67 @@ SCHEMA_V22 = (
     """,
 )
 
-SCHEMA_V23 = (
+SCHEMA_V24 = (
     """
     ALTER TABLE repositories
     ADD COLUMN autonomous_mode INTEGER NOT NULL DEFAULT 0
         CHECK (autonomous_mode IN (0, 1))
+    """,
+)
+
+
+SCHEMA_V25 = (
+    """
+    CREATE TABLE autonomous_issue_observations (
+        repository_id TEXT NOT NULL
+            REFERENCES repositories(id) ON DELETE CASCADE,
+        github_node_id TEXT NOT NULL,
+        issue_id TEXT REFERENCES issues(id) ON DELETE SET NULL,
+        issue_number INTEGER NOT NULL CHECK (issue_number > 0),
+        observed_state TEXT NOT NULL
+            CHECK (observed_state IN ('open', 'closed')),
+        open_generation INTEGER NOT NULL DEFAULT 1
+            CHECK (open_generation > 0),
+        first_observed_at TEXT NOT NULL,
+        last_observed_at TEXT NOT NULL,
+        closed_observed_at TEXT,
+        PRIMARY KEY (repository_id, github_node_id),
+        CHECK (
+            (observed_state = 'open' AND closed_observed_at IS NULL)
+            OR (observed_state = 'closed' AND closed_observed_at IS NOT NULL)
+        )
+    )
+    """,
+    """
+    CREATE INDEX autonomous_issue_observations_issue
+        ON autonomous_issue_observations(issue_id)
+    """,
+    """
+    INSERT OR IGNORE INTO autonomous_issue_observations (
+        repository_id,
+        github_node_id,
+        issue_id,
+        issue_number,
+        observed_state,
+        open_generation,
+        first_observed_at,
+        last_observed_at,
+        closed_observed_at
+    )
+    SELECT
+        activation_events.repository_id,
+        issues.github_node_id,
+        issues.id,
+        issues.number,
+        'open',
+        1,
+        activation_events.applied_at,
+        activation_events.applied_at,
+        NULL
+    FROM activation_events
+    JOIN issues ON issues.id = activation_events.issue_id
+    WHERE activation_events.github_event_id =
+          'autonomous:' || issues.github_node_id || ':open'
     """,
 )
 
@@ -1642,6 +1698,26 @@ class Database:
                     """INSERT INTO schema_version(version, applied_at)
                        VALUES (
                            23,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )"""
+                )
+            if current_version < 24:
+                for statement in SCHEMA_V24:
+                    connection.execute(statement)
+                connection.execute(
+                    """INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           24,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )"""
+                )
+            if current_version < 25:
+                for statement in SCHEMA_V25:
+                    connection.execute(statement)
+                connection.execute(
+                    """INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           25,
                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                        )"""
                 )

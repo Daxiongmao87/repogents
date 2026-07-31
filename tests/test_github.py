@@ -3,7 +3,13 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
-from repogents.github import FeedbackItem, GitHubClient, GitHubError
+from repogents.github import (
+    FeedbackItem,
+    GitHubClient,
+    GitHubError,
+    GitHubNotFound,
+    IssueInfo,
+)
 
 
 class StubGitHubClient(GitHubClient):
@@ -331,6 +337,113 @@ class GitHubAdapterTests(unittest.TestCase):
                 ("GET", "repos/owner/repo/issues?state=open&per_page=100&page=2"),
             ],
         )
+
+    def test_hydrate_open_issue_candidate_loads_existing_comments(self) -> None:
+        candidate = IssueInfo(
+            node_id="I3",
+            number=3,
+            url="https://github.com/owner/repo/issues/3",
+            title="Terse issue",
+            body="Fix it",
+            discussion=(),
+            updated_at="2026-01-01T00:00:00Z",
+        )
+
+        issue = self.client.hydrate_open_issue_candidate("owner", "repo", candidate)
+
+        self.assertIsNotNone(issue)
+        assert issue is not None
+        self.assertEqual(issue.discussion[0]["author"], "reviewer")
+        self.assertEqual(issue.discussion[0]["body"], "More context")
+        self.assertEqual(
+            self.client.requests,
+            [
+                ("GET", "repos/owner/repo/issues/3"),
+                ("GET", "repos/owner/repo/issues/3/comments?per_page=100&page=1"),
+            ],
+        )
+
+    def test_hydrate_open_issue_candidate_skips_disappeared_candidate(self) -> None:
+        class MissingIssueClient(StubGitHubClient):
+            def get_issue(self, owner: str, name: str, number: int) -> IssueInfo:
+                raise GitHubNotFound("missing")
+
+        candidate = IssueInfo(
+            node_id="I3",
+            number=3,
+            url="issue-url",
+            title="Issue",
+            body="",
+            discussion=(),
+            updated_at="2026-01-01T00:00:00Z",
+        )
+
+        self.assertIsNone(
+            MissingIssueClient({}).hydrate_open_issue_candidate(
+                "owner", "repo", candidate
+            )
+        )
+
+    def test_hydrate_open_issue_candidate_skips_changed_identity_or_state(self) -> None:
+        candidate = IssueInfo(
+            node_id="I3",
+            number=3,
+            url="issue-url",
+            title="Issue",
+            body="",
+            discussion=(),
+            updated_at="2026-01-01T00:00:00Z",
+        )
+        for hydrated in (
+            IssueInfo(
+                node_id="I-other",
+                number=3,
+                url="issue-url",
+                title="Issue",
+                body="",
+                discussion=(),
+                updated_at="2026-01-01T00:00:01Z",
+            ),
+            IssueInfo(
+                node_id="I3",
+                number=3,
+                url="issue-url",
+                title="Issue",
+                body="",
+                discussion=(),
+                updated_at="2026-01-01T00:00:01Z",
+                state="closed",
+            ),
+        ):
+            with self.subTest(node_id=hydrated.node_id, state=hydrated.state):
+                class ChangedIssueClient(StubGitHubClient):
+                    def get_issue(
+                        self, owner: str, name: str, number: int
+                    ) -> IssueInfo:
+                        return hydrated
+
+                self.assertIsNone(
+                    ChangedIssueClient({}).hydrate_open_issue_candidate(
+                        "owner", "repo", candidate
+                    )
+                )
+
+    def test_hydrate_open_issue_candidate_propagates_malformed_response(self) -> None:
+        responses = dict(self.responses)
+        responses["repos/owner/repo/issues/3"] = []
+        client = StubGitHubClient(responses)
+        candidate = IssueInfo(
+            node_id="I3",
+            number=3,
+            url="issue-url",
+            title="Issue",
+            body="",
+            discussion=(),
+            updated_at="2026-01-01T00:00:00Z",
+        )
+
+        with self.assertRaisesRegex(GitHubError, "issue response"):
+            client.hydrate_open_issue_candidate("owner", "repo", candidate)
 
     def test_ready_label_event_on_later_page_is_returned(self) -> None:
         class PagedClient(StubGitHubClient):

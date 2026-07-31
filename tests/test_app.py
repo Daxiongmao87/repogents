@@ -2021,6 +2021,34 @@ class ApplicationTests(unittest.TestCase):
 
         with self.db.transaction() as connection:
             connection.execute(
+                "UPDATE repositories SET autonomous_mode=1 WHERE id='repo-2'"
+            )
+        autonomous = actions.state()
+        self.assertEqual(autonomous["ready_issues"], [])
+        autonomous_discovery = {
+            item["repository_id"]: item
+            for item in autonomous["ready_issue_discovery"]
+        }
+        self.assertEqual(autonomous_discovery["repo-2"]["status"], "stale")
+        self.assertEqual(
+            autonomous_discovery["repo-2"]["error"], "Autonomous mode enabled"
+        )
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET autonomous_mode=0 WHERE id='repo-2'"
+            )
+        label_gated = actions.state()
+        self.assertEqual(label_gated["ready_issues"], first["ready_issues"])
+        label_discovery = {
+            item["repository_id"]: item
+            for item in label_gated["ready_issue_discovery"]
+        }
+        self.assertEqual(label_discovery["repo-2"]["status"], "available")
+        self.assertIsNone(label_discovery["repo-2"]["error"])
+
+        with self.db.transaction() as connection:
+            connection.execute(
                 "UPDATE repositories SET onboarding_state='blocked' WHERE id='repo-2'"
             )
         blocked = actions.state()
