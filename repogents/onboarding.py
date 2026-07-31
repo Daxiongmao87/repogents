@@ -1116,6 +1116,26 @@ class OnboardingService:
             raise KeyError(repository_id)
         return dict(row)
 
+    def set_repository_autonomous_mode(
+        self, repository_id: str, enabled: bool
+    ) -> dict[str, object]:
+        now = _utc_now()
+        with self.database.transaction() as connection:
+            result = connection.execute(
+                """UPDATE repositories
+                   SET autonomous_mode=?, updated_at=?
+                   WHERE id=? AND removed_at IS NULL""",
+                (1 if enabled else 0, now, repository_id),
+            )
+            if result.rowcount != 1:
+                raise KeyError(repository_id)
+            row = connection.execute(
+                "SELECT * FROM repositories WHERE id=?", (repository_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(repository_id)
+        return dict(row)
+
 
 def _normalize_repository_inputs(inputs: dict[str, object]) -> dict[str, Any]:
     allowed_keys = {

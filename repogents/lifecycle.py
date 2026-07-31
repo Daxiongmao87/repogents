@@ -125,6 +125,8 @@ def allowed_transition(current: RunState, target: RunState) -> bool:
 class ActivationClient(Protocol):
     def list_ready_events(self, owner: str, name: str) -> list[ActivationEvent]: ...
 
+    def list_open_issues(self, owner: str, name: str) -> list[IssueInfo]: ...
+
     def get_issue(self, owner: str, name: str, number: int) -> IssueInfo: ...
 
     def get_branch_head(self, owner: str, name: str, branch: str) -> str: ...
@@ -344,21 +346,33 @@ class RunLifecycle:
         team_version_id = repository["current_team_version_id"]
         if not sandbox_version_id or not team_version_id:
             raise RuntimeError("ready repository has no stored sandbox or team version")
-        list_ready_issues = getattr(self.github, "list_ready_issues", None)
-        if callable(list_ready_issues):
-            try:
-                ready_issues = list_ready_issues(
-                    str(repository["owner"]), str(repository["name"])
+        owner = str(repository["owner"])
+        name = str(repository["name"])
+        if bool(repository["autonomous_mode"]):
+            issues = self.github.list_open_issues(owner, name)
+            events = [
+                ActivationEvent(
+                    event_id=f"autonomous:{issue.node_id}:open",
+                    applied_at=issue.updated_at,
+                    issue=issue,
                 )
-            except GitHubError:
-                self._record_ready_issue_failure(repository_id)
-            else:
-                self._record_ready_issue_success(
-                    repository_id, int(repository["ready_issue_generation"]), ready_issues
-                )
-        events = self.github.list_ready_events(
-            str(repository["owner"]), str(repository["name"])
-        )
+                for issue in issues
+                if issue.state == "open"
+            ]
+        else:
+            list_ready_issues = getattr(self.github, "list_ready_issues", None)
+            if callable(list_ready_issues):
+                try:
+                    ready_issues = list_ready_issues(owner, name)
+                except GitHubError:
+                    self._record_ready_issue_failure(repository_id)
+                else:
+                    self._record_ready_issue_success(
+                        repository_id,
+                        int(repository["ready_issue_generation"]),
+                        ready_issues,
+                    )
+            events = self.github.list_ready_events(owner, name)
         created: list[str] = []
         for event in events:
             run_id = self._activate(repository, event)
@@ -1030,11 +1044,20 @@ class RunLifecycle:
         try:
             with self.database.transaction() as connection:
                 eligible = connection.execute(
-                    """SELECT 1 FROM repositories
-                       WHERE id=? AND enabled=1 AND removed_at IS NULL""",
+                    """SELECT * FROM repositories
+                       WHERE id=?
+                         AND enabled=1
+                         AND removed_at IS NULL
+                         AND onboarding_state='ready'
+                         AND current_sandbox_version_id IS NOT NULL
+                         AND current_team_version_id IS NOT NULL""",
                     (repository_id,),
                 ).fetchone()
                 if eligible is None:
+                    return None
+                if event.event_id.startswith("autonomous:") and not bool(
+                    eligible["autonomous_mode"]
+                ):
                     return None
                 already_processed = connection.execute(
                     """SELECT 1 FROM activation_events
@@ -1077,9 +1100,9 @@ class RunLifecycle:
                         repository_id,
                         issue_id,
                         activation_id,
-                        repository["current_sandbox_version_id"],  # type: ignore[index]
-                        repository["current_team_version_id"],  # type: ignore[index]
-                        repository["default_branch"],  # type: ignore[index]
+                        eligible["current_sandbox_version_id"],
+                        eligible["current_team_version_id"],
+                        eligible["default_branch"],
                         base_sha,
                         str(checkout),
                         str(root),

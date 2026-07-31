@@ -182,7 +182,7 @@ class DatabaseTests(unittest.TestCase):
             version = connection.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
-            self.assertEqual(version, 22)
+            self.assertEqual(version, 23)
 
     def test_activity_revision_advances_only_after_durable_change(self) -> None:
         initial = self.db.activity_revision
@@ -274,8 +274,60 @@ class DatabaseTests(unittest.TestCase):
             repository = connection.execute(
                 "SELECT enabled, removed_at FROM repositories WHERE id='legacy-repo'"
             ).fetchone()
-        self.assertTrue({"enabled", "removed_at"}.issubset(columns))
+        self.assertTrue({"enabled", "removed_at", "autonomous_mode"}.issubset(columns))
         self.assertEqual(tuple(repository), (1, None))
+        with migrated.connect() as connection:
+            autonomous_mode = connection.execute(
+                "SELECT autonomous_mode FROM repositories WHERE id='legacy-repo'"
+            ).fetchone()[0]
+        self.assertEqual(autonomous_mode, 0)
+
+    def test_repository_autonomous_mode_persists_across_reopen(self) -> None:
+        now = "2026-01-01T00:00:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO repositories
+                   (id, github_node_id, owner, name, url, default_branch,
+                    onboarding_state, created_at, updated_at)
+                   VALUES ('autonomous-repo', 'autonomous-node', 'owner',
+                           'autonomous', 'https://github.com/owner/autonomous',
+                           'main', 'ready', ?, ?)""",
+                (now, now),
+            )
+        with Database(self.path).connect() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT autonomous_mode FROM repositories "
+                    "WHERE id='autonomous-repo'"
+                ).fetchone()[0],
+                0,
+            )
+        with Database(self.path).transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET autonomous_mode=1, updated_at=? WHERE id=?",
+                (now, "autonomous-repo"),
+            )
+        with Database(self.path).connect() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT autonomous_mode FROM repositories "
+                    "WHERE id='autonomous-repo'"
+                ).fetchone()[0],
+                1,
+            )
+        with Database(self.path).transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET autonomous_mode=0, updated_at=? WHERE id=?",
+                (now, "autonomous-repo"),
+            )
+        with Database(self.path).connect() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT autonomous_mode FROM repositories "
+                    "WHERE id='autonomous-repo'"
+                ).fetchone()[0],
+                0,
+            )
 
     def test_schema_v1_team_timeout_is_backfilled_idempotently(self) -> None:
         legacy_path = Path(self.tempdir.name) / "legacy.sqlite3"
@@ -306,7 +358,7 @@ class DatabaseTests(unittest.TestCase):
             )
         self.assertEqual(tuple(member), (300, "lead"))
         self.assertEqual(contract_version, 1)
-        self.assertEqual(versions, tuple(range(1, 23)))
+        self.assertEqual(versions, tuple(range(1, 24)))
 
     def test_concurrent_schema_v1_migration_converges_once(self) -> None:
         legacy_path = Path(self.tempdir.name) / "concurrent-legacy.sqlite3"
@@ -355,13 +407,18 @@ class DatabaseTests(unittest.TestCase):
                     "SELECT version FROM schema_version ORDER BY version"
                 )
             )
-            columns = tuple(
+            member_columns = tuple(
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(team_members)")
             )
-        self.assertEqual(versions, tuple(range(1, 23)))
-        self.assertEqual(columns.count("action_timeout_seconds"), 1)
-        self.assertEqual(columns.count("atomic_role"), 1)
+            repository_columns = tuple(
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(repositories)")
+            )
+        self.assertEqual(versions, tuple(range(1, 24)))
+        self.assertEqual(member_columns.count("action_timeout_seconds"), 1)
+        self.assertEqual(member_columns.count("atomic_role"), 1)
+        self.assertEqual(repository_columns.count("autonomous_mode"), 1)
         with Database(legacy_path).connect() as connection:
             acceptance_tables = {
                 row["name"]
@@ -796,7 +853,7 @@ class DatabaseTests(unittest.TestCase):
                    WHERE id='pull-1'"""
             ).fetchone()[0]
 
-        self.assertEqual(version, 22)
+        self.assertEqual(version, 23)
         self.assertEqual(issue_version["version"], 1)
         self.assertEqual(issue_version["title"], "Issue")
         self.assertEqual(issue_version["body"], "Body")
@@ -883,7 +940,7 @@ class DatabaseTests(unittest.TestCase):
                      (SELECT COUNT(*) FROM pull_requests
                        WHERE id='pull-legacy' AND run_id='run-1')""").fetchone()
 
-        self.assertEqual(schema_version, 22)
+        self.assertEqual(schema_version, 23)
         self.assertEqual(run["state"], "implementing")
         self.assertIn("legacy issue snapshot", run["reason"])
         self.assertEqual(run["validated_sha"], "b" * 40)
@@ -983,7 +1040,7 @@ class DatabaseTests(unittest.TestCase):
                      AND to_state='waiting_for_feedback'"""
             ).fetchone()[0]
 
-        self.assertEqual(schema_version, 22)
+        self.assertEqual(schema_version, 23)
         self.assertEqual(run["state"], "waiting_for_feedback")
         self.assertEqual(run["last_completed_state"], "waiting_for_feedback")
         self.assertIsNone(run["reason"])
@@ -1048,7 +1105,7 @@ class DatabaseTests(unittest.TestCase):
                    FROM feedback_versions WHERE id='feedback-legacy'"""
             ).fetchone()
 
-        self.assertEqual(schema_version, 22)
+        self.assertEqual(schema_version, 23)
         self.assertTrue(
             {"review_thread_id", "review_thread_resolved"}.issubset(columns)
         )
@@ -1130,7 +1187,7 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()
             integrity = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-        self.assertEqual(schema_version, 22)
+        self.assertEqual(schema_version, 23)
         self.assertTrue(
             {"superseded_at", "superseded_by_feedback_id"}.issubset(columns)
         )
@@ -1266,7 +1323,7 @@ class DatabaseTests(unittest.TestCase):
                           retry_next_at, retry_last_error
                    FROM runs WHERE id='run-1'"""
             ).fetchone()
-        self.assertEqual(version, 22)
+        self.assertEqual(version, 23)
         self.assertEqual(tuple(retry_state), (0, None, None, None))
 
     def test_schema_v19_adds_durable_workflow_graph_state(self) -> None:
@@ -1293,7 +1350,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 22)
+        self.assertEqual(version, 23)
         self.assertTrue(
             {
                 "team_workflow_templates",
@@ -1329,7 +1386,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 22)
+        self.assertEqual(version, 23)
         self.assertTrue(
             {
                 "id",
@@ -1392,7 +1449,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 22)
+        self.assertEqual(version, 23)
         self.assertTrue(
             {
                 "id",
@@ -1509,7 +1566,7 @@ class DatabaseTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(version, 22)
+        self.assertEqual(version, 23)
         self.assertTrue(
             {
                 "id",

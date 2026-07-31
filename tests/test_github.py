@@ -186,6 +186,152 @@ class GitHubAdapterTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_list_open_issues_filters_and_normalizes_autonomous_candidates(self) -> None:
+        self.responses["repos/owner/repo/issues"] = [
+            {
+                "node_id": "I8",
+                "number": 8,
+                "html_url": "https://github.com/owner/repo/issues/8",
+                "title": "Later issue",
+                "body": None,
+                "state": "open",
+                "updated_at": "2026-01-03T00:00:00Z",
+            },
+            {
+                "node_id": "PR7",
+                "number": 7,
+                "html_url": "https://github.com/owner/repo/pull/7",
+                "title": "Pull request",
+                "body": "not an issue",
+                "state": "open",
+                "updated_at": "2026-01-02T00:00:00Z",
+                "pull_request": {"url": "pull-url"},
+            },
+            {
+                "node_id": "I6",
+                "number": 6,
+                "html_url": "https://github.com/owner/repo/issues/6",
+                "title": "Closed despite endpoint",
+                "body": "skip",
+                "state": "closed",
+                "updated_at": "2026-01-01T00:00:00Z",
+            },
+            {
+                "node_id": "I4",
+                "number": 4,
+                "html_url": "https://github.com/owner/repo/issues/4",
+                "title": "Older issue",
+                "body": "Implement it",
+                "state": "open",
+                "updated_at": "2025-12-31T00:00:00Z",
+            },
+            {"malformed": True},
+            {
+                "node_id": "IBOOL",
+                "number": True,
+                "html_url": "https://github.com/owner/repo/issues/1",
+                "title": "Boolean number",
+                "body": "skip",
+                "state": "open",
+                "updated_at": "2026-01-04T00:00:00Z"
+            },
+            {
+                "node_id": "IZERO",
+                "number": 0,
+                "html_url": "https://github.com/owner/repo/issues/0",
+                "title": "Zero number",
+                "body": "skip",
+                "state": "open",
+                "updated_at": "2026-01-04T00:00:00Z"
+            },
+            {
+                "node_id": "INEG",
+                "number": -2,
+                "html_url": "https://github.com/owner/repo/issues/-2",
+                "title": "Negative number",
+                "body": "skip",
+                "state": "open",
+                "updated_at": "2026-01-04T00:00:00Z"
+            },
+            {
+                "node_id": "ISTRING",
+                "number": "9",
+                "html_url": "https://github.com/owner/repo/issues/9",
+                "title": "String number",
+                "body": "skip",
+                "state": "open",
+                "updated_at": "2026-01-04T00:00:00Z"
+            },
+        ]
+
+        issues = self.client.list_open_issues("owner", "repo")
+
+        self.assertEqual([issue.number for issue in issues], [4, 8])
+        self.assertEqual(issues[0].node_id, "I4")
+        self.assertEqual(issues[0].body, "Implement it")
+        self.assertEqual(issues[1].body, "")
+        self.assertEqual(issues[0].discussion, ())
+        self.assertEqual(
+            self.client.requests,
+            [
+                (
+                    "GET",
+                    "repos/owner/repo/issues?state=open&per_page=100&page=1",
+                )
+            ],
+        )
+
+    def test_list_open_issues_reads_later_pages_and_sorts_by_number(self) -> None:
+        class PagedClient(StubGitHubClient):
+            def _request(
+                self,
+                method: str,
+                path: str,
+                *,
+                body: object | None = None,
+                headers: dict[str, str] | None = None,
+            ) -> tuple[object, dict[str, str]]:
+                self.requests.append((method, path))
+                if path.endswith("page=1"):
+                    return ([
+                        {
+                            "node_id": "I8",
+                            "number": 8,
+                            "html_url": "https://github.com/owner/repo/issues/8",
+                            "title": "Later number",
+                            "body": "page one",
+                            "state": "open",
+                            "updated_at": "2026-01-03T00:00:00Z",
+                        }
+                    ] + [{"pull_request": {}} for _ in range(99)]), {}
+                if path.endswith("page=2"):
+                    return ([
+                        {
+                            "node_id": "I4",
+                            "number": 4,
+                            "html_url": "https://github.com/owner/repo/issues/4",
+                            "title": "Earlier number",
+                            "body": "page two",
+                            "state": "open",
+                            "updated_at": "2026-01-04T00:00:00Z",
+                        }
+                    ]), {}
+                raise AssertionError(f"unexpected request {method} {path}")
+
+        client = PagedClient(self.responses)
+
+        issues = client.list_open_issues("owner", "repo")
+
+        self.assertEqual([issue.number for issue in issues], [4, 8])
+        self.assertEqual(
+            client.requests,
+            [
+                ("GET", "repos/owner/repo/issues?state=open&per_page=100&page=1"),
+                ("GET", "repos/owner/repo/issues?state=open&per_page=100&page=2"),
+            ],
+        )
+
     def test_ready_label_event_on_later_page_is_returned(self) -> None:
         class PagedClient(StubGitHubClient):
             def _request(

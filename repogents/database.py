@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Generator
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 SCHEMA_V1 = r"""
 BEGIN IMMEDIATE;
@@ -1249,6 +1249,14 @@ SCHEMA_V22 = (
     """,
 )
 
+SCHEMA_V23 = (
+    """
+    ALTER TABLE repositories
+    ADD COLUMN autonomous_mode INTEGER NOT NULL DEFAULT 0
+        CHECK (autonomous_mode IN (0, 1))
+    """,
+)
+
 
 class Database:
     """Owns SQLite connection policy and transactional schema initialization."""
@@ -1532,6 +1540,24 @@ class Database:
                         "schema v22 migration introduced foreign-key violations"
                     )
             else:
+                connection.commit()
+            if version < 23:
+                connection.execute("BEGIN IMMEDIATE")
+                current_version = int(
+                    connection.execute(
+                        "SELECT MAX(version) FROM schema_version"
+                    ).fetchone()[0]
+                )
+                if current_version < 23:
+                    for statement in SCHEMA_V23:
+                        connection.execute(statement)
+                    connection.execute(
+                        """INSERT INTO schema_version(version, applied_at)
+                           VALUES (
+                               23,
+                               strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                           )"""
+                    )
                 connection.commit()
             connection.execute("PRAGMA journal_mode = WAL")
         except BaseException:

@@ -26,9 +26,11 @@ from repogents.lifecycle import (
 class FakeActivationClient:
     events: list[ActivationEvent]
     current_issue: IssueInfo | None = None
+    open_issues: list[IssueInfo] | None = None
     base_sha: str = "b" * 40
     polls: int = 0
     issue_polls: int = 0
+    open_issue_polls: int = 0
 
     def list_ready_issues(self, owner: str, name: str) -> tuple[IssueInfo, ...]:
         return tuple(event.issue for event in self.events)
@@ -36,6 +38,12 @@ class FakeActivationClient:
     def list_ready_events(self, owner: str, name: str) -> list[ActivationEvent]:
         self.polls += 1
         return list(self.events)
+
+    def list_open_issues(self, owner: str, name: str) -> list[IssueInfo]:
+        self.open_issue_polls += 1
+        if self.open_issues is not None:
+            return list(self.open_issues)
+        return [event.issue for event in self.events]
 
     def get_issue(self, owner: str, name: str, number: int) -> IssueInfo:
         self.issue_polls += 1
@@ -304,6 +312,123 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertFalse(
             allowed_transition(RunState.CLOSED, RunState.RESOLVING_FEEDBACK)
         )
+
+    def test_default_mode_ignores_unlabeled_issue_and_preserves_label_activation(self) -> None:
+        event = self.github.events.pop()
+        self.github.open_issues = [event.issue]
+
+        self.assertEqual(self.lifecycle.poll_repository("repo-1"), ())
+        self.assertEqual(self.github.open_issue_polls, 0)
+
+        self.github.events.append(event)
+        created = self.lifecycle.poll_repository("repo-1")
+        self.assertEqual(len(created), 1)
+        self.assertEqual(self.github.polls, 2)
+
+    def test_autonomous_mode_discovers_all_open_issues_and_replays_idempotently(self) -> None:
+        older = self.event.issue
+        newer = IssueInfo(
+            node_id="I4",
+            number=4,
+            url="https://github.com/owner/repo/issues/4",
+            title="New unlabeled issue",
+            body="Handle this too",
+            discussion=(),
+            updated_at="2026-01-02T00:00:00Z",
+        )
+        closed = IssueInfo(
+            node_id="I5",
+            number=5,
+            url="https://github.com/owner/repo/issues/5",
+            title="Closed issue",
+            body="Do not activate",
+            discussion=(),
+            updated_at="2026-01-03T00:00:00Z",
+            state="closed",
+        )
+        self.github.events.clear()
+        self.github.open_issues = [older, newer, closed]
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET autonomous_mode=1 WHERE id='repo-1'"
+            )
+
+        first = self.lifecycle.poll_repository("repo-1")
+        second = self.lifecycle.poll_repository("repo-1")
+        restarted = RunLifecycle(
+            database=Database(self.root / "db.sqlite3"),
+            data_root=self.data_root,
+            github=self.github,
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+        )
+        restarted.database.initialize()
+        third = restarted.poll_repository("repo-1")
+
+        self.assertEqual(len(first), 2)
+        self.assertEqual(second, ())
+        self.assertEqual(third, ())
+        self.assertEqual(self.github.polls, 0)
+        with self.db.connect() as connection:
+            numbers = connection.execute(
+                """SELECT issues.number FROM runs
+                   JOIN issues ON issues.id=runs.issue_id
+                   ORDER BY issues.number"""
+            ).fetchall()
+            activation_ids = connection.execute(
+                "SELECT github_event_id FROM activation_events ORDER BY github_event_id"
+            ).fetchall()
+        self.assertEqual([row[0] for row in numbers], [3, 4])
+        self.assertEqual(
+            [row[0] for row in activation_ids],
+            ["autonomous:I3:open", "autonomous:I4:open"],
+        )
+
+    def test_autonomous_mode_preserves_existing_nonterminal_run(self) -> None:
+        existing = self.lifecycle.poll_repository("repo-1")[0]
+        self.github.events.clear()
+        self.github.open_issues = [self.event.issue]
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET autonomous_mode=1 WHERE id='repo-1'"
+            )
+
+        self.assertEqual(self.lifecycle.poll_repository("repo-1"), ())
+        with self.db.connect() as connection:
+            runs = connection.execute(
+                "SELECT id, state FROM runs WHERE issue_id=(SELECT id FROM issues WHERE number=3)"
+            ).fetchall()
+            activation_count = connection.execute(
+                "SELECT COUNT(*) FROM activation_events"
+            ).fetchone()[0]
+        self.assertEqual([(row[0], row[1]) for row in runs], [(existing, "queued")])
+        self.assertEqual(activation_count, 1)
+
+    def test_autonomous_activation_revalidates_mode_after_discovery(self) -> None:
+        self.github.events.clear()
+        self.github.open_issues = [self.event.issue]
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET autonomous_mode=1 WHERE id='repo-1'"
+            )
+        original = self.github.list_open_issues
+
+        def disable_after_discovery(owner: str, name: str) -> list[IssueInfo]:
+            issues = original(owner, name)
+            with self.db.transaction() as connection:
+                connection.execute(
+                    "UPDATE repositories SET autonomous_mode=0 WHERE id='repo-1'"
+                )
+            return issues
+
+        with patch.object(self.github, "list_open_issues", disable_after_discovery):
+            self.assertEqual(self.lifecycle.poll_repository("repo-1"), ())
+        with self.db.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM activation_events").fetchone()[0],
+                0,
+            )
 
     def test_repeated_poll_and_restart_create_exactly_one_run(self) -> None:
         first = self.lifecycle.poll_repository("repo-1")

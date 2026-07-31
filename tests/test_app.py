@@ -16,8 +16,9 @@ from repogents.lifecycle import RunState
 
 
 class FakeOnboarding:
-    def __init__(self) -> None:
+    def __init__(self, database: Database | None = None) -> None:
         self.calls: list[tuple[object, ...]] = []
+        self.database = database
 
     def onboard(self, identity: str, inputs: dict[str, object]) -> str:
         self.calls.append(("onboard", identity, inputs))
@@ -26,6 +27,26 @@ class FakeOnboarding:
     def reonboard(self, repository_id: str, inputs: dict[str, object]) -> str:
         self.calls.append(("reonboard", repository_id, inputs))
         return repository_id
+
+    def set_repository_autonomous_mode(
+        self, repository_id: str, autonomous: bool
+    ) -> dict[str, object]:
+        self.calls.append(("set_repository_autonomous_mode", repository_id, autonomous))
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM repositories WHERE id=? AND removed_at IS NULL",
+                (repository_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(repository_id)
+            connection.execute(
+                "UPDATE repositories SET autonomous_mode=? WHERE id=?",
+                (int(autonomous), repository_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM repositories WHERE id=?", (repository_id,)
+            ).fetchone()
+        return dict(updated)
 
 
 class FakeLifecycle:
@@ -1133,6 +1154,44 @@ class ApplicationTests(unittest.TestCase):
             FakeLifecycle(self.db).get_run("run-1")["state"],
             "queued",
         )
+
+    def test_repository_autonomous_mode_round_trips_across_reconstruction(self) -> None:
+        actions = ApplicationActions(
+            database=self.db,
+            onboarding=FakeOnboarding(self.db),
+            lifecycle=FakeLifecycle(self.db),
+            scheduler=FakeScheduler(),
+        )
+
+        repository = actions.state()["repositories"][0]
+        self.assertIs(repository["autonomous_mode"], False)
+
+        actions.set_repository_autonomous("repo-1", True)
+        repository = actions.state()["repositories"][0]
+        self.assertIs(repository["autonomous_mode"], True)
+
+        reopened_database = Database(self.root / "db.sqlite3")
+        reopened_database.initialize()
+        reopened_actions = ApplicationActions(
+            database=reopened_database,
+            onboarding=FakeOnboarding(reopened_database),
+            lifecycle=FakeLifecycle(reopened_database),
+            scheduler=FakeScheduler(),
+        )
+        repository = reopened_actions.state()["repositories"][0]
+        self.assertIs(repository["autonomous_mode"], True)
+
+        reopened_actions.set_repository_autonomous("repo-1", False)
+        final_database = Database(self.root / "db.sqlite3")
+        final_database.initialize()
+        final_actions = ApplicationActions(
+            database=final_database,
+            onboarding=FakeOnboarding(final_database),
+            lifecycle=FakeLifecycle(final_database),
+            scheduler=FakeScheduler(),
+        )
+        repository = final_actions.state()["repositories"][0]
+        self.assertIs(repository["autonomous_mode"], False)
 
     def test_repository_controls_archive_only_inactive_inventory(self) -> None:
         scheduler = FakeScheduler()

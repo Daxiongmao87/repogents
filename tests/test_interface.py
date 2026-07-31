@@ -72,6 +72,7 @@ class FakeActions:
                     "url": "https://github.com/owner/repo",
                     "default_branch": "main",
                     "enabled": True,
+                    "autonomous_mode": False,
                     "active": True,
                     "active_run_count": 1,
                     "latest_run_state": "waiting_for_feedback",
@@ -547,6 +548,13 @@ class FakeActions:
         if repository_id != "repo-1":
             raise KeyError(repository_id)
         self.calls.append(("enabled", repository_id, enabled))
+
+    def set_repository_autonomous(
+        self, repository_id: str, autonomous: bool
+    ) -> None:
+        if repository_id != "repo-1":
+            raise KeyError(repository_id)
+        self.calls.append(("autonomous", repository_id, autonomous))
 
     def remove_repository(self, repository_id: str) -> None:
         if repository_id != "repo-1":
@@ -1244,6 +1252,30 @@ class InterfaceTests(unittest.TestCase):
             json.loads(body),
             {"ok": True, "enabled": True, "paused": False},
         )
+        status, _, dashboard = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"autonomous_mode", dashboard)
+        self.assertIn(b"/autonomous", dashboard)
+        status, _, body = self.request(
+            "POST",
+            "/api/repositories/repo-1/autonomous",
+            {"autonomous": True},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body),
+            {"ok": True, "autonomous": True},
+        )
+        status, _, body = self.request(
+            "POST",
+            "/api/repositories/repo-1/autonomous",
+            {"autonomous": False},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body),
+            {"ok": True, "autonomous": False},
+        )
         routes = [
             ("/api/repositories/repo-1/reonboard", {"inputs": {"mode": "fresh"}}),
             ("/api/repositories/repo-1/remove", {}),
@@ -1263,6 +1295,8 @@ class InterfaceTests(unittest.TestCase):
                 ("add", "owner/second", {"fixtures": ["sample"]}),
                 ("enabled", "repo-1", False),
                 ("enabled", "repo-1", True),
+                ("autonomous", "repo-1", True),
+                ("autonomous", "repo-1", False),
                 ("reonboard", "repo-1", {"mode": "fresh"}),
                 ("remove", "repo-1"),
                 ("reorder", ["run-1"]),
@@ -1279,6 +1313,91 @@ class InterfaceTests(unittest.TestCase):
             {},
         )
         self.assertEqual(status, 404)
+
+    def test_autonomous_operator_control_survives_application_reconstruction(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from types import MethodType
+
+        from repogents.database import Database
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "state.sqlite3"
+            database = Database(database_path)
+            database.initialize()
+            now = "2026-01-01T00:00:00Z"
+            with database.transaction() as connection:
+                connection.execute(
+                    """INSERT INTO repositories
+                       (id, github_node_id, owner, name, url, default_branch,
+                        onboarding_state, created_at, updated_at)
+                       VALUES ('repo-1', 'R1', 'owner', 'repo',
+                               'https://github.com/owner/repo', 'main', 'ready', ?, ?)""",
+                    (now, now),
+                )
+
+            original_state = self.actions.state
+
+            def durable_state(_actions):
+                state = json.loads(json.dumps(original_state()))
+                with database.connect() as connection:
+                    autonomous = connection.execute(
+                        "SELECT autonomous_mode FROM repositories WHERE id='repo-1'"
+                    ).fetchone()[0]
+                state["repositories"][0]["autonomous_mode"] = bool(autonomous)
+                return state
+
+            def set_autonomous(_actions, repository_id: str, autonomous: bool):
+                if type(autonomous) is not bool:
+                    raise ValueError("autonomous must be a boolean")
+                with database.transaction() as connection:
+                    cursor = connection.execute(
+                        "UPDATE repositories SET autonomous_mode=? WHERE id=?",
+                        (int(autonomous), repository_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise KeyError(repository_id)
+
+            self.actions.state = MethodType(durable_state, self.actions)
+            self.actions.set_repository_autonomous = MethodType(
+                set_autonomous, self.actions
+            )
+
+            status, _, dashboard = self.request("GET", "/")
+            self.assertEqual(status, 200)
+            self.assertIn(b"Enable autonomous", dashboard)
+
+            status, _, body = self.request(
+                "POST",
+                "/api/repositories/repo-1/autonomous",
+                {"autonomous": True},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), {"ok": True, "autonomous": True})
+
+            database = Database(database_path)
+            database.initialize()
+            status, _, dashboard = self.request("GET", "/")
+            self.assertEqual(status, 200)
+            self.assertIn(b"Disable autonomous", dashboard)
+            self.assertIs(self.actions.state()["repositories"][0]["autonomous_mode"], True)
+
+            status, _, body = self.request(
+                "POST",
+                "/api/repositories/repo-1/autonomous",
+                {"autonomous": False},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), {"ok": True, "autonomous": False})
+
+            database = Database(database_path)
+            database.initialize()
+            status, _, dashboard = self.request("GET", "/")
+            self.assertEqual(status, 200)
+            self.assertIn(b"Enable autonomous", dashboard)
+            self.assertIs(
+                self.actions.state()["repositories"][0]["autonomous_mode"], False
+            )
 
     def test_invalid_retry_and_restart_states_return_bounded_errors(self) -> None:
         for action_name, path, detail in (

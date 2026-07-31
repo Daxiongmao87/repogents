@@ -219,13 +219,17 @@ Never place a secret value in `--inputs-json`. Store it in the controller enviro
 
 Secret values are command-scoped, redacted before durable output is stored, excluded from model context, and checked against committed changes before publication.
 
-## Delegate an issue
+## Delegate issues
+
+Repositories remain label-gated by default: apply `agent:ready` to delegate an issue as described below. For a ready, enabled repository, the dashboard also provides **Enable autonomous mode**, a durable per-repository opt-in that discovers all eligible open issues without requiring the label, including issues already open when the mode is enabled and issues opened later. Closed issues and pull-request records are excluded, and repeated polling or restarts do not duplicate an activation or an existing nonterminal run.
+
+Autonomous mode controls issue selection only. It does not bypass onboarding readiness, resume a paused repository, revive a removed repository, or change the repository's stored sandbox, team, and intended base lineage. The selected value persists across application restarts and can be turned off with **Disable autonomous mode** to restore label-only discovery.
 
 1. Create or select an issue in an onboarded repository.
-2. Apply the `agent:ready` label.
-3. Leave Repogents running, or run a single orchestration cycle with `repogents tick`.
+2. Apply the `agent:ready` label, unless that repository has autonomous mode enabled in the dashboard. Autonomous mode also discovers eligible issues that were already open when it was enabled.
+3. Leave Repogents running, or run a single orchestration cycle with `repogents tick`.e with `repogents tick`.
 
-The activating label event has a stable identity. Repeated polling and application restarts reuse the same run instead of creating duplicates. Repogents snapshots the intended base branch and commit, creates an isolated checkout, and exposes repository and issue evidence to the coordinating member. The coordinating member persists the complete atomic issue specification; an independently modeled verifier must approve that exact revision before any implementation assignment or checkout mutation.
+The activating label event or autonomous issue discovery has a stable identity. Repeated polling and application restarts reuse the same run instead of creating duplicates. Repogents snapshots the intended base branch and commit, creates an isolated checkout, and exposes repository and issue evidence to the coordinating member. The coordinating member persists the complete atomic issue specification; an independently modeled verifier must approve that exact revision before any implementation assignment or checkout mutation.
 
 Each run graph is bound to the stored issue, team, sandbox, exact base SHA, and active specification revision. The coordinating member can assess completed node evidence and propose a bounded new graph generation; the controller validates the revision, preserves prior generations, and reuses only exact-identity outputs. Repository and run views expose the stored specification history, review provenance, acceptance mapping, topology, live states, attempts, generation deltas, reuse decisions, and assessments.
 

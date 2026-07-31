@@ -21,6 +21,10 @@ class InterfaceActions(Protocol):
 
     def set_repository_enabled(self, repository_id: str, enabled: bool) -> None: ...
 
+    def set_repository_autonomous(
+        self, repository_id: str, autonomous: bool
+    ) -> None: ...
+
     def remove_repository(self, repository_id: str) -> None: ...
 
     def repository_log(self, repository_id: str) -> dict[str, object]: ...
@@ -277,6 +281,21 @@ class LocalInterfaceServer:
                     request,
                     HTTPStatus.OK,
                     {"ok": True, "enabled": enabled, "paused": not enabled},
+                )
+                return
+            if (
+                len(segments) == 4
+                and segments[:2] == ["api", "repositories"]
+                and segments[3] == "autonomous"
+            ):
+                autonomous = payload.get("autonomous")
+                if not isinstance(autonomous, bool):
+                    raise ValueError("autonomous must be a boolean")
+                self.actions.set_repository_autonomous(segments[2], autonomous)
+                self._send_json(
+                    request,
+                    HTTPStatus.OK,
+                    {"ok": True, "autonomous": autonomous},
                 )
                 return
             if (
@@ -2933,9 +2952,10 @@ function renderRepositoryList() {
   list.innerHTML = currentState.repositories.map(r => `
     <article class="repo-card ${String(r.id) === selectedRepositoryId ? 'selected' : ''}" data-repository="${esc(r.id)}" tabindex="0" aria-label="View ${esc(r.identity)}">
       <div class="row"><span class="repo-name">${esc(r.identity)}</span>${stateBadge(r)}</div>
-      <div class="repo-meta">${esc(r.onboarding_state)} · ${r.active_run_count ? `${esc(r.active_run_count)} active run` : 'no active work'}<br>Updated ${esc(date(r.latest_activity_at))}</div>
+      <div class="repo-meta">${esc(r.onboarding_state)} · ${r.active_run_count ? `${esc(r.active_run_count)} active run` : 'no active work'}<br>Autonomous mode: ${r.autonomous_mode ? 'Enabled' : 'Disabled'} · Updated ${esc(date(r.latest_activity_at))}</div>
       <div class="actions">
         <button class="button small" data-enabled="${esc(r.id)}" data-next-enabled="${r.enabled ? 'false' : 'true'}">${r.enabled ? 'Pause' : 'Resume'}</button>
+        <button class="button small" data-autonomous="${esc(r.id)}" data-next-autonomous="${r.autonomous_mode ? 'false' : 'true'}">${r.autonomous_mode ? 'Disable autonomous mode' : 'Enable autonomous mode'}</button>
         <button class="button small" data-reonboard="${esc(r.id)}">Re-onboard</button>
         <button class="button small danger" data-remove="${esc(r.id)}" ${r.active ? 'disabled title="Cancel or finish active work before removal"' : ''}>Remove repository</button>
       </div>
@@ -2979,6 +2999,7 @@ function renderRepositoryDetail() {
     ${repository.blocking_reason ? blockingError(repository.blocking_reason) : ''}
     <div class="status-grid">
       <div class="metric"><span>Scheduling</span><strong>${repository.enabled ? 'Running' : 'Paused'}</strong></div>
+      <div class="metric"><span>Autonomous mode</span><strong>${repository.autonomous_mode ? 'Enabled' : 'Disabled'}</strong></div>
       <div class="metric"><span>Activity</span><strong>${repository.active ? 'Active' : 'Idle'}</strong></div>
       <div class="metric"><span>Current run</span><strong>${esc(repository.latest_run_state ?? 'None')}</strong></div>
       <div class="metric"><span>Last update</span><strong>${esc(date(repository.latest_activity_at))}</strong></div>
@@ -3294,6 +3315,12 @@ document.body.addEventListener('click', event => {
   }
   if (b?.dataset.enabled) {
     return action(() => mutate(`/api/repositories/${encodeURIComponent(b.dataset.enabled)}/enabled`, {enabled:b.dataset.nextEnabled === 'true'}));
+  }
+  if (b?.dataset.autonomous) {
+    return action(() => mutate(
+      `/api/repositories/${encodeURIComponent(b.dataset.autonomous)}/autonomous`,
+      {autonomous:b.dataset.nextAutonomous === 'true'},
+    ));
   }
   if (b?.dataset.reonboard) {
     return action(() => {

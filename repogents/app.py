@@ -639,8 +639,9 @@ class ApplicationActions:
             repositories = connection.execute("""SELECT repositories.id,
                           repositories.owner || '/' || repositories.name AS identity,
                           repositories.url, repositories.default_branch,
-                          repositories.enabled, repositories.updated_at,
-                          repositories.onboarding_state, repositories.inputs_json,
+                          repositories.enabled, repositories.autonomous_mode,
+                          repositories.updated_at, repositories.onboarding_state,
+                          repositories.inputs_json,
                           repositories.blocking_reason,
                           repositories.current_sandbox_version_id AS sandbox_version_id,
                           repositories.current_team_version_id AS team_version_id,
@@ -927,6 +928,7 @@ class ApplicationActions:
         ready_issue_discovery: list[dict[str, object]] = []
         for row in repositories:
             value = dict(row)
+            value["autonomous_mode"] = bool(value["autonomous_mode"])
             repository_id = str(value["id"])
             repository_runs = runs_by_repository.get(repository_id, [])
             visible_repository_runs = [
@@ -1272,6 +1274,14 @@ class ApplicationActions:
         if not isinstance(enabled, bool):
             raise ValueError("enabled must be a boolean")
         self.lifecycle.set_repository_paused(repository_id, not enabled)
+        self.scheduler.request_tick()
+
+    def set_repository_autonomous(
+        self, repository_id: str, autonomous: bool
+    ) -> None:
+        if not isinstance(autonomous, bool):
+            raise ValueError("autonomous must be a boolean")
+        self.onboarding.set_repository_autonomous_mode(repository_id, autonomous)
         self.scheduler.request_tick()
 
     def reorder_runs(self, run_ids: list[str]) -> None:

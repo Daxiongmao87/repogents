@@ -434,6 +434,43 @@ class OnboardingTests(unittest.TestCase):
         )
 
 
+    def test_repository_autonomous_mode_round_trips_across_reopen(self) -> None:
+        now = "2026-01-01T00:00:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO repositories
+                   (id, github_node_id, owner, name, url, default_branch,
+                    onboarding_state, created_at, updated_at)
+                   VALUES ('repo-autonomy', 'node-autonomy', 'example', 'auto',
+                           'https://github.com/example/auto', 'main', 'ready', ?, ?)""",
+                (now, now),
+            )
+        service, _ = self.service(FakeSources())
+        enabled = service.set_repository_autonomous_mode("repo-autonomy", True)
+        self.assertEqual(enabled["autonomous_mode"], 1)
+        self.assertNotEqual(enabled["updated_at"], now)
+
+        reopened_database = Database(self.db.path)
+        reopened_database.initialize()
+        reopened = OnboardingService(
+            database=reopened_database,
+            data_root=self.root / "data",
+            github=FakeGitHub(self.repository),
+            sources=FakeSources(),
+            inspector=RepositoryInspector(),
+            team_formulator=FakeTeamFormulator(),
+        )
+        self.assertEqual(
+            reopened.get_repository("repo-autonomy")["autonomous_mode"], 1
+        )
+        disabled = reopened.set_repository_autonomous_mode("repo-autonomy", False)
+        self.assertEqual(disabled["autonomous_mode"], 0)
+        self.assertEqual(
+            service.get_repository("repo-autonomy")["autonomous_mode"], 0
+        )
+        with self.assertRaises(KeyError):
+            reopened.set_repository_autonomous_mode("missing-repository", True)
+
     def test_repository_identity_accepts_url_and_owner_name(self) -> None:
         self.assertEqual(parse_repository_identity("example/demo"), ("example", "demo"))
         self.assertEqual(
