@@ -418,6 +418,7 @@ class ApplicationTests(unittest.TestCase):
                     json.dumps(
                         {
                             "allowed_services": ["packages.example:443"],
+                            "automatic_merge_idle_seconds": 60,
                             "secret_bindings": [
                                 {
                                     "name": "PACKAGE_TOKEN",
@@ -1008,6 +1009,285 @@ class ApplicationTests(unittest.TestCase):
         orchestrator.poll_feedback()
 
         self.assertEqual(feedback.poll_calls, ["run-1"])
+
+    def test_feedback_poll_reconciles_automatic_merge_before_generic_closure(self) -> None:
+        now = "2026-01-01T00:02:00Z"
+        head_sha = "d" * 40
+        automatic_reason = "GitHub confirmed pull request merged by automatic merge"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs
+                   SET state='waiting_for_feedback', validated_sha=?
+                   WHERE id='run-1'""",
+                (head_sha,),
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('pr-1', 'run-1', 'PR1', 8, 'pr-1-url',
+                           'agent/issue-3-run-1', 'main', ?, ?, ?,
+                           'open', ?, ?)""",
+                ("a" * 40, head_sha, head_sha, now, now),
+            )
+            connection.execute(
+                """INSERT INTO automatic_merge_eligibility
+                   (id, pull_request_id, generation, expected_head_sha,
+                    activity_anchor_at, deadline_at, observed_at, state,
+                    created_at, updated_at)
+                   VALUES ('eligibility-1', 'pr-1', 1, ?, ?, ?, ?,
+                           'active', ?, ?)""",
+                (head_sha, now, now, now, now, now),
+            )
+            connection.execute(
+                """INSERT INTO automatic_merge_operations
+                   (id, eligibility_id, pull_request_id, expected_head_sha,
+                    state, request_json, created_at, requested_at)
+                   VALUES ('operation-1', 'eligibility-1', 'pr-1', ?,
+                           'reconciling', '{}', ?, ?)""",
+                (head_sha, now, now),
+            )
+
+        class ConfirmingLifecycle(FakeLifecycle):
+            def __init__(self, database: Database) -> None:
+                super().__init__(database)
+                self.merge_requests = 0
+
+            def reconcile_outstanding_automatic_merge(self, run_id: str) -> None:
+                self.calls.append(("automatic_merge", run_id))
+                with self.database.transaction() as connection:
+                    connection.execute(
+                        """UPDATE automatic_merge_operations
+                           SET state='confirmed', reconciled_at=?, confirmed_at=?
+                           WHERE id='operation-1'""",
+                        (now, now),
+                    )
+                    connection.execute(
+                        """UPDATE automatic_merge_eligibility
+                           SET state='completed', completed_at=?, updated_at=?
+                           WHERE id='eligibility-1'""",
+                        (now, now),
+                    )
+                    connection.execute(
+                        "UPDATE pull_requests SET state='merged', updated_at=? WHERE id='pr-1'",
+                        (now,),
+                    )
+                    connection.execute(
+                        """UPDATE runs
+                           SET state='closed', reason=?, closed_at=?, updated_at=?
+                           WHERE id=?""",
+                        (automatic_reason, now, now, run_id),
+                    )
+                    connection.execute(
+                        """INSERT INTO run_transitions
+                           (run_id, from_state, to_state, reason, occurred_at)
+                           VALUES (?, 'waiting_for_feedback', 'closed', ?, ?)""",
+                        (run_id, automatic_reason, now),
+                    )
+
+        class GenericMergedFeedback(FakeFeedback):
+            def poll_run(self, run_id: str) -> int:
+                with self.database.connect() as connection:
+                    run = connection.execute(
+                        "SELECT state, reason FROM runs WHERE id=?", (run_id,)
+                    ).fetchone()
+                self.assertEqual(run["state"], "closed")
+                self.assertEqual(run["reason"], automatic_reason)
+                return super().poll_run(run_id)
+
+        lifecycle = ConfirmingLifecycle(self.db)
+        feedback = GenericMergedFeedback(self.db)
+        feedback.assertEqual = self.assertEqual
+        orchestrator = Orchestrator(
+            database=self.db,
+            lifecycle=lifecycle,
+            execution=FakeExecution(self.db),
+            publication=FakePublication(self.db),
+            feedback=feedback,
+        )
+
+        orchestrator.poll_feedback()
+
+        with self.db.connect() as connection:
+            run = connection.execute(
+                "SELECT state, reason FROM runs WHERE id='run-1'"
+            ).fetchone()
+            operation = connection.execute(
+                "SELECT state FROM automatic_merge_operations WHERE id='operation-1'"
+            ).fetchone()
+            eligibility = connection.execute(
+                "SELECT state FROM automatic_merge_eligibility WHERE id='eligibility-1'"
+            ).fetchone()
+            transition = connection.execute(
+                """SELECT reason FROM run_transitions
+                   WHERE run_id='run-1' ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+        self.assertEqual(lifecycle.calls, [("automatic_merge", "run-1")])
+        self.assertEqual(feedback.poll_calls, ["run-1"])
+        self.assertEqual(operation["state"], "confirmed")
+        self.assertEqual(eligibility["state"], "completed")
+        self.assertEqual(run["state"], "closed")
+        self.assertEqual(run["reason"], automatic_reason)
+        self.assertEqual(transition["reason"], automatic_reason)
+        self.assertEqual(lifecycle.merge_requests, 0)
+
+    def test_feedback_poll_persists_new_activity_before_automatic_merge_eligibility(self) -> None:
+        now = "2026-01-01T00:02:00Z"
+        old_anchor = "2026-01-01T00:00:00Z"
+        new_anchor = "2026-01-01T00:02:00.250000Z"
+        new_deadline = "2026-01-01T00:03:00.250000Z"
+        head_sha = "d" * 40
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE runs SET state='waiting_for_feedback', validated_sha=?
+                   WHERE id='run-1'""",
+                (head_sha,),
+            )
+            connection.execute(
+                "UPDATE repositories SET automatic_merge_idle_seconds=60 WHERE id='repo-1'"
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('pr-1', 'run-1', 'PR1', 8, 'pr-1-url',
+                           'agent/issue-3-run-1', 'main', ?, ?, ?,
+                           'open', ?, ?)""",
+                ("a" * 40, head_sha, head_sha, old_anchor, old_anchor),
+            )
+            connection.execute(
+                """INSERT INTO automatic_merge_eligibility
+                   (id, pull_request_id, generation, expected_head_sha,
+                    activity_anchor_at, deadline_at, observed_at, state,
+                    created_at, updated_at)
+                   VALUES ('eligibility-1', 'pr-1', 1, ?, ?, ?, ?,
+                           'active', ?, ?)""",
+                (head_sha, old_anchor, now, old_anchor, old_anchor, old_anchor),
+            )
+
+        sequence: list[str] = []
+
+        class PersistingCommentFeedback(FakeFeedback):
+            def poll_run(self, run_id: str) -> int:
+                sequence.append("feedback")
+                with self.database.transaction() as connection:
+                    connection.execute(
+                        "UPDATE pull_requests SET updated_at=? WHERE run_id=?",
+                        (new_anchor, run_id),
+                    )
+                return super().poll_run(run_id)
+
+        class FeedbackAwareLifecycle(FakeLifecycle):
+            def __init__(self, database: Database) -> None:
+                super().__init__(database)
+                self.merge_requests = 0
+
+            def reconcile_outstanding_automatic_merge(self, run_id: str) -> None:
+                sequence.append("pre")
+
+            def reconcile_automatic_merge(self, run_id: str) -> None:
+                sequence.append("post")
+                with self.database.transaction() as connection:
+                    pull = connection.execute(
+                        "SELECT updated_at FROM pull_requests WHERE run_id=?",
+                        (run_id,),
+                    ).fetchone()
+                    self.assertEqual(pull["updated_at"], new_anchor)
+                    connection.execute(
+                        """UPDATE automatic_merge_eligibility
+                           SET state='superseded', superseded_at=?, updated_at=?
+                           WHERE id='eligibility-1'""",
+                        (new_anchor, new_anchor),
+                    )
+                    connection.execute(
+                        """INSERT INTO automatic_merge_eligibility
+                           (id, pull_request_id, generation, expected_head_sha,
+                            activity_anchor_at, deadline_at, observed_at, state,
+                            created_at, updated_at)
+                           VALUES ('eligibility-2', 'pr-1', 2, ?, ?, ?, ?,
+                                   'active', ?, ?)""",
+                        (head_sha, new_anchor, new_deadline, new_anchor, new_anchor, new_anchor),
+                    )
+
+        lifecycle = FeedbackAwareLifecycle(self.db)
+        lifecycle.assertEqual = self.assertEqual
+        feedback = PersistingCommentFeedback(self.db)
+        orchestrator = Orchestrator(
+            database=self.db,
+            lifecycle=lifecycle,
+            execution=FakeExecution(self.db),
+            publication=FakePublication(self.db),
+            feedback=feedback,
+        )
+
+        orchestrator.poll_feedback()
+
+        with self.db.connect() as connection:
+            eligibilities = connection.execute(
+                """SELECT generation, activity_anchor_at, deadline_at, state
+                   FROM automatic_merge_eligibility ORDER BY generation"""
+            ).fetchall()
+        self.assertEqual(sequence, ["pre", "feedback", "post"])
+        self.assertEqual(
+            [tuple(row) for row in eligibilities],
+            [
+                (1, old_anchor, now, "superseded"),
+                (2, new_anchor, new_deadline, "active"),
+            ],
+        )
+        self.assertEqual(lifecycle.merge_requests, 0)
+
+    def test_feedback_poll_failure_skips_new_automatic_merge_submission(self) -> None:
+        class TrackingLifecycle(FakeLifecycle):
+            def __init__(self, database: Database) -> None:
+                super().__init__(database)
+                self.pre_calls: list[str] = []
+                self.full_calls: list[str] = []
+
+            def reconcile_outstanding_automatic_merge(self, run_id: str) -> None:
+                self.pre_calls.append(run_id)
+
+            def reconcile_automatic_merge(self, run_id: str) -> None:
+                self.full_calls.append(run_id)
+
+        class FailingFeedback(FakeFeedback):
+            def poll_run(self, run_id: str) -> int:
+                super().poll_run(run_id)
+                raise GitHubError("feedback unavailable")
+
+        now = "2026-01-01T00:02:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET state='waiting_for_feedback' WHERE id='run-1'"
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('pr-1', 'run-1', 'PR1', 8, 'pr-1-url',
+                           'agent/issue-3-run-1', 'main', ?, ?, ?,
+                           'open', ?, ?)""",
+                ("a" * 40, "d" * 40, "d" * 40, now, now),
+            )
+        lifecycle = TrackingLifecycle(self.db)
+        feedback = FailingFeedback(self.db)
+        orchestrator = Orchestrator(
+            database=self.db,
+            lifecycle=lifecycle,
+            execution=FakeExecution(self.db),
+            publication=FakePublication(self.db),
+            feedback=feedback,
+        )
+
+        orchestrator.poll_feedback()
+
+        self.assertEqual(lifecycle.pre_calls, ["run-1"])
+        self.assertEqual(feedback.poll_calls, ["run-1"])
+        self.assertEqual(lifecycle.full_calls, [])
+        self.assertEqual(len(orchestrator.last_errors), 1)
 
     def test_feedback_poll_failure_does_not_block_other_open_pulls(self) -> None:
         self.seed_second_run()
@@ -1771,6 +2051,7 @@ class ApplicationTests(unittest.TestCase):
             repository["display_inputs"],
             {
                 "allowed_services": ["packages.example:443"],
+                "automatic_merge_idle_seconds": 60,
                 "secret_bindings": [
                     {
                         "name": "PACKAGE_TOKEN",

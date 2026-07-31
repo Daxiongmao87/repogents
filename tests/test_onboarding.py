@@ -1179,19 +1179,87 @@ class OnboardingTests(unittest.TestCase):
             {"validation_commands": [["python3", "-m", "unittest"]]},
         )
 
-    def test_automatic_merge_idle_seconds_requires_a_positive_integer(self) -> None:
+    def test_automatic_merge_idle_seconds_normalizes_nonpositive_as_disabled(self) -> None:
         normalize = __import__(
             "repogents.onboarding",
             fromlist=["_normalize_repository_inputs"],
         )._normalize_repository_inputs
 
-        for invalid in (True, False, 0, -1, 1.5, "60", None):
+        self.assertEqual(
+            normalize({"automatic_merge_idle_seconds": 60}),
+            {"automatic_merge_idle_seconds": 60},
+        )
+        for disabled in (0, -1):
+            with self.subTest(value=disabled):
+                self.assertEqual(
+                    normalize({"automatic_merge_idle_seconds": disabled}),
+                    {},
+                )
+        for invalid in (True, False, 1.5, "60", None):
             with self.subTest(value=invalid):
                 with self.assertRaisesRegex(
                     ValueError,
-                    "automatic_merge_idle_seconds must be a positive integer",
+                    "automatic_merge_idle_seconds must be an integer",
                 ):
                     normalize({"automatic_merge_idle_seconds": invalid})
+
+    def test_onboarding_and_reonboarding_persist_disabled_and_positive_idle_settings(
+        self,
+    ) -> None:
+        service, _github = self.service(
+            FakeSources({"go.mod": "module example.com/demo\n"})
+        )
+
+        repository_id = service.onboard(
+            "example/demo",
+            {"automatic_merge_idle_seconds": 0},
+        )
+
+        disabled = service.get_repository(repository_id)
+        self.assertEqual(disabled["onboarding_state"], "ready")
+        self.assertIsNone(disabled["automatic_merge_idle_seconds"])
+        self.assertEqual(json.loads(disabled["inputs_json"]), {})
+
+        service.reonboard(
+            repository_id,
+            {"automatic_merge_idle_seconds": 60},
+        )
+
+        enabled = service.get_repository(repository_id)
+        self.assertEqual(enabled["onboarding_state"], "ready")
+        self.assertEqual(enabled["automatic_merge_idle_seconds"], 60)
+        self.assertEqual(
+            json.loads(enabled["inputs_json"]),
+            {"automatic_merge_idle_seconds": 60},
+        )
+
+        display_inputs = __import__(
+            "repogents.app",
+            fromlist=["_display_repository_inputs"],
+        )._display_repository_inputs(enabled["inputs_json"])
+        display_inputs["allowed_services"] = ["API.Example.COM:443"]
+        service.reonboard(repository_id, display_inputs)
+
+        preserved = service.get_repository(repository_id)
+        self.assertEqual(preserved["automatic_merge_idle_seconds"], 60)
+        self.assertEqual(
+            json.loads(preserved["inputs_json"]),
+            {
+                "allowed_services": ["api.example.com:443"],
+                "automatic_merge_idle_seconds": 60,
+            },
+        )
+
+        display_inputs["automatic_merge_idle_seconds"] = -5
+        service.reonboard(repository_id, display_inputs)
+
+        disabled_again = service.get_repository(repository_id)
+        self.assertEqual(disabled_again["onboarding_state"], "ready")
+        self.assertIsNone(disabled_again["automatic_merge_idle_seconds"])
+        self.assertEqual(
+            json.loads(disabled_again["inputs_json"]),
+            {"allowed_services": ["api.example.com:443"]},
+        )
 
     def test_reonboarding_refreshes_metadata_and_retains_or_replaces_sanitized_inputs(
         self,

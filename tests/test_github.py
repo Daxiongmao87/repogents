@@ -414,14 +414,12 @@ class GitHubAdapterTests(unittest.TestCase):
             "mergeable": False,
             "updated_at": "2026-01-01T00:07:00Z",
         }
-        self.responses["repos/owner/repo/pulls/7/commits"] = [
-            {
-                "sha": "c" * 40,
-                "commit": {
-                    "committer": {"date": "2026-01-01T00:06:00.123456Z"}
-                },
-            }
-        ]
+        self.responses["repos/owner/repo/commits/" + "c" * 40] = {
+            "sha": "c" * 40,
+            "commit": {
+                "committer": {"date": "2026-01-01T00:06:00.123456Z"}
+            },
+        }
 
         pull = self.client.get_pull_request("owner", "repo", 7)
 
@@ -432,7 +430,7 @@ class GitHubAdapterTests(unittest.TestCase):
         self.assertIs(pull.mergeable, False)
         self.assertEqual(pull.head_commit_at, "2026-01-01T00:06:00.123456Z")
 
-    def test_pull_request_activity_is_bound_to_refreshed_head_sha(self) -> None:
+    def test_pull_request_activity_uses_direct_refreshed_head_commit(self) -> None:
         self.responses["repos/owner/repo/pulls/7"] = {
             "node_id": "PR7",
             "number": 7,
@@ -443,27 +441,26 @@ class GitHubAdapterTests(unittest.TestCase):
             "base": {"ref": "main", "sha": "d" * 40},
             "updated_at": "2026-01-01T00:07:00Z",
         }
-        self.responses["repos/owner/repo/pulls/7/commits"] = [
-            {
-                "sha": "c" * 40,
-                "commit": {
-                    "committer": {"date": "2026-01-01T00:06:00.123456Z"}
-                },
+        self.responses["repos/owner/repo/commits/" + "c" * 40] = {
+            "sha": "c" * 40,
+            "commit": {
+                "committer": {"date": "2026-01-01T00:06:00.123456Z"}
             },
-            {
-                "sha": "b" * 40,
-                "commit": {
-                    "committer": {"date": "2026-01-01T00:09:00.999999Z"}
-                },
-            },
-        ]
+        }
 
         pull = self.client.get_pull_request("owner", "repo", 7)
 
         self.assertEqual(pull.head_sha, "c" * 40)
         self.assertEqual(pull.head_commit_at, "2026-01-01T00:06:00.123456Z")
+        self.assertIn(
+            ("GET", "repos/owner/repo/commits/" + "c" * 40),
+            self.client.requests,
+        )
+        self.assertFalse(
+            any(path.startswith("repos/owner/repo/pulls/7/commits") for _, path in self.client.requests)
+        )
 
-    def test_pull_request_rejects_commit_activity_not_bound_to_refreshed_head(self) -> None:
+    def test_pull_request_rejects_direct_commit_not_bound_to_refreshed_head(self) -> None:
         self.responses["repos/owner/repo/pulls/7"] = {
             "node_id": "PR7",
             "number": 7,
@@ -474,19 +471,15 @@ class GitHubAdapterTests(unittest.TestCase):
             "base": {"ref": "main", "sha": "d" * 40},
             "updated_at": "2026-01-01T00:07:00Z",
         }
-        self.responses["repos/owner/repo/pulls/7/commits"] = [
-            {
-                "sha": "b" * 40,
-                "commit": {
-                    "committer": {"date": "2026-01-01T00:09:00.999999Z"}
-                },
-            }
-        ]
+        self.responses["repos/owner/repo/commits/" + "c" * 40] = {
+            "sha": "b" * 40,
+            "commit": {"committer": {"date": "2026-01-01T00:09:00Z"}},
+        }
 
-        with self.assertRaisesRegex(GitHubError, "omitted the refreshed head commit"):
+        with self.assertRaisesRegex(GitHubError, "did not match"):
             self.client.get_pull_request("owner", "repo", 7)
 
-    def test_pull_request_requires_head_commit_activity_timestamp(self) -> None:
+    def test_pull_request_requires_direct_head_commit_activity_timestamp(self) -> None:
         self.responses["repos/owner/repo/pulls/7"] = {
             "node_id": "PR7",
             "number": 7,
@@ -497,14 +490,33 @@ class GitHubAdapterTests(unittest.TestCase):
             "base": {"ref": "main", "sha": "d" * 40},
             "updated_at": "2026-01-01T00:07:00Z",
         }
-        self.responses["repos/owner/repo/pulls/7/commits"] = [
-            {"sha": "c" * 40, "commit": {"committer": {}}}
-        ]
+        self.responses["repos/owner/repo/commits/" + "c" * 40] = {
+            "sha": "c" * 40, "commit": {"committer": {}}
+        }
 
         with self.assertRaisesRegex(GitHubError, "activity timestamp"):
             self.client.get_pull_request("owner", "repo", 7)
 
-    def test_merge_pull_request_binds_expected_head_and_parses_result(self) -> None:
+    def test_repository_merge_method_is_deterministic_and_validated(self) -> None:
+        self.responses["repos/owner/repo"].update(
+            allow_merge_commit=False,
+            allow_squash_merge=True,
+            allow_rebase_merge=True,
+        )
+        self.assertEqual(
+            self.client.get_repository_merge_method("owner", "repo"), "squash"
+        )
+        self.responses["repos/owner/repo"].update(
+            allow_squash_merge=False, allow_rebase_merge=False
+        )
+        self.assertIsNone(
+            self.client.get_repository_merge_method("owner", "repo")
+        )
+        del self.responses["repos/owner/repo"]["allow_rebase_merge"]
+        with self.assertRaisesRegex(GitHubError, "merge capabilities"):
+            self.client.get_repository_merge_method("owner", "repo")
+
+    def test_merge_pull_request_binds_expected_head_method_and_parses_result(self) -> None:
         self.responses["repos/owner/repo/pulls/7/merge"] = {
             "merged": True,
             "message": "Pull Request successfully merged",
@@ -512,7 +524,7 @@ class GitHubAdapterTests(unittest.TestCase):
         }
 
         result = self.client.merge_pull_request(
-            "owner", "repo", 7, "c" * 40
+            "owner", "repo", 7, "c" * 40, "squash"
         )
 
         self.assertTrue(result.merged)
@@ -521,7 +533,10 @@ class GitHubAdapterTests(unittest.TestCase):
             self.client.requests[-1],
             ("PUT", "repos/owner/repo/pulls/7/merge"),
         )
-        self.assertEqual(self.client.request_bodies[-1], {"sha": "c" * 40})
+        self.assertEqual(
+            self.client.request_bodies[-1],
+            {"sha": "c" * 40, "merge_method": "squash"},
+        )
 
     def test_merge_pull_request_preserves_definite_rejection(self) -> None:
         self.responses["repos/owner/repo/pulls/7/merge"] = {
@@ -531,7 +546,7 @@ class GitHubAdapterTests(unittest.TestCase):
         }
 
         result = self.client.merge_pull_request(
-            "owner", "repo", 7, "c" * 40
+            "owner", "repo", 7, "c" * 40, "rebase"
         )
 
         self.assertFalse(result.merged)
@@ -544,7 +559,9 @@ class GitHubAdapterTests(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(GitHubError, "omitted required fields"):
-            self.client.merge_pull_request("owner", "repo", 7, "c" * 40)
+            self.client.merge_pull_request(
+                "owner", "repo", 7, "c" * 40, "merge"
+            )
 
     def test_find_response_requires_application_author_and_exact_inline_thread(
         self,

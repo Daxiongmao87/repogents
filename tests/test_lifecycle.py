@@ -47,6 +47,9 @@ class FakeActivationClient:
     def get_branch_head(self, owner: str, name: str, branch: str) -> str:
         return self.base_sha
 
+    def get_repository_merge_method(self, owner: str, name: str) -> str:
+        return "merge"
+
 
 class FakeCheckoutManager:
     def __init__(self) -> None:
@@ -2015,7 +2018,7 @@ class RunLifecycleTests(unittest.TestCase):
         ]
         merge_calls: list[tuple[str, str, int, str]] = []
         self.github.get_pull_request = lambda owner, name, number: pulls.pop(0)
-        self.github.merge_pull_request = lambda owner, name, number, expected: (
+        self.github.merge_pull_request = lambda owner, name, number, expected, method: (
             merge_calls.append((owner, name, number, expected))
             or {"merged": True, "message": "accepted", "sha": expected}
         )
@@ -2100,7 +2103,7 @@ class RunLifecycleTests(unittest.TestCase):
         )
         merge_calls: list[str] = []
         self.github.get_pull_request = lambda owner, name, number: pull
-        self.github.merge_pull_request = lambda owner, name, number, expected: (
+        self.github.merge_pull_request = lambda owner, name, number, expected, method: (
             merge_calls.append(expected) or {"merged": True, "sha": expected}
         )
 
@@ -2146,6 +2149,148 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual(generations[1]["deadline_at"], "2026-01-01T00:01:30.500000Z")
         self.assertEqual(merge_calls, [head_sha])
 
+    def test_automatic_merge_uses_composite_review_submission_as_idle_anchor(self) -> None:
+        from repogents.github import PullRequestInfo
+
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        self.lifecycle.transition(run_id, RunState.VALIDATING)
+        self.lifecycle.transition(run_id, RunState.PUBLISHING)
+        self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
+        head_sha = "c" * 40
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET automatic_merge_idle_seconds=60 WHERE id='repo-1'"
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('review-anchor-pull', ?, 'PR-review-anchor', 11, 'pull-url',
+                           'agent/issue-3-review-anchor', 'main', ?, ?, ?, 'open', ?, ?)""",
+                (run_id, "b" * 40, head_sha, head_sha,
+                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+            connection.execute(
+                """INSERT INTO feedback_versions
+                   (id, pull_request_id, feedback_type, github_object_id,
+                    github_version, author, body, state, observed_at)
+                   VALUES ('review-anchor-feedback', 'review-anchor-pull', 'review',
+                           'review-11',
+                           '2026-01-01T00:00:30.123456Z:deadbeef:COMMENTED',
+                           'reviewer', 'review activity', 'resolved',
+                           '2026-01-01T00:00:30.123456Z')"""
+            )
+
+        pull = PullRequestInfo(
+            node_id="PR-review-anchor", number=11, url="pull-url", state="open",
+            merged=False, head_branch="agent/issue-3-review-anchor", head_sha=head_sha,
+            base_branch="main", updated_at="2026-01-01T00:01:30.123456Z",
+            head_commit_at="2026-01-01T00:00:00.250000Z",
+        )
+        attempts: list[str] = []
+        self.github.get_pull_request = lambda owner, name, number: pull
+        self.github.merge_pull_request = lambda owner, name, number, expected, method: (
+            attempts.append(expected) or {"merged": True, "sha": expected}
+        )
+
+        with patch(
+            "repogents.lifecycle._utc_now",
+            return_value="2026-01-01T00:01:30.123455Z",
+        ):
+            self.lifecycle.reconcile_automatic_merge(run_id)
+        self.assertEqual(attempts, [])
+        with self.db.connect() as connection:
+            eligibility = connection.execute(
+                """SELECT activity_anchor_at, deadline_at
+                   FROM automatic_merge_eligibility
+                   WHERE pull_request_id='review-anchor-pull' AND state='active'"""
+            ).fetchone()
+        self.assertEqual(eligibility["activity_anchor_at"], "2026-01-01T00:00:30.123456Z")
+        self.assertEqual(eligibility["deadline_at"], "2026-01-01T00:01:30.123456Z")
+
+        with patch(
+            "repogents.lifecycle._utc_now",
+            return_value="2026-01-01T00:01:30.123456Z",
+        ):
+            self.lifecycle.reconcile_automatic_merge(run_id)
+        self.assertEqual(attempts, [head_sha])
+
+    def test_automatic_merge_duration_changes_replace_deadline_generation(self) -> None:
+        from repogents.github import PullRequestInfo
+
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        self.lifecycle.transition(run_id, RunState.VALIDATING)
+        self.lifecycle.transition(run_id, RunState.PUBLISHING)
+        self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
+        head_sha = "f" * 40
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET automatic_merge_idle_seconds=60 WHERE id='repo-1'"
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('duration-pull', ?, 'PR-duration', 12, 'pull-url',
+                           'agent/issue-3-duration', 'main', ?, ?, ?, 'open', ?, ?)""",
+                (run_id, "b" * 40, head_sha, head_sha,
+                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+
+        pull = PullRequestInfo(
+            node_id="PR-duration", number=12, url="pull-url", state="open",
+            merged=False, head_branch="agent/issue-3-duration", head_sha=head_sha,
+            base_branch="main", updated_at="2026-01-01T00:00:30Z",
+            head_commit_at="2026-01-01T00:00:00.250000Z",
+        )
+        attempts: list[str] = []
+        self.github.get_pull_request = lambda owner, name, number: pull
+        self.github.merge_pull_request = lambda owner, name, number, expected, method: (
+            attempts.append(expected) or {"merged": True, "sha": expected}
+        )
+
+        with patch("repogents.lifecycle._utc_now", return_value="2026-01-01T00:00:30Z"):
+            self.lifecycle.reconcile_automatic_merge(run_id)
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET automatic_merge_idle_seconds=120 WHERE id='repo-1'"
+            )
+        with patch("repogents.lifecycle._utc_now", return_value="2026-01-01T00:00:31Z"):
+            self.lifecycle.reconcile_automatic_merge(run_id)
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET automatic_merge_idle_seconds=10 WHERE id='repo-1'"
+            )
+        with patch(
+            "repogents.lifecycle._utc_now",
+            return_value="2026-01-01T00:00:10.250000Z",
+        ):
+            self.lifecycle.reconcile_automatic_merge(run_id)
+
+        with self.db.connect() as connection:
+            generations = connection.execute(
+                """SELECT generation, activity_anchor_at, deadline_at, state
+                   FROM automatic_merge_eligibility
+                   WHERE pull_request_id='duration-pull' ORDER BY generation"""
+            ).fetchall()
+        self.assertEqual(
+            [(row["generation"], row["deadline_at"], row["state"]) for row in generations],
+            [
+                (1, "2026-01-01T00:01:00.250000Z", "superseded"),
+                (2, "2026-01-01T00:02:00.250000Z", "superseded"),
+                (3, "2026-01-01T00:00:10.250000Z", "active"),
+            ],
+        )
+        self.assertTrue(all(
+            row["activity_anchor_at"] == "2026-01-01T00:00:00.250000Z"
+            for row in generations
+        ))
+        self.assertEqual(attempts, [head_sha])
+
     def test_automatic_merge_ambiguous_delivery_reconciles_without_retry(self) -> None:
         from repogents.github import PullRequestInfo
 
@@ -2179,7 +2324,10 @@ class RunLifecycleTests(unittest.TestCase):
         attempts: list[str] = []
         self.github.get_pull_request = lambda owner, name, number: pull
 
-        def ambiguous_merge(owner: str, name: str, number: int, expected: str) -> object:
+        def ambiguous_merge(
+            owner: str, name: str, number: int, expected: str, method: str
+        ) -> object:
+            self.assertEqual(method, "merge")
             attempts.append(expected)
             raise RuntimeError("connection reset after request upload")
 
@@ -2208,7 +2356,7 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual(restarted.get_run(run_id)["state"], RunState.WAITING_FOR_FEEDBACK.value)
 
     def test_automatic_merge_definite_rejection_retries_after_fresh_verification(self) -> None:
-        from repogents.github import PullRequestInfo
+        from repogents.github import PullRequestInfo, PullRequestMergeResult
 
         run_id = self.lifecycle.poll_repository("repo-1")[0]
         self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
@@ -2238,10 +2386,13 @@ class RunLifecycleTests(unittest.TestCase):
             head_commit_at="2026-01-01T00:00:00Z",
         )
         attempts: list[str] = []
-        results: list[object] = [False, {"merged": True}]
+        results = [
+            PullRequestMergeResult(merged=False, message="head changed", sha=None),
+            PullRequestMergeResult(merged=True, message="merged", sha=head_sha),
+        ]
         self.github.get_pull_request = lambda owner, name, number: pull
 
-        def merge(owner: str, name: str, number: int, expected: str) -> object:
+        def merge(owner: str, name: str, number: int, expected: str, method: str) -> object:
             attempts.append(expected)
             return results.pop(0)
 
@@ -2249,18 +2400,33 @@ class RunLifecycleTests(unittest.TestCase):
         with patch("repogents.lifecycle._utc_now", return_value="2026-01-01T00:00:02.000000Z"):
             self.lifecycle.reconcile_automatic_merge(run_id)
         with self.db.connect() as connection:
-            first_state = connection.execute(
-                "SELECT state FROM automatic_merge_operations"
-            ).fetchone()["state"]
-        self.assertEqual(first_state, "rejected")
+            first = connection.execute(
+                "SELECT state, result_json FROM automatic_merge_operations"
+            ).fetchone()
+        self.assertEqual(first["state"], "rejected")
+        self.assertEqual(
+            json.loads(first["result_json"]),
+            {"merged": False, "message": "head changed", "sha": None},
+        )
 
         with patch("repogents.lifecycle._utc_now", return_value="2026-01-01T00:00:03.000000Z"):
             self.lifecycle.reconcile_automatic_merge(run_id)
         with self.db.connect() as connection:
-            retried_state = connection.execute(
-                "SELECT state FROM automatic_merge_operations"
-            ).fetchone()["state"]
-        self.assertEqual(retried_state, "reconciling")
+            operations = connection.execute(
+                "SELECT state, result_json FROM automatic_merge_operations ORDER BY created_at"
+            ).fetchall()
+            eligibilities = connection.execute(
+                "SELECT generation, state FROM automatic_merge_eligibility ORDER BY generation"
+            ).fetchall()
+        self.assertEqual([row["state"] for row in operations], ["rejected", "reconciling"])
+        self.assertEqual(
+            json.loads(operations[1]["result_json"]),
+            {"merged": True, "message": "merged", "sha": head_sha},
+        )
+        self.assertEqual(
+            [(row["generation"], row["state"]) for row in eligibilities],
+            [(1, "superseded"), (2, "active")],
+        )
         self.assertEqual(attempts, [head_sha, head_sha])
         self.assertEqual(self.lifecycle.get_run(run_id)["state"], RunState.WAITING_FOR_FEEDBACK.value)
 

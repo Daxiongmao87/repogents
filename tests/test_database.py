@@ -719,16 +719,20 @@ class DatabaseTests(unittest.TestCase):
         operation = reopened.ensure_automatic_merge_operation(
             operation_id="operation-api-1",
             eligibility_id="eligibility-api-2",
-            request={"sha": "c" * 40},
+            request={"sha": "c" * 40, "merge_method": "squash"},
             created_at="2026-01-01T00:16:00.654321Z",
         )
         duplicate = reopened.ensure_automatic_merge_operation(
             operation_id="unused-operation-id",
             eligibility_id="eligibility-api-2",
-            request={"sha": "different"},
+            request={"sha": "different", "merge_method": "rebase"},
             created_at="2026-01-01T00:17:00Z",
         )
         self.assertEqual(operation["id"], duplicate["id"])
+        self.assertEqual(
+            duplicate["request_json"],
+            '{"merge_method":"squash","sha":"' + "c" * 40 + '"}',
+        )
         requesting = reopened.record_automatic_merge_operation_state(
             "operation-api-1",
             "requesting",
@@ -751,9 +755,13 @@ class DatabaseTests(unittest.TestCase):
         )
         final = Database(self.db.path)
         final.initialize()
+        persisted_operation = final.automatic_merge_operation(
+            "eligibility-api-2"
+        )
+        self.assertEqual(persisted_operation["state"], "confirmed")
         self.assertEqual(
-            final.automatic_merge_operation("eligibility-api-2")["state"],
-            "confirmed",
+            persisted_operation["request_json"],
+            '{"merge_method":"squash","sha":"' + "c" * 40 + '"}',
         )
         self.assertIsNone(final.active_automatic_merge_eligibility("pr-api"))
         final.set_repository_automatic_merge_idle_seconds(
@@ -762,6 +770,77 @@ class DatabaseTests(unittest.TestCase):
         self.assertIsNone(
             final.repository_automatic_merge_idle_seconds("repo-1")
         )
+
+    def test_review_thread_work_is_scoped_and_tracks_retryable_resolution(
+        self,
+    ) -> None:
+        self.seed_repository_run()
+        now = "2026-01-01T00:00:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('pr-thread-1', 'run-1', 'node-pr-thread-1', 11,
+                           'https://github.com/owner/repo/pull/11',
+                           'agent/run-1', 'main', ?, ?, ?, 'open', ?, ?)""",
+                ("a" * 40, "b" * 40, "b" * 40, now, now),
+            )
+            connection.execute(
+                """INSERT INTO feedback_versions
+                   (id, pull_request_id, feedback_type, github_object_id,
+                    github_version, author, body, state, observed_at,
+                    review_thread_id, review_thread_resolved)
+                   VALUES ('feedback-thread-1', 'pr-thread-1',
+                           'inline_comment', 'comment-thread-1', 'v1',
+                           'reviewer', 'please change this', 'resolved', ?,
+                           'thread-1', 0)""",
+                (now,),
+            )
+        for state in ("resolved", "answered", "declined"):
+            with self.db.transaction() as connection:
+                connection.execute(
+                    "UPDATE feedback_versions SET state=? WHERE id='feedback-thread-1'",
+                    (state,),
+                )
+            self.assertTrue(self.db.has_review_thread_work("run-1"))
+            self.assertFalse(self.db.has_review_thread_work("unrelated-run"))
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE feedback_versions
+                   SET review_thread_resolved=1
+                   WHERE id='feedback-thread-1'"""
+            )
+        self.assertFalse(self.db.has_review_thread_work("run-1"))
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO outbound_operations
+                   (id, run_id, kind, idempotency_key, request_json, state,
+                    created_at)
+                   VALUES ('resolve-thread-operation', 'run-1',
+                           'resolve_review_thread', 'resolve-thread-1', '{}',
+                           'pending', ?)""",
+                (now,),
+            )
+        self.assertTrue(self.db.has_review_thread_work("run-1"))
+        self.assertFalse(self.db.has_review_thread_work("unrelated-run"))
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE outbound_operations
+                   SET state='attempted', attempted_at=?, error='temporary'
+                   WHERE id='resolve-thread-operation'""",
+                (now,),
+            )
+        self.assertTrue(self.db.has_review_thread_work("run-1"))
+        with self.db.transaction() as connection:
+            connection.execute(
+                """UPDATE outbound_operations
+                   SET state='completed', completed_at=?, error=NULL
+                   WHERE id='resolve-thread-operation'""",
+                (now,),
+            )
+        self.assertFalse(self.db.has_review_thread_work("run-1"))
 
     def test_duplicate_feedback_pull_request_and_notification_are_rejected(
         self,

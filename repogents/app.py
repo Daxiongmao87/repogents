@@ -346,6 +346,13 @@ class Orchestrator:
         for row in rows:
             run_id = str(row["id"])
             try:
+                reconcile_outstanding_automatic_merge = getattr(
+                    self.lifecycle,
+                    "reconcile_outstanding_automatic_merge",
+                    None,
+                )
+                if callable(reconcile_outstanding_automatic_merge):
+                    reconcile_outstanding_automatic_merge(run_id)
                 self.feedback.poll_run(run_id)
                 reconcile_automatic_merge = getattr(
                     self.lifecycle, "reconcile_automatic_merge", None
@@ -1770,6 +1777,7 @@ def _display_repository_inputs(raw: str) -> dict[str, object]:
         "allowed_host_paths",
         "allowed_services",
         "validation_commands",
+        "automatic_merge_idle_seconds",
     ):
         if key in payload:
             display[key] = payload[key]

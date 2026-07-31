@@ -16,7 +16,7 @@ Repogents is intentionally an orchestrator, not a general-purpose agent shell. R
 8. Ingests reviews, inline review comments, and pull-request comments; reconciles changed requirements into a newly approved specification revision before source work, and updates the same pull request when source changes are required.
 9. Continues polling every open application-owned pull request; a merge ends the run, while closure without merge starts one fresh run when the linked issue remains open.
 
-Repogents never merges or closes pull requests.
+By default, Repogents leaves pull requests unmerged and never closes them directly. A repository explicitly configured with a positive `automatic_merge_idle_seconds` value may instead have an eligible pull request merged automatically after the verified idle period described below.
 
 ## Requirements
 
@@ -235,7 +235,7 @@ When the exact commit passes every discovered validation command, the approved s
 
 Keep Repogents running while a pull request is open. It polls submitted reviews, inline comments, general pull-request comments, and pull-request status independently of repository-local agent work. New or edited feedback is persisted before evaluation. Valid changes are implemented, revalidated, and pushed to the same branch; questions and rejected requests receive a response without inventing a source change.
 
-Automatic merge is disabled by default. To opt in for one onboarded repository, set its supported repository configuration value `automatic_merge_idle_seconds` to a positive number of seconds. Missing, zero, negative, or malformed values do not enable automatic merge. The setting is stored durably and remains in effect after Repogents restarts.
+Automatic merge is disabled by default. To opt in for one onboarded repository, set its supported repository configuration value `automatic_merge_idle_seconds` to a positive integer number of seconds. Missing values and nonpositive integers keep automatic merge disabled; zero or a negative integer can be used during re-onboarding to disable a previously enabled repository. Booleans and malformed non-integer values are validation errors and never enable the feature. The setting is stored durably and remains in effect after Repogents restarts.
 
 For an enabled repository, the idle interval starts from the later of the application pull request's current head-commit time and its latest relevant pull-request comment time. A changed head or a newer relevant comment resets the full interval. The activity anchor and deadline retain their precision across restart, so restarting neither shortens the wait nor creates a duplicate eligibility generation.
 

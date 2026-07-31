@@ -16,7 +16,13 @@ from typing import Protocol
 
 from .controller import RunPaused, RunProcessSupervisor, git_environment
 from .database import Database
-from .github import ActivationEvent, GitHubError, IssueInfo, PullRequestInfo
+from .github import (
+    ActivationEvent,
+    GitHubError,
+    IssueInfo,
+    PullRequestInfo,
+    PullRequestMergeResult,
+)
 from .sandbox import RunLayout
 
 
@@ -2029,6 +2035,76 @@ class RunLifecycle:
                     (str(layout.checkout), str(layout.root), _utc_now(), run_id),
                 )
 
+    def reconcile_outstanding_automatic_merge(self, run_id: str) -> None:
+        """Confirm an already-requested automatic merge without creating new work."""
+
+        with self._run_lock(run_id):
+            with self.database.connect() as connection:
+                context = connection.execute(
+                    """SELECT repositories.owner, repositories.name,
+                              pull_requests.id AS pull_id,
+                              pull_requests.number AS pull_number,
+                              automatic_merge_operations.id AS operation_id,
+                              automatic_merge_operations.eligibility_id
+                       FROM runs
+                       JOIN repositories ON repositories.id=runs.repository_id
+                       JOIN pull_requests ON pull_requests.run_id=runs.id
+                       JOIN automatic_merge_eligibility
+                         ON automatic_merge_eligibility.pull_request_id=pull_requests.id
+                       JOIN automatic_merge_operations
+                         ON automatic_merge_operations.eligibility_id=
+                            automatic_merge_eligibility.id
+                       WHERE runs.id=?
+                         AND runs.state NOT IN ('canceled', 'closed')
+                         AND automatic_merge_operations.state IN
+                             ('pending', 'requesting', 'reconciling')
+                       ORDER BY automatic_merge_operations.created_at DESC
+                       LIMIT 1""",
+                    (run_id,),
+                ).fetchone()
+            if context is None:
+                return
+            get_pull = getattr(self.github, "get_pull_request", None)
+            if not callable(get_pull):
+                return
+            try:
+                pull = get_pull(
+                    str(context["owner"]),
+                    str(context["name"]),
+                    int(context["pull_number"]),
+                )
+            except Exception:
+                return
+            observed_at = _utc_now()
+            pull_state = "merged" if pull.merged else pull.state
+            with self.database.transaction() as connection:
+                connection.execute(
+                    """UPDATE pull_requests
+                       SET state=?, remote_head_sha=?, updated_at=?
+                       WHERE id=?""",
+                    (pull_state, pull.head_sha, pull.updated_at, context["pull_id"]),
+                )
+                if pull.merged:
+                    connection.execute(
+                        """UPDATE automatic_merge_operations
+                           SET state='confirmed', reconciled_at=?, confirmed_at=?,
+                               last_error=NULL
+                           WHERE id=?""",
+                        (observed_at, observed_at, context["operation_id"]),
+                    )
+                    connection.execute(
+                        """UPDATE automatic_merge_eligibility
+                           SET state='completed', completed_at=?, updated_at=?
+                           WHERE id=?""",
+                        (observed_at, observed_at, context["eligibility_id"]),
+                    )
+            if pull.merged:
+                self.transition(
+                    run_id,
+                    RunState.CLOSED,
+                    reason="GitHub confirmed pull request merged by automatic merge",
+                )
+
     def reconcile_automatic_merge(self, run_id: str) -> None:
         """Refresh and safely advance opt-in automatic merge for one open PR."""
 
@@ -2141,6 +2217,18 @@ class RunLifecycle:
                     result = result.replace(tzinfo=timezone.utc)
                 return result.astimezone(timezone.utc)
 
+            def feedback_activity(value: object) -> datetime:
+                text = str(value or "").strip()
+                try:
+                    return parsed(text)
+                except (TypeError, ValueError):
+                    # Top-level review identities are stored as
+                    # <submitted-at>:<commit>:<state>. Extract only the known
+                    # leading UTC timestamp; malformed identities stay non-fatal.
+                    if text.endswith("Z") or "Z:" not in text:
+                        raise
+                    return parsed(text.split("Z:", 1)[0] + "Z")
+
             try:
                 anchor = parsed(pull.head_commit_at)
             except (TypeError, ValueError):
@@ -2155,13 +2243,14 @@ class RunLifecycle:
                 ).fetchall()
             for row in feedback_rows:
                 try:
-                    anchor = max(anchor, parsed(row["github_version"]))
+                    anchor = max(anchor, feedback_activity(row["github_version"]))
                 except (TypeError, ValueError):
                     continue
             anchor_at = anchor.isoformat(timespec="microseconds").replace("+00:00", "Z")
-            deadline_at = (anchor + timedelta(seconds=duration)).isoformat(
-                timespec="microseconds"
-            ).replace("+00:00", "Z")
+            deadline = anchor + timedelta(seconds=duration)
+            deadline_at = deadline.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            )
 
             with self.database.transaction() as connection:
                 active = connection.execute(
@@ -2169,10 +2258,23 @@ class RunLifecycle:
                        WHERE pull_request_id=? AND state='active'""",
                     (context["pull_id"],),
                 ).fetchone()
+                active_operation = (
+                    connection.execute(
+                        "SELECT state FROM automatic_merge_operations WHERE eligibility_id=?",
+                        (active["id"],),
+                    ).fetchone()
+                    if active is not None
+                    else None
+                )
                 reset = (
                     active is None
                     or str(active["expected_head_sha"]) != pull.head_sha
-                    or parsed(active["activity_anchor_at"]) < anchor
+                    or parsed(active["activity_anchor_at"]) != anchor
+                    or parsed(active["deadline_at"]) != deadline
+                    or (
+                        active_operation is not None
+                        and str(active_operation["state"]) == "rejected"
+                    )
                 )
                 if reset:
                     generation = int(
@@ -2227,6 +2329,7 @@ class RunLifecycle:
                 observation_time = parsed(observed_at)
                 if (
                     pending_feedback is not None
+                    or self.database.has_review_thread_work(run_id)
                     or parsed(active["deadline_at"]) > observation_time
                 ):
                     return
@@ -2237,12 +2340,61 @@ class RunLifecycle:
                                SET state='reconciling', reconciled_at=? WHERE id=?""",
                             (observed_at, existing["id"]),
                         )
-                    # A fresh pull observation above reconciles in-flight delivery.
-                    # Ambiguous or accepted delivery must never be sent again, while a
-                    # definite rejection remains recoverable after this new verified
-                    # observation passes every eligibility and safety gate again.
+                        return
                     if existing["state"] != "rejected":
                         return
+                    # A definite rejection is retryable only after this fresh pull
+                    # observation has passed every safety gate. Retire its eligibility
+                    # so the retry has a distinct durable generation and operation.
+                    connection.execute(
+                        """UPDATE automatic_merge_eligibility
+                           SET state='superseded', superseded_at=?, updated_at=?
+                           WHERE id=?""",
+                        (observed_at, observed_at, active["id"]),
+                    )
+                    generation = int(
+                        connection.execute(
+                            """SELECT COALESCE(MAX(generation), 0) + 1
+                               FROM automatic_merge_eligibility
+                               WHERE pull_request_id=?""",
+                            (context["pull_id"],),
+                        ).fetchone()[0]
+                    )
+                    eligibility_id = str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"{context['pull_id']}:automatic-merge:{generation}:{pull.head_sha}",
+                        )
+                    )
+                    connection.execute(
+                        """INSERT INTO automatic_merge_eligibility
+                           (id, pull_request_id, generation, expected_head_sha,
+                            activity_anchor_at, deadline_at, observed_at, state,
+                            created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+                        (
+                            eligibility_id, context["pull_id"], generation,
+                            pull.head_sha, anchor_at, deadline_at, observed_at,
+                            observed_at, observed_at,
+                        ),
+                    )
+                    active = connection.execute(
+                        "SELECT * FROM automatic_merge_eligibility WHERE id=?",
+                        (eligibility_id,),
+                    ).fetchone()
+                get_merge_method = getattr(
+                    self.github, "get_repository_merge_method", None
+                )
+                if not callable(get_merge_method):
+                    return
+                try:
+                    merge_method = get_merge_method(
+                        str(context["owner"]), str(context["name"])
+                    )
+                except Exception:
+                    return
+                if merge_method not in {"merge", "squash", "rebase"}:
+                    return
                 operation_id = str(
                     uuid.uuid5(
                         uuid.NAMESPACE_URL,
@@ -2264,7 +2416,12 @@ class RunLifecycle:
                     (
                         operation_id, active["id"], context["pull_id"],
                         pull.head_sha,
-                        _json({"expected_head_sha": pull.head_sha}),
+                        _json(
+                            {
+                                "expected_head_sha": pull.head_sha,
+                                "merge_method": merge_method,
+                            }
+                        ),
                         observed_at, observed_at,
                     ),
                 )
@@ -2289,6 +2446,7 @@ class RunLifecycle:
                         str(context["name"]),
                         int(context["pull_number"]),
                         pull.head_sha,
+                        merge_method,
                     )
                 except Exception as error:
                     self.database.record_automatic_merge_operation_state(
@@ -2298,9 +2456,18 @@ class RunLifecycle:
                         last_error=str(error),
                     )
                     return
-            accepted = result is not False and not (
-                isinstance(result, dict) and result.get("merged") is False
-            )
+            if isinstance(result, PullRequestMergeResult):
+                accepted = result.merged
+                persisted_result: object = {
+                    "merged": result.merged,
+                    "message": result.message,
+                    "sha": result.sha,
+                }
+            else:
+                accepted = result is not False and not (
+                    isinstance(result, dict) and result.get("merged") is False
+                )
+                persisted_result = result
             with self.database.transaction() as connection:
                 connection.execute(
                     """UPDATE automatic_merge_operations
@@ -2308,7 +2475,7 @@ class RunLifecycle:
                        WHERE id=?""",
                     (
                         "reconciling" if accepted else "rejected",
-                        _json(result),
+                        _json(persisted_result),
                         observed_at,
                         None if accepted else "GitHub rejected automatic merge",
                         operation_id,

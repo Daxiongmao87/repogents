@@ -1731,6 +1731,34 @@ class Database:
         finally:
             connection.close()
 
+    def has_review_thread_work(self, run_id: str) -> bool:
+        """Return whether a run has unresolved review-thread reconciliation work."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT
+                       EXISTS (
+                           SELECT 1
+                           FROM feedback_versions
+                           JOIN pull_requests
+                             ON pull_requests.id=feedback_versions.pull_request_id
+                           WHERE pull_requests.run_id=?
+                             AND feedback_versions.state IN (
+                                 'resolved', 'answered', 'declined'
+                             )
+                             AND feedback_versions.review_thread_id IS NOT NULL
+                             AND feedback_versions.review_thread_resolved=0
+                       ),
+                       EXISTS (
+                           SELECT 1
+                           FROM outbound_operations
+                           WHERE run_id=?
+                             AND kind='resolve_review_thread'
+                             AND state IN ('pending', 'attempted')
+                       )""",
+                (run_id, run_id),
+            ).fetchone()
+        return bool(row[0]) or bool(row[1])
+
     def set_repository_automatic_merge_idle_seconds(
         self, repository_id: str, idle_seconds: int | None, changed_at: str
     ) -> None:

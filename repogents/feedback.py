@@ -1135,31 +1135,7 @@ class FeedbackService:
         return operation_id, str(row["attempted_at"])
 
     def _has_review_thread_work(self, run_id: str) -> bool:
-        with self.database.connect() as connection:
-            row = connection.execute(
-                """SELECT
-                       EXISTS (
-                           SELECT 1
-                           FROM feedback_versions
-                           JOIN pull_requests
-                             ON pull_requests.id=feedback_versions.pull_request_id
-                           WHERE pull_requests.run_id=?
-                             AND feedback_versions.state IN (
-                                 'resolved', 'answered', 'declined'
-                             )
-                             AND feedback_versions.review_thread_id IS NOT NULL
-                             AND feedback_versions.review_thread_resolved=0
-                       ),
-                       EXISTS (
-                           SELECT 1
-                           FROM outbound_operations
-                           WHERE run_id=?
-                             AND kind='resolve_review_thread'
-                             AND state IN ('pending', 'attempted')
-                       )""",
-                (run_id, run_id),
-            ).fetchone()
-        return bool(row[0]) or bool(row[1])
+        return self.database.has_review_thread_work(run_id)
 
     def _resolve_review_threads(self, run_id: str) -> None:
         self._stage_review_thread_operations(run_id)

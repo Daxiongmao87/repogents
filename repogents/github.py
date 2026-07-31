@@ -605,20 +605,16 @@ class GitHubClient:
     def get_pull_request(self, owner: str, name: str, number: int) -> PullRequestInfo:
         payload, _ = self._request("GET", f"repos/{owner}/{name}/pulls/{number}")
         pull = self._pull_request(payload)
-        commits = self._paginate(
-            f"repos/{owner}/{name}/pulls/{number}/commits"
+        head_commit, _ = self._request(
+            "GET", f"repos/{owner}/{name}/commits/{pull.head_sha}"
         )
-        head_commit = next(
-            (
-                commit
-                for commit in commits
-                if isinstance(commit, dict) and commit.get("sha") == pull.head_sha
-            ),
-            None,
-        )
-        if head_commit is None:
+        if not isinstance(head_commit, dict):
             raise GitHubError(
-                "GitHub pull-request commits omitted the refreshed head commit"
+                "GitHub pull-request head commit response was not an object"
+            )
+        if head_commit.get("sha") != pull.head_sha:
+            raise GitHubError(
+                "GitHub pull-request head commit did not match the refreshed head SHA"
             )
         try:
             head_commit_at = head_commit["commit"]["committer"]["date"]
@@ -634,20 +630,39 @@ class GitHubClient:
             **{**pull.__dict__, "head_commit_at": head_commit_at}
         )
 
+    def get_repository_merge_method(self, owner: str, name: str) -> str | None:
+        payload, _ = self._request("GET", f"repos/{owner}/{name}")
+        if not isinstance(payload, dict):
+            raise GitHubError("GitHub repository capability response was not an object")
+        capabilities = (
+            ("merge", payload.get("allow_merge_commit")),
+            ("squash", payload.get("allow_squash_merge")),
+            ("rebase", payload.get("allow_rebase_merge")),
+        )
+        if any(not isinstance(enabled, bool) for _, enabled in capabilities):
+            raise GitHubError(
+                "GitHub repository response omitted valid merge capabilities"
+            )
+        return next((method for method, enabled in capabilities if enabled), None)
+
     def merge_pull_request(
         self,
         owner: str,
         name: str,
         number: int,
         expected_head_sha: str,
+        merge_method: str,
     ) -> PullRequestMergeResult:
         expected = expected_head_sha.strip()
         if not expected:
             raise ValueError("expected pull-request head SHA is required")
+        method = merge_method.strip().lower()
+        if method not in {"merge", "squash", "rebase"}:
+            raise ValueError("merge method must be merge, squash, or rebase")
         payload, _ = self._request(
             "PUT",
             f"repos/{owner}/{name}/pulls/{number}/merge",
-            body={"sha": expected},
+            body={"sha": expected, "merge_method": method},
         )
         if not isinstance(payload, dict):
             raise GitHubError("GitHub pull-request merge response was not an object")

@@ -1138,15 +1138,12 @@ def _normalize_repository_inputs(inputs: dict[str, object]) -> dict[str, Any]:
 
     if "automatic_merge_idle_seconds" in inputs:
         idle_seconds = inputs["automatic_merge_idle_seconds"]
-        if (
-            isinstance(idle_seconds, bool)
-            or not isinstance(idle_seconds, int)
-            or idle_seconds <= 0
-        ):
+        if isinstance(idle_seconds, bool) or not isinstance(idle_seconds, int):
             raise ValueError(
-                "automatic_merge_idle_seconds must be a positive integer"
+                "automatic_merge_idle_seconds must be an integer"
             )
-        normalized["automatic_merge_idle_seconds"] = idle_seconds
+        if idle_seconds > 0:
+            normalized["automatic_merge_idle_seconds"] = idle_seconds
 
     if "allowed_host_paths" in inputs:
         values = inputs["allowed_host_paths"]
