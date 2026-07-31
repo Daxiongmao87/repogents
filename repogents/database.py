@@ -1258,6 +1258,94 @@ SCHEMA_V23 = (
 )
 
 
+SCHEMA_V23 = (
+    """
+    ALTER TABLE runs ADD COLUMN resume_state TEXT
+        CHECK (
+            resume_state IS NULL
+            OR resume_state IN (
+                'implementing',
+                'validating',
+                'publishing',
+                'resolving_feedback'
+            )
+        )
+    """,
+    """
+    WITH ranked AS (
+        SELECT
+            id,
+            state,
+            ROW_NUMBER() OVER (
+                PARTITION BY repository_id
+                ORDER BY
+                    CASE WHEN force_requested_at IS NOT NULL THEN 0 ELSE 1 END,
+                    priority,
+                    created_at,
+                    id
+            ) AS active_rank
+        FROM runs
+        WHERE state IN (
+            'implementing',
+            'validating',
+            'publishing',
+            'resolving_feedback'
+        )
+    )
+    INSERT INTO run_transitions
+        (run_id, from_state, to_state, reason, occurred_at)
+    SELECT
+        id,
+        state,
+        'queued',
+        'schema v23 reconciled duplicate active repository run',
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    FROM ranked
+    WHERE active_rank > 1
+    """,
+    """
+    WITH ranked AS (
+        SELECT
+            id,
+            ROW_NUMBER() OVER (
+                PARTITION BY repository_id
+                ORDER BY
+                    CASE WHEN force_requested_at IS NOT NULL THEN 0 ELSE 1 END,
+                    priority,
+                    created_at,
+                    id
+            ) AS active_rank
+        FROM runs
+        WHERE state IN (
+            'implementing',
+            'validating',
+            'publishing',
+            'resolving_feedback'
+        )
+    )
+    UPDATE runs
+    SET
+        resume_state=state,
+        state='queued',
+        reason='schema v23 reconciled duplicate active repository run',
+        updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE id IN (
+        SELECT id FROM ranked WHERE active_rank > 1
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX one_active_run_per_repository
+        ON runs(repository_id)
+        WHERE state IN (
+            'implementing',
+            'validating',
+            'publishing',
+            'resolving_feedback'
+        )
+    """,
+)
+
+
 class Database:
     """Owns SQLite connection policy and transactional schema initialization."""
 
@@ -1541,24 +1629,23 @@ class Database:
                     )
             else:
                 connection.commit()
-            if version < 23:
-                connection.execute("BEGIN IMMEDIATE")
-                current_version = int(
-                    connection.execute(
-                        "SELECT MAX(version) FROM schema_version"
-                    ).fetchone()[0]
+            connection.execute("BEGIN IMMEDIATE")
+            current_version = int(
+                connection.execute(
+                    "SELECT MAX(version) FROM schema_version"
+                ).fetchone()[0]
+            )
+            if current_version < 23:
+                for statement in SCHEMA_V23:
+                    connection.execute(statement)
+                connection.execute(
+                    """INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           23,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )"""
                 )
-                if current_version < 23:
-                    for statement in SCHEMA_V23:
-                        connection.execute(statement)
-                    connection.execute(
-                        """INSERT INTO schema_version(version, applied_at)
-                           VALUES (
-                               23,
-                               strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                           )"""
-                    )
-                connection.commit()
+            connection.commit()
             connection.execute("PRAGMA journal_mode = WAL")
         except BaseException:
             if connection.in_transaction:

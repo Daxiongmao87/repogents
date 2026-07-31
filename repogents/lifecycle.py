@@ -30,6 +30,15 @@ class RunState(str, Enum):
     CANCELED = "canceled"
     CLOSED = "closed"
 
+ACTIVE_RUN_STATES = frozenset(
+    {
+        RunState.IMPLEMENTING,
+        RunState.VALIDATING,
+        RunState.PUBLISHING,
+        RunState.RESOLVING_FEEDBACK,
+    }
+)
+
 
 _TRANSITIONS: dict[RunState, frozenset[RunState]] = {
     RunState.QUEUED: frozenset(
@@ -659,31 +668,25 @@ class RunLifecycle:
                 f"issue requirements changed to revision {version}; "
                 "re-evaluating implementation and proof"
             )
-            target = (
-                RunState.QUEUED if state == RunState.QUEUED else RunState.IMPLEMENTING
-            )
-            if state in {RunState.BLOCKED, target}:
-                last_completed_state = current["last_completed_state"]
+            if state == RunState.QUEUED and current["resume_state"] is None:
+                connection.execute(
+                    "UPDATE runs SET reason=?, updated_at=? WHERE id=?",
+                    (reason, now, run_id),
+                )
+                connection.execute(
+                    """INSERT INTO run_transitions
+                       (run_id, from_state, to_state, reason, occurred_at)
+                       VALUES (?, 'queued', 'queued', ?, ?)""",
+                    (run_id, reason, now),
+                )
             else:
-                last_completed_state = state.value
-            connection.execute(
-                """UPDATE runs
-                   SET state=?, last_completed_state=?, reason=?, updated_at=?
-                   WHERE id=?""",
-                (
-                    target.value,
-                    last_completed_state,
-                    reason,
-                    now,
+                self.request_repository_lane(
+                    connection,
                     run_id,
-                ),
-            )
-            connection.execute(
-                """INSERT INTO run_transitions
-                   (run_id, from_state, to_state, reason, occurred_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (run_id, state.value, target.value, reason, now),
-            )
+                    RunState.IMPLEMENTING,
+                    reason=reason,
+                    allow_restart=True,
+                )
             connection.execute(
                 """UPDATE acceptance_verifications
                    SET state='superseded',
@@ -712,6 +715,191 @@ class RunLifecycle:
                 "issue revision persisted, but active sandbox cancellation failed"
             ) from cancellation_error
         return True
+
+    def request_repository_lane(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        target: RunState,
+        *,
+        reason: str | None = None,
+        allow_restart: bool = False,
+    ) -> bool:
+        """Activate a run or durably queue its exact requested phase."""
+
+        if target not in ACTIVE_RUN_STATES:
+            raise ValueError(f"{target.value} is not an active run state")
+        row = connection.execute(
+            """SELECT runs.*,
+                      repositories.enabled AS repository_enabled,
+                      repositories.removed_at AS repository_removed_at
+               FROM runs
+               JOIN repositories ON repositories.id=runs.repository_id
+               WHERE runs.id=?""",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        current = RunState(str(row["state"]))
+        if (
+            not bool(row["repository_enabled"])
+            or row["repository_removed_at"] is not None
+        ):
+            raise RunPaused(run_id)
+        if current in {RunState.CANCELED, RunState.CLOSED}:
+            raise ValueError(f"{current.value} run cannot request the repository lane")
+
+        sibling = connection.execute(
+            """SELECT id FROM runs
+               WHERE repository_id=? AND id!=?
+                 AND state IN (
+                     'implementing',
+                     'validating',
+                     'publishing',
+                     'resolving_feedback'
+                 )
+               LIMIT 1""",
+            (row["repository_id"], run_id),
+        ).fetchone()
+        now = _utc_now()
+        if sibling is not None:
+            if current == RunState.QUEUED:
+                connection.execute(
+                    """UPDATE runs
+                       SET resume_state=?, reason=?, updated_at=?
+                       WHERE id=?""",
+                    (target.value, reason, now, run_id),
+                )
+            else:
+                last_completed = (
+                    row["last_completed_state"]
+                    if current == RunState.BLOCKED
+                    else current.value
+                )
+                connection.execute(
+                    """UPDATE runs
+                       SET state='queued', resume_state=?,
+                           last_completed_state=?, reason=?, updated_at=?
+                       WHERE id=?""",
+                    (target.value, last_completed, reason, now, run_id),
+                )
+                connection.execute(
+                    """INSERT INTO run_transitions
+                       (run_id, from_state, to_state, reason, occurred_at)
+                       VALUES (?, ?, 'queued', ?, ?)""",
+                    (run_id, current.value, reason, now),
+                )
+            return False
+
+        if current == target:
+            if not allow_restart:
+                raise ValueError(
+                    f"invalid run transition: {current.value} -> {target.value}"
+                )
+            connection.execute(
+                """UPDATE runs
+                   SET resume_state=NULL, reason=?, updated_at=?
+                   WHERE id=?""",
+                (reason, now, run_id),
+            )
+            connection.execute(
+                """INSERT INTO run_transitions
+                   (run_id, from_state, to_state, reason, occurred_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (run_id, current.value, target.value, reason, now),
+            )
+            return True
+        resumable = (
+            current == RunState.QUEUED
+            and str(row["resume_state"] or "") == target.value
+        )
+        if not resumable and not allow_restart and not allowed_transition(
+            current, target
+        ):
+            raise ValueError(
+                f"invalid run transition: {current.value} -> {target.value}"
+            )
+        if current in {RunState.BLOCKED, RunState.QUEUED}:
+            last_completed = row["last_completed_state"]
+        else:
+            last_completed = current.value
+        connection.execute(
+            """UPDATE runs
+               SET state=?, resume_state=NULL, last_completed_state=?,
+                   reason=?, updated_at=?
+               WHERE id=?""",
+            (target.value, last_completed, reason, now, run_id),
+        )
+        connection.execute(
+            """INSERT INTO run_transitions
+               (run_id, from_state, to_state, reason, occurred_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (run_id, current.value, target.value, reason, now),
+        )
+        return True
+
+    def suspend_for_preemption(self, run_id: str) -> str:
+        """Yield an active repository lane without losing its exact phase."""
+
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT state, resume_state FROM runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            current = RunState(str(row["state"]))
+            if current == RunState.QUEUED and row["resume_state"] is not None:
+                return str(row["resume_state"])
+            if current not in ACTIVE_RUN_STATES:
+                raise ValueError(f"{current.value} run does not own a repository lane")
+            now = _utc_now()
+            reason = "repository lane yielded to a forced sibling run"
+            connection.execute(
+                """UPDATE runs
+                   SET state='queued', resume_state=?, updated_at=?
+                   WHERE id=?""",
+                (current.value, now, run_id),
+            )
+            connection.execute(
+                """INSERT INTO run_transitions
+                   (run_id, from_state, to_state, reason, occurred_at)
+                   VALUES (?, ?, 'queued', ?, ?)""",
+                (run_id, current.value, reason, now),
+            )
+            return current.value
+
+    def resume_suspended(self, run_id: str) -> str | None:
+        """Reclaim the repository lane for a durably suspended phase."""
+
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT resume_state, reason FROM runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            if row["resume_state"] is None:
+                return None
+            target = RunState(str(row["resume_state"]))
+            active = self.request_repository_lane(
+                connection,
+                run_id,
+                target,
+                reason=row["reason"],
+                allow_restart=True,
+            )
+            return target.value if active else None
+
+    def activate_queued(self, run_id: str) -> bool:
+        """Atomically claim an idle repository lane for queued work."""
+
+        with self.database.transaction() as connection:
+            return self.request_repository_lane(
+                connection,
+                run_id,
+                RunState.IMPLEMENTING,
+            )
 
     def record_validated_revision(
         self,
@@ -1174,6 +1362,7 @@ class RunLifecycle:
             connection.execute(
                 """UPDATE runs
                    SET state=?, last_completed_state=?, reason=?, updated_at=?,
+                       resume_state=NULL,
                        canceled_at=CASE WHEN ?='canceled' THEN ? ELSE canceled_at END,
                        closed_at=CASE WHEN ?='closed' THEN ? ELSE closed_at END,
                        retry_attempt_count=CASE
@@ -1264,15 +1453,37 @@ class RunLifecycle:
                         raise ValueError(
                             f"blocked run cannot resume from {target.value}"
                         )
+                    if target in ACTIVE_RUN_STATES:
+                        activated = self.request_repository_lane(
+                            connection,
+                            run_id,
+                            target,
+                            reason=reason,
+                            allow_restart=True,
+                        )
+                        stored_target = target if activated else RunState.QUEUED
+                    else:
+                        connection.execute(
+                            """UPDATE runs
+                               SET state=?, resume_state=NULL, reason=?, updated_at=?
+                               WHERE id=?""",
+                            (target.value, reason, now, run_id),
+                        )
+                        connection.execute(
+                            """INSERT INTO run_transitions
+                               (run_id, from_state, to_state, reason, occurred_at)
+                               VALUES (?, ?, ?, ?, ?)""",
+                            (run_id, current.value, target.value, reason, now),
+                        )
+                        stored_target = target
                     connection.execute(
                         """UPDATE runs
-                           SET state=?, reason=?, updated_at=?,
-                               retry_attempt_count=0,
+                           SET retry_attempt_count=0,
                                retry_operation=NULL,
                                retry_next_at=NULL,
                                retry_last_error=NULL
                            WHERE id=?""",
-                        (target.value, reason, now, run_id),
+                        (run_id,),
                     )
                 else:
                     if row["retry_next_at"] is None:
@@ -1280,19 +1491,20 @@ class RunLifecycle:
                             "run is not blocked and no retry is pending"
                         )
                     target = current
+                    stored_target = current
                     connection.execute(
                         """UPDATE runs
                            SET retry_next_at=NULL, updated_at=?
                            WHERE id=?""",
                         (now, run_id),
                     )
-                connection.execute(
-                    """INSERT INTO run_transitions
-                       (run_id, from_state, to_state, reason, occurred_at)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (run_id, current.value, target.value, reason, now),
-                )
-                return target.value
+                    connection.execute(
+                        """INSERT INTO run_transitions
+                           (run_id, from_state, to_state, reason, occurred_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (run_id, current.value, target.value, reason, now),
+                    )
+                return stored_target.value
 
     def restart(self, run_id: str) -> str:
         """Create one fresh run for a canceled run's current open issue."""
@@ -1604,20 +1816,12 @@ class RunLifecycle:
                     ).fetchone()
                     if candidate is None:
                         continue
-                    now = _utc_now()
-                    updated = connection.execute(
-                        """UPDATE runs
-                           SET state='resolving_feedback', reason=?, updated_at=?
-                           WHERE id=? AND state='blocked'""",
-                        (recovery_reason, now, run_id),
-                    ).rowcount
-                    if updated != 1:
-                        continue
-                    connection.execute(
-                        """INSERT INTO run_transitions
-                           (run_id, from_state, to_state, reason, occurred_at)
-                           VALUES (?, 'blocked', 'resolving_feedback', ?, ?)""",
-                        (run_id, recovery_reason, now),
+                    self.request_repository_lane(
+                        connection,
+                        run_id,
+                        RunState.RESOLVING_FEEDBACK,
+                        reason=recovery_reason,
+                        allow_restart=True,
                     )
                     recovered.append(run_id)
         return tuple(recovered)
@@ -1716,28 +1920,12 @@ class RunLifecycle:
                     ).fetchone()
                     if candidate is None:
                         continue
-                    now = _utc_now()
-                    updated = connection.execute(
-                        """UPDATE runs
-                           SET state='publishing', reason=?, updated_at=?
-                           WHERE id=? AND state='blocked'""",
-                        (
-                            _LEGACY_PUBLICATION_MERGE_BASE_RECOVERY_REASON,
-                            now,
-                            run_id,
-                        ),
-                    ).rowcount
-                    if updated != 1:
-                        continue
-                    connection.execute(
-                        """INSERT INTO run_transitions
-                           (run_id, from_state, to_state, reason, occurred_at)
-                           VALUES (?, 'blocked', 'publishing', ?, ?)""",
-                        (
-                            run_id,
-                            _LEGACY_PUBLICATION_MERGE_BASE_RECOVERY_REASON,
-                            now,
-                        ),
+                    self.request_repository_lane(
+                        connection,
+                        run_id,
+                        RunState.PUBLISHING,
+                        reason=_LEGACY_PUBLICATION_MERGE_BASE_RECOVERY_REASON,
+                        allow_restart=True,
                     )
                     recovered.append(run_id)
         return tuple(recovered)
@@ -1816,20 +2004,12 @@ class RunLifecycle:
                         evidence,
                     ):
                         continue
-                    now = _utc_now()
-                    updated = connection.execute(
-                        """UPDATE runs
-                           SET state='publishing', reason=NULL, updated_at=?
-                           WHERE id=? AND state='blocked'""",
-                        (now, run_id),
-                    ).rowcount
-                    if updated != 1:
-                        continue
-                    connection.execute(
-                        """INSERT INTO run_transitions
-                           (run_id, from_state, to_state, reason, occurred_at)
-                           VALUES (?, 'blocked', 'publishing', ?, ?)""",
-                        (run_id, _LEGACY_ACCEPTANCE_RECOVERY_REASON, now),
+                    self.request_repository_lane(
+                        connection,
+                        run_id,
+                        RunState.PUBLISHING,
+                        reason=_LEGACY_ACCEPTANCE_RECOVERY_REASON,
+                        allow_restart=True,
                     )
                     recovered.append(run_id)
         return tuple(recovered)

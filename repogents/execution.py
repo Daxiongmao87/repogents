@@ -31,6 +31,7 @@ from .workflow import (
     WorkflowNodeContext,
     WorkflowTemplate,
     WorkflowService,
+    validate_workflow_output,
 )
 from .validation import compare_findings, extract_findings
 
@@ -318,6 +319,26 @@ def _bounded_redacted_text(
     limit: int = _ACTION_HISTORY_LIMIT,
 ) -> str:
     return redact_text(value, secret_values)[:limit]
+
+
+def _contains_resolved_secret(
+    value: object,
+    secret_values: set[str],
+) -> bool:
+    if isinstance(value, str):
+        return redact_text(value, secret_values) != value
+    if isinstance(value, dict):
+        return any(
+            _contains_resolved_secret(key, secret_values)
+            or _contains_resolved_secret(item, secret_values)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(
+            _contains_resolved_secret(item, secret_values)
+            for item in value
+        )
+    return False
 
 
 def _action_history_value(
@@ -1384,6 +1405,7 @@ class ExecutionService:
                 secret_bindings,
                 resolved_secret_values,
                 workflow_resources=context.resources,
+                workflow_expected_output=context.expected_output,
             )
             if yielded:
                 raise WorkflowExecutionError(
@@ -1595,10 +1617,13 @@ class ExecutionService:
                     "completion_contract": (
                         "Complete only this node objective. Finish with a "
                         "concise summary and an output object matching "
-                        "expected_output. Do not assign members or alter "
-                        "the outer graph. Report recoverable concerns in "
-                        "the typed output rather than blocking the "
-                        "repository."
+                        "expected_output. Output keys cannot be argv, code, "
+                        "command, credential, executable, password, program, "
+                        "script, secret, shell, or token; record passive "
+                        "verification with scenario and result fields. Do not "
+                        "assign members or alter the outer graph. Report "
+                        "recoverable concerns in the typed output rather than "
+                        "blocking the repository."
                     ),
                 },
                 ensure_ascii=False,
@@ -1893,6 +1918,7 @@ class ExecutionService:
         require_assignment: bool = False,
         continue_after_assignment: bool = False,
         workflow_resources: tuple[str, ...] | None = None,
+        workflow_expected_output: Mapping[str, object] | None = None,
         require_specification: bool = False,
         supersede_specification_id: str | None = None,
         specification_context_sha256: str | None = None,
@@ -2108,24 +2134,33 @@ class ExecutionService:
                             _ACTION_HISTORY_LIMIT - len(label) - len(" finished: "),
                         ),
                     )
-                    transcript.append(f"{label} finished: {safe_summary}")
-                    self._store_transcript(layout, transcript)
+                    normalized_output: dict[str, object]
                     if isinstance(output, dict):
-                        encoded_output = json.dumps(
+                        json.dumps(
                             output,
                             ensure_ascii=False,
                             sort_keys=True,
                         )
-                        redacted_output = redact_text(
-                            encoded_output,
+                        if _contains_resolved_secret(
+                            output,
                             resolved_secret_values,
-                        )
-                        if redacted_output != encoded_output:
+                        ):
                             raise PermissionError(
                                 "workflow output contains a resolved "
                                 "secret value"
                             )
-                        return dict(output), False
+                        normalized_output = dict(output)
+                    else:
+                        normalized_output = {"summary": safe_summary}
+                    if workflow_expected_output is not None:
+                        validate_workflow_output(
+                            normalized_output,
+                            workflow_expected_output,
+                        )
+                    transcript.append(f"{label} finished: {safe_summary}")
+                    self._store_transcript(layout, transcript)
+                    if isinstance(output, dict):
+                        return normalized_output, False
                     return safe_summary, False
                 if name == "block":
                     reason = action.get("reason")

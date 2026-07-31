@@ -615,6 +615,131 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual(self.sandbox.canceled, [run_id])
         self.assertEqual(self.github.issue_polls, 2)
 
+    def test_issue_revision_discovery_waits_for_same_repository_lane(self) -> None:
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(
+            run_id,
+            RunState.BLOCKED,
+            reason="waiting for corrected issue requirements",
+        )
+        now = "2026-01-01T00:01:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO issues
+                   (id, repository_id, github_node_id, number, url, title, body,
+                    discussion_json, updated_at)
+                   VALUES ('issue-2', 'repo-1', 'I4', 4, 'issue-4-url',
+                           'Other issue', 'Body', '[]', ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO activation_events
+                   (id, repository_id, issue_id, github_event_id, applied_at)
+                   VALUES ('activation-2', 'repo-1', 'issue-2', 'event-2', ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO runs
+                   (id, repository_id, issue_id, activation_event_id,
+                    sandbox_version_id, team_version_id, intended_base_branch,
+                    base_sha, state, checkout_path, run_path, created_at,
+                    updated_at)
+                   VALUES ('run-2', 'repo-1', 'issue-2', 'activation-2',
+                           'sandbox-1', 'team-1', 'main', ?, 'validating',
+                           '/tmp/run-2/checkout', '/tmp/run-2', ?, ?)""",
+                ("b" * 40, now, now),
+            )
+        self.github.current_issue = IssueInfo(
+            node_id="I3",
+            number=3,
+            url="https://github.com/owner/repo/issues/3",
+            title="Corrected issue",
+            body="Use the corrected durable behavior.",
+            discussion=(),
+            updated_at="2026-01-02T00:00:00Z",
+        )
+
+        self.assertTrue(self.lifecycle.poll_issue_revision(run_id))
+
+        with self.db.connect() as connection:
+            run = connection.execute(
+                "SELECT state, resume_state FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            versions = connection.execute(
+                """SELECT COUNT(*) FROM issue_versions
+                   WHERE issue_id=(SELECT issue_id FROM runs WHERE id=?)""",
+                (run_id,),
+            ).fetchone()[0]
+        self.assertEqual(tuple(run), ("queued", "implementing"))
+        self.assertEqual(versions, 2)
+
+    def test_preempted_lane_owner_resumes_only_after_sibling_is_idle(
+        self,
+    ) -> None:
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        now = "2026-01-01T00:01:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO issues
+                   (id, repository_id, github_node_id, number, url, title, body,
+                    discussion_json, updated_at)
+                   VALUES ('issue-2', 'repo-1', 'I4', 4, 'issue-4-url',
+                           'Forced issue', 'Body', '[]', ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO activation_events
+                   (id, repository_id, issue_id, github_event_id, applied_at)
+                   VALUES ('activation-2', 'repo-1', 'issue-2', 'event-2', ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO runs
+                   (id, repository_id, issue_id, activation_event_id,
+                    sandbox_version_id, team_version_id, intended_base_branch,
+                    base_sha, state, checkout_path, run_path, created_at,
+                    updated_at)
+                   VALUES ('run-2', 'repo-1', 'issue-2', 'activation-2',
+                           'sandbox-1', 'team-1', 'main', ?, 'queued',
+                           '/tmp/run-2/checkout', '/tmp/run-2', ?, ?)""",
+                ("b" * 40, now, now),
+            )
+
+        self.assertEqual(
+            self.lifecycle.suspend_for_preemption(run_id),
+            RunState.IMPLEMENTING.value,
+        )
+        self.assertTrue(self.lifecycle.activate_queued("run-2"))
+        self.assertIsNone(self.lifecycle.resume_suspended(run_id))
+        with self.db.connect() as connection:
+            occupied = connection.execute(
+                """SELECT id, state, resume_state, checkout_path
+                   FROM runs ORDER BY id"""
+            ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["state"], row["resume_state"]) for row in occupied],
+            [
+                (run_id, "queued", "implementing"),
+                ("run-2", "implementing", None),
+            ],
+        )
+        self.assertTrue(all(row["checkout_path"] for row in occupied))
+
+        self.lifecycle.transition("run-2", RunState.VALIDATING)
+        self.lifecycle.transition("run-2", RunState.PUBLISHING)
+        self.lifecycle.transition("run-2", RunState.WAITING_FOR_FEEDBACK)
+        self.assertEqual(
+            self.lifecycle.resume_suspended(run_id),
+            RunState.IMPLEMENTING.value,
+        )
+        with self.db.connect() as connection:
+            resumed = connection.execute(
+                "SELECT state, resume_state FROM runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+        self.assertEqual(tuple(resumed), ("implementing", None))
+
     def test_rapid_issue_edits_fence_stale_validation_and_terminal_runs(self) -> None:
         run_id = self.lifecycle.poll_repository("repo-1")[0]
         with self.db.connect() as connection:

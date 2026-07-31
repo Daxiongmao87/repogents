@@ -22,7 +22,7 @@ from .database import Database
 from .execution import ExecutionService, MiniSweModelRuntime
 from .feedback import FeedbackService, MiniSweFeedbackEvaluator
 from .github import GitHubClient
-from .lifecycle import GitCheckoutManager, RunLifecycle, RunState
+from .lifecycle import ACTIVE_RUN_STATES, GitCheckoutManager, RunLifecycle, RunState
 from .mini_swe import MINI_SWE_RUNTIME
 from .onboarding import (
     GitSourceManager,
@@ -47,6 +47,7 @@ _TERMINAL_OR_IDLE = {
     RunState.BLOCKED.value,
     *_TERMINAL_RUN_STATES,
 }
+_ACTIVE_RUN_STATES = {state.value for state in ACTIVE_RUN_STATES}
 _RUN_REASON_SUMMARY_LIMIT = 400
 _FOCUSABLE_RUN_STATES = {
     RunState.QUEUED.value,
@@ -73,6 +74,9 @@ class LifecycleOperations(Protocol):
     def cancel(self, run_id: str, reason: str) -> None: ...
     def retry(self, run_id: str) -> str: ...
     def restart(self, run_id: str) -> str: ...
+    def suspend_for_preemption(self, run_id: str) -> str: ...
+    def resume_suspended(self, run_id: str) -> str | None: ...
+    def activate_queued(self, run_id: str) -> bool: ...
 
     def set_repository_paused(
         self, repository_id: str, paused: bool
@@ -162,11 +166,50 @@ class Orchestrator:
         with self._repository_lock(repository_id):
             self._repository_advance_started()
             try:
-                for run_id in self._ordered_run_ids(repository_id):
+                visited: set[str] = set()
+                while True:
+                    candidates = tuple(
+                        run_id
+                        for run_id in self._ordered_run_ids(repository_id)
+                        if run_id not in visited
+                    )
+                    if not candidates:
+                        return
+                    run_id = candidates[0]
+                    active_run_id = self._active_run_id(repository_id)
+                    if active_run_id is not None and active_run_id != run_id:
+                        self.lifecycle.suspend_for_preemption(active_run_id)
+                    run = self.lifecycle.get_run(run_id)
+                    if run["state"] == RunState.QUEUED.value:
+                        if run.get("resume_state") is not None:
+                            if self.lifecycle.resume_suspended(run_id) is None:
+                                return
+                        elif not self.lifecycle.activate_queued(run_id):
+                            return
                     self._advance(run_id)
                     self._clear_focus_if_idle(run_id)
+                    after = str(self.lifecycle.get_run(run_id)["state"])
+                    if after in _ACTIVE_RUN_STATES:
+                        return
+                    visited.add(run_id)
             finally:
                 self._repository_advance_finished()
+
+    def _active_run_id(self, repository_id: str) -> str | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT id FROM runs
+                   WHERE repository_id=?
+                     AND state IN (
+                         'implementing',
+                         'validating',
+                         'publishing',
+                         'resolving_feedback'
+                     )
+                   LIMIT 1""",
+                (repository_id,),
+            ).fetchone()
+        return None if row is None else str(row["id"])
 
     def _repository_lock(self, repository_id: str) -> threading.Lock:
         with self._repository_locks_guard:
@@ -209,6 +252,25 @@ class Orchestrator:
                 ).fetchone()
                 if focused is not None:
                     return (focused,)
+                active = connection.execute(
+                    """SELECT runs.id, runs.repository_id
+                       FROM runs
+                       JOIN repositories
+                         ON repositories.id=runs.repository_id
+                       WHERE runs.repository_id=?
+                         AND runs.state IN (
+                             'implementing',
+                             'validating',
+                             'publishing',
+                             'resolving_feedback'
+                         )
+                         AND repositories.enabled=1
+                         AND repositories.removed_at IS NULL
+                       LIMIT 1""",
+                    (repository_id,),
+                ).fetchone()
+                if active is not None:
+                    return (active,)
             rows = connection.execute(
                 """SELECT runs.id, runs.repository_id FROM runs
                    JOIN repositories
@@ -660,7 +722,8 @@ class ApplicationActions:
                           issues.number AS issue_number,
                           issues.title AS issue_title,
                           issues.url AS issue_url,
-                          runs.state, runs.last_completed_state, runs.reason,
+                          runs.state, runs.resume_state,
+                          runs.last_completed_state, runs.reason,
                           runs.base_sha, runs.validated_sha,
                           runs.sandbox_version_id, runs.team_version_id,
                           run_sandbox.version AS sandbox_version,
@@ -939,7 +1002,7 @@ class ApplicationActions:
             active_runs = [
                 run
                 for run in visible_repository_runs
-                if str(run["state"]) not in _TERMINAL_OR_IDLE
+                if str(run["state"]) in _ACTIVE_RUN_STATES
             ]
             latest_run = visible_repository_runs[0] if visible_repository_runs else None
             activity_times = [str(value.pop("updated_at"))]

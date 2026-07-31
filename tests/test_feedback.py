@@ -1457,6 +1457,69 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(runs[0]["state"], RunState.CLOSED.value)
         self.assertIn("issue is closed", runs[0]["reason"])
 
+    def test_feedback_discovery_waits_for_same_repository_lane(self) -> None:
+        now = "2026-01-01T00:02:00Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO issues
+                   (id, repository_id, github_node_id, number, url, title, body,
+                    discussion_json, updated_at)
+                   VALUES ('issue-2', 'repo-1', 'I2', 4, 'issue-2-url',
+                           'Other issue', 'Body', '[]', ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO activation_events
+                   (id, repository_id, issue_id, github_event_id, applied_at)
+                   VALUES ('activation-2', 'repo-1', 'issue-2', 'event-2', ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO runs
+                   (id, repository_id, issue_id, activation_event_id,
+                    sandbox_version_id, team_version_id, intended_base_branch,
+                    base_sha, state, checkout_path, run_path, created_at,
+                    updated_at)
+                   VALUES ('run-2', 'repo-1', 'issue-2', 'activation-2',
+                           'sandbox-1', 'team-1', 'main', ?, 'implementing',
+                           '/tmp/run-2/checkout', '/tmp/run-2', ?, ?)""",
+                ("a" * 40, now, now),
+            )
+        self.gateway.items = [
+            self.item(
+                "inline_comment",
+                "comment-while-sibling-active",
+                "v1",
+                "Please change this behavior",
+            )
+        ]
+
+        self.assertEqual(self.service.poll_run("run-1"), 1)
+
+        with self.db.connect() as connection:
+            run = connection.execute(
+                "SELECT state, resume_state FROM runs WHERE id='run-1'"
+            ).fetchone()
+            feedback_state = connection.execute(
+                """SELECT state FROM feedback_versions
+                   WHERE github_object_id='comment-while-sibling-active'"""
+            ).fetchone()[0]
+        self.assertEqual(tuple(run), ("queued", "resolving_feedback"))
+        self.assertEqual(feedback_state, "pending")
+        self.assertEqual(self.evaluator.calls, [])
+        self.assertEqual(self.executor.calls, [])
+
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET state='waiting_for_feedback' WHERE id='run-2'"
+            )
+        self.assertEqual(self.service.poll_run("run-1"), 0)
+        with self.db.connect() as connection:
+            run = connection.execute(
+                "SELECT state, resume_state FROM runs WHERE id='run-1'"
+            ).fetchone()
+        self.assertEqual(tuple(run), ("resolving_feedback", None))
+
     def test_polling_feedback_activates_resolution_without_agent_work(
         self,
     ) -> None:

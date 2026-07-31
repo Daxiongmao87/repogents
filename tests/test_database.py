@@ -32,6 +32,7 @@ from repogents.database import (
     SCHEMA_V20,
     SCHEMA_V21,
     SCHEMA_V22,
+    SCHEMA_V23,
 )
 
 
@@ -66,6 +67,7 @@ class DatabaseTests(unittest.TestCase):
             19: SCHEMA_V19,
             20: SCHEMA_V20,
             21: SCHEMA_V21,
+            22: SCHEMA_V22,
         }
         with sqlite3.connect(path) as connection:
             connection.executescript(SCHEMA_V1)
@@ -170,6 +172,60 @@ class DatabaseTests(unittest.TestCase):
                     "2026-01-01T00:00:00Z",
                     "2026-01-01T00:00:00Z",
                 ),
+            )
+
+    def seed_active_run_conflict(
+        self,
+        database: Database,
+        *,
+        forced_run_id: str | None = None,
+    ) -> None:
+        now = "2026-01-01T00:01:00Z"
+        forced_at = "2026-01-01T00:02:00Z"
+        with database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO issues
+                   (id, repository_id, github_node_id, number, url, title, body,
+                    discussion_json, updated_at)
+                   VALUES ('issue-2', 'repo-1', 'I_node_2', 4,
+                           'https://github.com/owner/repo/issues/4',
+                           'Second issue', 'Body', '[]', ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO activation_events
+                   (id, repository_id, issue_id, github_event_id, applied_at)
+                   VALUES ('activation-2', 'repo-1', 'issue-2', 'event-2', ?)""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO runs
+                   (id, repository_id, issue_id, activation_event_id,
+                    sandbox_version_id, team_version_id, intended_base_branch,
+                    base_sha, state, priority, force_requested_at,
+                    created_at, updated_at)
+                   VALUES ('run-2', 'repo-1', 'issue-2', 'activation-2',
+                           'sandbox-1', 'team-1', 'main', ?, 'validating',
+                           0, ?, ?, ?)""",
+                (
+                    "a" * 40,
+                    forced_at if forced_run_id == "run-2" else None,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """UPDATE runs
+                   SET state='implementing', priority=10, force_requested_at=?
+                   WHERE id='run-1'""",
+                (forced_at if forced_run_id == "run-1" else None,),
+            )
+            connection.execute(
+                """INSERT INTO run_transitions
+                   (run_id, from_state, to_state, reason, occurred_at)
+                   VALUES ('run-1', 'queued', 'implementing', 'fixture', ?),
+                          ('run-2', 'queued', 'validating', 'fixture', ?)""",
+                (now, now),
             )
 
     def test_initialization_is_idempotent_and_enables_integrity_modes(self) -> None:
@@ -1580,6 +1636,75 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(preserved, (1, 1, 1, 1))
         self.assertEqual(foreign_key_violations, [])
 
+
+    def test_schema_v23_enforces_one_active_run_per_repository(self) -> None:
+        migrated = self.legacy_database("schema-v22-active-runs.sqlite3", 22)
+        self.seed_repository_run(database=migrated)
+        self.seed_active_run_conflict(migrated, forced_run_id="run-1")
+
+        migrated.initialize()
+
+        with migrated.connect() as connection:
+            version = connection.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()[0]
+            runs = connection.execute(
+                """SELECT id, state, resume_state, force_requested_at
+                   FROM runs ORDER BY id"""
+            ).fetchall()
+            transitions = connection.execute(
+                "SELECT COUNT(*) FROM run_transitions"
+            ).fetchone()[0]
+            indexes = {
+                row["name"]: row["sql"]
+                for row in connection.execute(
+                    """SELECT name, sql FROM sqlite_master
+                       WHERE type='index' AND tbl_name='runs'"""
+                )
+            }
+            foreign_key_violations = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+
+        self.assertEqual(version, 23)
+        self.assertEqual(
+            [tuple(row) for row in runs],
+            [
+                ("run-1", "implementing", None, "2026-01-01T00:02:00Z"),
+                ("run-2", "queued", "validating", None),
+            ],
+        )
+        self.assertEqual(transitions, 3)
+        self.assertIn("one_active_run_per_repository", indexes)
+        self.assertEqual(foreign_key_violations, [])
+        with self.assertRaises(sqlite3.IntegrityError):
+            with migrated.transaction() as connection:
+                connection.execute(
+                    "UPDATE runs SET state='implementing' WHERE id='run-2'"
+                )
+
+    def test_schema_v23_migration_uses_priority_without_force(self) -> None:
+        migrated = self.legacy_database(
+            "schema-v22-active-run-priority.sqlite3",
+            22,
+        )
+        self.seed_repository_run(database=migrated)
+        self.seed_active_run_conflict(migrated)
+
+        migrated.initialize()
+
+        with migrated.connect() as connection:
+            rows = connection.execute(
+                """SELECT id, state, resume_state
+                   FROM runs ORDER BY id"""
+            ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                ("run-1", "queued", "implementing"),
+                ("run-2", "validating", None),
+            ],
+        )
 
 
 if __name__ == "__main__":
