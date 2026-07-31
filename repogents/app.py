@@ -347,6 +347,11 @@ class Orchestrator:
             run_id = str(row["id"])
             try:
                 self.feedback.poll_run(run_id)
+                reconcile_automatic_merge = getattr(
+                    self.lifecycle, "reconcile_automatic_merge", None
+                )
+                if callable(reconcile_automatic_merge):
+                    reconcile_automatic_merge(run_id)
             except Exception as error:
                 detail, _ = _display_run_reason(str(error) or error.__class__.__name__)
                 self.last_errors.append(f"feedback poll {run_id}: {detail}")

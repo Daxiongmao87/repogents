@@ -229,13 +229,21 @@ The activating label event has a stable identity. Repeated polling and applicati
 
 Each run graph is bound to the stored issue, team, sandbox, exact base SHA, and active specification revision. The coordinating member can assess completed node evidence and propose a bounded new graph generation; the controller validates the revision, preserves prior generations, and reuses only exact-identity outputs. Repository and run views expose the stored specification history, review provenance, acceptance mapping, topology, live states, attempts, generation deltas, reuse decisions, and assessments.
 
-When the exact commit passes every discovered validation command, the approved specification's independent acceptance, scope review, and secret scan, Repogents pushes a deterministic `agent/issue-<issue-number>-<run-id>` branch and opens one pull request. The pull request remains unmerged for you to review.
+When the exact commit passes every discovered validation command, the approved specification's independent acceptance, scope review, and secret scan, Repogents pushes a deterministic `agent/issue-<issue-number>-<run-id>` branch and opens one pull request. By default, Repogents leaves that pull request unmerged for you to review.
 
-## Feedback monitoring
+## Feedback monitoring and optional automatic merge
 
 Keep Repogents running while a pull request is open. It polls submitted reviews, inline comments, general pull-request comments, and pull-request status independently of repository-local agent work. New or edited feedback is persisted before evaluation. Valid changes are implemented, revalidated, and pushed to the same branch; questions and rejected requests receive a response without inventing a source change.
 
-After all observed feedback is resolved, the same run remains in `waiting_for_feedback`. Elapsed time does not complete the run or stop polling. A merge moves the run to `closed`. Closing the pull request without merge closes that attempt and creates one fresh run from the repository's current stored sandbox and team when the linked issue remains open.
+Automatic merge is disabled by default. To opt in for one onboarded repository, set its supported repository configuration value `automatic_merge_idle_seconds` to a positive number of seconds. Missing, zero, negative, or malformed values do not enable automatic merge. The setting is stored durably and remains in effect after Repogents restarts.
+
+For an enabled repository, the idle interval starts from the later of the application pull request's current head-commit time and its latest relevant pull-request comment time. A changed head or a newer relevant comment resets the full interval. The activity anchor and deadline retain their precision across restart, so restarting neither shortens the wait nor creates a duplicate eligibility generation.
+
+Reaching the deadline is not enough by itself. Repogents first refreshes GitHub successfully and verifies that the pull request is still open and unmerged, still has the expected application branch and head SHA, has no newer activity, and has no pending feedback requiring resolution. Stale observations, refresh failures, closure, a changed head, or unresolved feedback defer or cancel that merge attempt rather than counting unobserved time as idle.
+
+An eligible merge request is bound to the verified head SHA. Repogents records and reconciles the operation with current GitHub state before retrying an ambiguous transport result or after restart; an already merged pull request is treated as success without another merge request. A rejected or temporarily unavailable merge remains recoverable and continues monitoring. The run closes for automatic merge only after a successful GitHub observation confirms that the pull request is merged. Repogents does not directly close the issue or pull request after a failed merge request.
+
+After all observed feedback is resolved, a run without automatic merge enabled remains in `waiting_for_feedback`; elapsed time alone does not complete it or stop polling. A confirmed merge moves the run to `closed`. Closing the pull request without merge closes that attempt and creates one fresh run from the repository's current stored sandbox and team when the linked issue remains open.
 
 ## Other commands
 
@@ -278,9 +286,9 @@ Repogents currently supports:
 - one Linux host;
 - local SQLite and filesystem storage;
 - one stored environment and team lineage per repository;
-- unmerged pull-request delivery.
+- unmerged pull-request delivery by default, with per-repository opt-in automatic merge after a verified idle interval.
 
-It does not provide multiple users or tenants, distributed workers, high availability, automatic merging, container orchestration, CPU or memory quotas, remote artifact storage, or protection against deliberately malicious repositories.
+It does not provide multiple users or tenants, distributed workers, high availability, container orchestration, CPU or memory quotas, remote artifact storage, or protection against deliberately malicious repositories.
 
 ## Development
 

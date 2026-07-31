@@ -102,8 +102,16 @@ class PullRequestInfo:
     head_sha: str
     base_branch: str
     updated_at: str
+    head_commit_at: str | None = None
     base_sha: str = ""
     mergeable: bool | None = None
+
+
+@dataclass(frozen=True)
+class PullRequestMergeResult:
+    merged: bool
+    message: str
+    sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -596,7 +604,65 @@ class GitHubClient:
 
     def get_pull_request(self, owner: str, name: str, number: int) -> PullRequestInfo:
         payload, _ = self._request("GET", f"repos/{owner}/{name}/pulls/{number}")
-        return self._pull_request(payload)
+        pull = self._pull_request(payload)
+        commits = self._paginate(
+            f"repos/{owner}/{name}/pulls/{number}/commits"
+        )
+        head_commit = next(
+            (
+                commit
+                for commit in commits
+                if isinstance(commit, dict) and commit.get("sha") == pull.head_sha
+            ),
+            None,
+        )
+        if head_commit is None:
+            raise GitHubError(
+                "GitHub pull-request commits omitted the refreshed head commit"
+            )
+        try:
+            head_commit_at = head_commit["commit"]["committer"]["date"]
+        except (KeyError, TypeError) as error:
+            raise GitHubError(
+                "GitHub pull-request head commit omitted its activity timestamp"
+            ) from error
+        if not isinstance(head_commit_at, str) or not head_commit_at.strip():
+            raise GitHubError(
+                "GitHub pull-request head commit activity timestamp was invalid"
+            )
+        return PullRequestInfo(
+            **{**pull.__dict__, "head_commit_at": head_commit_at}
+        )
+
+    def merge_pull_request(
+        self,
+        owner: str,
+        name: str,
+        number: int,
+        expected_head_sha: str,
+    ) -> PullRequestMergeResult:
+        expected = expected_head_sha.strip()
+        if not expected:
+            raise ValueError("expected pull-request head SHA is required")
+        payload, _ = self._request(
+            "PUT",
+            f"repos/{owner}/{name}/pulls/{number}/merge",
+            body={"sha": expected},
+        )
+        if not isinstance(payload, dict):
+            raise GitHubError("GitHub pull-request merge response was not an object")
+        merged = payload.get("merged")
+        message = payload.get("message")
+        sha = payload.get("sha")
+        if not isinstance(merged, bool) or not isinstance(message, str):
+            raise GitHubError(
+                "GitHub pull-request merge response omitted required fields"
+            )
+        if sha is not None and not isinstance(sha, str):
+            raise GitHubError(
+                "GitHub pull-request merge response SHA was invalid"
+            )
+        return PullRequestMergeResult(merged=merged, message=message, sha=sha)
 
     @staticmethod
     def _pull_request(payload: object) -> PullRequestInfo:

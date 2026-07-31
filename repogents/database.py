@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Generator
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 SCHEMA_V1 = r"""
 BEGIN IMMEDIATE;
@@ -1250,6 +1250,81 @@ SCHEMA_V22 = (
 )
 
 
+SCHEMA_V24 = (
+    """
+    ALTER TABLE repositories
+        ADD COLUMN automatic_merge_idle_seconds INTEGER
+            CHECK (
+                automatic_merge_idle_seconds IS NULL
+                OR (
+                    typeof(automatic_merge_idle_seconds) = 'integer'
+                    AND automatic_merge_idle_seconds > 0
+                )
+            )
+    """,
+    """
+    CREATE TABLE automatic_merge_eligibility (
+        id TEXT PRIMARY KEY,
+        pull_request_id TEXT NOT NULL
+            REFERENCES pull_requests(id) ON DELETE CASCADE,
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        expected_head_sha TEXT NOT NULL CHECK (length(expected_head_sha) > 0),
+        activity_anchor_at TEXT NOT NULL CHECK (length(activity_anchor_at) > 0),
+        deadline_at TEXT NOT NULL CHECK (length(deadline_at) > 0),
+        observed_at TEXT NOT NULL CHECK (length(observed_at) > 0),
+        state TEXT NOT NULL CHECK (state IN ('active', 'superseded', 'completed')),
+        superseded_at TEXT,
+        completed_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (pull_request_id, generation),
+        UNIQUE (pull_request_id, id),
+        CHECK (
+            (state = 'active' AND superseded_at IS NULL AND completed_at IS NULL)
+            OR (state = 'superseded' AND superseded_at IS NOT NULL AND completed_at IS NULL)
+            OR (state = 'completed' AND superseded_at IS NULL AND completed_at IS NOT NULL)
+        )
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX automatic_merge_one_active_generation
+        ON automatic_merge_eligibility(pull_request_id)
+        WHERE state = 'active'
+    """,
+    """
+    CREATE INDEX automatic_merge_eligibility_deadline
+        ON automatic_merge_eligibility(state, deadline_at)
+    """,
+    """
+    CREATE TABLE automatic_merge_operations (
+        id TEXT PRIMARY KEY,
+        eligibility_id TEXT NOT NULL UNIQUE,
+        pull_request_id TEXT NOT NULL,
+        expected_head_sha TEXT NOT NULL CHECK (length(expected_head_sha) > 0),
+        state TEXT NOT NULL CHECK (state IN (
+            'pending', 'requesting', 'reconciling', 'confirmed', 'rejected'
+        )),
+        request_json TEXT NOT NULL CHECK (json_valid(request_json)),
+        result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+        created_at TEXT NOT NULL,
+        requested_at TEXT,
+        reconciled_at TEXT,
+        confirmed_at TEXT,
+        last_error TEXT,
+        UNIQUE (pull_request_id, eligibility_id, expected_head_sha),
+        FOREIGN KEY (pull_request_id, eligibility_id)
+            REFERENCES automatic_merge_eligibility(pull_request_id, id)
+            ON DELETE CASCADE,
+        CHECK (state <> 'confirmed' OR confirmed_at IS NOT NULL)
+    )
+    """,
+    """
+    CREATE INDEX automatic_merge_operations_reconciliation
+        ON automatic_merge_operations(state, created_at)
+    """,
+)
+
+
 SCHEMA_V23 = (
     """
     ALTER TABLE runs ADD COLUMN resume_state TEXT
@@ -1637,6 +1712,16 @@ class Database:
                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                        )"""
                 )
+            if current_version < 24:
+                for statement in SCHEMA_V24:
+                    connection.execute(statement)
+                connection.execute(
+                    """INSERT INTO schema_version(version, applied_at)
+                       VALUES (
+                           24,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       )"""
+                )
             connection.commit()
             connection.execute("PRAGMA journal_mode = WAL")
         except BaseException:
@@ -1645,3 +1730,188 @@ class Database:
             raise
         finally:
             connection.close()
+
+    def set_repository_automatic_merge_idle_seconds(
+        self, repository_id: str, idle_seconds: int | None, changed_at: str
+    ) -> None:
+        if idle_seconds is not None and (
+            isinstance(idle_seconds, bool)
+            or not isinstance(idle_seconds, int)
+            or idle_seconds <= 0
+        ):
+            raise ValueError("automatic merge idle duration must be a positive integer")
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE repositories
+                   SET automatic_merge_idle_seconds=?, updated_at=?
+                   WHERE id=?""",
+                (idle_seconds, changed_at, repository_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(repository_id)
+
+    def repository_automatic_merge_idle_seconds(
+        self, repository_id: str
+    ) -> int | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT automatic_merge_idle_seconds FROM repositories WHERE id=?",
+                (repository_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(repository_id)
+        value = row["automatic_merge_idle_seconds"]
+        return None if value is None else int(value)
+
+    def active_automatic_merge_eligibility(
+        self, pull_request_id: str
+    ) -> dict[str, object] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM automatic_merge_eligibility
+                   WHERE pull_request_id=? AND state='active'""",
+                (pull_request_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def replace_automatic_merge_eligibility(
+        self, *, eligibility_id: str, pull_request_id: str,
+        expected_head_sha: str, activity_anchor_at: str, deadline_at: str,
+        observed_at: str, changed_at: str
+    ) -> dict[str, object]:
+        with self.transaction() as connection:
+            active = connection.execute(
+                """SELECT * FROM automatic_merge_eligibility
+                   WHERE pull_request_id=? AND state='active'""",
+                (pull_request_id,),
+            ).fetchone()
+            if active is not None and (
+                active["expected_head_sha"] == expected_head_sha
+                and active["activity_anchor_at"] == activity_anchor_at
+                and active["deadline_at"] == deadline_at
+            ):
+                connection.execute(
+                    """UPDATE automatic_merge_eligibility
+                       SET observed_at=?, updated_at=? WHERE id=?""",
+                    (observed_at, changed_at, active["id"]),
+                )
+                row = connection.execute(
+                    "SELECT * FROM automatic_merge_eligibility WHERE id=?",
+                    (active["id"],),
+                ).fetchone()
+                return dict(row)
+            generation = int(
+                connection.execute(
+                    """SELECT COALESCE(MAX(generation), 0)
+                       FROM automatic_merge_eligibility WHERE pull_request_id=?""",
+                    (pull_request_id,),
+                ).fetchone()[0]
+            ) + 1
+            if active is not None:
+                connection.execute(
+                    """UPDATE automatic_merge_eligibility
+                       SET state='superseded', superseded_at=?, updated_at=?
+                       WHERE id=?""",
+                    (changed_at, changed_at, active["id"]),
+                )
+            connection.execute(
+                """INSERT INTO automatic_merge_eligibility
+                   (id, pull_request_id, generation, expected_head_sha,
+                    activity_anchor_at, deadline_at, observed_at, state,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+                (eligibility_id, pull_request_id, generation, expected_head_sha,
+                 activity_anchor_at, deadline_at, observed_at, changed_at, changed_at),
+            )
+            row = connection.execute(
+                "SELECT * FROM automatic_merge_eligibility WHERE id=?",
+                (eligibility_id,),
+            ).fetchone()
+            return dict(row)
+
+    def ensure_automatic_merge_operation(
+        self, *, operation_id: str, eligibility_id: str,
+        request: object, created_at: str
+    ) -> dict[str, object]:
+        encode = lambda value: __import__("json").dumps(
+            value, sort_keys=True, separators=(",", ":")
+        )
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM automatic_merge_operations WHERE eligibility_id=?",
+                (eligibility_id,),
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
+            eligibility = connection.execute(
+                "SELECT * FROM automatic_merge_eligibility WHERE id=?",
+                (eligibility_id,),
+            ).fetchone()
+            if eligibility is None:
+                raise KeyError(eligibility_id)
+            connection.execute(
+                """INSERT INTO automatic_merge_operations
+                   (id, eligibility_id, pull_request_id, expected_head_sha,
+                    state, request_json, created_at)
+                   VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+                (operation_id, eligibility_id, eligibility["pull_request_id"],
+                 eligibility["expected_head_sha"], encode(request), created_at),
+            )
+            row = connection.execute(
+                "SELECT * FROM automatic_merge_operations WHERE id=?",
+                (operation_id,),
+            ).fetchone()
+            return dict(row)
+
+    def automatic_merge_operation(
+        self, eligibility_id: str
+    ) -> dict[str, object] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM automatic_merge_operations WHERE eligibility_id=?",
+                (eligibility_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def record_automatic_merge_operation_state(
+        self, operation_id: str, state: str, *, changed_at: str,
+        result: object | None = None, last_error: str | None = None
+    ) -> dict[str, object]:
+        if state not in {"pending", "requesting", "reconciling", "confirmed", "rejected"}:
+            raise ValueError(f"unsupported automatic merge operation state: {state}")
+        result_json = None if result is None else __import__("json").dumps(
+            result, sort_keys=True, separators=(",", ":")
+        )
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE automatic_merge_operations
+                   SET state=?, result_json=COALESCE(?, result_json),
+                       requested_at=CASE WHEN ?='requesting' THEN ? ELSE requested_at END,
+                       reconciled_at=CASE WHEN ? IN ('reconciling','rejected','confirmed')
+                                          THEN ? ELSE reconciled_at END,
+                       confirmed_at=CASE WHEN ?='confirmed' THEN ? ELSE confirmed_at END,
+                       last_error=?
+                   WHERE id=?""",
+                (state, result_json, state, changed_at, state, changed_at,
+                 state, changed_at, last_error, operation_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(operation_id)
+            row = connection.execute(
+                "SELECT * FROM automatic_merge_operations WHERE id=?",
+                (operation_id,),
+            ).fetchone()
+            return dict(row)
+
+    def complete_automatic_merge_eligibility(
+        self, eligibility_id: str, completed_at: str
+    ) -> None:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE automatic_merge_eligibility
+                   SET state='completed', completed_at=?, updated_at=?
+                   WHERE id=? AND state='active'""",
+                (completed_at, completed_at, eligibility_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(eligibility_id)

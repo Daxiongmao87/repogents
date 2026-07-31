@@ -758,8 +758,9 @@ class OnboardingService:
             connection.execute(
                 """INSERT INTO repositories
                    (id, github_node_id, owner, name, url, default_branch,
-                    onboarding_state, blocking_reason, inputs_json, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    onboarding_state, blocking_reason, inputs_json,
+                    automatic_merge_idle_seconds, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                      github_node_id=excluded.github_node_id,
                      owner=excluded.owner,
@@ -769,6 +770,8 @@ class OnboardingService:
                      onboarding_state=excluded.onboarding_state,
                      blocking_reason=excluded.blocking_reason,
                      inputs_json=excluded.inputs_json,
+                     automatic_merge_idle_seconds=
+                         excluded.automatic_merge_idle_seconds,
                      enabled=1,
                      removed_at=NULL,
                      updated_at=excluded.updated_at""",
@@ -782,6 +785,7 @@ class OnboardingService:
                     initial_state,
                     blocking_reason,
                     _json(normalized_inputs),
+                    normalized_inputs.get("automatic_merge_idle_seconds"),
                     now,
                     now,
                 ),
@@ -824,7 +828,8 @@ class OnboardingService:
                     """UPDATE repositories
                        SET github_node_id=?, owner=?, name=?, url=?,
                            default_branch=?, onboarding_state='inspecting',
-                           blocking_reason=NULL, inputs_json=?, updated_at=?
+                           blocking_reason=NULL, inputs_json=?,
+                           automatic_merge_idle_seconds=?, updated_at=?
                        WHERE id=?""",
                     (
                         repository.node_id,
@@ -833,6 +838,7 @@ class OnboardingService:
                         repository.url,
                         repository.default_branch,
                         _json(normalized_inputs),
+                        normalized_inputs.get("automatic_merge_idle_seconds"),
                         _utc_now(),
                         repository_id,
                     ),
@@ -1121,6 +1127,7 @@ def _normalize_repository_inputs(inputs: dict[str, object]) -> dict[str, Any]:
     allowed_keys = {
         "allowed_host_paths",
         "allowed_services",
+        "automatic_merge_idle_seconds",
         "secret_bindings",
         "validation_commands",
     }
@@ -1128,6 +1135,18 @@ def _normalize_repository_inputs(inputs: dict[str, object]) -> dict[str, Any]:
     if unknown:
         raise ValueError(f"unsupported repository input: {unknown[0]}")
     normalized: dict[str, Any] = {}
+
+    if "automatic_merge_idle_seconds" in inputs:
+        idle_seconds = inputs["automatic_merge_idle_seconds"]
+        if (
+            isinstance(idle_seconds, bool)
+            or not isinstance(idle_seconds, int)
+            or idle_seconds <= 0
+        ):
+            raise ValueError(
+                "automatic_merge_idle_seconds must be a positive integer"
+            )
+        normalized["automatic_merge_idle_seconds"] = idle_seconds
 
     if "allowed_host_paths" in inputs:
         values = inputs["allowed_host_paths"]

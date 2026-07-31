@@ -1948,5 +1948,322 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual(blocked, 0)
 
 
+    def test_automatic_merge_waits_for_fresh_verified_idle_state_and_confirmation(self) -> None:
+        from repogents.github import PullRequestInfo
+
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        self.lifecycle.transition(run_id, RunState.VALIDATING)
+        self.lifecycle.transition(run_id, RunState.PUBLISHING)
+        self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
+        head_sha = "c" * 40
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET automatic_merge_idle_seconds=60 WHERE id='repo-1'"
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('automatic-pull', ?, 'PR-auto', 8, 'pull-url',
+                           'agent/issue-3-auto', 'main', ?, ?, ?, 'open', ?, ?)""",
+                (
+                    run_id,
+                    "b" * 40,
+                    head_sha,
+                    head_sha,
+                    "2026-01-01T00:00:00.000000Z",
+                    "2026-01-01T00:00:00.000000Z",
+                ),
+            )
+            connection.execute(
+                """INSERT INTO feedback_versions
+                   (id, pull_request_id, feedback_type, github_object_id,
+                    github_version, author, body, state, observed_at)
+                   VALUES ('automatic-feedback', 'automatic-pull', 'comment',
+                           'comment-1', '2026-01-01T00:00:30.000000Z',
+                           'reviewer', 'please verify', 'pending',
+                           '2026-01-01T00:00:30.000000Z')"""
+            )
+
+        pulls = [
+            PullRequestInfo(
+                node_id="PR-auto", number=8, url="pull-url", state="open",
+                merged=False, head_branch="unexpected-branch", head_sha=head_sha,
+                base_branch="main", updated_at="2026-01-01T00:01:30.000000Z",
+                head_commit_at="2026-01-01T00:00:00.000000Z",
+            ),
+            PullRequestInfo(
+                node_id="PR-auto", number=8, url="pull-url", state="open",
+                merged=False, head_branch="agent/issue-3-auto", head_sha=head_sha,
+                base_branch="main", updated_at="2026-01-01T00:01:30.000000Z",
+                head_commit_at="2026-01-01T00:00:00.000000Z",
+            ),
+            PullRequestInfo(
+                node_id="PR-auto", number=8, url="pull-url", state="open",
+                merged=False, head_branch="agent/issue-3-auto", head_sha=head_sha,
+                base_branch="main", updated_at="2026-01-01T00:01:31.000000Z",
+                head_commit_at="2026-01-01T00:00:00.000000Z",
+            ),
+            PullRequestInfo(
+                node_id="PR-auto", number=8, url="pull-url", state="closed",
+                merged=True, head_branch="agent/issue-3-auto", head_sha=head_sha,
+                base_branch="main", updated_at="2026-01-01T00:01:32.000000Z",
+                head_commit_at="2026-01-01T00:00:00.000000Z",
+            ),
+        ]
+        merge_calls: list[tuple[str, str, int, str]] = []
+        self.github.get_pull_request = lambda owner, name, number: pulls.pop(0)
+        self.github.merge_pull_request = lambda owner, name, number, expected: (
+            merge_calls.append((owner, name, number, expected))
+            or {"merged": True, "message": "accepted", "sha": expected}
+        )
+
+        with patch(
+            "repogents.lifecycle._utc_now",
+            side_effect=[
+                "2026-01-01T00:01:30.000000Z",
+                "2026-01-01T00:01:30.000000Z",
+                "2026-01-01T00:01:31.000000Z",
+                "2026-01-01T00:01:32.000000Z",
+                "2026-01-01T00:01:32.000001Z",
+            ],
+        ):
+            self.lifecycle.reconcile_automatic_merge(run_id)
+            with self.db.connect() as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM automatic_merge_eligibility"
+                    ).fetchone()[0],
+                    0,
+                )
+            self.lifecycle.reconcile_automatic_merge(run_id)
+            self.assertEqual(merge_calls, [])
+            with self.db.transaction() as connection:
+                connection.execute(
+                    "UPDATE feedback_versions SET state='resolved' WHERE id='automatic-feedback'"
+                )
+            self.lifecycle.reconcile_automatic_merge(run_id)
+            self.assertEqual(merge_calls, [("owner", "repo", 8, head_sha)])
+            self.assertEqual(
+                self.lifecycle.get_run(run_id)["state"],
+                RunState.WAITING_FOR_FEEDBACK.value,
+            )
+            self.lifecycle.reconcile_automatic_merge(run_id)
+
+        with self.db.connect() as connection:
+            operation = connection.execute(
+                "SELECT state, expected_head_sha FROM automatic_merge_operations"
+            ).fetchone()
+            eligibility = connection.execute(
+                "SELECT state, activity_anchor_at, deadline_at FROM automatic_merge_eligibility"
+            ).fetchone()
+        self.assertEqual(operation["state"], "confirmed")
+        self.assertEqual(operation["expected_head_sha"], head_sha)
+        self.assertEqual(eligibility["state"], "completed")
+        self.assertEqual(eligibility["activity_anchor_at"], "2026-01-01T00:00:30.000000Z")
+        self.assertEqual(eligibility["deadline_at"], "2026-01-01T00:01:30.000000Z")
+        self.assertEqual(self.lifecycle.get_run(run_id)["state"], RunState.CLOSED.value)
+        self.assertEqual(len(merge_calls), 1)
+
+    def test_automatic_merge_fractional_boundary_and_new_comment_reset(self) -> None:
+        from repogents.github import PullRequestInfo
+
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        self.lifecycle.transition(run_id, RunState.VALIDATING)
+        self.lifecycle.transition(run_id, RunState.PUBLISHING)
+        self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
+        head_sha = "e" * 40
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET automatic_merge_idle_seconds=60 WHERE id='repo-1'"
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('fractional-pull', ?, 'PR-fractional', 10, 'pull-url',
+                           'agent/issue-3-fractional', 'main', ?, ?, ?, 'open', ?, ?)""",
+                (run_id, "b" * 40, head_sha, head_sha,
+                 "2026-01-01T00:00:00.250000Z",
+                 "2026-01-01T00:00:00.250000Z"),
+            )
+
+        pull = PullRequestInfo(
+            node_id="PR-fractional", number=10, url="pull-url", state="open",
+            merged=False, head_branch="agent/issue-3-fractional", head_sha=head_sha,
+            base_branch="main", updated_at="2026-01-01T00:01:30.500000Z",
+            head_commit_at="2026-01-01T00:00:00.250000Z",
+        )
+        merge_calls: list[str] = []
+        self.github.get_pull_request = lambda owner, name, number: pull
+        self.github.merge_pull_request = lambda owner, name, number, expected: (
+            merge_calls.append(expected) or {"merged": True, "sha": expected}
+        )
+
+        with patch(
+            "repogents.lifecycle._utc_now",
+            side_effect=[
+                "2026-01-01T00:01:00.249999Z",
+                "2026-01-01T00:01:00.250000Z",
+                "2026-01-01T00:01:30.499999Z",
+                "2026-01-01T00:01:30.500000Z",
+            ],
+        ):
+            self.lifecycle.reconcile_automatic_merge(run_id)
+            self.assertEqual(merge_calls, [])
+            with self.db.transaction() as connection:
+                connection.execute(
+                    """INSERT INTO feedback_versions
+                       (id, pull_request_id, feedback_type, github_object_id,
+                        github_version, author, body, state, observed_at)
+                       VALUES ('fractional-comment', 'fractional-pull', 'comment',
+                               'comment-fractional', '2026-01-01T00:00:30.500000Z',
+                               'reviewer', 'later activity', 'resolved',
+                               '2026-01-01T00:00:30.500000Z')"""
+                )
+            self.lifecycle.reconcile_automatic_merge(run_id)
+            self.assertEqual(merge_calls, [])
+            self.lifecycle.reconcile_automatic_merge(run_id)
+            self.assertEqual(merge_calls, [])
+            self.lifecycle.reconcile_automatic_merge(run_id)
+
+        with self.db.connect() as connection:
+            generations = connection.execute(
+                """SELECT activity_anchor_at, deadline_at, state
+                   FROM automatic_merge_eligibility
+                   WHERE pull_request_id='fractional-pull'
+                   ORDER BY created_at"""
+            ).fetchall()
+        self.assertEqual(len(generations), 2)
+        self.assertEqual(generations[0]["activity_anchor_at"], "2026-01-01T00:00:00.250000Z")
+        self.assertEqual(generations[0]["deadline_at"], "2026-01-01T00:01:00.250000Z")
+        self.assertEqual(generations[0]["state"], "superseded")
+        self.assertEqual(generations[1]["activity_anchor_at"], "2026-01-01T00:00:30.500000Z")
+        self.assertEqual(generations[1]["deadline_at"], "2026-01-01T00:01:30.500000Z")
+        self.assertEqual(merge_calls, [head_sha])
+
+    def test_automatic_merge_ambiguous_delivery_reconciles_without_retry(self) -> None:
+        from repogents.github import PullRequestInfo
+
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        self.lifecycle.transition(run_id, RunState.VALIDATING)
+        self.lifecycle.transition(run_id, RunState.PUBLISHING)
+        self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
+        head_sha = "d" * 40
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET automatic_merge_idle_seconds=1 WHERE id='repo-1'"
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('ambiguous-pull', ?, 'PR-ambiguous', 9, 'pull-url',
+                           'agent/issue-3-ambiguous', 'main', ?, ?, ?, 'open', ?, ?)""",
+                (run_id, "b" * 40, head_sha, head_sha,
+                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+
+        pull = PullRequestInfo(
+            node_id="PR-ambiguous", number=9, url="pull-url", state="open",
+            merged=False, head_branch="agent/issue-3-ambiguous", head_sha=head_sha,
+            base_branch="main", updated_at="2026-01-01T00:00:02Z",
+            head_commit_at="2026-01-01T00:00:00Z",
+        )
+        attempts: list[str] = []
+        self.github.get_pull_request = lambda owner, name, number: pull
+
+        def ambiguous_merge(owner: str, name: str, number: int, expected: str) -> object:
+            attempts.append(expected)
+            raise RuntimeError("connection reset after request upload")
+
+        self.github.merge_pull_request = ambiguous_merge
+        with patch("repogents.lifecycle._utc_now", return_value="2026-01-01T00:00:02.000000Z"):
+            self.lifecycle.reconcile_automatic_merge(run_id)
+        restarted = RunLifecycle(
+            database=Database(self.root / "db.sqlite3"),
+            data_root=self.data_root,
+            github=self.github,
+            checkouts=self.checkouts,
+            sandbox=self.sandbox,
+        )
+        restarted.database.initialize()
+        with patch("repogents.lifecycle._utc_now", return_value="2026-01-01T00:00:03.000000Z"):
+            restarted.reconcile_automatic_merge(run_id)
+
+        with self.db.connect() as connection:
+            operation = connection.execute(
+                "SELECT state, requested_at, reconciled_at FROM automatic_merge_operations"
+            ).fetchone()
+        self.assertEqual(operation["state"], "reconciling")
+        self.assertIsNotNone(operation["requested_at"] )
+        self.assertIsNotNone(operation["reconciled_at"] )
+        self.assertEqual(attempts, [head_sha])
+        self.assertEqual(restarted.get_run(run_id)["state"], RunState.WAITING_FOR_FEEDBACK.value)
+
+    def test_automatic_merge_definite_rejection_retries_after_fresh_verification(self) -> None:
+        from repogents.github import PullRequestInfo
+
+        run_id = self.lifecycle.poll_repository("repo-1")[0]
+        self.lifecycle.transition(run_id, RunState.IMPLEMENTING)
+        self.lifecycle.transition(run_id, RunState.VALIDATING)
+        self.lifecycle.transition(run_id, RunState.PUBLISHING)
+        self.lifecycle.transition(run_id, RunState.WAITING_FOR_FEEDBACK)
+        head_sha = "e" * 40
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET automatic_merge_idle_seconds=1 WHERE id='repo-1'"
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('rejected-pull', ?, 'PR-rejected', 10, 'pull-url',
+                           'agent/issue-3-rejected', 'main', ?, ?, ?, 'open', ?, ?)""",
+                (run_id, "b" * 40, head_sha, head_sha,
+                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+
+        pull = PullRequestInfo(
+            node_id="PR-rejected", number=10, url="pull-url", state="open",
+            merged=False, head_branch="agent/issue-3-rejected", head_sha=head_sha,
+            base_branch="main", updated_at="2026-01-01T00:00:02Z",
+            head_commit_at="2026-01-01T00:00:00Z",
+        )
+        attempts: list[str] = []
+        results: list[object] = [False, {"merged": True}]
+        self.github.get_pull_request = lambda owner, name, number: pull
+
+        def merge(owner: str, name: str, number: int, expected: str) -> object:
+            attempts.append(expected)
+            return results.pop(0)
+
+        self.github.merge_pull_request = merge
+        with patch("repogents.lifecycle._utc_now", return_value="2026-01-01T00:00:02.000000Z"):
+            self.lifecycle.reconcile_automatic_merge(run_id)
+        with self.db.connect() as connection:
+            first_state = connection.execute(
+                "SELECT state FROM automatic_merge_operations"
+            ).fetchone()["state"]
+        self.assertEqual(first_state, "rejected")
+
+        with patch("repogents.lifecycle._utc_now", return_value="2026-01-01T00:00:03.000000Z"):
+            self.lifecycle.reconcile_automatic_merge(run_id)
+        with self.db.connect() as connection:
+            retried_state = connection.execute(
+                "SELECT state FROM automatic_merge_operations"
+            ).fetchone()["state"]
+        self.assertEqual(retried_state, "reconciling")
+        self.assertEqual(attempts, [head_sha, head_sha])
+        self.assertEqual(self.lifecycle.get_run(run_id)["state"], RunState.WAITING_FOR_FEEDBACK.value)
+
+
 if __name__ == "__main__":
     unittest.main()

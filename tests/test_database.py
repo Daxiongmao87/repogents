@@ -238,7 +238,7 @@ class DatabaseTests(unittest.TestCase):
             version = connection.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
-            self.assertEqual(version, 23)
+            self.assertEqual(version, 24)
 
     def test_activity_revision_advances_only_after_durable_change(self) -> None:
         initial = self.db.activity_revision
@@ -362,7 +362,7 @@ class DatabaseTests(unittest.TestCase):
             )
         self.assertEqual(tuple(member), (300, "lead"))
         self.assertEqual(contract_version, 1)
-        self.assertEqual(versions, tuple(range(1, 24)))
+        self.assertEqual(versions, tuple(range(1, 25)))
 
     def test_concurrent_schema_v1_migration_converges_once(self) -> None:
         legacy_path = Path(self.tempdir.name) / "concurrent-legacy.sqlite3"
@@ -415,7 +415,7 @@ class DatabaseTests(unittest.TestCase):
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(team_members)")
             )
-        self.assertEqual(versions, tuple(range(1, 24)))
+        self.assertEqual(versions, tuple(range(1, 25)))
         self.assertEqual(columns.count("action_timeout_seconds"), 1)
         self.assertEqual(columns.count("atomic_role"), 1)
         with Database(legacy_path).connect() as connection:
@@ -488,6 +488,280 @@ class DatabaseTests(unittest.TestCase):
                            'sandbox-1', 'team-1', 'main', ?, 'queued', ?, ?)""",
                 ("b" * 40, "2026-01-01T00:00:01Z", "2026-01-01T00:00:01Z"),
             )
+
+    def test_schema_v24_automatic_merge_state_is_restart_safe_and_disabled_for_legacy_repositories(self) -> None:
+        legacy_path = Path(self.tempdir.name) / "automatic-merge-legacy.sqlite3"
+        now = "2026-01-01T00:00:00.123456Z"
+        with sqlite3.connect(legacy_path) as connection:
+            connection.executescript(SCHEMA_V1)
+            connection.execute(
+                """INSERT INTO repositories
+                   (id, github_node_id, owner, name, url, default_branch,
+                    onboarding_state, created_at, updated_at)
+                   VALUES ('legacy-repo', 'legacy-node', 'owner', 'legacy',
+                           'https://github.com/owner/legacy', 'main',
+                           'ready', ?, ?)""",
+                (now, now),
+            )
+        migrated = Database(legacy_path)
+        migrated.initialize()
+        with migrated.connect() as connection:
+            disabled = connection.execute(
+                "SELECT automatic_merge_idle_seconds FROM repositories "
+                "WHERE id='legacy-repo'"
+            ).fetchone()[0]
+        self.assertIsNone(disabled)
+
+        self.seed_repository_run()
+        anchor = "2026-01-01T00:00:00.123456Z"
+        deadline = "2026-01-01T00:15:00.123456Z"
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET automatic_merge_idle_seconds=900 "
+                "WHERE id='repo-1'"
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('pr-auto', 'run-1', 'PR_auto', 9, 'pr-url',
+                           'agent/issue-3-run-1', 'main', ?, ?, ?,
+                           'open', ?, ?)""",
+                ("a" * 40, "b" * 40, "b" * 40, anchor, anchor),
+            )
+            connection.execute(
+                """INSERT INTO automatic_merge_eligibility
+                   (id, pull_request_id, generation, expected_head_sha,
+                    activity_anchor_at, deadline_at, observed_at, state,
+                    created_at, updated_at)
+                   VALUES ('eligibility-1', 'pr-auto', 1, ?, ?, ?, ?,
+                           'active', ?, ?)""",
+                ("b" * 40, anchor, deadline, anchor, anchor, anchor),
+            )
+            connection.execute(
+                """INSERT INTO automatic_merge_operations
+                   (id, eligibility_id, pull_request_id, expected_head_sha,
+                    state, request_json, created_at)
+                   VALUES ('merge-operation-1', 'eligibility-1', 'pr-auto', ?,
+                           'reconciling', '{}', ?)""",
+                ("b" * 40, anchor),
+            )
+        reopened = Database(self.db.path)
+        reopened.initialize()
+        with reopened.connect() as connection:
+            repository = connection.execute(
+                "SELECT automatic_merge_idle_seconds FROM repositories "
+                "WHERE id='repo-1'"
+            ).fetchone()
+            eligibility = connection.execute(
+                """SELECT generation, expected_head_sha, activity_anchor_at,
+                          deadline_at, observed_at, state
+                   FROM automatic_merge_eligibility
+                   WHERE id='eligibility-1'"""
+            ).fetchone()
+            operation = connection.execute(
+                """SELECT eligibility_id, pull_request_id, expected_head_sha, state
+                   FROM automatic_merge_operations
+                   WHERE id='merge-operation-1'"""
+            ).fetchone()
+        self.assertEqual(repository[0], 900)
+        self.assertEqual(
+            tuple(eligibility),
+            (1, "b" * 40, anchor, deadline, anchor, "active"),
+        )
+        self.assertEqual(
+            tuple(operation),
+            ("eligibility-1", "pr-auto", "b" * 40, "reconciling"),
+        )
+
+    def test_schema_v23_rejects_invalid_configuration_and_duplicate_merge_generations(self) -> None:
+        self.seed_repository_run()
+        for invalid in (0, -1, 1.5, "malformed"):
+            with (
+                self.assertRaises(sqlite3.IntegrityError),
+                self.db.transaction() as connection,
+            ):
+                connection.execute(
+                    "UPDATE repositories SET automatic_merge_idle_seconds=? "
+                    "WHERE id='repo-1'",
+                    (invalid,),
+                )
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE repositories SET automatic_merge_idle_seconds=NULL "
+                "WHERE id='repo-1'"
+            )
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('pr-auto', 'run-1', 'PR_auto', 9, 'pr-url',
+                           'agent/issue-3-run-1', 'main', ?, ?, ?,
+                           'open', ?, ?)""",
+                ("a" * 40, "b" * 40, "b" * 40,
+                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+            connection.execute(
+                """INSERT INTO automatic_merge_eligibility
+                   (id, pull_request_id, generation, expected_head_sha,
+                    activity_anchor_at, deadline_at, observed_at, state,
+                    created_at, updated_at)
+                   VALUES ('eligibility-1', 'pr-auto', 1, ?, ?, ?, ?,
+                           'active', ?, ?)""",
+                ("b" * 40,) + ("2026-01-01T00:00:00Z",) * 5,
+            )
+        with (
+            self.assertRaises(sqlite3.IntegrityError),
+            self.db.transaction() as connection,
+        ):
+            connection.execute(
+                """INSERT INTO automatic_merge_eligibility
+                   (id, pull_request_id, generation, expected_head_sha,
+                    activity_anchor_at, deadline_at, observed_at, state,
+                    created_at, updated_at)
+                   VALUES ('eligibility-2', 'pr-auto', 2, ?, ?, ?, ?,
+                           'active', ?, ?)""",
+                ("b" * 40,) + ("2026-01-01T00:00:01Z",) * 5,
+            )
+        with (
+            self.assertRaises(sqlite3.IntegrityError),
+            self.db.transaction() as connection,
+        ):
+            connection.execute(
+                """INSERT INTO automatic_merge_operations
+                   (id, eligibility_id, pull_request_id, expected_head_sha,
+                    state, request_json, created_at)
+                   VALUES ('merge-operation-mismatch', 'eligibility-1',
+                           'missing-pr', ?, 'pending', '{}', ?)""",
+                ("b" * 40, "2026-01-01T00:00:00Z"),
+            )
+        with self.db.connect() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchall(),
+                [],
+            )
+
+    def test_automatic_merge_database_apis_resume_generations_and_operations(
+        self,
+    ) -> None:
+        self.seed_repository_run()
+        for invalid in (True, 0, -1, 1.5, "900"):
+            with self.assertRaises(ValueError):
+                self.db.set_repository_automatic_merge_idle_seconds(
+                    "repo-1", invalid, "2026-01-01T00:00:00.000001Z"
+                )
+        self.db.set_repository_automatic_merge_idle_seconds(
+            "repo-1", 900, "2026-01-01T00:00:00.000001Z"
+        )
+        reopened = Database(self.db.path)
+        reopened.initialize()
+        self.assertEqual(
+            reopened.repository_automatic_merge_idle_seconds("repo-1"), 900
+        )
+        with reopened.transaction() as connection:
+            connection.execute(
+                """INSERT INTO pull_requests
+                   (id, run_id, github_node_id, number, url, branch_name,
+                    intended_base_branch, base_sha, validated_head_sha,
+                    remote_head_sha, state, created_at, updated_at)
+                   VALUES ('pr-api', 'run-1', 'PR_api', 10, 'pr-url',
+                           'agent/issue-3-run-1', 'main', ?, ?, ?,
+                           'open', ?, ?)""",
+                (
+                    "a" * 40,
+                    "b" * 40,
+                    "b" * 40,
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+        anchor = "2026-01-01T00:00:00.123456Z"
+        deadline = "2026-01-01T00:15:00.123456Z"
+        first = reopened.replace_automatic_merge_eligibility(
+            eligibility_id="eligibility-api-1",
+            pull_request_id="pr-api",
+            expected_head_sha="b" * 40,
+            activity_anchor_at=anchor,
+            deadline_at=deadline,
+            observed_at=anchor,
+            changed_at=anchor,
+        )
+        resumed = reopened.replace_automatic_merge_eligibility(
+            eligibility_id="unused-id",
+            pull_request_id="pr-api",
+            expected_head_sha="b" * 40,
+            activity_anchor_at=anchor,
+            deadline_at=deadline,
+            observed_at="2026-01-01T00:00:01.000001Z",
+            changed_at="2026-01-01T00:00:01.000001Z",
+        )
+        self.assertEqual(first["id"], resumed["id"])
+        self.assertEqual(resumed["generation"], 1)
+        self.assertEqual(resumed["activity_anchor_at"], anchor)
+        second = reopened.replace_automatic_merge_eligibility(
+            eligibility_id="eligibility-api-2",
+            pull_request_id="pr-api",
+            expected_head_sha="c" * 40,
+            activity_anchor_at="2026-01-01T00:01:00.654321Z",
+            deadline_at="2026-01-01T00:16:00.654321Z",
+            observed_at="2026-01-01T00:01:00.654321Z",
+            changed_at="2026-01-01T00:01:00.654321Z",
+        )
+        self.assertEqual(second["generation"], 2)
+        self.assertEqual(
+            reopened.active_automatic_merge_eligibility("pr-api")["id"],
+            "eligibility-api-2",
+        )
+        operation = reopened.ensure_automatic_merge_operation(
+            operation_id="operation-api-1",
+            eligibility_id="eligibility-api-2",
+            request={"sha": "c" * 40},
+            created_at="2026-01-01T00:16:00.654321Z",
+        )
+        duplicate = reopened.ensure_automatic_merge_operation(
+            operation_id="unused-operation-id",
+            eligibility_id="eligibility-api-2",
+            request={"sha": "different"},
+            created_at="2026-01-01T00:17:00Z",
+        )
+        self.assertEqual(operation["id"], duplicate["id"])
+        requesting = reopened.record_automatic_merge_operation_state(
+            "operation-api-1",
+            "requesting",
+            changed_at="2026-01-01T00:16:01.000001Z",
+        )
+        confirmed = reopened.record_automatic_merge_operation_state(
+            "operation-api-1",
+            "confirmed",
+            changed_at="2026-01-01T00:16:02.000001Z",
+            result={"merged": True},
+        )
+        self.assertEqual(
+            requesting["requested_at"], "2026-01-01T00:16:01.000001Z"
+        )
+        self.assertEqual(
+            confirmed["confirmed_at"], "2026-01-01T00:16:02.000001Z"
+        )
+        reopened.complete_automatic_merge_eligibility(
+            "eligibility-api-2", "2026-01-01T00:16:02.000001Z"
+        )
+        final = Database(self.db.path)
+        final.initialize()
+        self.assertEqual(
+            final.automatic_merge_operation("eligibility-api-2")["state"],
+            "confirmed",
+        )
+        self.assertIsNone(final.active_automatic_merge_eligibility("pr-api"))
+        final.set_repository_automatic_merge_idle_seconds(
+            "repo-1", None, "2026-01-01T00:20:00Z"
+        )
+        self.assertIsNone(
+            final.repository_automatic_merge_idle_seconds("repo-1")
+        )
 
     def test_duplicate_feedback_pull_request_and_notification_are_rejected(
         self,
@@ -852,7 +1126,7 @@ class DatabaseTests(unittest.TestCase):
                    WHERE id='pull-1'"""
             ).fetchone()[0]
 
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 24)
         self.assertEqual(issue_version["version"], 1)
         self.assertEqual(issue_version["title"], "Issue")
         self.assertEqual(issue_version["body"], "Body")
@@ -939,7 +1213,7 @@ class DatabaseTests(unittest.TestCase):
                      (SELECT COUNT(*) FROM pull_requests
                        WHERE id='pull-legacy' AND run_id='run-1')""").fetchone()
 
-        self.assertEqual(schema_version, 23)
+        self.assertEqual(schema_version, 24)
         self.assertEqual(run["state"], "implementing")
         self.assertIn("legacy issue snapshot", run["reason"])
         self.assertEqual(run["validated_sha"], "b" * 40)
@@ -1039,7 +1313,7 @@ class DatabaseTests(unittest.TestCase):
                      AND to_state='waiting_for_feedback'"""
             ).fetchone()[0]
 
-        self.assertEqual(schema_version, 23)
+        self.assertEqual(schema_version, 24)
         self.assertEqual(run["state"], "waiting_for_feedback")
         self.assertEqual(run["last_completed_state"], "waiting_for_feedback")
         self.assertIsNone(run["reason"])
@@ -1104,7 +1378,7 @@ class DatabaseTests(unittest.TestCase):
                    FROM feedback_versions WHERE id='feedback-legacy'"""
             ).fetchone()
 
-        self.assertEqual(schema_version, 23)
+        self.assertEqual(schema_version, 24)
         self.assertTrue(
             {"review_thread_id", "review_thread_resolved"}.issubset(columns)
         )
@@ -1186,7 +1460,7 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()
             integrity = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-        self.assertEqual(schema_version, 23)
+        self.assertEqual(schema_version, 24)
         self.assertTrue(
             {"superseded_at", "superseded_by_feedback_id"}.issubset(columns)
         )
@@ -1322,7 +1596,7 @@ class DatabaseTests(unittest.TestCase):
                           retry_next_at, retry_last_error
                    FROM runs WHERE id='run-1'"""
             ).fetchone()
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 24)
         self.assertEqual(tuple(retry_state), (0, None, None, None))
 
     def test_schema_v19_adds_durable_workflow_graph_state(self) -> None:
@@ -1349,7 +1623,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 24)
         self.assertTrue(
             {
                 "team_workflow_templates",
@@ -1385,7 +1659,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 24)
         self.assertTrue(
             {
                 "id",
@@ -1448,7 +1722,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 24)
         self.assertTrue(
             {
                 "id",
@@ -1565,7 +1839,7 @@ class DatabaseTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 24)
         self.assertTrue(
             {
                 "id",
@@ -1609,7 +1883,7 @@ class DatabaseTests(unittest.TestCase):
                 "PRAGMA foreign_key_check"
             ).fetchall()
 
-        self.assertEqual(version, 23)
+        self.assertEqual(version, 24)
         self.assertEqual(
             [tuple(row) for row in runs],
             [

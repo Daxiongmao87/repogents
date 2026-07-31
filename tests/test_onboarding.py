@@ -1179,6 +1179,20 @@ class OnboardingTests(unittest.TestCase):
             {"validation_commands": [["python3", "-m", "unittest"]]},
         )
 
+    def test_automatic_merge_idle_seconds_requires_a_positive_integer(self) -> None:
+        normalize = __import__(
+            "repogents.onboarding",
+            fromlist=["_normalize_repository_inputs"],
+        )._normalize_repository_inputs
+
+        for invalid in (True, False, 0, -1, 1.5, "60", None):
+            with self.subTest(value=invalid):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "automatic_merge_idle_seconds must be a positive integer",
+                ):
+                    normalize({"automatic_merge_idle_seconds": invalid})
+
     def test_reonboarding_refreshes_metadata_and_retains_or_replaces_sanitized_inputs(
         self,
     ) -> None:
