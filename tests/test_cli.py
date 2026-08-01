@@ -42,6 +42,21 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "9.8.7\n")
         build_runtime.assert_not_called()
 
+    def test_version_succeeds_with_invalid_poll_seconds_without_runtime(self) -> None:
+        stdout = io.StringIO()
+        with (
+            patch.dict(os.environ, {"REPOGENTS_POLL_SECONDS": "not-a-number"}),
+            patch.object(cli, "package_version", return_value="9.8.7"),
+            patch.object(cli, "build_runtime") as build_runtime,
+            patch("sys.stdout", stdout),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            cli.main(["--version"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(stdout.getvalue(), "9.8.7\n")
+        build_runtime.assert_not_called()
+
     def test_invalid_lan_port_environment_value_is_rejected_before_runtime(self) -> None:
         with (
             patch.dict(os.environ, {"REPOGENTS_LAN_PORT": "not-a-port"}),
