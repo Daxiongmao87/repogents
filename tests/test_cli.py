@@ -77,6 +77,7 @@ class CommandLineTests(unittest.TestCase):
         self,
     ) -> None:
         stdout = io.StringIO()
+        stderr = io.StringIO()
         with (
             patch.dict(
                 os.environ,
@@ -88,12 +89,14 @@ class CommandLineTests(unittest.TestCase):
             patch.object(cli, "__version__", "9.8.7"),
             patch.object(cli, "build_runtime") as build_runtime,
             patch("sys.stdout", stdout),
+            patch("sys.stderr", stderr),
             self.assertRaises(SystemExit) as raised,
         ):
             cli.main(["--version"])
 
         self.assertEqual(raised.exception.code, 0)
         self.assertEqual(stdout.getvalue(), "9.8.7\n")
+        self.assertEqual(stderr.getvalue(), "")
         build_runtime.assert_not_called()
 
     def test_invalid_lan_port_environment_value_is_rejected_before_runtime(self) -> None:
