@@ -26,9 +26,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--data-dir",
         type=Path,
-        default=Path(
-            os.environ.get("REPOGENTS_DATA_DIR", "~/.local/share/repogents")
-        ).expanduser(),
+        default=Path(os.environ.get("REPOGENTS_DATA_DIR", "~/.local/share/repogents")),
         help="durable application data directory",
     )
     value.add_argument(
@@ -67,7 +65,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     token = _github_token()
     poll_interval = arguments.poll_interval if arguments.command == "serve" else 10.0
     runtime = build_runtime(
-        arguments.data_dir,
+        arguments.data_dir.expanduser(),
         github_token=token,
         model=arguments.model,
         model_base_url=arguments.model_base_url,
