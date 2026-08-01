@@ -3,19 +3,34 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from importlib.metadata import PackageNotFoundError, version as package_version
 import subprocess
 import sys
 from pathlib import Path
 from typing import Sequence
 
+from . import __version__
 from .app import build_runtime
 from .interface import LocalInterfaceServer
+
+
+def _installed_version() -> str:
+    try:
+        return package_version("repogents")
+    except PackageNotFoundError:
+        # Package metadata is unavailable when running directly from a source checkout.
+        return __version__
 
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         prog="repogents",
         description="Local restart-safe repository agent orchestrator",
+    )
+    value.add_argument(
+        "--version",
+        action="version",
+        version=_installed_version(),
     )
     value.add_argument(
         "--data-dir",
