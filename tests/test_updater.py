@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -173,6 +174,51 @@ class MainBranchUpdaterTests(unittest.TestCase):
             f"{expected_sha}\n",
         )
 
+    def create_offline_build_backend(self, wheelhouse: Path) -> None:
+        wheelhouse.mkdir()
+        backend = r"""
+import re
+import zipfile
+from pathlib import Path
+
+
+def _version():
+    project = Path('pyproject.toml').read_text(encoding='utf-8').split('[project]', 1)[1]
+    return re.search(r'^version\s*=\s*"([^"]+)"', project, re.MULTILINE).group(1)
+
+
+def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
+    version = _version()
+    filename = f'repogents-{version}-py3-none-any.whl'
+    target = Path(wheel_directory) / filename
+    dist_info = f'repogents-{version}.dist-info'
+    source = str(Path.cwd()).replace('\\', '\\\\')
+    with zipfile.ZipFile(target, 'w') as archive:
+        archive.writestr('repogents-editable.pth', source + '\n')
+        archive.writestr(dist_info + '/METADATA', f'Metadata-Version: 2.1\nName: repogents\nVersion: {version}\n')
+        archive.writestr(dist_info + '/WHEEL', 'Wheel-Version: 1.0\nGenerator: repogents-test-backend\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
+        archive.writestr(dist_info + '/entry_points.txt', '[console_scripts]\nrepogents = repogents.cli:main\n')
+        archive.writestr(dist_info + '/RECORD', '')
+    return filename
+
+
+def get_requires_for_build_editable(config_settings=None):
+    return []
+"""
+        wheel = wheelhouse / 'repogents_test_backend-1.0-py3-none-any.whl'
+        dist_info = 'repogents_test_backend-1.0.dist-info'
+        with zipfile.ZipFile(wheel, 'w') as archive:
+            archive.writestr('repogents_test_backend.py', backend)
+            archive.writestr(
+                dist_info + '/METADATA',
+                'Metadata-Version: 2.1\nName: repogents-test-backend\nVersion: 1.0\n',
+            )
+            archive.writestr(
+                dist_info + '/WHEEL',
+                'Wheel-Version: 1.0\nGenerator: test fixture\nRoot-Is-Purelib: true\nTag: py3-none-any\n',
+            )
+            archive.writestr(dist_info + '/RECORD', '')
+
     def test_update_refreshes_version_metadata_before_restart(self) -> None:
         old_version = "1.0.0"
         new_version = "2.0.0"
@@ -194,8 +240,8 @@ class MainBranchUpdaterTests(unittest.TestCase):
         )
         (self.publisher / "pyproject.toml").write_text(
             "[build-system]\n"
-            "requires = [\"setuptools\"]\n"
-            "build-backend = \"setuptools.build_meta\"\n\n"
+            "requires = [\"repogents-test-backend==1.0\"]\n"
+            "build-backend = \"repogents_test_backend\"\n\n"
             "[project]\n"
             "name = \"repogents\"\n"
             f"version = \"{old_version}\"\n",
@@ -226,7 +272,6 @@ class MainBranchUpdaterTests(unittest.TestCase):
                 sys.executable,
                 "-m",
                 "venv",
-                "--system-site-packages",
                 str(virtualenv),
             ],
             check=True,
@@ -235,13 +280,32 @@ class MainBranchUpdaterTests(unittest.TestCase):
         )
         python = virtualenv / "bin" / "python"
         scripts = virtualenv / "bin"
+        wheelhouse = self.root / "wheelhouse"
+        self.create_offline_build_backend(wheelhouse)
+        remove_setuptools = subprocess.run(
+            [str(python), "-m", "pip", "uninstall", "--yes", "setuptools"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(remove_setuptools.returncode, 0, remove_setuptools.stderr)
+        for module in ("setuptools", "repogents_test_backend"):
+            missing_build_requirement = subprocess.run(
+                [str(python), "-c", f"import {module}"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_build_requirement.returncode, 0)
+        build_environment = os.environ.copy()
+        build_environment["PIP_NO_INDEX"] = "1"
+        build_environment["PIP_FIND_LINKS"] = str(wheelhouse)
         install = subprocess.run(
             [
                 str(python),
                 "-m",
                 "pip",
                 "install",
-                "--no-build-isolation",
                 "--no-deps",
                 "--ignore-installed",
                 "--prefix",
@@ -252,6 +316,7 @@ class MainBranchUpdaterTests(unittest.TestCase):
             check=False,
             capture_output=True,
             text=True,
+            env=build_environment,
         )
         self.assertEqual(
             install.returncode,
@@ -277,6 +342,7 @@ class MainBranchUpdaterTests(unittest.TestCase):
         def run_in_test_environment(command, *args, **kwargs):
             if command[:4] == [str(python), "-m", "pip", "install"]:
                 command = [*command[:4], "--prefix", str(virtualenv), *command[4:]]
+                kwargs["env"] = build_environment
             return original_run(command, *args, **kwargs)
 
         with mock.patch("repogents.updater.sys.executable", str(python)), mock.patch(

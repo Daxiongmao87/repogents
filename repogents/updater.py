@@ -170,7 +170,6 @@ class MainBranchUpdater:
                 "-m",
                 "pip",
                 "install",
-                "--no-build-isolation",
                 "--no-deps",
                 "--force-reinstall",
                 "--editable",
