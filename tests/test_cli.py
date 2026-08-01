@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import os
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -76,28 +78,25 @@ class CommandLineTests(unittest.TestCase):
     def test_version_succeeds_with_both_invalid_environment_values_without_runtime(
         self,
     ) -> None:
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with (
-            patch.dict(
-                os.environ,
-                {
-                    "REPOGENTS_LAN_PORT": "not-a-number",
-                    "REPOGENTS_POLL_SECONDS": "not-a-number",
-                },
-            ),
-            patch.object(cli, "__version__", "9.8.7"),
-            patch.object(cli, "build_runtime") as build_runtime,
-            patch("sys.stdout", stdout),
-            patch("sys.stderr", stderr),
-            self.assertRaises(SystemExit) as raised,
-        ):
-            cli.main(["--version"])
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "REPOGENTS_LAN_PORT": "not-a-number",
+                "REPOGENTS_POLL_SECONDS": "not-a-number",
+            }
+        )
 
-        self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(stdout.getvalue(), "9.8.7\n")
-        self.assertEqual(stderr.getvalue(), "")
-        build_runtime.assert_not_called()
+        completed = subprocess.run(
+            [sys.executable, "-m", "repogents.cli", "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, f"{cli.__version__}\n")
+        self.assertEqual(completed.stderr, "")
 
     def test_version_succeeds_with_unresolvable_data_dir_without_expansion(
         self,
