@@ -45,6 +45,40 @@ class CliVersionTests(unittest.TestCase):
                 self.assertEqual(result.stderr, "")
                 self.assertFalse(Path(home, ".local", "share", "repogents").exists())
 
+    def test_version_bypasses_malformed_similarity_threshold(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        pyproject = (repository / "pyproject.toml").read_text(encoding="utf-8")
+        project_section = pyproject.split("[project]", 1)[1].split("[", 1)[0]
+        match = re.search(r'^version\s*=\s*"([^\"]+)"\s*$', project_section, re.MULTILINE)
+        self.assertIsNotNone(match)
+        expected_version = match.group(1)
+
+        with tempfile.TemporaryDirectory() as home:
+            environment = os.environ.copy()
+            environment["HOME"] = home
+            environment["REPOGENTS_SIMILARITY_THRESHOLD"] = "not-a-number"
+            environment.pop("REPOGENTS_DATA_DIR", None)
+            environment.pop("GITHUB_TOKEN", None)
+            environment.pop("GH_TOKEN", None)
+            environment.pop("REPOGENTS_MODEL", None)
+
+            result = subprocess.run(
+                [sys.executable, "-m", "repogents.cli", "--version"],
+                cwd=repository,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, f"{expected_version}\n")
+            self.assertEqual(result.stderr, "")
+            self.assertFalse(Path(home, ".local", "share", "repogents").exists())
+
     def test_version_from_uninstalled_source_checkout(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         pyproject = (repository / "pyproject.toml").read_text(encoding="utf-8")
