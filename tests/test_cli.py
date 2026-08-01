@@ -39,6 +39,7 @@ class CliVersionTests(unittest.TestCase):
             }
             environment["HOME"] = temporary_home
             environment["PATH"] = str(executable.parent)
+            environment["REPOGENTS_LAN_PORT"] = "not-a-number"
 
             result = subprocess.run(
                 [str(executable), "--version"],
