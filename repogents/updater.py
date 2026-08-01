@@ -122,6 +122,7 @@ class MainBranchUpdater:
                 restarted=False,
             )
 
+        self._refresh_editable_install()
         self.service_controller.restart_and_verify(self.service_name)
         self._write_restarted_commit(local_sha)
         print(
@@ -161,6 +162,29 @@ class MainBranchUpdater:
 
     def _revision(self, revision: str) -> str:
         return self._git("rev-parse", "--verify", revision).stdout.strip()
+
+    def _refresh_editable_install(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-build-isolation",
+                "--no-deps",
+                "--force-reinstall",
+                "--editable",
+                str(self.repository),
+            ],
+            cwd=self.repository,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise UpdateCommandFailed(
+                "refresh editable installation metadata", result.returncode
+            )
 
     def _git(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         result = self._git_result(*arguments)

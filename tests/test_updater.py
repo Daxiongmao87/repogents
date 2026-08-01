@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from repogents.updater import MainBranchUpdater, UpdateRefused
 
@@ -102,8 +105,11 @@ class MainBranchUpdaterTests(unittest.TestCase):
         untracked_state.write_text("{}\n", encoding="utf-8")
         controller = RecordingServiceController()
 
-        outcome = self.updater(controller).check_once()
+        updater = self.updater(controller)
+        with mock.patch.object(updater, "_refresh_editable_install") as refresh:
+            outcome = updater.check_once()
 
+        refresh.assert_called_once_with()
         self.assertTrue(outcome.updated)
         self.assertTrue(outcome.restarted)
         self.assertEqual(outcome.commit_sha, expected_sha)
@@ -136,8 +142,12 @@ class MainBranchUpdaterTests(unittest.TestCase):
         expected_sha = self.publish()
         failing_controller = RecordingServiceController(failures=1)
 
-        with self.assertRaisesRegex(RuntimeError, "service restart failed"):
-            self.updater(failing_controller).check_once()
+        updater = self.updater(failing_controller)
+        with mock.patch.object(updater, "_refresh_editable_install") as refresh:
+            with self.assertRaisesRegex(RuntimeError, "service restart failed"):
+                updater.check_once()
+
+        refresh.assert_called_once_with()
 
         self.assertEqual(
             self.git(self.checkout, "rev-parse", "HEAD").stdout.strip(),
@@ -149,7 +159,11 @@ class MainBranchUpdaterTests(unittest.TestCase):
         )
 
         retry_controller = RecordingServiceController()
-        outcome = self.updater(retry_controller).check_once()
+        updater = self.updater(retry_controller)
+        with mock.patch.object(updater, "_refresh_editable_install") as refresh:
+            outcome = updater.check_once()
+
+        refresh.assert_called_once_with()
 
         self.assertFalse(outcome.updated)
         self.assertTrue(outcome.restarted)
@@ -158,6 +172,152 @@ class MainBranchUpdaterTests(unittest.TestCase):
             self.state_file.read_text(encoding="utf-8"),
             f"{expected_sha}\n",
         )
+
+    def test_update_refreshes_version_metadata_before_restart(self) -> None:
+        old_version = "1.0.0"
+        new_version = "2.0.0"
+        package = self.publisher / "repogents"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "cli.py").write_text(
+            "import argparse\n"
+            "from importlib.metadata import version\n"
+            "from pathlib import Path\n"
+            "def main():\n"
+            "    parser = argparse.ArgumentParser()\n"
+            "    parser.add_argument('--version', action='version', "
+            "version=version('repogents'))\n"
+            "    parser.parse_args()\n"
+            "    (Path.home() / '.local/share/repogents').mkdir("
+            "parents=True, exist_ok=True)\n",
+            encoding="utf-8",
+        )
+        (self.publisher / "pyproject.toml").write_text(
+            "[build-system]\n"
+            "requires = [\"setuptools\"]\n"
+            "build-backend = \"setuptools.build_meta\"\n\n"
+            "[project]\n"
+            "name = \"repogents\"\n"
+            f"version = \"{old_version}\"\n",
+            encoding="utf-8",
+        )
+        (self.publisher / "setup.py").write_text(
+            "import re\n"
+            "from pathlib import Path\n"
+            "from setuptools import setup\n"
+            "metadata = Path('pyproject.toml').read_text(encoding='utf-8')\n"
+            "project = metadata.split('[project]', 1)[1]\n"
+            "declared = re.search(r'^version\\s*=\\s*\"([^\"]+)\"', "
+            "project, re.MULTILINE).group(1)\n"
+            "setup(name='repogents', version=declared, packages=['repogents'], "
+            "entry_points={'console_scripts': ['repogents=repogents.cli:main']})\n",
+            encoding="utf-8",
+        )
+        self.git(self.publisher, "add", "pyproject.toml", "setup.py", "repogents")
+        self.git(self.publisher, "commit", "-m", "add installable project")
+        self.git(self.publisher, "push", "origin", "main")
+        self.git(self.checkout, "pull", "--ff-only")
+        installed_sha = self.git(self.checkout, "rev-parse", "HEAD").stdout.strip()
+        self.record_restarted_commit(installed_sha)
+
+        virtualenv = self.root / "venv"
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "venv",
+                "--system-site-packages",
+                str(virtualenv),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        python = virtualenv / "bin" / "python"
+        scripts = virtualenv / "bin"
+        install = subprocess.run(
+            [
+                str(python),
+                "-m",
+                "pip",
+                "install",
+                "--no-build-isolation",
+                "--no-deps",
+                "--ignore-installed",
+                "--prefix",
+                str(virtualenv),
+                "--editable",
+                str(self.checkout),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            install.returncode,
+            0,
+            f"editable install failed:\nstdout:\n{install.stdout}\nstderr:\n{install.stderr}",
+        )
+
+        pyproject = self.publisher / "pyproject.toml"
+        pyproject.write_text(
+            pyproject.read_text(encoding="utf-8").replace(old_version, new_version),
+            encoding="utf-8",
+        )
+        self.git(self.publisher, "add", "pyproject.toml")
+        self.git(self.publisher, "commit", "-m", "bump version")
+        self.git(self.publisher, "push", "origin", "main")
+
+        executable = scripts / "repogents"
+
+        controller = RecordingServiceController()
+        updater = self.updater(controller)
+        original_run = subprocess.run
+
+        def run_in_test_environment(command, *args, **kwargs):
+            if command[:4] == [str(python), "-m", "pip", "install"]:
+                command = [*command[:4], "--prefix", str(virtualenv), *command[4:]]
+            return original_run(command, *args, **kwargs)
+
+        with mock.patch("repogents.updater.sys.executable", str(python)), mock.patch(
+            "repogents.updater.subprocess.run", side_effect=run_in_test_environment
+        ):
+            outcome = updater.check_once()
+
+        self.assertTrue(outcome.updated)
+        self.assertTrue(outcome.restarted)
+        self.assertEqual(controller.restart_calls, ["repogents.service"])
+        self.assertTrue(executable.is_file(), f"missing refreshed executable: {executable}")
+        with tempfile.TemporaryDirectory() as temporary_home:
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if key
+                not in {
+                    "GITHUB_TOKEN",
+                    "GH_TOKEN",
+                    "OPENAI_API_KEY",
+                    "REPOGENTS_DATA_DIR",
+                    "REPOGENTS_MODEL",
+                    "REPOGENTS_MODEL_BASE_URL",
+                }
+            }
+            environment["HOME"] = temporary_home
+            result = subprocess.run(
+                [str(executable), "--version"],
+                cwd=self.checkout,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            self.assertEqual(result.stdout, f"{new_version}\n".encode())
+            self.assertEqual(result.stderr, b"")
+            self.assertFalse(
+                (Path(temporary_home) / ".local" / "share" / "repogents").exists()
+            )
 
     def test_refuses_non_main_branch_without_restart(self) -> None:
         self.record_restarted_commit(self.initial_sha)

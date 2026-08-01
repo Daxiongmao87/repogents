@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sysconfig
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class CliVersionTests(unittest.TestCase):
     def test_installed_executable_prints_declared_version_without_configuration(self) -> None:
-        executable = ROOT / ".venv" / "bin" / "repogents"
+        executable = Path(sysconfig.get_path("scripts")) / "repogents"
         self.assertTrue(executable.is_file(), f"missing installed executable: {executable}")
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         project_section = pyproject.split("[project]", 1)[1].split("\n[", 1)[0]
