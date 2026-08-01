@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import argparse
 import json
+from importlib.metadata import version
 import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Sequence
 
-from .app import build_runtime
-from .interface import LocalInterfaceServer
-
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         prog="repogents",
         description="Local restart-safe repository agent orchestrator",
+    )
+    value.add_argument(
+        "--version",
+        action="version",
+        version=version("repogents"),
     )
     value.add_argument(
         "--data-dir",
@@ -58,6 +61,8 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
+    from .app import build_runtime
+    from .interface import LocalInterfaceServer
     token = _github_token()
     poll_interval = arguments.poll_interval if arguments.command == "serve" else 10.0
     runtime = build_runtime(
