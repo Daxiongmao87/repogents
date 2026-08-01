@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -21,34 +22,39 @@ class CliVersionTests(unittest.TestCase):
         )
         self.assertIsNotNone(version_match, "missing [project] version in pyproject.toml")
         declared_version = version_match.group(1)
-        environment = {
-            key: value
-            for key, value in os.environ.items()
-            if key
-            not in {
-                "GITHUB_TOKEN",
-                "GH_TOKEN",
-                "OPENAI_API_KEY",
-                "REPOGENTS_DATA_DIR",
-                "REPOGENTS_MODEL",
-                "REPOGENTS_MODEL_BASE_URL",
+        with tempfile.TemporaryDirectory() as temporary_home:
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if key
+                not in {
+                    "GITHUB_TOKEN",
+                    "GH_TOKEN",
+                    "OPENAI_API_KEY",
+                    "REPOGENTS_DATA_DIR",
+                    "REPOGENTS_MODEL",
+                    "REPOGENTS_MODEL_BASE_URL",
+                }
             }
-        }
-        environment["PATH"] = str(executable.parent)
+            environment["HOME"] = temporary_home
+            environment["PATH"] = str(executable.parent)
 
-        result = subprocess.run(
-            [str(executable), "--version"],
-            cwd=ROOT,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+            result = subprocess.run(
+                [str(executable), "--version"],
+                cwd=ROOT,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
 
-        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
-        self.assertEqual(result.stdout, f"{declared_version}\n".encode())
-        self.assertEqual(result.stderr, b"")
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            self.assertEqual(result.stdout, f"{declared_version}\n".encode())
+            self.assertEqual(result.stderr, b"")
+            self.assertFalse(
+                (Path(temporary_home) / ".local" / "share" / "repogents").exists()
+            )
 
 
 if __name__ == "__main__":
