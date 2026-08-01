@@ -2,12 +2,31 @@ from __future__ import annotations
 
 import argparse
 import json
-from importlib.metadata import version
+from importlib.metadata import version as distribution_version
 import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Sequence
+
+
+def _version() -> str:
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    try:
+        in_project = False
+        for line in pyproject.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("["):
+                in_project = stripped == "[project]"
+            elif in_project and stripped.startswith("version"):
+                key, separator, value = stripped.partition("=")
+                declared = value.strip()
+                if separator and key.strip() == "version" and len(declared) >= 2:
+                    if declared[0] == declared[-1] and declared[0] in {"'", '"'}:
+                        return declared[1:-1]
+    except OSError:
+        pass
+    return distribution_version("repogents")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -18,7 +37,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--version",
         action="version",
-        version=version("repogents"),
+        version=_version(),
     )
     value.add_argument(
         "--data-dir",
