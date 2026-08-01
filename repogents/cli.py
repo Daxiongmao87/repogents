@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from importlib.metadata import version
 from pathlib import Path
 from typing import Sequence
 
@@ -16,6 +17,11 @@ def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         prog="repogents",
         description="Local restart-safe repository agent orchestrator",
+    )
+    value.add_argument(
+        "--version",
+        action="version",
+        version=version("repogents"),
     )
     value.add_argument(
         "--data-dir",
