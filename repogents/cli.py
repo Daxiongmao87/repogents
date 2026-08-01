@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from importlib.metadata import PackageNotFoundError, version as package_version
 import subprocess
 import sys
 from pathlib import Path
@@ -14,14 +13,6 @@ from .app import build_runtime
 from .interface import LocalInterfaceServer
 
 
-def _installed_version() -> str:
-    try:
-        return package_version("repogents")
-    except PackageNotFoundError:
-        # Package metadata is unavailable when running directly from a source checkout.
-        return __version__
-
-
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         prog="repogents",
@@ -30,7 +21,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--version",
         action="version",
-        version=_installed_version(),
+        version=__version__,
     )
     value.add_argument(
         "--data-dir",
