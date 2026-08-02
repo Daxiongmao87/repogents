@@ -26,6 +26,8 @@ class InstalledCliVersionTests(unittest.TestCase):
             "REPOGENTS_DATA_DIR",
         ):
             environment.pop(name, None)
+        environment["REPOGENTS_LAN_PORT"] = "invalid"
+        environment["REPOGENTS_POLL_SECONDS"] = "invalid"
 
         result = subprocess.run(
             [repository / ".venv" / "bin" / "repogents", "--version"],
