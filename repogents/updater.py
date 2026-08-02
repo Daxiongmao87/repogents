@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -8,6 +9,51 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, Sequence
+
+
+_OFFLINE_EDITABLE_BACKEND = r"""import json
+import zipfile
+from pathlib import Path
+
+
+def get_requires_for_build_editable(config_settings=None):
+    return []
+
+
+def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
+    project = json.loads(Path("refresh.json").read_text(encoding="utf-8"))
+    normalized = project["name"].replace("-", "_")
+    wheel_version = project["normalized_version"]
+    distribution = f"{normalized}-{wheel_version}.dist-info"
+    filename = f"{normalized}-{wheel_version}-py3-none-any.whl"
+    metadata = [
+        "Metadata-Version: 2.1",
+        f"Name: {project['name']}",
+        f"Version: {project['version']}",
+    ]
+    if project.get("requires_python"):
+        metadata.append(f"Requires-Python: {project['requires_python']}")
+    metadata.extend(f"Requires-Dist: {item}" for item in project["dependencies"])
+    entries = ["[console_scripts]"]
+    entries.extend(
+        f"{name} = {target}" for name, target in project["scripts"].items()
+    )
+    with zipfile.ZipFile(Path(wheel_directory) / filename, "w") as archive:
+        archive.writestr(f"{normalized}-editable.pth", project["source"] + "\n")
+        archive.writestr(
+            f"{distribution}/METADATA", "\n".join(metadata) + "\n"
+        )
+        archive.writestr(
+            f"{distribution}/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: repogents-updater\n"
+            "Root-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+        archive.writestr(
+            f"{distribution}/entry_points.txt", "\n".join(entries) + "\n"
+        )
+        archive.writestr(f"{distribution}/RECORD", "")
+    return filename
+"""
 
 
 class UpdateRefused(RuntimeError):
@@ -66,6 +112,9 @@ class MainBranchUpdater:
     ) -> None:
         self.repository = repository.resolve()
         self.state_file = state_file.expanduser().resolve()
+        self.refresh_state_file = self.state_file.with_name(
+            f"{self.state_file.name}.installation-refreshed"
+        )
         self.service_name = service_name
         self.remote = remote
         self.branch = branch
@@ -110,10 +159,28 @@ class MainBranchUpdater:
                 raise UpdateCommandFailed("verify fast-forward", 1)
             updated = True
 
-        if self._read_restarted_commit() == local_sha:
+        restarted_commit = self._read_restarted_commit()
+        refreshed_commit = self._read_checkpoint(self.refresh_state_file)
+        refreshed_now = False
+
+        if refreshed_commit != local_sha:
+            # A legacy restart checkpoint does not prove that installation
+            # metadata and runtime dependencies were reconciled. Refresh first
+            # so a refresh failure preserves the last verified restart, then
+            # invalidate matching legacy evidence before recording the refresh.
+            # This ordering is failure-safe: a crash before invalidation repeats
+            # the refresh, while a crash afterwards leaves the restart retryable.
+            self._refresh_installation_metadata()
+            if restarted_commit == local_sha:
+                self._remove_checkpoint(self.state_file)
+                restarted_commit = None
+            self._write_checkpoint(self.refresh_state_file, local_sha)
+            refreshed_now = True
+
+        if restarted_commit == local_sha and not refreshed_now:
             print(
                 f"repogents-updater: {self.branch} is current at {local_sha}; "
-                "restart already recorded",
+                "installation refresh and restart already recorded",
                 flush=True,
             )
             return UpdateOutcome(
@@ -133,6 +200,73 @@ class MainBranchUpdater:
             updated=updated,
             restarted=True,
         )
+
+    def _refresh_installation_metadata(self) -> None:
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover - Python 3.10 compatibility
+            from pip._vendor import tomli as tomllib
+
+        project = tomllib.loads(
+            (self.repository / "pyproject.toml").read_text(encoding="utf-8")
+        )["project"]
+        from pip._vendor.packaging.version import Version
+
+        metadata = {
+            "name": project["name"],
+            "version": project["version"],
+            "normalized_version": str(Version(project["version"])),
+            "requires_python": project.get("requires-python"),
+            "dependencies": project.get("dependencies", []),
+            "scripts": project.get("scripts", {}),
+            "source": str(self.repository),
+        }
+
+        # Pip records the editable target in direct_url.json, so keep the
+        # backend beside the durable updater checkpoint rather than in a
+        # temporary directory. Its generated .pth resolves imports from the
+        # fast-forwarded repository checkout recorded in metadata.
+        build_root = self.state_file.parent / "editable-refresh"
+        build_root.mkdir(parents=True, exist_ok=True)
+        (build_root / "pyproject.toml").write_text(
+            "[build-system]\n"
+            "requires = []\n"
+            "build-backend = 'refresh_backend'\n"
+            "backend-path = ['.']\n",
+            encoding="utf-8",
+        )
+        (build_root / "refresh.json").write_text(
+            json.dumps(metadata), encoding="utf-8"
+        )
+        (build_root / "refresh_backend.py").write_text(
+            _OFFLINE_EDITABLE_BACKEND, encoding="utf-8"
+        )
+
+        commands = (
+            (
+                "refresh editable Repogents installation",
+                ["--force-reinstall", "--no-deps"],
+            ),
+            ("reconcile Repogents runtime dependencies", []),
+        )
+        for operation, options in commands:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    *options,
+                    "--editable",
+                    str(build_root),
+                ],
+                cwd=self.repository,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise UpdateCommandFailed(operation, result.returncode)
 
     def _require_safe_checkout(self) -> None:
         branch = self._git_result(
@@ -179,18 +313,39 @@ class MainBranchUpdater:
         )
 
     def _read_restarted_commit(self) -> str | None:
+        return self._read_checkpoint(self.state_file)
+
+    @staticmethod
+    def _read_checkpoint(checkpoint: Path) -> str | None:
         try:
-            value = self.state_file.read_text(encoding="utf-8").strip()
+            value = checkpoint.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             return None
         return value or None
 
     def _write_restarted_commit(self, commit_sha: str) -> None:
-        parent = self.state_file.parent
+        self._write_checkpoint(self.state_file, commit_sha)
+
+    @staticmethod
+    def _remove_checkpoint(checkpoint: Path) -> None:
+        try:
+            checkpoint.unlink()
+        except FileNotFoundError:
+            return
+        parent = checkpoint.parent
+        directory_descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+
+    @staticmethod
+    def _write_checkpoint(checkpoint: Path, commit_sha: str) -> None:
+        parent = checkpoint.parent
         parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
             dir=parent,
-            prefix=f".{self.state_file.name}.",
+            prefix=f".{checkpoint.name}.",
             text=True,
         )
         temporary = Path(temporary_name)
@@ -200,7 +355,7 @@ class MainBranchUpdater:
                 handle.write(f"{commit_sha}\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.state_file)
+            os.replace(temporary, checkpoint)
             directory_descriptor = os.open(
                 parent, os.O_RDONLY | os.O_DIRECTORY
             )
