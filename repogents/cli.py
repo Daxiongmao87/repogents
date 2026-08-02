@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -12,10 +13,22 @@ from .app import build_runtime
 from .interface import LocalInterfaceServer
 
 
+COMMANDS_JSON = '{"commands":["onboard","serve","state","tick"],"program":"repogents"}'
+_GLOBAL_VALUE_OPTIONS = ("--data-dir", "--model", "--model-base-url")
+# Match argparse's negative-number classification. Such tokens are consumed as
+# values when no negative-number option is registered, as is true for this parser.
+_NEGATIVE_NUMBER_MATCHER = re.compile(r"^-\d+$|^-\d*\.\d+$")
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         prog="repogents",
         description="Local restart-safe repository agent orchestrator",
+    )
+    value.add_argument(
+        "--commands-json",
+        action="store_true",
+        help="print the command manifest as JSON and exit",
     )
     value.add_argument(
         "--data-dir",
@@ -56,8 +69,56 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def _commands_json_requested(command_line: Sequence[str]) -> bool:
+    """Return whether the manifest flag occurs in the global option context."""
+    index = 0
+    while index < len(command_line):
+        argument = command_line[index]
+        if argument == "--commands-json":
+            return True
+        if argument == "--" or not argument.startswith("-"):
+            return False
+
+        option = argument.split("=", 1)[0]
+        value_options = (
+            [option]
+            if option in _GLOBAL_VALUE_OPTIONS
+            else [
+                candidate
+                for candidate in _GLOBAL_VALUE_OPTIONS
+                if candidate.startswith(option)
+            ]
+        )
+        if len(value_options) != 1:
+            # Unknown and ambiguous options must retain argparse's normal error
+            # rather than being hidden by a later manifest token.
+            return False
+        if "=" not in argument:
+            if index + 1 >= len(command_line):
+                return False
+            option_value = command_line[index + 1]
+            if (
+                option_value.startswith("-")
+                and option_value != "-"
+                and not _NEGATIVE_NUMBER_MATCHER.match(option_value)
+            ):
+                # Argparse reports a missing value when the next token looks
+                # like an option. A lone hyphen and negative numbers are the
+                # exceptions: argparse consumes them as values for this parser's
+                # global options.
+                return False
+            # Skip the token argparse consumes as this global option's value.
+            index += 1
+        index += 1
+    return False
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = parser().parse_args(argv)
+    command_line = sys.argv[1:] if argv is None else argv
+    if _commands_json_requested(command_line):
+        print(COMMANDS_JSON)
+        return 0
+    arguments = parser().parse_args(command_line)
     token = _github_token()
     poll_interval = arguments.poll_interval if arguments.command == "serve" else 10.0
     runtime = build_runtime(
