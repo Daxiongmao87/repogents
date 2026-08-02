@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repogents"
+version = "0.1.0"
+description = "Adaptive GitHub issue-to-pull-request agent service"
+requires-python = ">=3.10"
+dependencies = [
+  "mini-swe-agent==2.4.6",
+  "sentence-transformers==5.6.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=9.0,<10"]
+
+[project.scripts]
+repogents = "repogents.main:main"
+
+[tool.setuptools.packages.find]
+include = ["repogents*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

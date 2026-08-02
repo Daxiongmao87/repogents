@@ -1,0 +1,1952 @@
+from base64 import b64decode
+from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
+import subprocess
+
+import pytest
+
+from repogents.github import (
+    FeedbackAddress,
+    GitHubClient,
+    GitHubFeedback,
+    GitHubIssue,
+    PullRequest,
+)
+
+
+def test_adapter_values_are_exact_and_immutable():
+    issue = GitHubIssue(number=7, title="Fix it", body="Details", url="https://example.test/issues/7")
+    feedback = GitHubFeedback(
+        external_id="inline:31",
+        kind="inline",
+        body="Change this",
+        path="src/app.py",
+        line=14,
+        review_thread_id="PRRT_thread_31",
+        top_level_comment_id=31,
+    )
+    pull = PullRequest(
+        number=9,
+        url="https://example.test/pulls/9",
+        branch="agent/issue-7",
+        state="open",
+        merged=False,
+        diff="diff --git a/src/app.py b/src/app.py",
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+    )
+    address = FeedbackAddress(
+        status="RESOLVED",
+        response_url="https://example.test/pulls/9#discussion_r91",
+    )
+
+    assert issue == GitHubIssue(7, "Fix it", "Details", "https://example.test/issues/7")
+    assert feedback == GitHubFeedback(
+        "inline:31",
+        "inline",
+        "Change this",
+        "src/app.py",
+        14,
+        "PRRT_thread_31",
+        31,
+    )
+    assert GitHubFeedback(
+        "inline:31",
+        "inline",
+        "Change this",
+        "src/app.py",
+        14,
+    ).review_thread_id is None
+    assert pull == PullRequest(
+        9,
+        "https://example.test/pulls/9",
+        "agent/issue-7",
+        "open",
+        False,
+        "diff --git a/src/app.py b/src/app.py",
+        "0123456789abcdef0123456789abcdef01234567",
+    )
+    assert PullRequest(
+        9,
+        "https://example.test/pulls/9",
+        "agent/issue-7",
+        "open",
+        False,
+        "diff --git a/src/app.py b/src/app.py",
+    ).head_sha == ""
+    assert address == FeedbackAddress(
+        "RESOLVED",
+        "https://example.test/pulls/9#discussion_r91",
+    )
+    with pytest.raises(FrozenInstanceError):
+        issue.title = "Changed"
+    with pytest.raises(FrozenInstanceError):
+        feedback.body = "Changed"
+    with pytest.raises(FrozenInstanceError):
+        pull.state = "closed"
+    with pytest.raises(FrozenInstanceError):
+        address.response_url = "https://example.test/changed"
+
+
+def test_repository_returns_metadata_through_the_request_boundary():
+    calls = []
+    metadata = {
+        "full_name": "acme/widgets",
+        "default_branch": "main",
+        "clone_url": "https://github.com/acme/widgets.git",
+        "private": True,
+    }
+
+    def request(method, path, *, query=None, json_body=None):
+        calls.append((method, path, query, json_body))
+        return metadata
+
+    client = GitHubClient("placeholder-token", request=request)
+
+    assert client.repository("acme/widgets") == metadata
+    assert calls == [("GET", "/repos/acme/widgets", None, None)]
+
+
+def test_default_request_authenticates_and_decodes_repository_json(monkeypatch):
+    captured = {}
+
+    class Response:
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self):
+            return (
+                b'{"full_name":"acme/widgets","default_branch":"main",'
+                b'"clone_url":"https://github.com/acme/widgets.git"}'
+            )
+
+    def urlopen(request):
+        captured["request"] = request
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    client = GitHubClient("placeholder-token", api_base="https://api.example.test/")
+
+    assert client.repository("acme/widgets")["default_branch"] == "main"
+    request = captured["request"]
+    assert request.method == "GET"
+    assert request.full_url == "https://api.example.test/repos/acme/widgets"
+    assert request.get_header("Authorization") == "Bearer placeholder-token"
+
+
+def test_list_ready_issues_requests_the_ready_open_issue_set():
+    calls = []
+    response = [
+        {
+            "number": 7,
+            "title": "First",
+            "body": "First body",
+            "html_url": "https://example.test/issues/7",
+        },
+        {
+            "number": 8,
+            "title": "No body",
+            "body": None,
+            "html_url": "https://example.test/issues/8",
+        },
+        {
+            "number": 9,
+            "title": "A pull request, not an issue",
+            "body": "Ignored",
+            "html_url": "https://example.test/pulls/9",
+            "pull_request": {"url": "https://api.example.test/pulls/9"},
+        },
+    ]
+
+    def request(method, path, *, query=None, json_body=None):
+        calls.append((method, path, query, json_body))
+        return response
+
+    client = GitHubClient("placeholder-token", request=request)
+
+    assert client.list_ready_issues("acme/widgets") == [
+        GitHubIssue(7, "First", "First body", "https://example.test/issues/7"),
+        GitHubIssue(8, "No body", "", "https://example.test/issues/8"),
+    ]
+    assert calls == [
+        (
+            "GET",
+            "/repos/acme/widgets/issues",
+            {"state": "open", "labels": "agent:ready", "per_page": 100, "page": 1},
+            None,
+        )
+    ]
+
+
+def test_list_ready_issues_paginates_until_a_short_page():
+    calls = []
+    pages = {
+        1: [
+            {
+                "number": number,
+                "title": f"Issue {number}",
+                "body": f"Body {number}",
+                "html_url": f"https://example.test/issues/{number}",
+            }
+            for number in range(1, 101)
+        ],
+        2: [
+            {
+                "number": 101,
+                "title": "Issue 101",
+                "body": "Body 101",
+                "html_url": "https://example.test/issues/101",
+            }
+        ],
+    }
+
+    def request(method, path, *, query=None, json_body=None):
+        calls.append((method, path, query, json_body))
+        return pages[query["page"]]
+
+    client = GitHubClient("placeholder-token", request=request)
+
+    issues = client.list_ready_issues("acme/widgets")
+
+    assert [issue.number for issue in issues] == list(range(1, 102))
+    assert issues[0] == GitHubIssue(
+        1,
+        "Issue 1",
+        "Body 1",
+        "https://example.test/issues/1",
+    )
+    assert issues[-1] == GitHubIssue(
+        101,
+        "Issue 101",
+        "Body 101",
+        "https://example.test/issues/101",
+    )
+    assert calls == [
+        (
+            "GET",
+            "/repos/acme/widgets/issues",
+            {
+                "state": "open",
+                "labels": "agent:ready",
+                "per_page": 100,
+                "page": 1,
+            },
+            None,
+        ),
+        (
+            "GET",
+            "/repos/acme/widgets/issues",
+            {
+                "state": "open",
+                "labels": "agent:ready",
+                "per_page": 100,
+                "page": 2,
+            },
+            None,
+        ),
+    ]
+
+
+def test_checkout_clones_the_target_branch_into_a_new_workspace(tmp_path):
+    request_calls = []
+    command_calls = []
+    workspace = tmp_path / "widgets"
+
+    def request(method, path, *, query=None, json_body=None):
+        request_calls.append((method, path, query, json_body))
+        return {
+            "full_name": "acme/widgets",
+            "default_branch": "main",
+            "clone_url": "https://github.com/acme/widgets.git",
+        }
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    assert client.checkout("acme/widgets", "main", workspace) == workspace
+    assert request_calls == [("GET", "/repos/acme/widgets", None, None)]
+    assert command_calls[0][0] == [
+        "git",
+        "clone",
+        "--branch",
+        "main",
+        "--single-branch",
+        "https://github.com/acme/widgets.git",
+        str(workspace),
+    ]
+    assert command_calls[0][1] is None
+    assert command_calls[0][2]["GIT_TERMINAL_PROMPT"] == "0"
+    assert "placeholder-token" not in repr(command_calls)
+
+
+def test_checkout_updates_an_existing_target_branch_workspace(tmp_path):
+    workspace = tmp_path / "widgets"
+    (workspace / ".git").mkdir(parents=True)
+    command_calls = []
+
+    def unexpected_request(method, path, *, query=None, json_body=None):
+        raise AssertionError("an existing checkout does not need repository metadata")
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=unexpected_request,
+        command_runner=command_runner,
+    )
+
+    assert client.checkout("acme/widgets", "main", workspace) == workspace
+    assert [call[0] for call in command_calls] == [
+        ["git", "fetch", "origin", "main"],
+        ["git", "checkout", "main"],
+        ["git", "pull", "--ff-only", "origin", "main"],
+    ]
+    assert all(call[1] == workspace for call in command_calls)
+    assert all(call[2]["GIT_TERMINAL_PROMPT"] == "0" for call in command_calls)
+
+
+def test_pull_request_returns_current_state_and_diff():
+    calls = []
+    pull_json = {
+        "number": 12,
+        "html_url": "https://example.test/pulls/12",
+        "head": {
+            "ref": "agent/issue-7",
+            "sha": "1111111111111111111111111111111111111111",
+        },
+        "state": "closed",
+        "merged": True,
+    }
+    diff = "diff --git a/old.py b/new.py\n"
+
+    def request(method, path, *, query=None, json_body=None):
+        calls.append((method, path, query, json_body))
+        if path.endswith(".diff"):
+            return diff
+        return pull_json
+
+    client = GitHubClient("placeholder-token", request=request)
+
+    assert client.pull_request("acme/widgets", 12) == PullRequest(
+        number=12,
+        url="https://example.test/pulls/12",
+        branch="agent/issue-7",
+        state="closed",
+        merged=True,
+        diff=diff,
+        head_sha="1111111111111111111111111111111111111111",
+    )
+    assert calls == [
+        ("GET", "/repos/acme/widgets/pulls/12", None, None),
+        ("GET", "/repos/acme/widgets/pulls/12.diff", None, None),
+    ]
+
+
+def test_default_request_uses_the_github_diff_media_type(monkeypatch):
+    requests = []
+    pull_json = (
+        b'{"number":12,"html_url":"https://example.test/pulls/12",'
+        b'"head":{"ref":"agent/issue-7","sha":"2222222222222222222222222222222222222222"},'
+        b'"state":"open","merged":false}'
+    )
+    diff = b"diff --git a/old.py b/new.py\n"
+
+    class Response:
+        def __init__(self, body, content_type):
+            self._body = body
+            self.headers = {"Content-Type": content_type}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self):
+            return self._body
+
+    def urlopen(request):
+        requests.append(request)
+        if request.get_header("Accept") == "application/vnd.github.diff":
+            return Response(diff, "text/plain; charset=utf-8")
+        return Response(pull_json, "application/json; charset=utf-8")
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    client = GitHubClient("placeholder-token", api_base="https://api.example.test")
+
+    assert client.pull_request("acme/widgets", 12).diff == diff.decode()
+    assert [request.full_url for request in requests] == [
+        "https://api.example.test/repos/acme/widgets/pulls/12",
+        "https://api.example.test/repos/acme/widgets/pulls/12",
+    ]
+    assert requests[1].get_header("Accept") == "application/vnd.github.diff"
+
+
+def test_repeated_publication_keeps_one_issue_commit_on_the_remote_branch(tmp_path):
+    remote = tmp_path / "remote.git"
+    workspace = tmp_path / "workspace"
+    upstream = tmp_path / "upstream"
+
+    def git(*args, cwd=tmp_path):
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "--bare", str(remote))
+    git("init", "-b", "main", str(workspace))
+    (workspace / "base.txt").write_text("base\n")
+    git("add", "--all", cwd=workspace)
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "Base",
+        cwd=workspace,
+    )
+    git("remote", "add", "origin", str(remote), cwd=workspace)
+    git("push", "--set-upstream", "origin", "main", cwd=workspace)
+    issue_ref = "refs/heads/agent/issue-7"
+
+    def request(method, path, *, query=None, json_body=None):
+        if path.endswith(".diff"):
+            return "updated diff"
+        if method == "GET" and path == "/repos/acme/widgets/pulls":
+            return []
+        if method == "POST":
+            return {"number": 12}
+        return {
+            "number": 12,
+            "html_url": "https://example.test/pulls/12",
+            "head": {
+                "ref": "agent/issue-7",
+                "sha": git("--git-dir", str(remote), "rev-parse", issue_ref),
+            },
+            "state": "open",
+            "merged": False,
+        }
+
+    client = GitHubClient("placeholder-token", request=request)
+    (workspace / "feature.txt").write_text("first\n")
+    first = client.publish(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+    )
+    git("update-ref", "-d", f"refs/remotes/origin/agent/issue-7", cwd=workspace)
+    git("clone", "--branch", "main", str(remote), str(upstream))
+    (upstream / "base.txt").write_text("base\nupstream\n")
+    git("add", "--all", cwd=upstream)
+    git(
+        "-c",
+        "user.name=Upstream",
+        "-c",
+        "user.email=upstream@example.invalid",
+        "commit",
+        "-m",
+        "Advance main",
+        cwd=upstream,
+    )
+    git("push", "origin", "main", cwd=upstream)
+
+    (workspace / "feature.txt").write_text("first\nsecond\n")
+    second = client.publish(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+        existing_pr=12,
+    )
+
+    assert first.head_sha != second.head_sha
+    assert git(
+        "--git-dir",
+        str(remote),
+        "rev-list",
+        "--count",
+        f"refs/heads/main..{issue_ref}",
+    ) == "1"
+    assert git("--git-dir", str(remote), "rev-parse", f"{issue_ref}^") == git(
+        "--git-dir",
+        str(remote),
+        "rev-parse",
+        "refs/heads/main",
+    )
+    assert git(
+        "--git-dir",
+        str(remote),
+        "show",
+        f"{issue_ref}:feature.txt",
+    ) == "first\nsecond"
+    assert git(
+        "--git-dir",
+        str(remote),
+        "show",
+        f"{issue_ref}:base.txt",
+    ) == "base\nupstream"
+    assert git(
+        "--git-dir",
+        str(remote),
+        "log",
+        "-1",
+        "--pretty=%s",
+        issue_ref,
+    ) == "Resolve issue #7"
+
+
+def test_publish_uses_local_pushed_head_when_pull_api_is_stale(tmp_path):
+    request_calls = []
+    command_calls = []
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    local_head_sha = "8888888888888888888888888888888888888888"
+    remote_head_sha = "2222222222222222222222222222222222222222"
+    pull_json = {
+        "number": 12,
+        "html_url": "https://example.test/pulls/12",
+        "head": {
+            "ref": "agent/issue-7",
+            "sha": "3333333333333333333333333333333333333333",
+        },
+        "state": "open",
+        "merged": False,
+    }
+    diff = "diff --git a/app.py b/app.py\n"
+
+    def request(method, path, *, query=None, json_body=None):
+        request_calls.append((method, path, query, json_body))
+        if method == "GET" and path == "/repos/acme/widgets/pulls":
+            return []
+        if method == "POST":
+            return {"number": 12}
+        if path.endswith(".diff"):
+            return diff
+        return pull_json
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        if args == [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            "refs/heads/agent/issue-7",
+        ]:
+            return SimpleNamespace(
+                stdout=f"{remote_head_sha}\trefs/heads/agent/issue-7\n"
+            )
+        if args == ["git", "diff", "--cached", "--name-only"]:
+            return SimpleNamespace(stdout="app.py\n")
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(stdout=f"{local_head_sha}\n")
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    assert client.publish(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+        existing_pr=12,
+    ) == PullRequest(
+        12,
+        "https://example.test/pulls/12",
+        "agent/issue-7",
+        "open",
+        False,
+        diff,
+        local_head_sha,
+    )
+    assert [call[0] for call in command_calls] == [
+        ["git", "checkout", "-B", "agent/issue-7"],
+        ["git", "fetch", "origin", "main"],
+        [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            "refs/heads/agent/issue-7",
+        ],
+        ["git", "add", "--all"],
+        ["git", "diff", "--cached", "--name-only"],
+        ["git", "commit", "-m", "Resolve issue #7"],
+        ["git", "rebase", "origin/main"],
+        ["git", "rev-parse", "HEAD"],
+        ["git", "reset", "--soft", "origin/main"],
+        ["git", "diff", "--cached", "--name-only"],
+        ["git", "commit", "-m", "Resolve issue #7"],
+        [
+            "git",
+            "push",
+            f"--force-with-lease=refs/heads/agent/issue-7:{remote_head_sha}",
+            "--set-upstream",
+            "origin",
+            "agent/issue-7",
+        ],
+        ["git", "rev-parse", "HEAD"],
+    ]
+    assert all(call[1] == workspace for call in command_calls)
+    assert all(call[2]["GIT_TERMINAL_PROMPT"] == "0" for call in command_calls)
+    assert request_calls == [
+        ("GET", "/repos/acme/widgets/pulls/12", None, None),
+        ("GET", "/repos/acme/widgets/pulls/12.diff", None, None),
+    ]
+    assert "placeholder-token" not in repr(command_calls)
+
+
+def test_publish_pushes_the_issue_branch_without_duplicating_an_existing_pr(tmp_path):
+    request_calls = []
+    command_calls = []
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    local_head_sha = "6666666666666666666666666666666666666666"
+    pull_json = {
+        "number": 12,
+        "html_url": "https://example.test/pulls/12",
+        "head": {
+            "ref": "agent/issue-7",
+            "sha": "4444444444444444444444444444444444444444",
+        },
+        "state": "open",
+        "merged": False,
+    }
+
+    def request(method, path, *, query=None, json_body=None):
+        request_calls.append((method, path, query, json_body))
+        if method == "POST":
+            raise AssertionError("an existing pull request must not be recreated")
+        if path.endswith(".diff"):
+            return "updated diff"
+        return pull_json
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        if args == [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            "refs/heads/agent/issue-7",
+        ]:
+            return SimpleNamespace(
+                stdout="4444444444444444444444444444444444444444"
+                "\trefs/heads/agent/issue-7\n"
+            )
+        if args == ["git", "diff", "--cached", "--name-only"]:
+            return SimpleNamespace(stdout="app.py\n")
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(stdout=f"{local_head_sha}\n")
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    pull = client.publish(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+        existing_pr=12,
+    )
+
+    assert pull.number == 12
+    assert pull.branch == "agent/issue-7"
+    assert [call[0] for call in command_calls] == [
+        ["git", "checkout", "-B", "agent/issue-7"],
+        ["git", "fetch", "origin", "main"],
+        [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            "refs/heads/agent/issue-7",
+        ],
+        ["git", "add", "--all"],
+        ["git", "diff", "--cached", "--name-only"],
+        ["git", "commit", "-m", "Resolve issue #7"],
+        ["git", "rebase", "origin/main"],
+        ["git", "rev-parse", "HEAD"],
+        ["git", "reset", "--soft", "origin/main"],
+        ["git", "diff", "--cached", "--name-only"],
+        ["git", "commit", "-m", "Resolve issue #7"],
+        [
+            "git",
+            "push",
+            "--force-with-lease=refs/heads/agent/issue-7:"
+            "4444444444444444444444444444444444444444",
+            "--set-upstream",
+            "origin",
+            "agent/issue-7",
+        ],
+        ["git", "rev-parse", "HEAD"],
+    ]
+    assert request_calls == [
+        ("GET", "/repos/acme/widgets/pulls/12", None, None),
+        ("GET", "/repos/acme/widgets/pulls/12.diff", None, None),
+    ]
+
+
+def test_initial_publish_reuses_an_open_issue_branch_pull_request(tmp_path):
+    request_calls = []
+    command_calls = []
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    local_head_sha = "6666666666666666666666666666666666666666"
+    pull_json = {
+        "number": 12,
+        "html_url": "https://example.test/pulls/12",
+        "head": {
+            "ref": "agent/issue-7",
+            "sha": "5555555555555555555555555555555555555555",
+        },
+        "state": "open",
+        "merged": False,
+    }
+
+    def request(method, path, *, query=None, json_body=None):
+        request_calls.append((method, path, query, json_body))
+        if method == "POST":
+            raise AssertionError("the open issue-branch pull request must be reused")
+        if path == "/repos/acme/widgets/pulls":
+            return [
+                {
+                    "number": 11,
+                    "head": {
+                        "ref": "agent/issue-6",
+                        "repo": {"full_name": "acme/widgets"},
+                    },
+                    "base": {"ref": "main"},
+                },
+                {
+                    "number": 12,
+                    "head": {
+                        "ref": "agent/issue-7",
+                        "repo": {"full_name": "acme/widgets"},
+                    },
+                    "base": {"ref": "main"},
+                },
+            ]
+        if path.endswith(".diff"):
+            return "existing diff"
+        return pull_json
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        if args == [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            "refs/heads/agent/issue-7",
+        ]:
+            return SimpleNamespace(
+                stdout="5555555555555555555555555555555555555555"
+                "\trefs/heads/agent/issue-7\n"
+            )
+        if args == ["git", "diff", "--cached", "--name-only"]:
+            return SimpleNamespace(stdout="app.py\n")
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(stdout=f"{local_head_sha}\n")
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    pull = client.publish("acme/widgets", 7, "main", workspace)
+
+    assert pull == PullRequest(
+        12,
+        "https://example.test/pulls/12",
+        "agent/issue-7",
+        "open",
+        False,
+        "existing diff",
+        local_head_sha,
+    )
+    assert [call[0] for call in command_calls] == [
+        ["git", "checkout", "-B", "agent/issue-7"],
+        ["git", "fetch", "origin", "main"],
+        [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            "refs/heads/agent/issue-7",
+        ],
+        ["git", "add", "--all"],
+        ["git", "diff", "--cached", "--name-only"],
+        ["git", "commit", "-m", "Resolve issue #7"],
+        ["git", "rebase", "origin/main"],
+        ["git", "rev-parse", "HEAD"],
+        ["git", "reset", "--soft", "origin/main"],
+        ["git", "diff", "--cached", "--name-only"],
+        ["git", "commit", "-m", "Resolve issue #7"],
+        [
+            "git",
+            "push",
+            "--force-with-lease=refs/heads/agent/issue-7:"
+            "5555555555555555555555555555555555555555",
+            "--set-upstream",
+            "origin",
+            "agent/issue-7",
+        ],
+        ["git", "rev-parse", "HEAD"],
+    ]
+    assert request_calls == [
+        (
+            "GET",
+            "/repos/acme/widgets/pulls",
+            {"state": "open", "per_page": 100, "page": 1},
+            None,
+        ),
+        ("GET", "/repos/acme/widgets/pulls/12", None, None),
+        ("GET", "/repos/acme/widgets/pulls/12.diff", None, None),
+    ]
+
+
+def test_initial_publish_requires_matching_base_and_supplied_head_repository(tmp_path):
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    request_calls = []
+    pull_json = {
+        "number": 15,
+        "html_url": "https://example.test/pulls/15",
+        "head": {
+            "ref": "agent/issue-7",
+            "sha": "6666666666666666666666666666666666666666",
+        },
+        "state": "open",
+        "merged": False,
+    }
+
+    def request(method, path, *, query=None, json_body=None):
+        request_calls.append((method, path, query, json_body))
+        if method == "POST":
+            raise AssertionError("the matching open pull request must be reused")
+        if path == "/repos/acme/widgets/pulls":
+            return [
+                {
+                    "number": 13,
+                    "head": {
+                        "ref": "agent/issue-7",
+                        "repo": {"full_name": "acme/widgets"},
+                    },
+                    "base": {"ref": "release"},
+                },
+                {
+                    "number": 14,
+                    "head": {
+                        "ref": "agent/issue-7",
+                        "repo": {"full_name": "other/widgets"},
+                    },
+                    "base": {"ref": "main"},
+                },
+                {
+                    "number": 15,
+                    "head": {"ref": "agent/issue-7"},
+                    "base": {"ref": "main"},
+                },
+            ]
+        if path.endswith(".diff"):
+            return "existing diff"
+        return pull_json
+
+    def command_runner(args, *, cwd=None, env=None):
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(
+                stdout="6666666666666666666666666666666666666666\n"
+            )
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    pull = client.publish("acme/widgets", 7, "main", workspace)
+
+    assert pull.number == 15
+    assert request_calls == [
+        (
+            "GET",
+            "/repos/acme/widgets/pulls",
+            {"state": "open", "per_page": 100, "page": 1},
+            None,
+        ),
+        ("GET", "/repos/acme/widgets/pulls/15", None, None),
+        ("GET", "/repos/acme/widgets/pulls/15.diff", None, None),
+    ]
+
+
+def test_publish_with_no_staged_changes_skips_commit_but_still_pushes(tmp_path):
+    request_calls = []
+    command_calls = []
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    pull_json = {
+        "number": 12,
+        "html_url": "https://example.test/pulls/12",
+        "head": {
+            "ref": "agent/issue-7",
+            "sha": "7777777777777777777777777777777777777777",
+        },
+        "state": "open",
+        "merged": False,
+    }
+
+    def request(method, path, *, query=None, json_body=None):
+        request_calls.append((method, path, query, json_body))
+        if path.endswith(".diff"):
+            return "existing diff"
+        return pull_json
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        if args == [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            "refs/heads/agent/issue-7",
+        ]:
+            return SimpleNamespace(
+                stdout="7777777777777777777777777777777777777777"
+                "\trefs/heads/agent/issue-7\n"
+            )
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(
+                stdout="7777777777777777777777777777777777777777\n"
+            )
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    pull = client.publish(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+        existing_pr=12,
+    )
+
+    assert pull.number == 12
+    assert [call[0] for call in command_calls] == [
+        ["git", "checkout", "-B", "agent/issue-7"],
+        ["git", "fetch", "origin", "main"],
+        [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            "refs/heads/agent/issue-7",
+        ],
+        ["git", "add", "--all"],
+        ["git", "diff", "--cached", "--name-only"],
+        ["git", "rebase", "origin/main"],
+        ["git", "rev-parse", "HEAD"],
+        [
+            "git",
+            "push",
+            "--force-with-lease=refs/heads/agent/issue-7:"
+            "7777777777777777777777777777777777777777",
+            "--set-upstream",
+            "origin",
+            "agent/issue-7",
+        ],
+        ["git", "rev-parse", "HEAD"],
+    ]
+    assert request_calls == [
+        ("GET", "/repos/acme/widgets/pulls/12", None, None),
+        ("GET", "/repos/acme/widgets/pulls/12.diff", None, None),
+    ]
+
+
+
+def test_publish_retry_preserves_remote_head_when_local_head_is_unchanged(
+    tmp_path,
+):
+    command_calls = []
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    prior_remote_head = "6666666666666666666666666666666666666666"
+    pushed_head = "7777777777777777777777777777777777777777"
+    publish_attempt = 0
+
+    def request(method, path, *, query=None, json_body=None):
+        if path.endswith(".diff"):
+            return "existing diff"
+        return {
+            "number": 12,
+            "html_url": "https://example.test/pulls/12",
+            "head": {
+                "ref": "agent/issue-7",
+                "sha": pushed_head,
+            },
+            "state": "open",
+            "merged": False,
+        }
+
+    def command_runner(args, *, cwd=None, env=None):
+        nonlocal publish_attempt
+        command_calls.append((args, cwd, env))
+        if args == [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            "refs/heads/agent/issue-7",
+        ]:
+            publish_attempt += 1
+            remote_head = (
+                prior_remote_head if publish_attempt == 1 else pushed_head
+            )
+            return SimpleNamespace(
+                stdout=f"{remote_head}\trefs/heads/agent/issue-7\n"
+            )
+        if args == ["git", "diff", "--cached", "--name-only"]:
+            return SimpleNamespace(
+                stdout="app.py\n" if publish_attempt == 1 else ""
+            )
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(stdout=f"{pushed_head}\n")
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    first = client.publish(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+        existing_pr=12,
+    )
+    command_calls.clear()
+
+    second = client.publish(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+        existing_pr=12,
+    )
+
+    assert first.head_sha == pushed_head
+    assert second.head_sha == first.head_sha
+    retry_commands = [call[0] for call in command_calls]
+    assert ["git", "reset", "--soft", "origin/main"] not in retry_commands
+    assert not any(command[1] == "commit" for command in retry_commands)
+
+
+def test_list_feedback_uses_inline_comments_and_request_changes_state_only():
+    calls = []
+    service_marker = "<!-- repogents-feedback:inline:101 -->"
+    responses = {
+        "/repos/acme/widgets/pulls/12/comments": [
+            {
+                "id": 101,
+                "node_id": "PRRC_inline_101",
+                "body": "Use the shared helper",
+                "path": "src/app.py",
+                "line": 14,
+            },
+            {
+                "id": 102,
+                "node_id": "PRRC_inline_102",
+                "in_reply_to_id": 101,
+                "body": "This old line also needs correction",
+                "path": "src/old.py",
+                "line": None,
+            },
+            {
+                "id": 103,
+                "node_id": "PRRC_service_reply",
+                "in_reply_to_id": 101,
+                "body": (
+                    "Addressed in validated commit "
+                    "`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.\n\n"
+                    f"{service_marker}"
+                ),
+                "path": "src/app.py",
+                "line": 14,
+            },
+        ],
+        "/repos/acme/widgets/pulls/12/reviews": [
+            {
+                "id": 201,
+                "state": "CHANGES_REQUESTED",
+                "body": "Please address the review",
+            },
+            {
+                "id": 202,
+                "state": "APPROVED",
+                "body": "Approved",
+            },
+            {
+                "id": 203,
+                "state": "COMMENTED",
+                "body": "This still needs work",
+            },
+        ],
+        "/repos/acme/widgets/issues/12/comments": [
+            {"id": 301, "body": "This NEEDS WORK before release."},
+            {"id": 302, "body": "Looks good to me."},
+            {
+                "id": 303,
+                "body": (
+                    "Addressed in validated commit "
+                    "`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.\n\n"
+                    "<!-- repogents-feedback:comment:301 -->"
+                ),
+            },
+        ],
+    }
+
+    def request(method, path, *, query=None, json_body=None):
+        calls.append((method, path, query, json_body))
+        if path == "/graphql":
+            operation = json_body["query"].lstrip().split()[1].split("(")[0]
+            assert operation == "ReviewThreads"
+            return {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": [
+                                    {
+                                        "id": "PRRT_shared_thread",
+                                        "isResolved": False,
+                                        "viewerCanResolve": True,
+                                        "comments": {
+                                            "nodes": [
+                                                {"id": "PRRC_inline_101"},
+                                                {"id": "PRRC_inline_102"},
+                                                {"id": "PRRC_service_reply"},
+                                            ],
+                                            "pageInfo": {
+                                                "hasNextPage": False,
+                                                "endCursor": None,
+                                            },
+                                        },
+                                    }
+                                ],
+                                "pageInfo": {
+                                    "hasNextPage": False,
+                                    "endCursor": None,
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        return responses[path]
+
+    client = GitHubClient("placeholder-token", request=request)
+
+    assert client.list_feedback("acme/widgets", 12) == [
+        GitHubFeedback(
+            "inline:101",
+            "inline",
+            "Use the shared helper",
+            "src/app.py",
+            14,
+            "PRRT_shared_thread",
+            101,
+        ),
+        GitHubFeedback(
+            "inline:102",
+            "inline",
+            "This old line also needs correction",
+            "src/old.py",
+            None,
+            "PRRT_shared_thread",
+            101,
+        ),
+        GitHubFeedback(
+            "review:201",
+            "review",
+            "Please address the review",
+        ),
+    ]
+    assert calls[:2] == [
+        (
+            "GET",
+            "/repos/acme/widgets/pulls/12/comments",
+            {"per_page": 100, "page": 1},
+            None,
+        ),
+        (
+            "GET",
+            "/repos/acme/widgets/pulls/12/reviews",
+            {"per_page": 100, "page": 1},
+            None,
+        ),
+    ]
+    assert len(calls) == 3
+    graphql_call = calls[2]
+    assert graphql_call[:3] == ("POST", "/graphql", None)
+    assert graphql_call[3]["variables"] == {
+        "owner": "acme",
+        "name": "widgets",
+        "number": 12,
+        "after": None,
+    }
+    document = "".join(graphql_call[3]["query"].split()).replace(",", "")
+    assert "repository(owner:$ownername:$name)" in document
+    assert "pullRequest(number:$number)" in document
+    assert "reviewThreads(first:100after:$after)" in document
+    assert "comments(first:100)" in document
+    for field in (
+        "id",
+        "isResolved",
+        "viewerCanResolve",
+        "pageInfo",
+        "hasNextPage",
+        "endCursor",
+    ):
+        assert field in document
+
+
+def test_list_feedback_paginates_inline_comments_and_reviews():
+    calls = []
+    inline_path = "/repos/acme/widgets/pulls/12/comments"
+    review_path = "/repos/acme/widgets/pulls/12/reviews"
+    conversation_path = "/repos/acme/widgets/issues/12/comments"
+    pages = {
+        (inline_path, 1): [
+            {
+                "id": number,
+                "node_id": f"PRRC_inline_{number}",
+                "body": f"Inline {number}",
+                "path": f"src/{number}.py",
+                "line": number,
+            }
+            for number in range(1, 101)
+        ],
+        (inline_path, 2): [
+            {
+                "id": 101,
+                "node_id": "PRRC_inline_101",
+                "body": "Inline 101",
+                "path": "src/101.py",
+                "line": 101,
+            }
+        ],
+        (review_path, 1): [
+            {"id": number, "state": "APPROVED", "body": "Approved"}
+            for number in range(1, 100)
+        ]
+        + [
+            {
+                "id": 200,
+                "state": "CHANGES_REQUESTED",
+                "body": "First requested change",
+            }
+        ],
+        (review_path, 2): [
+            {
+                "id": 201,
+                "state": "CHANGES_REQUESTED",
+                "body": "Second requested change",
+            },
+            {"id": 202, "state": "APPROVED", "body": "Approved"},
+        ],
+        (conversation_path, 1): [
+            {"id": number, "body": "Discussion only"} for number in range(1, 100)
+        ]
+        + [{"id": 300, "body": "This NEEDS WORK."}],
+        (conversation_path, 2): [
+            {"id": 301, "body": "This NeEdS WoRk too."},
+            {"id": 302, "body": "Looks good."},
+        ],
+    }
+    no_more_pages = {"hasNextPage": False, "endCursor": None}
+    thread_a = {
+        "id": "PRRT_thread_a",
+        "isResolved": False,
+        "viewerCanResolve": True,
+        "comments": {
+            "nodes": [
+                *({"id": f"PRRC_inline_{number}"} for number in range(1, 100)),
+                {"id": "PRRC_unrelated_comment"},
+            ],
+            "pageInfo": {
+                "hasNextPage": True,
+                "endCursor": "thread-a-comments-page-1",
+            },
+        },
+    }
+    irrelevant_threads = [
+        {
+            "id": f"PRRT_irrelevant_{number}",
+            "isResolved": False,
+            "viewerCanResolve": True,
+            "comments": {
+                "nodes": [{"id": f"PRRC_irrelevant_{number}"}],
+                "pageInfo": no_more_pages,
+            },
+        }
+        for number in range(2, 101)
+    ]
+    thread_b = {
+        "id": "PRRT_thread_b",
+        "isResolved": False,
+        "viewerCanResolve": True,
+        "comments": {
+            "nodes": [{"id": "PRRC_inline_101"}],
+            "pageInfo": no_more_pages,
+        },
+    }
+
+    def review_threads_response(nodes, *, has_next_page, end_cursor):
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": nodes,
+                            "pageInfo": {
+                                "hasNextPage": has_next_page,
+                                "endCursor": end_cursor,
+                            },
+                        }
+                    }
+                }
+            }
+        }
+
+    def request(method, path, *, query=None, json_body=None):
+        calls.append((method, path, query, json_body))
+        if path != "/graphql":
+            return pages[(path, query["page"])]
+        operation = json_body["query"].lstrip().split()[1].split("(")[0]
+        variables = json_body["variables"]
+        if operation == "ReviewThreads":
+            if variables["after"] is None:
+                return review_threads_response(
+                    [thread_a, *irrelevant_threads],
+                    has_next_page=True,
+                    end_cursor="review-threads-page-1",
+                )
+            assert variables["after"] == "review-threads-page-1"
+            return review_threads_response(
+                [thread_b],
+                has_next_page=False,
+                end_cursor=None,
+            )
+        if operation == "ReviewThreadComments":
+            assert variables == {
+                "threadId": "PRRT_thread_a",
+                "after": "thread-a-comments-page-1",
+            }
+            return {
+                "data": {
+                    "node": {
+                        "id": "PRRT_thread_a",
+                        "comments": {
+                            "nodes": [{"id": "PRRC_inline_100"}],
+                            "pageInfo": no_more_pages,
+                        },
+                    }
+                }
+            }
+        raise AssertionError(f"unexpected GraphQL operation: {operation}")
+
+    client = GitHubClient("placeholder-token", request=request)
+
+    feedback = client.list_feedback("acme/widgets", 12)
+
+    assert [item.external_id for item in feedback] == [
+        *(f"inline:{number}" for number in range(1, 102)),
+        "review:200",
+        "review:201",
+    ]
+    assert feedback[99] == GitHubFeedback(
+        "inline:100",
+        "inline",
+        "Inline 100",
+        "src/100.py",
+        100,
+        "PRRT_thread_a",
+        100,
+    )
+    assert feedback[100] == GitHubFeedback(
+        "inline:101",
+        "inline",
+        "Inline 101",
+        "src/101.py",
+        101,
+        "PRRT_thread_b",
+        101,
+    )
+    rest_calls = calls[:4]
+    assert [(call[1], call[2]["page"]) for call in rest_calls] == [
+        (inline_path, 1),
+        (inline_path, 2),
+        (review_path, 1),
+        (review_path, 2),
+    ]
+    assert all(call[2]["per_page"] == 100 for call in rest_calls)
+    graphql_calls = calls[4:]
+    assert [
+        call[3]["query"].lstrip().split()[1].split("(")[0]
+        for call in graphql_calls
+    ] == [
+        "ReviewThreads",
+        "ReviewThreadComments",
+        "ReviewThreads",
+    ]
+    assert [call[:3] for call in graphql_calls] == [
+        ("POST", "/graphql", None),
+        ("POST", "/graphql", None),
+        ("POST", "/graphql", None),
+    ]
+    assert [call[3]["variables"] for call in graphql_calls] == [
+        {
+            "owner": "acme",
+            "name": "widgets",
+            "number": 12,
+            "after": None,
+        },
+        {
+            "threadId": "PRRT_thread_a",
+            "after": "thread-a-comments-page-1",
+        },
+        {
+            "owner": "acme",
+            "name": "widgets",
+            "number": 12,
+            "after": "review-threads-page-1",
+        },
+    ]
+    outer_document = "".join(graphql_calls[0][3]["query"].split()).replace(",", "")
+    assert "reviewThreads(first:100after:$after)" in outer_document
+    assert "comments(first:100)" in outer_document
+    inner_document = "".join(graphql_calls[1][3]["query"].split()).replace(",", "")
+    assert "node(id:$threadId)" in inner_document
+    assert "...onPullRequestReviewThread" in inner_document
+    assert "comments(first:100after:$after)" in inner_document
+    for field in ("id", "pageInfo", "hasNextPage", "endCursor"):
+        assert field in inner_document
+
+
+def test_address_feedback_replies_to_inline_top_level_before_resolving_thread():
+    calls = []
+    head_sha = "8888888888888888888888888888888888888888"
+    marker = "<!-- repogents-feedback:inline:101 -->"
+    acknowledgement = f"Addressed in validated commit `{head_sha}`.\n\n{marker}"
+    comments_path = "/repos/acme/widgets/pulls/12/comments"
+    reply_path = f"{comments_path}/77/replies"
+    response_url = "https://example.test/pulls/12#discussion_r901"
+
+    def request(method, path, *, query=None, json_body=None):
+        calls.append((method, path, query, json_body))
+        if method == "GET" and path == comments_path:
+            return []
+        if method == "POST" and path == reply_path:
+            return {
+                "id": 901,
+                "body": acknowledgement,
+                "html_url": response_url,
+            }
+        if method == "POST" and path == "/graphql":
+            operation = json_body["query"].lstrip().split()[1].split("(")[0]
+            if operation == "ReviewThread":
+                return {
+                    "data": {
+                        "node": {
+                            "id": "PRRT_inline_101",
+                            "isResolved": False,
+                            "viewerCanResolve": True,
+                        }
+                    }
+                }
+            if operation == "ResolveThread":
+                return {
+                    "data": {
+                        "resolveReviewThread": {
+                            "thread": {
+                                "id": "PRRT_inline_101",
+                                "isResolved": True,
+                            }
+                        }
+                    }
+                }
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    client = GitHubClient("placeholder-token", request=request)
+    feedback = GitHubFeedback(
+        external_id="inline:101",
+        kind="inline",
+        body="Use the shared helper",
+        path="src/app.py",
+        line=14,
+        review_thread_id="PRRT_inline_101",
+        top_level_comment_id=77,
+    )
+
+    assert client.address_feedback(
+        "acme/widgets",
+        12,
+        feedback,
+        head_sha,
+    ) == FeedbackAddress("RESOLVED", response_url)
+    assert [call[:3] for call in calls] == [
+        (
+            "GET",
+            comments_path,
+            {"per_page": 100, "page": 1},
+        ),
+        ("POST", reply_path, None),
+        ("POST", "/graphql", None),
+        ("POST", "/graphql", None),
+    ]
+    assert calls[0][3] is None
+    assert calls[1][3] == {"body": acknowledgement}
+    state_body = calls[2][3]
+    assert state_body["variables"] == {"threadId": "PRRT_inline_101"}
+    assert state_body["query"].lstrip().split()[1].split("(")[0] == "ReviewThread"
+    state_document = "".join(state_body["query"].split()).replace(",", "")
+    assert "node(id:$threadId)" in state_document
+    assert "...onPullRequestReviewThread" in state_document
+    for field in ("id", "isResolved", "viewerCanResolve"):
+        assert field in state_document
+    resolution_body = calls[3][3]
+    assert resolution_body["variables"] == {
+        "input": {"threadId": "PRRT_inline_101"}
+    }
+    assert (
+        resolution_body["query"].lstrip().split()[1].split("(")[0]
+        == "ResolveThread"
+    )
+    resolution_document = "".join(resolution_body["query"].split()).replace(",", "")
+    assert "resolveReviewThread(input:$input)" in resolution_document
+    assert "thread{idisResolved}" in resolution_document
+
+
+@pytest.mark.parametrize(
+    ("kind", "external_id"),
+    [
+        ("review", "review:201"),
+    ],
+)
+def test_address_feedback_acknowledges_non_thread_feedback_without_resolution(
+    kind,
+    external_id,
+):
+    calls = []
+    head_sha = "9999999999999999999999999999999999999999"
+    marker = f"<!-- repogents-feedback:{external_id} -->"
+    acknowledgement = f"Addressed in validated commit `{head_sha}`.\n\n{marker}"
+    comments_path = "/repos/acme/widgets/issues/12/comments"
+    response_url = "https://example.test/pulls/12#issuecomment-902"
+
+    def request(method, path, *, query=None, json_body=None):
+        calls.append((method, path, query, json_body))
+        if method == "GET" and path == comments_path:
+            return []
+        if method == "POST" and path == comments_path:
+            return {
+                "id": 902,
+                "body": acknowledgement,
+                "html_url": response_url,
+            }
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    client = GitHubClient("placeholder-token", request=request)
+    feedback = GitHubFeedback(
+        external_id=external_id,
+        kind=kind,
+        body="Please address this feedback",
+    )
+
+    assert client.address_feedback(
+        "acme/widgets",
+        12,
+        feedback,
+        head_sha,
+    ) == FeedbackAddress("ACKNOWLEDGED", response_url)
+    assert calls == [
+        (
+            "GET",
+            comments_path,
+            {"per_page": 100, "page": 1},
+            None,
+        ),
+        (
+            "POST",
+            comments_path,
+            None,
+            {"body": acknowledgement},
+        ),
+    ]
+
+
+def test_address_feedback_rejects_general_pull_request_comments():
+    calls = []
+
+    def request(method, path, *, query=None, json_body=None):
+        calls.append((method, path, query, json_body))
+        return []
+
+    client = GitHubClient("placeholder-token", request=request)
+    feedback = GitHubFeedback(
+        external_id="comment:301",
+        kind="comment",
+        body="This NEEDS WORK before release.",
+    )
+
+    with pytest.raises(ValueError):
+        client.address_feedback(
+            "acme/widgets",
+            12,
+            feedback,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+
+    assert calls == []
+
+
+
+@pytest.mark.parametrize("already_resolved", [False, True])
+def test_address_feedback_retry_reuses_marker_and_reconciles_inline_resolution(
+    already_resolved,
+):
+    calls = []
+    head_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    marker = "<!-- repogents-feedback:inline:101 -->"
+    acknowledgement = f"Addressed in validated commit `{head_sha}`.\n\n{marker}"
+    comments_path = "/repos/acme/widgets/pulls/12/comments"
+    reply_path = f"{comments_path}/77/replies"
+    response_url = "https://example.test/pulls/12#discussion_r901"
+    first_page = [
+        {
+            "id": number,
+            "body": f"Unrelated review comment {number}",
+            "html_url": f"https://example.test/comments/{number}",
+        }
+        for number in range(1, 101)
+    ]
+
+    def request(method, path, *, query=None, json_body=None):
+        calls.append((method, path, query, json_body))
+        if method == "GET" and path == comments_path:
+            if query["page"] == 1:
+                return first_page
+            assert query["page"] == 2
+            return [
+                {
+                    "id": 901,
+                    "body": acknowledgement,
+                    "html_url": response_url,
+                }
+            ]
+        if path == reply_path:
+            raise AssertionError("retry must not post a duplicate acknowledgement")
+        if method == "POST" and path == "/graphql":
+            operation = json_body["query"].lstrip().split()[1].split("(")[0]
+            if operation == "ReviewThread":
+                return {
+                    "data": {
+                        "node": {
+                            "id": "PRRT_inline_101",
+                            "isResolved": already_resolved,
+                            "viewerCanResolve": True,
+                        }
+                    }
+                }
+            if operation == "ResolveThread" and not already_resolved:
+                return {
+                    "data": {
+                        "resolveReviewThread": {
+                            "thread": {
+                                "id": "PRRT_inline_101",
+                                "isResolved": True,
+                            }
+                        }
+                    }
+                }
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    client = GitHubClient("placeholder-token", request=request)
+    feedback = GitHubFeedback(
+        external_id="inline:101",
+        kind="inline",
+        body="Use the shared helper",
+        path="src/app.py",
+        line=14,
+        review_thread_id="PRRT_inline_101",
+        top_level_comment_id=77,
+    )
+
+    assert client.address_feedback(
+        "acme/widgets",
+        12,
+        feedback,
+        head_sha,
+    ) == FeedbackAddress("RESOLVED", response_url)
+    assert calls[:2] == [
+        (
+            "GET",
+            comments_path,
+            {"per_page": 100, "page": 1},
+            None,
+        ),
+        (
+            "GET",
+            comments_path,
+            {"per_page": 100, "page": 2},
+            None,
+        ),
+    ]
+    assert all(call[1] != reply_path for call in calls)
+    graphql_calls = calls[2:]
+    assert [
+        call[3]["query"].lstrip().split()[1].split("(")[0]
+        for call in graphql_calls
+    ] == (
+        ["ReviewThread"]
+        if already_resolved
+        else ["ReviewThread", "ResolveThread"]
+    )
+    assert all(call[:3] == ("POST", "/graphql", None) for call in graphql_calls)
+    assert graphql_calls[0][3]["variables"] == {
+        "threadId": "PRRT_inline_101"
+    }
+    if not already_resolved:
+        assert graphql_calls[1][3]["variables"] == {
+            "input": {"threadId": "PRRT_inline_101"}
+        }
+
+
+
+def test_address_feedback_rejects_marker_for_a_different_head_sha():
+    calls = []
+    current_head_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    prior_head_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    marker = "<!-- repogents-feedback:inline:101 -->"
+    comments_path = "/repos/acme/widgets/pulls/12/comments"
+    response_url = "https://example.test/pulls/12#discussion_r901"
+
+    def request(method, path, *, query=None, json_body=None):
+        calls.append((method, path, query, json_body))
+        if method == "GET" and path == comments_path:
+            return [
+                {
+                    "id": 901,
+                    "body": (
+                        "Addressed in validated commit "
+                        f"`{prior_head_sha}`.\n\n{marker}"
+                    ),
+                    "html_url": response_url,
+                }
+            ]
+        if method == "POST" and path == "/graphql":
+            return {
+                "data": {
+                    "node": {
+                        "id": "PRRT_inline_101",
+                        "isResolved": True,
+                        "viewerCanResolve": True,
+                    }
+                }
+            }
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    client = GitHubClient("placeholder-token", request=request)
+    feedback = GitHubFeedback(
+        external_id="inline:101",
+        kind="inline",
+        body="Use the shared helper",
+        path="src/app.py",
+        line=14,
+        review_thread_id="PRRT_inline_101",
+        top_level_comment_id=77,
+    )
+
+    with pytest.raises(RuntimeError):
+        client.address_feedback(
+            "acme/widgets",
+            12,
+            feedback,
+            current_head_sha,
+        )
+
+    assert calls == [
+        (
+            "GET",
+            comments_path,
+            {"per_page": 100, "page": 1},
+            None,
+        )
+    ]
+
+
+def test_client_exposes_no_merge_operation():
+    assert not hasattr(GitHubClient, "merge")
+
+
+def _git_config(environment):
+    return {
+        environment[f"GIT_CONFIG_KEY_{index}"]: environment[f"GIT_CONFIG_VALUE_{index}"]
+        for index in range(int(environment["GIT_CONFIG_COUNT"]))
+    }
+
+
+def test_git_network_commands_use_transient_token_without_persisting_it(tmp_path):
+    token = "placeholder-token"
+    command_calls = []
+    new_workspace = tmp_path / "new"
+    existing_workspace = tmp_path / "existing"
+    (existing_workspace / ".git").mkdir(parents=True)
+
+    def request(method, path, *, query=None, json_body=None):
+        if path == "/repos/acme/widgets":
+            return {
+                "full_name": "acme/widgets",
+                "default_branch": "main",
+                "clone_url": "https://github.com/acme/widgets.git",
+            }
+        if path.endswith(".diff"):
+            return "updated diff"
+        return {
+            "number": 12,
+            "html_url": "https://example.test/pulls/12",
+            "head": {
+                "ref": "agent/issue-7",
+                "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            },
+            "state": "open",
+            "merged": False,
+        }
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(
+                stdout="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+            )
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(token, request=request, command_runner=command_runner)
+
+    client.checkout("acme/widgets", "main", new_workspace)
+    client.checkout("acme/widgets", "main", existing_workspace)
+    client.publish(
+        "acme/widgets",
+        7,
+        "main",
+        existing_workspace,
+        existing_pr=12,
+    )
+
+    network_calls = [
+        call
+        for call in command_calls
+        if call[0][1] in {"clone", "fetch", "pull", "push"}
+    ]
+    assert [call[0][1] for call in network_calls] == [
+        "clone",
+        "fetch",
+        "pull",
+        "fetch",
+        "push",
+    ]
+    for args, _, environment in network_calls:
+        authorization = _git_config(environment)["http.extraHeader"]
+        prefix = "Authorization: Basic "
+        assert authorization.startswith(prefix)
+        assert b64decode(authorization.removeprefix(prefix)).decode() == (
+            f"x-access-token:{token}"
+        )
+        assert token not in repr(args)
+        assert all("@" not in arg for arg in args if "://" in arg)
+    assert not any(call[0][1:3] == ["remote", "set-url"] for call in command_calls)
+
+
+def test_publish_commit_supplies_service_local_git_identity(tmp_path):
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    command_calls = []
+
+    def request(method, path, *, query=None, json_body=None):
+        if path.endswith(".diff"):
+            return "updated diff"
+        return {
+            "number": 12,
+            "html_url": "https://example.test/pulls/12",
+            "head": {
+                "ref": "agent/issue-7",
+                "sha": "cccccccccccccccccccccccccccccccccccccccc",
+            },
+            "state": "open",
+            "merged": False,
+        }
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        if args == ["git", "diff", "--cached", "--name-only"]:
+            return SimpleNamespace(stdout="app.py\n")
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(
+                stdout="cccccccccccccccccccccccccccccccccccccccc\n"
+            )
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    client.publish(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+        existing_pr=12,
+    )
+
+    commit_call = next(call for call in command_calls if call[0][1] == "commit")
+    commit_config = _git_config(commit_call[2])
+    assert commit_config["user.name"]
+    assert commit_config["user.email"]
