@@ -1,5 +1,6 @@
 import copy
 import sqlite3
+import threading
 
 import pytest
 
@@ -865,3 +866,488 @@ def test_recovery_requeues_only_interrupted_work_and_keeps_active_run_unique(sto
     assert created is False
     assert reopened.recover_interrupted_work() == 0
     assert reopened.claim_node_work(node["id"])["key"] == "implement"
+
+
+def test_repository_add_operation_lifecycle_metadata_uses_injected_clock(tmp_path):
+    """Pending rows stay nonterminal and terminal transitions get one clock age."""
+    now = [1000.0]
+    store = Store(tmp_path / "operation-metadata.sqlite", clock=lambda: now[0])
+
+    pending = store.begin_repository_add_operation(
+        "operation-pending", "acme/pending", None
+    )
+    assert pending["created_at"] == 1000.0
+    assert pending["updated_at"] == 1000.0
+    assert pending["terminal_at"] is None
+
+    # Idempotent lookup/replay does not refresh age and cannot shorten retention.
+    now[0] = 1010.0
+    replayed = store.begin_repository_add_operation(
+        "operation-pending", "acme/pending", None
+    )
+    assert replayed["created_at"] == 1000.0
+    assert replayed["updated_at"] == 1000.0
+    assert replayed["terminal_at"] is None
+
+    now[0] = 1020.0
+    failed = store.fail_repository_add_operation(
+        "operation-pending", "repository lookup failed"
+    )
+    assert failed["state"] == "FAILED"
+    assert failed["created_at"] == 1000.0
+    assert failed["updated_at"] == 1020.0
+    assert failed["terminal_at"] == 1020.0
+
+    now[0] = 1030.0
+    store.begin_repository_add_operation(
+        "operation-committed", "acme/committed", "release"
+    )
+    now[0] = 1040.0
+    repository = store.add_repository_for_operation(
+        "operation-committed", "acme/committed", "release", 0.72
+    )
+    committed = store.get_repository_add_operation("operation-committed")
+    assert committed["state"] == "COMMITTED"
+    assert committed["repository_id"] == repository["id"]
+    assert committed["created_at"] == 1030.0
+    assert committed["updated_at"] == 1040.0
+    assert committed["terminal_at"] == 1040.0
+
+
+def test_repository_add_operation_schema_migrates_existing_rows_conservatively(tmp_path):
+    """Legacy operation rows survive upgrade and start a fresh retention window."""
+    path = tmp_path / "legacy-operation.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        PRAGMA foreign_keys=ON;
+        CREATE TABLE repositories (
+            id INTEGER PRIMARY KEY,
+            github_repository TEXT NOT NULL UNIQUE,
+            target_branch TEXT NOT NULL,
+            similarity_threshold REAL NOT NULL,
+            tracked INTEGER NOT NULL DEFAULT 1 CHECK (tracked IN (0, 1))
+        );
+        CREATE TABLE repository_add_operations (
+            operation_id TEXT PRIMARY KEY,
+            github_repository TEXT NOT NULL,
+            target_branch TEXT,
+            state TEXT NOT NULL CHECK (state IN ('PENDING', 'COMMITTED', 'FAILED')),
+            repository_id INTEGER REFERENCES repositories(id),
+            error TEXT
+        );
+        INSERT INTO repositories(
+            id, github_repository, target_branch, similarity_threshold, tracked
+        ) VALUES (7, 'acme/committed', 'main', 0.72, 1);
+        INSERT INTO repository_add_operations VALUES
+            ('pending', 'acme/pending', NULL, 'PENDING', NULL, NULL),
+            ('committed', 'acme/committed', 'main', 'COMMITTED', 7, NULL),
+            ('failed', 'acme/failed', NULL, 'FAILED', NULL, 'not found');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    store = Store(path, clock=lambda: 5000.0)
+    pending = store.get_repository_add_operation("pending")
+    committed = store.get_repository_add_operation("committed")
+    failed = store.get_repository_add_operation("failed")
+
+    for operation in (pending, committed, failed):
+        assert operation["created_at"] == 5000.0
+        assert operation["updated_at"] == 5000.0
+    assert pending["terminal_at"] is None
+    assert committed["terminal_at"] == 5000.0
+    assert failed["terminal_at"] == 5000.0
+    assert committed["repository_id"] == 7
+    assert failed["error"] == "not found"
+
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1]: row for row in connection.execute(
+                "PRAGMA table_info(repository_add_operations)"
+            )
+        }
+        assert {"created_at", "updated_at", "terminal_at"} <= columns.keys()
+        indexes = {
+            row[1] for row in connection.execute(
+                "PRAGMA index_list(repository_add_operations)"
+            )
+        }
+        assert "repository_add_operations_terminal_age" in indexes
+
+
+def test_repository_add_operation_purge_is_bounded_and_terminal_only(tmp_path):
+    now = [1000.0]
+    store = Store(tmp_path / "operation-retention.sqlite", clock=lambda: now[0])
+
+    store.begin_repository_add_operation("pending-old", "acme/pending", None)
+    store.begin_repository_add_operation("failed-old-a", "acme/failed-a", None)
+    store.fail_repository_add_operation("failed-old-a", "not found")
+    store.begin_repository_add_operation("failed-old-b", "acme/failed-b", None)
+    store.fail_repository_add_operation("failed-old-b", "not found")
+    store.begin_repository_add_operation("committed-old", "acme/committed", "main")
+    repository = store.add_repository_for_operation(
+        "committed-old", "acme/committed", "main", 0.72
+    )
+
+    now[0] = 1099.0
+    assert store.purge_expired_repository_add_operations(100.0, limit=2) == 0
+    for operation_id in ("pending-old", "failed-old-a", "failed-old-b", "committed-old"):
+        assert store.get_repository_add_operation(operation_id) is not None
+
+    now[0] = 1100.0
+    assert store.purge_expired_repository_add_operations(100.0, limit=2) == 2
+    assert store.get_repository_add_operation("pending-old")["state"] == "PENDING"
+    assert store.get_repository(repository["id"])["github_repository"] == "acme/committed"
+    assert len(store.list_nodes(repository["id"])) == 2
+
+    # A second short transaction drains only the remaining eligible batch. The
+    # old PENDING operation remains recoverable regardless of its age.
+    assert store.purge_expired_repository_add_operations(100.0, limit=2) == 1
+    assert store.purge_expired_repository_add_operations(100.0, limit=2) == 0
+    assert store.get_repository_add_operation("pending-old")["state"] == "PENDING"
+    assert store.get_repository(repository["id"]) is not None
+
+
+def test_repository_add_operation_purge_isolates_recent_and_unrelated_rows(tmp_path):
+    now = [2000.0]
+    store = Store(tmp_path / "operation-retention-isolation.sqlite", clock=lambda: now[0])
+    store.begin_repository_add_operation("expired", "acme/expired", None)
+    store.fail_repository_add_operation("expired", "missing")
+
+    now[0] = 2090.0
+    store.begin_repository_add_operation("recent", "acme/recent", None)
+    store.fail_repository_add_operation("recent", "missing")
+    unrelated = store.add_repository("acme/unrelated", "main", 0.72)
+
+    now[0] = 2101.0
+    assert store.purge_expired_repository_add_operations(100.0, limit=10) == 1
+    assert store.get_repository_add_operation("expired") is None
+    assert store.get_repository_add_operation("recent")["state"] == "FAILED"
+    assert store.get_repository(unrelated["id"])["github_repository"] == "acme/unrelated"
+
+
+def test_repository_add_operation_purge_validates_policy(tmp_path):
+    store = Store(tmp_path / "operation-retention-validation.sqlite")
+    for retention in (0, -1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="retention_seconds"):
+            store.purge_expired_repository_add_operations(retention, limit=1)
+    for limit in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="limit"):
+            store.purge_expired_repository_add_operations(60, limit=limit)
+
+
+def test_terminal_operation_retention_preserves_status_and_idempotent_replay_until_cutoff(tmp_path):
+    """Terminal results remain authoritative through the inclusive retention window."""
+    now = [1000.0]
+    store = Store(tmp_path / "operation-retention-window.sqlite", clock=lambda: now[0])
+
+    store.begin_repository_add_operation("failed-window", "acme/failed-window", None)
+    failed = store.fail_repository_add_operation("failed-window", "not found")
+    store.begin_repository_add_operation(
+        "committed-window", "acme/committed-window", "release"
+    )
+    repository = store.add_repository_for_operation(
+        "committed-window", "acme/committed-window", "release", 0.72
+    )
+
+    now[0] = 1099.999
+    assert store.purge_expired_repository_add_operations(100.0, limit=10) == 0
+    assert store.begin_repository_add_operation(
+        "failed-window", "acme/failed-window", None
+    ) == failed
+    replayed = store.begin_repository_add_operation(
+        "committed-window", "acme/committed-window", "release"
+    )
+    assert replayed["state"] == "COMMITTED"
+    assert replayed["repository_id"] == repository["id"]
+    assert replayed["terminal_at"] == 1000.0
+
+    # Eligibility is inclusive at terminal_at <= now - retention_seconds.
+    now[0] = 1100.0
+    assert store.purge_expired_repository_add_operations(100.0, limit=10) == 2
+    assert store.get_repository_add_operation("failed-window") is None
+    assert store.get_repository_add_operation("committed-window") is None
+    assert store.get_repository(repository["id"])["github_repository"] == (
+        "acme/committed-window"
+    )
+    assert len(store.list_nodes(repository["id"])) == 2
+
+
+def test_cleanup_serializes_with_concurrent_registration_failure_and_commit(tmp_path):
+    """Concurrent lifecycle transitions cannot age-purge PENDING or fresh terminals."""
+    now = [1000.0]
+    store = Store(tmp_path / "operation-retention-concurrency.sqlite", clock=lambda: now[0])
+
+    for index in range(12):
+        operation_id = f"expired-{index}"
+        store.begin_repository_add_operation(
+            operation_id, f"acme/expired-{index}", None
+        )
+        store.fail_repository_add_operation(operation_id, "expired failure")
+
+    pending_ids = [f"active-{index}" for index in range(12)]
+    for index, operation_id in enumerate(pending_ids):
+        store.begin_repository_add_operation(
+            operation_id, f"acme/active-{index}", "main"
+        )
+
+    now[0] = 1200.0
+    start = threading.Barrier(4)
+    errors = []
+
+    def purge_batches():
+        try:
+            start.wait(timeout=2)
+            for _ in range(8):
+                store.purge_expired_repository_add_operations(100.0, limit=2)
+        except BaseException as error:
+            errors.append(error)
+
+    def fail_active():
+        try:
+            start.wait(timeout=2)
+            for index in range(0, 12, 2):
+                store.fail_repository_add_operation(
+                    pending_ids[index], "fresh failure"
+                )
+        except BaseException as error:
+            errors.append(error)
+
+    def commit_active():
+        try:
+            start.wait(timeout=2)
+            for index in range(1, 12, 2):
+                store.add_repository_for_operation(
+                    pending_ids[index], f"acme/active-{index}", "main", 0.72
+                )
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=purge_batches),
+        threading.Thread(target=fail_active),
+        threading.Thread(target=commit_active),
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=2)
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert errors == []
+    for index, operation_id in enumerate(pending_ids):
+        operation = store.get_repository_add_operation(operation_id)
+        expected_state = "FAILED" if index % 2 == 0 else "COMMITTED"
+        assert operation["state"] == expected_state
+        assert operation["terminal_at"] == 1200.0
+        if expected_state == "COMMITTED":
+            repository = store.get_repository(operation["repository_id"])
+            assert repository["github_repository"] == f"acme/active-{index}"
+    assert all(
+        store.get_repository_add_operation(f"expired-{index}") is None
+        for index in range(12)
+    )
+
+
+def test_repository_add_commit_clamps_lifecycle_time_after_clock_rollback(tmp_path):
+    """A backward clock cannot roll back the atomic repository/operation commit."""
+    now = [1000.0]
+    store = Store(tmp_path / "operation-clock-rollback-commit.sqlite", clock=lambda: now[0])
+    store.begin_repository_add_operation(
+        "rollback-commit", "acme/rollback-commit", "release"
+    )
+
+    now[0] = 900.0
+    repository = store.add_repository_for_operation(
+        "rollback-commit", "acme/rollback-commit", "release", 0.72
+    )
+    operation = store.get_repository_add_operation("rollback-commit")
+
+    assert operation["state"] == "COMMITTED"
+    assert operation["created_at"] == 1000.0
+    assert operation["updated_at"] == 1000.0
+    assert operation["terminal_at"] == 1000.0
+    assert operation["repository_id"] == repository["id"]
+    assert store.get_repository(repository["id"])["github_repository"] == (
+        "acme/rollback-commit"
+    )
+    assert len(store.list_nodes(repository["id"])) == 2
+
+    now[0] = 1101.0
+    assert store.purge_expired_repository_add_operations(100.0, limit=10) == 1
+    assert store.get_repository_add_operation("rollback-commit") is None
+    assert store.get_repository(repository["id"]) is not None
+
+
+def test_repository_add_failure_clamps_to_existing_lifecycle_floor(tmp_path):
+    """FAILED settlement cannot precede creation or a prior durable update."""
+    now = [1000.0]
+    path = tmp_path / "operation-clock-rollback-failure.sqlite"
+    store = Store(path, clock=lambda: now[0])
+    store.begin_repository_add_operation(
+        "rollback-failure", "acme/rollback-failure", None
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE repository_add_operations SET updated_at = 1050 WHERE operation_id = ?",
+            ("rollback-failure",),
+        )
+        connection.commit()
+
+    now[0] = 900.0
+    failed = store.fail_repository_add_operation(
+        "rollback-failure", "metadata unavailable"
+    )
+
+    assert failed["state"] == "FAILED"
+    assert failed["created_at"] == 1000.0
+    assert failed["updated_at"] == 1050.0
+    assert failed["terminal_at"] == 1050.0
+    assert failed["error"] == "metadata unavailable"
+    assert store.list_repositories() == []
+
+
+def test_pending_add_recovery_clamps_each_operation_after_clock_rollback(tmp_path):
+    """Startup recovery uses each PENDING row's own durable lifecycle floor."""
+    now = [1000.0]
+    path = tmp_path / "operation-clock-rollback-recovery.sqlite"
+    store = Store(path, clock=lambda: now[0])
+    store.begin_repository_add_operation("rollback-old", "acme/old", None)
+    now[0] = 1100.0
+    store.begin_repository_add_operation("rollback-new", "acme/new", None)
+
+    now[0] = 900.0
+    assert store.recover_pending_repository_add_operations() == 2
+    old = store.get_repository_add_operation("rollback-old")
+    new = store.get_repository_add_operation("rollback-new")
+
+    assert (old["state"], old["updated_at"], old["terminal_at"]) == (
+        "FAILED", 1000.0, 1000.0
+    )
+    assert (new["state"], new["updated_at"], new["terminal_at"]) == (
+        "FAILED", 1100.0, 1100.0
+    )
+    assert store.list_repositories() == []
+
+
+def test_reopening_migrated_operation_history_does_not_rewrite_rows(tmp_path):
+    """Normal startup must not update complete retained idempotency history."""
+    path = tmp_path / "operation-noop-reopen.sqlite"
+    store = Store(path, clock=lambda: 1000.0)
+    for index in range(300):
+        operation_id = f"complete-{index:03d}"
+        store.begin_repository_add_operation(
+            operation_id, f"acme/complete-{index}", None
+        )
+        store.fail_repository_add_operation(operation_id, "retained failure")
+
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE operation_update_audit(count INTEGER NOT NULL);
+            INSERT INTO operation_update_audit VALUES (0);
+            CREATE TRIGGER audit_repository_add_operation_update
+            AFTER UPDATE ON repository_add_operations
+            BEGIN
+                UPDATE operation_update_audit SET count = count + 1;
+            END;
+            """
+        )
+        before = connection.execute(
+            """SELECT operation_id, state, created_at, updated_at, terminal_at
+            FROM repository_add_operations ORDER BY operation_id"""
+        ).fetchall()
+        connection.commit()
+
+    # A different clock makes any accidental startup rewrite observable in both the
+    # audit trigger and row values. Schema/index checks remain safe to repeat.
+    Store(path, clock=lambda: 5000.0)
+    Store(path, clock=lambda: 6000.0)
+
+    with sqlite3.connect(path) as connection:
+        after = connection.execute(
+            """SELECT operation_id, state, created_at, updated_at, terminal_at
+            FROM repository_add_operations ORDER BY operation_id"""
+        ).fetchall()
+        updates = connection.execute(
+            "SELECT count FROM operation_update_audit"
+        ).fetchone()[0]
+    assert updates == 0
+    assert after == before
+
+
+def test_operation_lifecycle_backfill_repairs_only_incomplete_rows(tmp_path):
+    """Selective migration repairs lifecycle metadata without touching valid rows."""
+    path = tmp_path / "operation-selective-backfill.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE repositories (
+            id INTEGER PRIMARY KEY,
+            github_repository TEXT NOT NULL UNIQUE,
+            target_branch TEXT NOT NULL,
+            similarity_threshold REAL NOT NULL,
+            tracked INTEGER NOT NULL DEFAULT 1 CHECK (tracked IN (0, 1))
+        );
+        CREATE TABLE repository_add_operations (
+            operation_id TEXT PRIMARY KEY,
+            github_repository TEXT NOT NULL,
+            target_branch TEXT,
+            state TEXT NOT NULL CHECK (state IN ('PENDING', 'COMMITTED', 'FAILED')),
+            repository_id INTEGER REFERENCES repositories(id),
+            error TEXT,
+            created_at REAL,
+            updated_at REAL,
+            terminal_at REAL
+        );
+        INSERT INTO repository_add_operations VALUES
+            ('complete', 'acme/complete', NULL, 'FAILED', NULL, 'kept', 10, 20, 20),
+            ('missing-created', 'acme/missing-created', NULL, 'FAILED', NULL, 'repair', NULL, 15, NULL),
+            ('regressed-updated', 'acme/regressed-updated', NULL, 'PENDING', NULL, NULL, 30, 25, 99),
+            ('terminal-before-update', 'acme/terminal-before-update', NULL, 'FAILED', NULL, 'repair', 40, 50, 45);
+        CREATE TABLE operation_update_audit(operation_id TEXT PRIMARY KEY, count INTEGER NOT NULL);
+        INSERT INTO operation_update_audit VALUES
+            ('complete', 0), ('missing-created', 0),
+            ('regressed-updated', 0), ('terminal-before-update', 0);
+        CREATE TRIGGER audit_repository_add_operation_update
+        AFTER UPDATE ON repository_add_operations
+        BEGIN
+            UPDATE operation_update_audit
+            SET count = count + 1 WHERE operation_id = NEW.operation_id;
+        END;
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    store = Store(path, clock=lambda: 1000.0)
+    complete = store.get_repository_add_operation("complete")
+    missing = store.get_repository_add_operation("missing-created")
+    pending = store.get_repository_add_operation("regressed-updated")
+    terminal = store.get_repository_add_operation("terminal-before-update")
+
+    assert (complete["created_at"], complete["updated_at"], complete["terminal_at"]) == (
+        10.0, 20.0, 20.0
+    )
+    assert (missing["created_at"], missing["updated_at"], missing["terminal_at"]) == (
+        1000.0, 1000.0, 1000.0
+    )
+    assert (pending["created_at"], pending["updated_at"], pending["terminal_at"]) == (
+        30.0, 30.0, None
+    )
+    assert (terminal["created_at"], terminal["updated_at"], terminal["terminal_at"]) == (
+        40.0, 50.0, 50.0
+    )
+    with sqlite3.connect(path) as connection:
+        counts = dict(connection.execute(
+            "SELECT operation_id, count FROM operation_update_audit"
+        ))
+    assert counts == {
+        "complete": 0,
+        "missing-created": 1,
+        "regressed-updated": 1,
+        "terminal-before-update": 1,
+    }

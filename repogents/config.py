@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,11 @@ class ServiceConfig:
     similarity_threshold: float = 0.75
     promotion_threshold: int = 3
     stale_run_threshold: int = 3
+    github_request_timeout: float = 30.0
+    git_command_timeout: float = 300.0
+    http_request_io_timeout: float = 30.0
+    repository_add_operation_retention_seconds: float = 7 * 24 * 60 * 60
+    repository_add_operation_cleanup_batch_size: int = 100
 
     @classmethod
     def from_env(cls) -> "ServiceConfig":
@@ -41,6 +47,21 @@ class ServiceConfig:
             stale_run_threshold=int(
                 os.getenv("REPOGENTS_NODE_STALE_RUN_THRESHOLD", "3")
             ),
+            github_request_timeout=float(
+                os.getenv("REPOGENTS_GITHUB_REQUEST_TIMEOUT", "30")
+            ),
+            git_command_timeout=float(
+                os.getenv("REPOGENTS_GIT_COMMAND_TIMEOUT", "300")
+            ),
+            http_request_io_timeout=float(
+                os.getenv("REPOGENTS_HTTP_REQUEST_IO_TIMEOUT", "30")
+            ),
+            repository_add_operation_retention_seconds=float(
+                os.getenv("REPOGENTS_ADD_OPERATION_RETENTION_SECONDS", str(7 * 24 * 60 * 60))
+            ),
+            repository_add_operation_cleanup_batch_size=int(
+                os.getenv("REPOGENTS_ADD_OPERATION_CLEANUP_BATCH_SIZE", "100")
+            ),
         )
         if not config.host:
             raise ValueError("REPOGENTS_LAN_HOST must be nonempty")
@@ -54,4 +75,34 @@ class ServiceConfig:
             )
         if config.promotion_threshold <= 0 or config.stale_run_threshold <= 0:
             raise ValueError("node thresholds must be positive")
+        if (
+            not math.isfinite(config.github_request_timeout)
+            or config.github_request_timeout <= 0
+        ):
+            raise ValueError(
+                "REPOGENTS_GITHUB_REQUEST_TIMEOUT must be finite and positive"
+            )
+        if (
+            not math.isfinite(config.git_command_timeout)
+            or config.git_command_timeout <= 0
+        ):
+            raise ValueError(
+                "REPOGENTS_GIT_COMMAND_TIMEOUT must be finite and positive"
+            )
+        if (
+            not math.isfinite(config.http_request_io_timeout)
+            or config.http_request_io_timeout <= 0
+        ):
+            raise ValueError(
+                "REPOGENTS_HTTP_REQUEST_IO_TIMEOUT must be finite and positive"
+            )
+        if (
+            not math.isfinite(config.repository_add_operation_retention_seconds)
+            or config.repository_add_operation_retention_seconds <= 0
+        ):
+            raise ValueError(
+                "REPOGENTS_ADD_OPERATION_RETENTION_SECONDS must be finite and positive"
+            )
+        if config.repository_add_operation_cleanup_batch_size <= 0:
+            raise ValueError("REPOGENTS_ADD_OPERATION_CLEANUP_BATCH_SIZE must be positive")
         return config

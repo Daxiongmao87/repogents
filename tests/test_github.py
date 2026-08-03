@@ -1,7 +1,13 @@
 from base64 import b64decode
 from dataclasses import FrozenInstanceError
+import json
 from types import SimpleNamespace
+import os
+from pathlib import Path
+import shutil
 import subprocess
+import threading
+import time
 
 import pytest
 
@@ -11,6 +17,7 @@ from repogents.github import (
     GitHubFeedback,
     GitHubIssue,
     PullRequest,
+    _GitWorkspaceSnapshot,
 )
 
 
@@ -112,20 +119,27 @@ def test_default_request_authenticates_and_decodes_repository_json(monkeypatch):
     class Response:
         headers = {"Content-Type": "application/json; charset=utf-8"}
 
+        def __init__(self):
+            self._consumed = False
+
         def __enter__(self):
             return self
 
         def __exit__(self, exc_type, exc, traceback):
             return False
 
-        def read(self):
+        def read(self, size=-1):
+            if self._consumed:
+                return b""
+            self._consumed = True
             return (
                 b'{"full_name":"acme/widgets","default_branch":"main",'
                 b'"clone_url":"https://github.com/acme/widgets.git"}'
             )
 
-    def urlopen(request):
+    def urlopen(request, *, timeout):
         captured["request"] = request
+        captured["timeout"] = timeout
         return Response()
 
     monkeypatch.setattr("urllib.request.urlopen", urlopen)
@@ -136,6 +150,7 @@ def test_default_request_authenticates_and_decodes_repository_json(monkeypatch):
     assert request.method == "GET"
     assert request.full_url == "https://api.example.test/repos/acme/widgets"
     assert request.get_header("Authorization") == "Bearer placeholder-token"
+    assert 0 < captured["timeout"] <= 30.0
 
 
 def test_list_ready_issues_requests_the_ready_open_issue_set():
@@ -290,6 +305,201 @@ def test_checkout_clones_the_target_branch_into_a_new_workspace(tmp_path):
     assert "placeholder-token" not in repr(command_calls)
 
 
+def test_checkout_cleans_partial_workspace_after_clone_timeout_and_retries(tmp_path):
+    workspace = tmp_path / "widgets"
+    command_calls = []
+    clone_attempts = 0
+
+    def request(method, path, *, query=None, json_body=None):
+        return {
+            "full_name": "acme/widgets",
+            "default_branch": "main",
+            "clone_url": "https://github.com/acme/widgets.git",
+        }
+
+    def command_runner(args, *, cwd=None, env=None):
+        nonlocal clone_attempts
+        command_calls.append((args, cwd, env))
+        if args[1] == "clone":
+            clone_attempts += 1
+            (workspace / ".git").mkdir(parents=True)
+            (workspace / ".git" / "config").write_text("partial", encoding="utf-8")
+            if clone_attempts == 1:
+                raise subprocess.TimeoutExpired(args, timeout=300.0)
+            (workspace / "README.md").write_text("complete", encoding="utf-8")
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token", request=request, command_runner=command_runner
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client.checkout("acme/widgets", "main", workspace)
+
+    assert captured.value.timeout == 300.0
+    assert not workspace.exists()
+    assert client.checkout("acme/widgets", "main", workspace) == workspace
+    assert clone_attempts == 2
+    assert (workspace / ".git" / "config").read_text(encoding="utf-8") == "partial"
+    assert (workspace / "README.md").read_text(encoding="utf-8") == "complete"
+    assert [call[0][1] for call in command_calls] == ["clone", "clone"]
+
+
+def test_checkout_clone_timeout_never_removes_preexisting_workspace(tmp_path):
+    workspace = tmp_path / "caller-owned"
+    workspace.mkdir()
+    sentinel = workspace / "keep.txt"
+    sentinel.write_text("caller data", encoding="utf-8")
+
+    def request(method, path, *, query=None, json_body=None):
+        return {
+            "full_name": "acme/widgets",
+            "default_branch": "main",
+            "clone_url": "https://github.com/acme/widgets.git",
+        }
+
+    def command_runner(args, *, cwd=None, env=None):
+        (workspace / ".git").mkdir()
+        raise subprocess.TimeoutExpired(args, timeout=300.0)
+
+    client = GitHubClient(
+        "placeholder-token", request=request, command_runner=command_runner
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        client.checkout("acme/widgets", "main", workspace)
+
+    assert workspace.is_dir()
+    assert sentinel.read_text(encoding="utf-8") == "caller data"
+    assert not (workspace / ".git").exists()
+
+
+def test_checkout_cleans_partial_clone_from_preexisting_empty_workspace_and_retries(tmp_path):
+    workspace = tmp_path / "existing-empty"
+    workspace.mkdir()
+    command_calls = []
+    clone_attempts = 0
+
+    def request(method, path, *, query=None, json_body=None):
+        return {
+            "full_name": "acme/widgets",
+            "default_branch": "main",
+            "clone_url": "https://github.com/acme/widgets.git",
+        }
+
+    def command_runner(args, *, cwd=None, env=None):
+        nonlocal clone_attempts
+        command_calls.append((args, cwd, env))
+        assert args[1] == "clone"
+        clone_attempts += 1
+        (workspace / ".git" / "objects").mkdir(parents=True)
+        (workspace / ".git" / "config").write_text("partial", encoding="utf-8")
+        (workspace / "clone-created.tmp").write_text("partial", encoding="utf-8")
+        if clone_attempts == 1:
+            raise subprocess.TimeoutExpired(args, timeout=300.0)
+        (workspace / "README.md").write_text("complete", encoding="utf-8")
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token", request=request, command_runner=command_runner
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client.checkout("acme/widgets", "release", workspace)
+
+    assert captured.value.timeout == 300.0
+    assert workspace.is_dir()
+    assert list(workspace.iterdir()) == []
+
+    assert client.checkout("acme/widgets", "release", workspace) == workspace
+    assert clone_attempts == 2
+    assert [call[0][1] for call in command_calls] == ["clone", "clone"]
+    assert all("release" in call[0] for call in command_calls)
+    assert (workspace / ".git" / "config").read_text(encoding="utf-8") == "partial"
+    assert (workspace / "README.md").read_text(encoding="utf-8") == "complete"
+
+
+def test_checkout_timeout_preserves_preexisting_directory_tree_and_valid_checkout(tmp_path):
+    workspace = tmp_path / "caller-owned"
+    nested = workspace / "notes" / "archive"
+    nested.mkdir(parents=True)
+    sentinel = nested / "keep.txt"
+    sentinel.write_text("caller data", encoding="utf-8")
+
+    def request(method, path, *, query=None, json_body=None):
+        return {
+            "full_name": "acme/widgets",
+            "default_branch": "main",
+            "clone_url": "https://github.com/acme/widgets.git",
+        }
+
+    def timed_out_clone(args, *, cwd=None, env=None):
+        (workspace / ".git" / "objects").mkdir(parents=True)
+        (workspace / "clone-created.tmp").write_text("partial", encoding="utf-8")
+        raise subprocess.TimeoutExpired(args, timeout=300.0)
+
+    client = GitHubClient(
+        "placeholder-token", request=request, command_runner=timed_out_clone
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        client.checkout("acme/widgets", "main", workspace)
+
+    assert workspace.is_dir()
+    assert sentinel.read_text(encoding="utf-8") == "caller data"
+    assert (workspace / "notes").is_dir()
+    assert not (workspace / ".git").exists()
+    assert not (workspace / "clone-created.tmp").exists()
+
+    valid_workspace = tmp_path / "valid"
+    (valid_workspace / ".git").mkdir(parents=True)
+    valid_sentinel = valid_workspace / "keep.txt"
+    valid_sentinel.write_text("valid checkout", encoding="utf-8")
+    calls = []
+
+    def existing_runner(args, *, cwd=None, env=None):
+        calls.append((args, cwd, env))
+        return SimpleNamespace(stdout="")
+
+    existing_client = GitHubClient(
+        "placeholder-token", request=request, command_runner=existing_runner
+    )
+    assert existing_client.checkout("acme/widgets", "main", valid_workspace) == valid_workspace
+    assert valid_sentinel.read_text(encoding="utf-8") == "valid checkout"
+    assert [call[0][1] for call in calls] == ["fetch", "checkout", "pull"]
+
+
+def test_checkout_non_timeout_clone_failure_preserves_error_and_partial_destination(tmp_path):
+    workspace = tmp_path / "failed-clone"
+    command_error = subprocess.CalledProcessError(
+        128,
+        ["git", "clone"],
+        stderr="fatal: repository unavailable",
+    )
+
+    def request(method, path, *, query=None, json_body=None):
+        return {
+            "full_name": "acme/widgets",
+            "default_branch": "main",
+            "clone_url": "https://github.com/acme/widgets.git",
+        }
+
+    def command_runner(args, *, cwd=None, env=None):
+        (workspace / ".git").mkdir(parents=True)
+        (workspace / "clone.log").write_text("diagnostic", encoding="utf-8")
+        raise command_error
+
+    client = GitHubClient(
+        "placeholder-token", request=request, command_runner=command_runner
+    )
+
+    with pytest.raises(subprocess.CalledProcessError) as captured:
+        client.checkout("acme/widgets", "main", workspace)
+
+    assert captured.value is command_error
+    assert (workspace / ".git").is_dir()
+    assert (workspace / "clone.log").read_text(encoding="utf-8") == "diagnostic"
+
+
 def test_checkout_updates_an_existing_target_branch_workspace(tmp_path):
     workspace = tmp_path / "widgets"
     (workspace / ".git").mkdir(parents=True)
@@ -367,6 +577,7 @@ def test_default_request_uses_the_github_diff_media_type(monkeypatch):
     class Response:
         def __init__(self, body, content_type):
             self._body = body
+            self._consumed = False
             self.headers = {"Content-Type": content_type}
 
         def __enter__(self):
@@ -375,10 +586,14 @@ def test_default_request_uses_the_github_diff_media_type(monkeypatch):
         def __exit__(self, exc_type, exc, traceback):
             return False
 
-        def read(self):
+        def read(self, size=-1):
+            if self._consumed:
+                return b""
+            self._consumed = True
             return self._body
 
-    def urlopen(request):
+    def urlopen(request, *, timeout):
+        assert 0 < timeout <= 30.0
         requests.append(request)
         if request.get_header("Accept") == "application/vnd.github.diff":
             return Response(diff, "text/plain; charset=utf-8")
@@ -1950,3 +2165,1940 @@ def test_publish_commit_supplies_service_local_git_identity(tmp_path):
     commit_config = _git_config(commit_call[2])
     assert commit_config["user.name"]
     assert commit_config["user.email"]
+
+
+@pytest.mark.parametrize(
+    ("argument", "value", "message"),
+    [
+        ("transport_timeout", float("nan"), "transport_timeout"),
+        ("transport_timeout", float("inf"), "transport_timeout"),
+        ("transport_timeout", float("-inf"), "transport_timeout"),
+        ("transport_timeout", 0.0, "transport_timeout"),
+        ("transport_timeout", -1.0, "transport_timeout"),
+        ("git_command_timeout", float("nan"), "git_command_timeout"),
+        ("git_command_timeout", float("inf"), "git_command_timeout"),
+        ("git_command_timeout", float("-inf"), "git_command_timeout"),
+        ("git_command_timeout", 0.0, "git_command_timeout"),
+        ("git_command_timeout", -1.0, "git_command_timeout"),
+    ],
+)
+def test_github_client_rejects_invalid_independent_timeout_budgets(
+    argument, value, message
+):
+    with pytest.raises(ValueError, match=message):
+        GitHubClient("placeholder-token", **{argument: value})
+
+
+def test_default_git_runner_uses_independent_transfer_timeout(monkeypatch, tmp_path):
+    calls = []
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, args, **kwargs):
+            calls.append((args, kwargs))
+
+        def communicate(self, *, timeout):
+            assert timeout == 600.0
+            return "", ""
+
+    monkeypatch.setattr("subprocess.Popen", Process)
+    client = GitHubClient(
+        "placeholder-token",
+        transport_timeout=11.0,
+        git_command_timeout=600.0,
+    )
+
+    for command in (
+        ["git", "clone", "https://example.test/acme/widget.git", "widget"],
+        ["git", "fetch", "origin", "main"],
+        ["git", "pull", "--ff-only", "origin", "main"],
+        ["git", "push", "origin", "agent/issue-7"],
+    ):
+        result = client._default_command_runner(
+            command, cwd=tmp_path, env={"GIT_TERMINAL_PROMPT": "0"}
+        )
+        assert result.returncode == 0
+
+    assert [call[0] for call in calls] == [
+        ["git", "clone", "https://example.test/acme/widget.git", "widget"],
+        ["git", "fetch", "origin", "main"],
+        ["git", "pull", "--ff-only", "origin", "main"],
+        ["git", "push", "origin", "agent/issue-7"],
+    ]
+    assert all(call[1]["cwd"] == tmp_path for call in calls)
+    assert all(call[1]["stdout"] is subprocess.PIPE for call in calls)
+    assert all(call[1]["stderr"] is subprocess.PIPE for call in calls)
+    assert all(call[1]["text"] is True for call in calls)
+    assert all(call[1]["env"]["GIT_TERMINAL_PROMPT"] == "0" for call in calls)
+    if os.name == "nt":
+        assert all(
+            call[1]["creationflags"] == subprocess.CREATE_NEW_PROCESS_GROUP
+            for call in calls
+        )
+    else:
+        assert all(call[1]["start_new_session"] is True for call in calls)
+
+
+def test_http_and_git_timeout_defaults_are_distinct():
+    client = GitHubClient("placeholder-token")
+
+    assert client._transport_timeout == 30.0
+    assert client._git_command_timeout == 300.0
+    assert client._git_command_timeout > client._transport_timeout
+
+
+def test_default_http_request_uses_http_budget_not_git_budget(monkeypatch):
+    captured = {}
+
+    class Response:
+        headers = {"Content-Type": "application/json"}
+
+        def __init__(self):
+            self._consumed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size=-1):
+            if self._consumed:
+                return b""
+            self._consumed = True
+            return b'{"full_name":"acme/widget","default_branch":"main"}'
+
+    def urlopen(request, *, timeout):
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    client = GitHubClient(
+        "placeholder-token",
+        transport_timeout=12.5,
+        git_command_timeout=900.0,
+    )
+
+    assert client.repository("acme/widget")["default_branch"] == "main"
+    assert 0 < captured["timeout"] <= 12.5
+
+
+@pytest.mark.parametrize("command", ["checkout", "pull", "commit", "rebase"])
+def test_mutating_git_timeout_recovers_workspace_and_allows_retry(tmp_path, command):
+    """Each supported timed-out mutation leaves a reusable, lock-free workspace."""
+    workspace = tmp_path / command
+    git_dir = workspace / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    original_head = "1" * 40
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git_dir / "refs" / "heads" / "main").write_text(
+        original_head + "\n", encoding="ascii"
+    )
+    caller_content = workspace / "generated.txt"
+    caller_content.write_text("keep generated work", encoding="utf-8")
+    calls = []
+    timed_out = [True]
+
+    target_args = {
+        "checkout": ["git", "checkout", "feature"],
+        "pull": ["git", "pull", "--ff-only", "origin", "main"],
+        "commit": ["git", "commit", "-m", "Resolve issue #7"],
+        "rebase": ["git", "rebase", "origin/main"],
+    }[command]
+
+    def command_runner(args, *, cwd=None, env=None):
+        calls.append((list(args), cwd, env))
+        if args == target_args and timed_out[0]:
+            timed_out[0] = False
+            (git_dir / "index.lock").write_text("locked", encoding="utf-8")
+            # Model an unintended branch/worktree transition plus operation state.
+            (git_dir / "HEAD").write_text(
+                "ref: refs/heads/interrupted\n", encoding="utf-8"
+            )
+            (git_dir / "refs" / "heads" / "interrupted").write_text(
+                "2" * 40 + "\n", encoding="ascii"
+            )
+            if command == "rebase":
+                (git_dir / "rebase-merge").mkdir()
+                (git_dir / "rebase-merge" / "head-name").write_text(
+                    "refs/heads/main", encoding="utf-8"
+                )
+            raise subprocess.TimeoutExpired(args, timeout=300.0)
+        if args in (
+            ["git", "checkout", "main"],
+            ["git", "checkout", "--force", "main"],
+        ):
+            (git_dir / "HEAD").write_text(
+                "ref: refs/heads/main\n", encoding="utf-8"
+            )
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token", request=lambda *_args, **_kwargs: None,
+        command_runner=command_runner,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client._run_mutating_git(
+            target_args, workspace=workspace, env=client._git_command_env
+        )
+
+    assert captured.value.cmd == target_args
+    assert captured.value.timeout == 300.0
+    assert not (git_dir / "index.lock").exists()
+    assert not (git_dir / "rebase-merge").exists()
+    assert (git_dir / "HEAD").read_text(encoding="utf-8") == (
+        "ref: refs/heads/main\n"
+    )
+    assert caller_content.read_text(encoding="utf-8") == "keep generated work"
+    expected_checkout = (
+        ["git", "checkout", "--force", "main"]
+        if command in {"checkout", "pull"}
+        else ["git", "checkout", "main"]
+    )
+    expected_reset = [
+        "git",
+        "reset",
+        "--hard" if command in {"checkout", "pull"} else "--mixed",
+        original_head,
+    ]
+    assert expected_checkout in [call[0] for call in calls]
+    assert expected_reset in [call[0] for call in calls]
+    if command == "rebase":
+        assert ["git", "rebase", "--abort"] in [call[0] for call in calls]
+
+    # A later poll/publish attempt can use the same workspace without manual cleanup.
+    result = client._run_mutating_git(
+        target_args, workspace=workspace, env=client._git_command_env
+    )
+    assert result.stdout == ""
+    assert calls[-1][0] == target_args
+
+
+def test_incomplete_mutation_timeout_recovery_marks_workspace_unusable_and_preserves_timeout(tmp_path):
+    """A failed in-place restore cannot be hidden by a different exception or reused."""
+    workspace = tmp_path / "damaged"
+    git_dir = workspace / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    original_head = "1" * 40
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git_dir / "refs" / "heads" / "main").write_text(
+        original_head + "\n", encoding="ascii"
+    )
+    caller_content = workspace / "generated.txt"
+    caller_content.write_text("preserve me", encoding="utf-8")
+    target_args = ["git", "checkout", "feature"]
+    timeout = subprocess.TimeoutExpired(target_args, timeout=300.0)
+
+    def command_runner(args, *, cwd=None, env=None):
+        if args == target_args:
+            (git_dir / "index.lock").write_text("locked", encoding="utf-8")
+            (git_dir / "HEAD").write_text(
+                "ref: refs/heads/interrupted\n", encoding="utf-8"
+            )
+            raise timeout
+        if args == ["git", "reset", "--hard", original_head]:
+            raise subprocess.CalledProcessError(128, args, stderr="reset failed")
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=lambda *_args, **_kwargs: None,
+        command_runner=command_runner,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client._run_mutating_git(
+            target_args, workspace=workspace, env=client._git_command_env
+        )
+
+    assert captured.value is timeout
+    assert not (git_dir / "index.lock").exists()
+    assert caller_content.read_text(encoding="utf-8") == "preserve me"
+    marker = git_dir / "repogents-workspace-unusable"
+    assert marker.is_file()
+    assert "could not restore pre-timeout Git HEAD" in marker.read_text(
+        encoding="utf-8"
+    )
+    diagnostics = getattr(timeout, "__notes__", None) or getattr(
+        timeout, "repogents_recovery_errors", []
+    )
+    assert any("could not fully recover Git workspace" in detail for detail in diagnostics)
+
+    with pytest.raises(RuntimeError, match="requires recreation"):
+        client.checkout("acme/widgets", "main", workspace)
+    assert caller_content.read_text(encoding="utf-8") == "preserve me"
+
+
+def test_checkout_and_publish_route_timeout_sensitive_mutations_through_recovery():
+    source = Path(__file__).resolve().parents[1] / "repogents" / "github.py"
+    implementation = source.read_text(encoding="utf-8")
+
+    assert 'if args[1] in {"checkout", "pull"}' in implementation
+    assert implementation.count("self._run_mutating_git(") >= 5
+    assert '["git", "commit", "-m", f"Resolve issue #{issue_number}"]' in implementation
+    assert '["git", "rebase", f"origin/{target_branch}"]' in implementation
+
+
+@pytest.mark.parametrize(
+    ("path", "content_type", "chunks"),
+    [
+        (
+            "/repos/acme/widget",
+            "application/json; charset=utf-8",
+            [b'{"full_name":"acme/widget",', b'"default_branch":"main"}'],
+        ),
+        (
+            "/repos/acme/widget/pulls/7.diff",
+            "text/plain; charset=utf-8",
+            [b"diff --git a/old.py ", b"b/new.py\n"],
+        ),
+    ],
+)
+def test_default_request_enforces_total_deadline_while_reading_response_body(
+    monkeypatch, path, content_type, chunks
+):
+    """Trickle chunks below inactivity timeout cannot renew the total HTTP budget."""
+    clock = [100.0]
+    read_calls = []
+
+    class Response:
+        headers = {"Content-Type": content_type}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size=-1):
+            read_calls.append(size)
+            # Each individual read completes before the configured 1-second socket
+            # inactivity timeout, but the complete body exceeds that same total budget.
+            clock[0] += 0.6
+            return chunks.pop(0) if chunks else b""
+
+    def urlopen(request, *, timeout):
+        assert 0 < timeout <= 1.0
+        return Response()
+
+    monkeypatch.setattr("repogents.github.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    client = GitHubClient("placeholder-token", transport_timeout=1.0)
+
+    with pytest.raises(TimeoutError, match="total transport deadline"):
+        client._default_request("GET", path)
+
+    assert read_calls == [64 * 1024, 64 * 1024]
+
+
+def test_default_request_preserves_successful_chunked_json_and_diff_decoding(monkeypatch):
+    """Bounded body reads preserve complete successful JSON and text responses."""
+    clock = [200.0]
+    responses = [
+        (
+            "application/json; charset=utf-8",
+            [b'{"full_name":"acme/widget",', b'"default_branch":"main"}', b""],
+        ),
+        ("text/plain; charset=utf-8", [b"diff --git ", b"a/old b/new\n", b""]),
+    ]
+    socket_timeouts = []
+
+    class Socket:
+        def settimeout(self, timeout):
+            socket_timeouts.append(timeout)
+
+    class Response:
+        def __init__(self, content_type, chunks):
+            self.headers = {"Content-Type": content_type}
+            self.chunks = chunks
+            self.fp = SimpleNamespace(raw=SimpleNamespace(_sock=Socket()))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size=-1):
+            assert size == 64 * 1024
+            clock[0] += 0.1
+            return self.chunks.pop(0)
+
+    def urlopen(request, *, timeout):
+        content_type, chunks = responses.pop(0)
+        return Response(content_type, chunks)
+
+    monkeypatch.setattr("repogents.github.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    client = GitHubClient("placeholder-token", transport_timeout=1.0)
+
+    assert client._default_request("GET", "/repos/acme/widget") == {
+        "full_name": "acme/widget",
+        "default_branch": "main",
+    }
+    assert client._default_request("GET", "/repos/acme/widget/pulls/7.diff") == (
+        "diff --git a/old b/new\n"
+    )
+    assert len(socket_timeouts) == 6
+    assert all(0 < timeout <= 1.0 for timeout in socket_timeouts)
+
+
+def test_slow_github_response_deadline_releases_lookup_capacity_without_late_commit(
+    monkeypatch, tmp_path
+):
+    """A timed-out metadata body settles FAILED and the fixed slot is reusable."""
+    import time
+
+    from repogents.application import Application, ApplicationConfig
+    from repogents.store import Store
+
+    read_started = threading.Event()
+    request_count = 0
+
+    class SlowResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __init__(self):
+            self.chunks = [
+                b'{"full_name":"acme/slow",',
+                b'"default_branch":"main",',
+                b'"clone_url":"https://example.test/acme/slow.git"}',
+                b"",
+            ]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size=-1):
+            assert size == 64 * 1024
+            read_started.set()
+            time.sleep(0.025)  # below the 60ms inactivity budget per read
+            return self.chunks.pop(0)
+
+    class FastResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size=-1):
+            assert size == 64 * 1024
+            if hasattr(self, "done"):
+                return b""
+            self.done = True
+            return (
+                b'{"full_name":"acme/recovered","default_branch":"main",'
+                b'"clone_url":"https://example.test/acme/recovered.git"}'
+            )
+
+    def urlopen(_request, *, timeout):
+        nonlocal request_count
+        request_count += 1
+        assert timeout > 0
+        return SlowResponse() if request_count == 1 else FastResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    github = GitHubClient("placeholder-token", transport_timeout=0.06)
+    store = Store(tmp_path / "state.sqlite3")
+    app = Application(
+        store,
+        github,
+        object(),
+        object(),
+        ApplicationConfig(
+            data_dir=tmp_path / "runtime",
+            add_repository_lookup_timeout=0.5,
+            add_repository_lookup_max_workers=1,
+        ),
+    )
+    try:
+        with pytest.raises(TimeoutError, match="total transport deadline"):
+            app.add_repository("acme/slow", operation_id="slow-response")
+
+        assert read_started.is_set()
+        operation = app.repository_add_operation("slow-response")
+        assert operation is not None
+        assert operation["state"] == "FAILED", operation
+        assert store.list_repositories() == []
+
+        recovered = app.add_repository(
+            "acme/recovered", operation_id="recovered-response"
+        )
+        assert recovered["github_repository"] == "acme/recovered"
+        assert app.repository_add_operation("recovered-response")["state"] == "COMMITTED"
+        assert request_count == 2
+    finally:
+        app.close()
+
+
+def test_slow_github_response_cannot_outlive_poller_service_ownership(
+    monkeypatch, tmp_path
+):
+    """Shutdown retains ownership until a slow response expires and poller exits."""
+    import time
+
+    from repogents.http_api import HttpService
+    from repogents.service_ownership import (
+        ServiceOwnership,
+        ServiceOwnershipUnavailableError,
+    )
+
+    ownership_path = tmp_path / ".repogents-service.lock"
+    read_started = threading.Event()
+    mutations = []
+
+    class SlowResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __init__(self):
+            self.chunks = [b"[", b"]", b" ", b" ", b""]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size=-1):
+            assert size == 64 * 1024
+            read_started.set()
+            time.sleep(0.12)  # each chunk is below the 400ms inactivity timeout
+            return self.chunks.pop(0)
+
+    def urlopen(_request, *, timeout):
+        assert timeout > 0
+        return SlowResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    github = GitHubClient("placeholder-token", transport_timeout=0.4)
+
+    class PollingApplication:
+        def __init__(self):
+            self.ownership = ServiceOwnership(ownership_path)
+            self.closed = False
+
+        def acquire_service_ownership(self):
+            self.ownership.acquire()
+
+        def poll_once(self):
+            github._default_request("GET", "/repos/acme/widget/issues")
+            mutations.append("late-poller-mutation")
+
+        def state(self):
+            return {"repositories": []}
+
+        def close(self):
+            self.closed = True
+            self.ownership.close()
+
+    application = PollingApplication()
+    service = HttpService(application, "127.0.0.1", 0, 60)
+    serving = threading.Thread(target=service.serve_forever)
+    serving.start()
+    assert read_started.wait(timeout=1)
+
+    service.shutdown()
+    serving.join(timeout=0.05)
+    assert serving.is_alive()
+    assert application.ownership.acquired is True
+
+    competitor = ServiceOwnership(ownership_path)
+    with pytest.raises(ServiceOwnershipUnavailableError):
+        competitor.acquire()
+
+    serving.join(timeout=1)
+    assert not serving.is_alive()
+    assert application.closed is True
+    assert application.ownership.acquired is False
+    assert mutations == []
+
+    replacement = ServiceOwnership(ownership_path)
+    replacement.acquire()
+    replacement.close()
+
+
+def test_clone_timeout_cleanup_failure_preserves_timeout_without_add_note(
+    tmp_path, monkeypatch
+):
+    """Python 3.10-compatible diagnostics cannot mask the clone timeout."""
+    workspace = tmp_path / "partial-cleanup-failure"
+
+    class TimeoutWithoutAddNote(subprocess.TimeoutExpired):
+        add_note = None
+
+    clone_args = [
+        "git",
+        "clone",
+        "--branch",
+        "main",
+        "--single-branch",
+        "https://github.com/acme/widgets.git",
+        str(workspace),
+    ]
+    timeout = TimeoutWithoutAddNote(clone_args, timeout=300.0)
+
+    def request(method, path, *, query=None, json_body=None):
+        return {
+            "full_name": "acme/widgets",
+            "default_branch": "main",
+            "clone_url": "https://github.com/acme/widgets.git",
+        }
+
+    def command_runner(args, *, cwd=None, env=None):
+        assert args == clone_args
+        (workspace / ".git").mkdir(parents=True)
+        raise timeout
+
+    cleanup_error = OSError("cleanup denied")
+
+    def failed_cleanup(path):
+        assert path == workspace
+        raise cleanup_error
+
+    monkeypatch.setattr("repogents.github.shutil.rmtree", failed_cleanup)
+    client = GitHubClient(
+        "placeholder-token", request=request, command_runner=command_runner
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client.checkout("acme/widgets", "main", workspace)
+
+    assert captured.value is timeout
+    assert timeout.add_note is None
+    assert timeout.repogents_recovery_errors == [
+        f"could not remove partial clone workspace {workspace}: cleanup denied"
+    ]
+    assert workspace.is_dir()
+    assert (workspace / ".git").is_dir()
+
+
+def test_clone_timeout_cleanup_diagnostic_uses_exception_note_when_available():
+    """Newer interpreters may retain the same diagnostic through exception notes."""
+    timeout = subprocess.TimeoutExpired(["git", "clone"], timeout=300.0)
+
+    GitHubClient._record_recovery_error(timeout, "clone cleanup failed")
+
+    notes = getattr(timeout, "__notes__", None)
+    if callable(getattr(timeout, "add_note", None)):
+        assert notes == ["clone cleanup failed"]
+        assert not hasattr(timeout, "repogents_recovery_errors")
+    else:
+        assert timeout.repogents_recovery_errors == ["clone cleanup failed"]
+
+
+def test_fast_forward_pull_timeout_restores_tracked_worktree_and_allows_retry(tmp_path):
+    """A post-merge timeout cannot leave upstream tracked changes as local edits."""
+    def git(*args, cwd=None):
+        return subprocess.run(
+            ["git", *args], cwd=cwd, check=True, text=True,
+            capture_output=True, timeout=5,
+        )
+
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    workspace = tmp_path / "workspace"
+    git("init", "--bare", str(remote))
+    git("init", "-b", "main", str(seed))
+    git("config", "user.name", "Repogents Test", cwd=seed)
+    git("config", "user.email", "repogents@example.test", cwd=seed)
+    tracked = seed / "tracked.txt"
+    tracked.write_text("before\n", encoding="utf-8")
+    git("add", "tracked.txt", cwd=seed)
+    git("commit", "-m", "initial", cwd=seed)
+    git("remote", "add", "origin", str(remote), cwd=seed)
+    git("push", "-u", "origin", "main", cwd=seed)
+    git("clone", "--branch", "main", str(remote), str(workspace))
+    pre_pull_head = git("rev-parse", "HEAD", cwd=workspace).stdout.strip()
+
+    tracked.write_text("after\n", encoding="utf-8")
+    git("commit", "-am", "upstream update", cwd=seed)
+    git("push", "origin", "main", cwd=seed)
+    upstream_head = git("rev-parse", "HEAD", cwd=seed).stdout.strip()
+
+    hook = workspace / ".git" / "hooks" / "post-merge"
+    hook.write_text("#!/bin/sh\nsleep 2\n", encoding="utf-8")
+    hook.chmod(0o755)
+    client = GitHubClient(
+        "placeholder-token",
+        request=lambda *_args, **_kwargs: None,
+        git_command_timeout=0.2,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client.checkout("acme/widget", "main", workspace)
+
+    assert captured.value.cmd[:3] == ["git", "pull", "--ff-only"]
+    assert git("rev-parse", "HEAD", cwd=workspace).stdout.strip() == pre_pull_head
+    assert git("symbolic-ref", "--short", "HEAD", cwd=workspace).stdout.strip() == "main"
+    assert (workspace / "tracked.txt").read_text(encoding="utf-8") == "before\n"
+    assert git("status", "--porcelain", cwd=workspace).stdout == ""
+    assert not (workspace / ".git" / "repogents-workspace-unusable").exists()
+
+    # Removing the deliberately slow hook lets the same workspace fast-forward
+    # cleanly; no local tracked changes remain to block the retry.
+    hook.unlink()
+    assert client.checkout("acme/widget", "main", workspace) == workspace
+    assert git("rev-parse", "HEAD", cwd=workspace).stdout.strip() == upstream_head
+    assert (workspace / "tracked.txt").read_text(encoding="utf-8") == "after\n"
+    assert git("status", "--porcelain", cwd=workspace).stdout == ""
+
+
+
+def test_branch_checkout_timeout_restores_tracked_worktree_and_allows_retry(tmp_path):
+    """A post-checkout timeout restores the original branch and tracked files."""
+    def git(*args, cwd=None):
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("unrelated caller content\n", encoding="utf-8")
+    git("init", "--bare", str(remote))
+    git("init", "-b", "main", str(seed))
+    git("config", "user.name", "Repogents Test", cwd=seed)
+    git("config", "user.email", "repogents@example.test", cwd=seed)
+    tracked = seed / "tracked.txt"
+    tracked.write_text("main content\n", encoding="utf-8")
+    git("add", "tracked.txt", cwd=seed)
+    git("commit", "-m", "main content", cwd=seed)
+    git("checkout", "-b", "feature", cwd=seed)
+    tracked.write_text("feature content\n", encoding="utf-8")
+    git("commit", "-am", "feature content", cwd=seed)
+    feature_head = git("rev-parse", "HEAD", cwd=seed).stdout.strip()
+    git("checkout", "main", cwd=seed)
+    git("remote", "add", "origin", str(remote), cwd=seed)
+    git("push", "origin", "main", "feature", cwd=seed)
+    git("clone", "--branch", "main", str(remote), str(workspace))
+    pre_checkout_head = git("rev-parse", "HEAD", cwd=workspace).stdout.strip()
+    generated = workspace / "generated.txt"
+    generated.write_text("untracked generated work\n", encoding="utf-8")
+
+    hook = workspace / ".git" / "hooks" / "post-checkout"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "branch=$(git symbolic-ref --quiet --short HEAD)\n"
+        "if [ \"$branch\" = feature ]; then sleep 2; fi\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    client = GitHubClient(
+        "placeholder-token",
+        request=lambda *_args, **_kwargs: None,
+        git_command_timeout=0.2,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client.checkout("acme/widget", "feature", workspace)
+
+    assert captured.value.cmd[:2] == ["git", "checkout"]
+    assert git("rev-parse", "HEAD", cwd=workspace).stdout.strip() == pre_checkout_head
+    assert git("symbolic-ref", "--short", "HEAD", cwd=workspace).stdout.strip() == "main"
+    assert (workspace / "tracked.txt").read_text(encoding="utf-8") == "main content\n"
+    assert generated.read_text(encoding="utf-8") == "untracked generated work\n"
+    assert outside.read_text(encoding="utf-8") == "unrelated caller content\n"
+    assert git("status", "--porcelain", cwd=workspace).stdout == "?? generated.txt\n"
+    assert not (workspace / ".git" / "repogents-workspace-unusable").exists()
+
+    hook.unlink()
+    assert client.checkout("acme/widget", "feature", workspace) == workspace
+    assert git("rev-parse", "HEAD", cwd=workspace).stdout.strip() == feature_head
+    assert git("symbolic-ref", "--short", "HEAD", cwd=workspace).stdout.strip() == "feature"
+    assert (workspace / "tracked.txt").read_text(encoding="utf-8") == "feature content\n"
+    assert generated.read_text(encoding="utf-8") == "untracked generated work\n"
+    assert outside.read_text(encoding="utf-8") == "unrelated caller content\n"
+    assert git("status", "--porcelain", cwd=workspace).stdout == "?? generated.txt\n"
+
+
+def test_checkout_pull_use_hard_recovery_but_commit_rebase_preserve_generated_work():
+    """Only checkout/pull receive destructive tracked-worktree restoration."""
+    source = Path(__file__).resolve().parents[1] / "repogents" / "github.py"
+    implementation = source.read_text(encoding="utf-8")
+
+    assert 'restores_tracked_worktree = command in {"checkout", "pull"}' in implementation
+    assert 'reset_mode = "--hard" if restores_tracked_worktree else "--mixed"' in implementation
+    assert 'checkout_args.append("--force")' in implementation
+
+
+def test_publication_checkout_timeout_preserves_preexisting_tracked_agent_edits(tmp_path):
+    """A timed-out issue-branch checkout restores the agent's exact tracked state."""
+    def git(*args, cwd=None):
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+
+    def git_bytes(*args, cwd=None):
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+
+    remote = tmp_path / "remote.git"
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("unrelated caller content\n", encoding="utf-8")
+    git("init", "--bare", str(remote))
+    git("init", "-b", "main", str(workspace))
+    git("config", "user.name", "Repogents Test", cwd=workspace)
+    git("config", "user.email", "repogents@example.test", cwd=workspace)
+    (workspace / "staged.txt").write_text("base staged\n", encoding="utf-8")
+    (workspace / "unstaged.txt").write_text("base unstaged\n", encoding="utf-8")
+    (workspace / "mixed.txt").write_text("base mixed\n", encoding="utf-8")
+    (workspace / "binary.dat").write_bytes(b"base\x00binary\xff\n")
+    (workspace / ".gitattributes").write_text("nonutf.txt text\n", encoding="utf-8")
+    (workspace / "nonutf.txt").write_bytes(b"base text\n")
+    git("add", "--all", cwd=workspace)
+    git("commit", "-m", "base", cwd=workspace)
+    git("remote", "add", "origin", str(remote), cwd=workspace)
+    git("push", "--set-upstream", "origin", "main", cwd=workspace)
+    original_head = git("rev-parse", "HEAD", cwd=workspace).stdout.strip()
+
+    # Model generated publication work across both index and worktree layers.
+    (workspace / "staged.txt").write_text("agent staged edit\n", encoding="utf-8")
+    (workspace / "mixed.txt").write_text("agent staged mixed\n", encoding="utf-8")
+    git("add", "staged.txt", "mixed.txt", cwd=workspace)
+    (workspace / "unstaged.txt").write_text("agent unstaged edit\n", encoding="utf-8")
+    (workspace / "binary.dat").write_bytes(b"agent\x00binary\xfe\x01\n")
+    # Git is explicitly told this file is text, so its textual hunk contains the
+    # raw non-UTF-8 byte rather than an ASCII binary patch encoding.
+    (workspace / "nonutf.txt").write_bytes(b"agent text \xff\n")
+    (workspace / "mixed.txt").write_text(
+        "agent staged mixed\nagent unstaged mixed\n", encoding="utf-8"
+    )
+    generated = workspace / "generated.txt"
+    generated.write_text("untracked generated work\n", encoding="utf-8")
+    expected_cached = git_bytes("diff", "--cached", "--binary", cwd=workspace).stdout
+    expected_unstaged = git_bytes("diff", "--binary", cwd=workspace).stdout
+    assert b"agent text \xff" in expected_unstaged
+    expected_status = git("status", "--porcelain", cwd=workspace).stdout
+
+    hook = workspace / ".git" / "hooks" / "post-checkout"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "branch=$(git symbolic-ref --quiet --short HEAD)\n"
+        "case \"$branch\" in agent/issue-*) sleep 2;; esac\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    def request(method, path, *, query=None, json_body=None):
+        if path.endswith(".diff"):
+            return "published diff"
+        return {
+            "number": 12,
+            "html_url": "https://example.test/pulls/12",
+            "head": {
+                "ref": "agent/issue-80",
+                "sha": git("rev-parse", "HEAD", cwd=workspace).stdout.strip(),
+            },
+            "state": "open",
+            "merged": False,
+        }
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        git_command_timeout=0.2,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client.publish(
+            "acme/widget", 80, "main", workspace, existing_pr=12
+        )
+
+    assert captured.value.cmd == ["git", "checkout", "-B", "agent/issue-80"]
+    assert not getattr(captured.value, "__notes__", [])
+    assert not getattr(captured.value, "repogents_recovery_errors", [])
+    assert git("symbolic-ref", "--short", "HEAD", cwd=workspace).stdout.strip() == "main"
+    assert git("rev-parse", "HEAD", cwd=workspace).stdout.strip() == original_head
+    assert git_bytes("diff", "--cached", "--binary", cwd=workspace).stdout == expected_cached
+    assert git_bytes("diff", "--binary", cwd=workspace).stdout == expected_unstaged
+    assert (workspace / "nonutf.txt").read_bytes() == b"agent text \xff\n"
+    assert git("status", "--porcelain", cwd=workspace).stdout == expected_status
+    assert generated.read_text(encoding="utf-8") == "untracked generated work\n"
+    assert outside.read_text(encoding="utf-8") == "unrelated caller content\n"
+    assert not (workspace / ".git" / "repogents-workspace-unusable").exists()
+
+    # The same workspace can publish after the deliberately slow hook is removed;
+    # the preserved edits become the issue commit rather than being lost in recovery.
+    hook.unlink()
+    published = client.publish(
+        "acme/widget", 80, "main", workspace, existing_pr=12
+    )
+    assert published.branch == "agent/issue-80"
+    assert git("symbolic-ref", "--short", "HEAD", cwd=workspace).stdout.strip() == (
+        "agent/issue-80"
+    )
+    assert git("show", "HEAD:staged.txt", cwd=workspace).stdout == "agent staged edit\n"
+    assert git("show", "HEAD:unstaged.txt", cwd=workspace).stdout == "agent unstaged edit\n"
+    assert git("show", "HEAD:mixed.txt", cwd=workspace).stdout == (
+        "agent staged mixed\nagent unstaged mixed\n"
+    )
+    binary_result = subprocess.run(
+        ["git", "show", "HEAD:binary.dat"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
+    assert binary_result.stdout == b"agent\x00binary\xfe\x01\n"
+    nonutf_result = git_bytes("show", "HEAD:nonutf.txt", cwd=workspace)
+    assert nonutf_result.stdout == b"agent text \xff\n"
+    assert git("show", "HEAD:generated.txt", cwd=workspace).stdout == (
+        "untracked generated work\n"
+    )
+    assert outside.read_text(encoding="utf-8") == "unrelated caller content\n"
+    assert git("status", "--porcelain", cwd=workspace).stdout == ""
+
+
+def test_publication_checkout_uses_edit_preserving_snapshot_recovery_contract():
+    source = Path(__file__).resolve().parents[1] / "repogents" / "github.py"
+    implementation = source.read_text(encoding="utf-8")
+
+    assert "publication_snapshot = self._publication_workspace_snapshot(workspace_path)" in implementation
+    assert "snapshot=publication_snapshot" in implementation
+    assert 'patch = self._binary_command_runner(' in implementation
+    assert '["git", "diff", "--binary", snapshot.head]' in implementation
+    assert 'mode="wb"' in implementation
+    assert '["git", "apply", "--binary", str(patch_path)]' in implementation
+    assert "os.replace(temporary_index, index_path)" in implementation
+
+def test_git_process_group_completion_ignores_zombie_only_procfs_members(monkeypatch):
+    """Zombie-only procfs remnants are not mutation-capable liveness failures."""
+    groups = [
+        {101: ("Z", 1), 102: ("Z", 1)},
+        {101: ("Z", 1), 102: ("S", 1)},
+    ]
+
+    monkeypatch.setattr(
+        GitHubClient,
+        "_git_process_group_members",
+        staticmethod(lambda _process_group: groups.pop(0)),
+    )
+
+    assert GitHubClient._git_process_group_exists(100) is False
+    assert GitHubClient._git_process_group_exists(100) is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group integration coverage")
+def test_default_git_timeout_terminates_complete_helper_process_group(tmp_path):
+    """A timed-out Git alias cannot leave its shell or long-lived child orphaned."""
+    helper = tmp_path / "hang-helper.sh"
+    child = tmp_path / "hang-child.py"
+    helper_pid = tmp_path / "helper.pid"
+    child_pid = tmp_path / "child.pid"
+    late_marker = tmp_path / "late-marker"
+    child.write_text(
+        "import os, sys, time\n"
+        "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+        "time.sleep(30)\n"
+        "open(sys.argv[2], 'w').write('late')\n",
+        encoding="utf-8",
+    )
+    helper.write_text(
+        "#!/bin/sh\n"
+        f"echo $$ > {helper_pid}\n"
+        f"python3 {child} {child_pid} {late_marker} &\n"
+        "wait $!\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, timeout=5)
+    client = GitHubClient("placeholder-token", git_command_timeout=0.15)
+    command = ["git", "-c", f"alias.repogents-hang=!{helper}", "repogents-hang"]
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client._default_command_runner(command, cwd=tmp_path)
+
+    assert captured.value.cmd == command
+    assert not getattr(captured.value, "__notes__", [])
+    assert not getattr(captured.value, "repogents_recovery_errors", [])
+    assert helper_pid.is_file()
+    assert child_pid.is_file()
+    pids = [int(helper_pid.read_text()), int(child_pid.read_text())]
+
+    def process_exists(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    deadline = time.monotonic() + 2
+    while any(process_exists(pid) for pid in pids) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not any(process_exists(pid) for pid in pids)
+    assert not late_marker.exists()
+
+    # Repeated timeouts reuse no old process group and leave no accumulating helper.
+    helper_pid.unlink()
+    child_pid.unlink()
+    with pytest.raises(subprocess.TimeoutExpired) as repeated:
+        client._default_command_runner(command, cwd=tmp_path)
+    assert not getattr(repeated.value, "__notes__", [])
+    assert not getattr(repeated.value, "repogents_recovery_errors", [])
+    second_pids = [int(helper_pid.read_text()), int(child_pid.read_text())]
+    deadline = time.monotonic() + 2
+    while any(process_exists(pid) for pid in second_pids) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not any(process_exists(pid) for pid in second_pids)
+    assert not late_marker.exists()
+
+    helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    result = client._default_command_runner(command, cwd=tmp_path)
+    assert result.returncode == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="real Git hook timeout coverage uses POSIX hooks")
+def test_pre_rebase_hook_timeout_skips_abort_without_state_and_allows_retry(tmp_path):
+    """A hook timeout before rebase state exists cannot quarantine the workspace."""
+    def git(*args, cwd=None):
+        return subprocess.run(
+            ["git", *args], cwd=cwd, check=True, text=True,
+            capture_output=True, timeout=5,
+        )
+
+    workspace = tmp_path / "workspace"
+    git("init", "-b", "main", str(workspace))
+    git("config", "user.name", "Repogents Test", cwd=workspace)
+    git("config", "user.email", "repogents@example.test", cwd=workspace)
+    tracked = workspace / "tracked.txt"
+    tracked.write_text("base\n", encoding="utf-8")
+    git("add", "tracked.txt", cwd=workspace)
+    git("commit", "-m", "base", cwd=workspace)
+    git("checkout", "-b", "feature", cwd=workspace)
+    (workspace / "feature.txt").write_text("feature\n", encoding="utf-8")
+    git("add", "feature.txt", cwd=workspace)
+    git("commit", "-m", "feature", cwd=workspace)
+    feature_head = git("rev-parse", "HEAD", cwd=workspace).stdout.strip()
+    git("checkout", "main", cwd=workspace)
+    tracked.write_text("main update\n", encoding="utf-8")
+    git("commit", "-am", "main update", cwd=workspace)
+    git("checkout", "feature", cwd=workspace)
+    generated = workspace / "generated.txt"
+    generated.write_text("preserve generated work\n", encoding="utf-8")
+    status_before = git("status", "--porcelain", cwd=workspace).stdout
+
+    hook = workspace / ".git" / "hooks" / "pre-rebase"
+    hook.write_text("#!/bin/sh\nsleep 2\n", encoding="utf-8")
+    hook.chmod(0o755)
+    client = GitHubClient("placeholder-token", git_command_timeout=0.2)
+    command = ["git", "rebase", "main"]
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client._run_mutating_git(
+            command, workspace=workspace, env=client._git_identity_env
+        )
+
+    assert captured.value.cmd == command
+    assert git("symbolic-ref", "--short", "HEAD", cwd=workspace).stdout.strip() == "feature"
+    assert git("rev-parse", "HEAD", cwd=workspace).stdout.strip() == feature_head
+    assert git("status", "--porcelain", cwd=workspace).stdout == status_before
+    assert generated.read_text(encoding="utf-8") == "preserve generated work\n"
+    assert not (workspace / ".git" / "rebase-merge").exists()
+    assert not (workspace / ".git" / "rebase-apply").exists()
+    assert not (workspace / ".git" / "repogents-workspace-unusable").exists()
+    assert not getattr(captured.value, "__notes__", [])
+    assert not getattr(captured.value, "repogents_recovery_errors", [])
+
+    hook.unlink()
+    result = client._run_mutating_git(
+        command, workspace=workspace, env=client._git_identity_env
+    )
+    assert result.returncode == 0
+    assert git("symbolic-ref", "--short", "HEAD", cwd=workspace).stdout.strip() == "feature"
+    assert generated.read_text(encoding="utf-8") == "preserve generated work\n"
+    assert not (workspace / ".git" / "repogents-workspace-unusable").exists()
+
+
+def test_rebase_abort_failure_is_benign_when_state_disappears_before_result(tmp_path):
+    """A raced no-rebase abort result is ignored after Git removes its state."""
+    workspace = tmp_path / "workspace"
+    git_dir = workspace / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    head = "1" * 40
+    (git_dir / "refs" / "heads" / "main").write_text(head + "\n", encoding="ascii")
+    rebase_state = git_dir / "rebase-merge"
+    rebase_state.mkdir()
+    calls = []
+
+    def command_runner(args, *, cwd=None, env=None):
+        calls.append(list(args))
+        if args == ["git", "rebase", "--abort"]:
+            shutil.rmtree(rebase_state)
+            raise subprocess.CalledProcessError(
+                128, args, stderr="fatal: No rebase in progress?"
+            )
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token", request=lambda *_args, **_kwargs: None,
+        command_runner=command_runner,
+    )
+    client._recover_timed_out_git_mutation(
+        workspace, client._workspace_snapshot(workspace), "rebase"
+    )
+
+    assert ["git", "rebase", "--abort"] in calls
+    assert ["git", "checkout", "main"] in calls
+    assert ["git", "reset", "--mixed", head] in calls
+    assert not (git_dir / "repogents-workspace-unusable").exists()
+
+
+def test_persistent_active_rebase_abort_failure_quarantines_and_preserves_timeout(tmp_path):
+    """A genuine abort failure with active metadata retains quarantine semantics."""
+    workspace = tmp_path / "workspace"
+    git_dir = workspace / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    head = "1" * 40
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git_dir / "refs" / "heads" / "main").write_text(head + "\n", encoding="ascii")
+    rebase_state = git_dir / "rebase-merge"
+    rebase_state.mkdir()
+    (rebase_state / "head-name").write_text("refs/heads/main\n", encoding="utf-8")
+    generated = workspace / "generated.txt"
+    generated.write_text("preserve generated work\n", encoding="utf-8")
+    command = ["git", "rebase", "origin/main"]
+    timeout = subprocess.TimeoutExpired(command, timeout=300.0)
+    calls = []
+
+    def command_runner(args, *, cwd=None, env=None):
+        calls.append(list(args))
+        if args == command:
+            raise timeout
+        if args == ["git", "rebase", "--abort"]:
+            assert rebase_state.is_dir()
+            raise subprocess.CalledProcessError(
+                128, args, stderr="fatal: could not abort active rebase"
+            )
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token", request=lambda *_args, **_kwargs: None,
+        command_runner=command_runner,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client._run_mutating_git(
+            command, workspace=workspace, env=client._git_identity_env
+        )
+
+    assert captured.value is timeout
+    assert ["git", "rebase", "--abort"] in calls
+    assert ["git", "checkout", "main"] in calls
+    assert ["git", "reset", "--mixed", head] in calls
+    assert not rebase_state.exists()
+    assert generated.read_text(encoding="utf-8") == "preserve generated work\n"
+    marker = git_dir / "repogents-workspace-unusable"
+    assert marker.is_file()
+    assert "git rebase --abort failed" in marker.read_text(encoding="utf-8")
+    diagnostics = getattr(timeout, "__notes__", None) or getattr(
+        timeout, "repogents_recovery_errors", []
+    )
+    assert any("could not fully recover Git workspace" in detail for detail in diagnostics)
+
+    with pytest.raises(RuntimeError, match="requires recreation"):
+        client.checkout("acme/widget", "main", workspace)
+
+
+def test_publication_binary_patch_restore_failure_quarantines_without_masking_timeout(tmp_path):
+    """Unsafe byte-patch restoration preserves timeout identity and quarantines."""
+    workspace = tmp_path / "workspace"
+    git_dir = workspace / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    head = "1" * 40
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git_dir / "refs" / "heads" / "main").write_text(head + "\n", encoding="ascii")
+    original_index = b"binary-index\x00\xff"
+    (git_dir / "index").write_bytes(b"checkout-mutated-index")
+    generated = workspace / "generated.txt"
+    generated.write_text("preserve generated work\n", encoding="utf-8")
+
+    checkout = ["git", "checkout", "-B", "agent/issue-84"]
+    timeout = subprocess.TimeoutExpired(checkout, timeout=300.0)
+    patch = b"diff --git a/nonutf.txt b/nonutf.txt\n+raw byte: \xff\n"
+    captured_patch = []
+
+    def command_runner(args, *, cwd=None, env=None):
+        if args == checkout:
+            raise timeout
+        if args[:3] == ["git", "apply", "--binary"]:
+            patch_path = Path(args[3])
+            captured_patch.append(patch_path.read_bytes())
+            raise subprocess.CalledProcessError(1, args, stderr="patch rejected")
+        return SimpleNamespace(stdout="", stderr="", returncode=0, args=args)
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=lambda *_args, **_kwargs: None,
+        command_runner=command_runner,
+    )
+    snapshot = _GitWorkspaceSnapshot(
+        head,
+        "main",
+        index=original_index,
+        tracked_worktree_patch=patch,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client._run_mutating_git(
+            checkout,
+            workspace=workspace,
+            env=client._git_command_env,
+            snapshot=snapshot,
+        )
+
+    assert captured.value is timeout
+    assert captured_patch == [patch]
+    assert (git_dir / "index").read_bytes() == original_index
+    assert list(git_dir.glob("repogents-worktree-*.patch")) == []
+    assert generated.read_text(encoding="utf-8") == "preserve generated work\n"
+    marker = git_dir / "repogents-workspace-unusable"
+    assert marker.is_file()
+    assert "could not restore pre-timeout Git HEAD" in marker.read_text(encoding="utf-8")
+    diagnostics = getattr(timeout, "__notes__", None) or getattr(
+        timeout, "repogents_recovery_errors", []
+    )
+    assert any("could not fully recover Git workspace" in detail for detail in diagnostics)
+
+
+def test_default_git_timeout_marks_unconfirmed_tree_termination_unsafe(monkeypatch):
+    """Termination failure is propagated on the original timeout, not swallowed."""
+    command = ["git", "checkout", "feature"]
+    timeout_error = subprocess.TimeoutExpired(command, timeout=0.1)
+
+    class Process:
+        pid = 12345
+        returncode = None
+
+        def communicate(self, *, timeout):
+            if timeout == 0.1:
+                raise timeout_error
+            raise subprocess.TimeoutExpired(command, timeout=timeout)
+
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: Process())
+    client = GitHubClient("placeholder-token", git_command_timeout=0.1)
+    monkeypatch.setattr(
+        client,
+        "_terminate_git_process_tree",
+        lambda process: (_ for _ in ()).throw(OSError("helper still alive")),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client._default_command_runner(command)
+
+    assert captured.value is timeout_error
+    assert timeout_error.repogents_git_tree_termination_safe is False
+    diagnostics = getattr(timeout_error, "__notes__", None) or getattr(
+        timeout_error, "repogents_recovery_errors", []
+    )
+    assert any(
+        "could not fully terminate timed-out Git process tree: helper still alive"
+        in detail
+        for detail in diagnostics
+    )
+
+
+def test_unsafe_git_tree_termination_skips_workspace_recovery_and_quarantines(
+    tmp_path, monkeypatch
+):
+    """Possible live helpers forbid every in-place recovery action."""
+    workspace = tmp_path / "unsafe-workspace"
+    git_dir = workspace / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git_dir / "refs" / "heads" / "main").write_text(
+        "1" * 40 + "\n", encoding="ascii"
+    )
+    stale_lock = git_dir / "index.lock"
+    stale_lock.write_text("possibly active", encoding="utf-8")
+    generated = workspace / "generated.txt"
+    generated.write_text("preserve me", encoding="utf-8")
+    command = ["git", "checkout", "feature"]
+    timeout = subprocess.TimeoutExpired(command, timeout=0.1)
+    popen_calls = []
+
+    class Process:
+        pid = 12345
+        returncode = None
+
+        def communicate(self, *, timeout):
+            if timeout == 0.1:
+                raise timeout_error
+            raise subprocess.TimeoutExpired(command, timeout=timeout)
+
+    timeout_error = timeout
+
+    def popen(args, **kwargs):
+        popen_calls.append((list(args), kwargs))
+        return Process()
+
+    monkeypatch.setattr("subprocess.Popen", popen)
+    client = GitHubClient(
+        "placeholder-token",
+        request=lambda *_args, **_kwargs: None,
+        git_command_timeout=0.1,
+    )
+    monkeypatch.setattr(
+        client,
+        "_terminate_git_process_tree",
+        lambda process: (_ for _ in ()).throw(OSError("helper still alive")),
+    )
+    recovery_calls = []
+    monkeypatch.setattr(
+        client,
+        "_recover_timed_out_git_mutation",
+        lambda *args, **kwargs: recovery_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client._run_mutating_git(
+            command, workspace=workspace, env=client._git_command_env
+        )
+
+    assert captured.value is timeout
+    assert timeout.repogents_git_tree_termination_safe is False
+    assert [call[0] for call in popen_calls] == [command]
+    assert popen_calls[0][1]["cwd"] == workspace
+    assert recovery_calls == []
+    # No lock cleanup, checkout/reset, rebase abort, or patch restoration ran.
+    assert stale_lock.read_text(encoding="utf-8") == "possibly active"
+    assert generated.read_text(encoding="utf-8") == "preserve me"
+    marker = git_dir / "repogents-workspace-unusable"
+    assert marker.read_text(encoding="utf-8") == (
+        "Git process-tree termination could not be confirmed; in-place timeout "
+        "recovery was skipped"
+    )
+    diagnostics = getattr(timeout, "__notes__", None) or getattr(
+        timeout, "repogents_recovery_errors", []
+    )
+    assert any("helper still alive" in detail for detail in diagnostics)
+
+    with pytest.raises(RuntimeError, match="requires recreation"):
+        client.checkout("acme/widget", "main", workspace)
+    with pytest.raises(RuntimeError, match="requires recreation"):
+        client.publish("acme/widget", 85, "main", workspace, existing_pr=12)
+    assert [call[0] for call in popen_calls] == [command]
+
+
+@pytest.mark.parametrize(
+    "taskkill_outcome", ["timeout", "error", "failure-status", "wait-timeout"]
+)
+def test_windows_taskkill_failure_marks_timeout_unsafe_and_quarantines_without_recovery(
+    tmp_path, monkeypatch, taskkill_outcome
+):
+    """Every unconfirmed Windows task-tree outcome forbids workspace recovery."""
+    workspace = tmp_path / f"windows-{taskkill_outcome}"
+    git_dir = workspace / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git_dir / "refs" / "heads" / "main").write_text(
+        "1" * 40 + "\n", encoding="ascii"
+    )
+    stale_lock = git_dir / "index.lock"
+    stale_lock.write_text("possibly active", encoding="utf-8")
+    generated = workspace / "generated.txt"
+    generated.write_text("preserve me", encoding="utf-8")
+    command = ["git", "checkout", "feature"]
+    timeout_error = subprocess.TimeoutExpired(command, timeout=0.1)
+
+    class Process:
+        pid = 43210
+        returncode = None
+
+        def communicate(self, *, timeout):
+            if timeout == 0.1:
+                raise timeout_error
+            raise subprocess.TimeoutExpired(command, timeout=timeout)
+
+        def wait(self, *, timeout):
+            if taskkill_outcome == "wait-timeout":
+                raise subprocess.TimeoutExpired(command, timeout=timeout)
+            raise AssertionError("top-level wait must not hide failed taskkill")
+
+        def poll(self):
+            return None
+
+    def taskkill(args, **kwargs):
+        assert args == ["taskkill", "/PID", "43210", "/T", "/F"]
+        assert kwargs["timeout"] == 0.5
+        if taskkill_outcome == "timeout":
+            raise subprocess.TimeoutExpired(args, timeout=0.5)
+        if taskkill_outcome == "error":
+            raise OSError("taskkill unavailable")
+        return SimpleNamespace(
+            returncode=0 if taskkill_outcome == "wait-timeout" else 5
+        )
+
+    monkeypatch.setattr("repogents.github.os.name", "nt")
+    monkeypatch.setattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr("subprocess.run", taskkill)
+    client = GitHubClient(
+        "placeholder-token",
+        request=lambda *_args, **_kwargs: None,
+        git_command_timeout=0.1,
+    )
+    recovery_calls = []
+    monkeypatch.setattr(
+        client,
+        "_recover_timed_out_git_mutation",
+        lambda *args, **kwargs: recovery_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client._run_mutating_git(
+            command, workspace=workspace, env=client._git_command_env
+        )
+
+    assert captured.value is timeout_error
+    assert timeout_error.repogents_git_tree_termination_safe is False
+    assert recovery_calls == []
+    assert stale_lock.read_text(encoding="utf-8") == "possibly active"
+    assert generated.read_text(encoding="utf-8") == "preserve me"
+    marker = git_dir / "repogents-workspace-unusable"
+    assert "termination could not be confirmed" in marker.read_text(encoding="utf-8")
+    diagnostics = getattr(timeout_error, "__notes__", None) or getattr(
+        timeout_error, "repogents_recovery_errors", []
+    )
+    assert any("could not fully terminate timed-out Git process tree" in detail for detail in diagnostics)
+    if taskkill_outcome == "failure-status":
+        assert any("exit status 5" in detail for detail in diagnostics)
+    if taskkill_outcome == "wait-timeout":
+        assert any("did not exit after taskkill" in detail for detail in diagnostics)
+
+
+def test_windows_confirmed_taskkill_and_git_exit_permit_timeout_recovery(
+    tmp_path, monkeypatch
+):
+    """Successful task-tree termination retains the existing recovery path."""
+    workspace = tmp_path / "windows-confirmed"
+    git_dir = workspace / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    head = "1" * 40
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git_dir / "refs" / "heads" / "main").write_text(head + "\n", encoding="ascii")
+    command = ["git", "checkout", "feature"]
+    timeout_error = subprocess.TimeoutExpired(command, timeout=0.1)
+
+    class Process:
+        pid = 54321
+        returncode = None
+        exited = False
+
+        def communicate(self, *, timeout):
+            if timeout == 0.1:
+                raise timeout_error
+            return "", ""
+
+        def wait(self, *, timeout):
+            self.exited = True
+            self.returncode = 1
+            return self.returncode
+
+        def poll(self):
+            return self.returncode if self.exited else None
+
+    process = Process()
+    taskkill_calls = []
+
+    def taskkill(args, **kwargs):
+        taskkill_calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("repogents.github.os.name", "nt")
+    monkeypatch.setattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr("subprocess.run", taskkill)
+    client = GitHubClient(
+        "placeholder-token",
+        request=lambda *_args, **_kwargs: None,
+        git_command_timeout=0.1,
+    )
+    recovery_calls = []
+    monkeypatch.setattr(
+        client,
+        "_recover_timed_out_git_mutation",
+        lambda *args, **kwargs: recovery_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client._run_mutating_git(
+            command, workspace=workspace, env=client._git_command_env
+        )
+
+    assert captured.value is timeout_error
+    assert timeout_error.repogents_git_tree_termination_safe is True
+    assert len(taskkill_calls) == 1
+    assert len(recovery_calls) == 1
+    assert recovery_calls[0][0][0] == workspace
+    assert recovery_calls[0][0][2] == "checkout"
+    assert not (git_dir / "repogents-workspace-unusable").exists()
+    assert not getattr(timeout_error, "__notes__", [])
+    assert not getattr(timeout_error, "repogents_recovery_errors", [])
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_unsafe_clone_timeout_quarantines_destination_without_cleanup(
+    tmp_path, preexisting, monkeypatch
+):
+    """An unconfirmed clone tree is quarantined without touching its destination."""
+    workspace = tmp_path / ("existing-target" if preexisting else "new-target")
+    caller_file = workspace / "caller.txt"
+    if preexisting:
+        workspace.mkdir()
+        caller_file.write_text("caller-owned\n", encoding="utf-8")
+    clone_calls = []
+    timeout = subprocess.TimeoutExpired(["git", "clone"], timeout=300.0)
+    timeout.repogents_git_tree_termination_safe = False
+    GitHubClient._record_recovery_error(
+        timeout, "could not fully terminate timed-out Git process tree: helper alive"
+    )
+
+    def request(method, path, *, query=None, json_body=None):
+        return {
+            "full_name": "acme/unsafe",
+            "default_branch": "main",
+            "clone_url": "https://github.test/acme/unsafe.git",
+        }
+
+    def command_runner(args, *, cwd=None, env=None):
+        clone_calls.append(list(args))
+        (workspace / ".git" / "objects").mkdir(parents=True, exist_ok=True)
+        (workspace / ".git" / "config").write_text("partial\n", encoding="utf-8")
+        (workspace / "clone-created.tmp").write_text("still active\n", encoding="utf-8")
+        raise timeout
+
+    client = GitHubClient(
+        "placeholder-token", request=request, command_runner=command_runner
+    )
+    destructive_cleanup_calls = []
+
+    def forbidden_rmtree(path, *args, **kwargs):
+        destructive_cleanup_calls.append(("rmtree", Path(path)))
+        raise AssertionError("unsafe clone timeout must not remove a destination tree")
+
+    def forbidden_unlink(path, *args, **kwargs):
+        destructive_cleanup_calls.append(("unlink", Path(path)))
+        raise AssertionError("unsafe clone timeout must not unlink destination state")
+
+    monkeypatch.setattr("repogents.github.shutil.rmtree", forbidden_rmtree)
+    monkeypatch.setattr(Path, "unlink", forbidden_unlink)
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        client.checkout("acme/unsafe", "main", workspace)
+
+    assert captured.value is timeout
+    assert timeout.repogents_git_tree_termination_safe is False
+    assert (workspace / ".git" / "config").read_text(encoding="utf-8") == "partial\n"
+    assert (workspace / "clone-created.tmp").read_text(encoding="utf-8") == (
+        "still active\n"
+    )
+    if preexisting:
+        assert caller_file.read_text(encoding="utf-8") == "caller-owned\n"
+    quarantine = workspace.parent / f".{workspace.name}.repogents-workspace-unusable"
+    assert quarantine.read_text(encoding="utf-8") == (
+        "Git process-tree termination could not be confirmed; partial clone cleanup "
+        "was skipped"
+    )
+    diagnostics = getattr(timeout, "__notes__", None) or getattr(
+        timeout, "repogents_recovery_errors", []
+    )
+    assert any("helper alive" in detail for detail in diagnostics)
+
+    # Reuse is rejected before metadata lookup or any clone/fetch/checkout/pull work.
+    with pytest.raises(RuntimeError, match="requires recreation"):
+        client.checkout("acme/unsafe", "main", workspace)
+    with pytest.raises(RuntimeError, match="requires recreation"):
+        client.publish("acme/unsafe", 87, "main", workspace, existing_pr=12)
+    assert len(clone_calls) == 1
+    assert destructive_cleanup_calls == []
+
+
+def test_safe_clone_timeout_cleanup_contract_remains_retryable(tmp_path):
+    """Confirmed process-tree exit retains the established cleanup and retry path."""
+    workspace = tmp_path / "safe-target"
+    attempts = 0
+
+    def request(method, path, *, query=None, json_body=None):
+        return {
+            "full_name": "acme/safe",
+            "default_branch": "main",
+            "clone_url": "https://github.test/acme/safe.git",
+        }
+
+    def command_runner(args, *, cwd=None, env=None):
+        nonlocal attempts
+        attempts += 1
+        (workspace / ".git").mkdir(parents=True, exist_ok=True)
+        if attempts == 1:
+            timeout = subprocess.TimeoutExpired(args, timeout=300.0)
+            timeout.repogents_git_tree_termination_safe = True
+            raise timeout
+        (workspace / "README.md").write_text("complete\n", encoding="utf-8")
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token", request=request, command_runner=command_runner
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        client.checkout("acme/safe", "main", workspace)
+
+    assert not workspace.exists()
+    assert not (workspace.parent / ".safe-target.repogents-workspace-unusable").exists()
+    assert client.checkout("acme/safe", "main", workspace) == workspace
+    assert attempts == 2
+    assert (workspace / "README.md").read_text(encoding="utf-8") == "complete\n"
+
+
+@pytest.mark.parametrize("workers", [0, -1, True, 1.5])
+def test_github_client_rejects_invalid_http_transport_worker_capacity(workers):
+    with pytest.raises(ValueError, match="http_transport_max_workers"):
+        GitHubClient("placeholder-token", http_transport_max_workers=workers)
+
+
+def test_default_request_bounds_stalled_dns_with_fixed_transport_capacity(
+    monkeypatch,
+):
+    """Resolver stalls consume only fixed complete-request workers and time out callers."""
+    import socket
+
+    capacity = 2
+    resolver_started = threading.Barrier(capacity + 1)
+    release_resolver = threading.Event()
+    resolver_calls = 0
+    resolver_guard = threading.Lock()
+    successful_resolution = [False]
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def stalled_getaddrinfo(*args, **kwargs):
+        nonlocal resolver_calls
+        with resolver_guard:
+            resolver_calls += 1
+            call = resolver_calls
+        if not successful_resolution[0] and call <= capacity:
+            resolver_started.wait(timeout=2)
+            assert release_resolver.wait(timeout=3)
+        return real_getaddrinfo("localhost", 80, type=socket.SOCK_STREAM)
+
+    class Response:
+        headers = {"Content-Type": "application/json"}
+
+        def __init__(self):
+            self.chunks = [
+                b'{"full_name":"acme/recovered","default_branch":"main"}',
+                b"",
+            ]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size=-1):
+            return self.chunks.pop(0)
+
+    def resolving_urlopen(request, *, timeout):
+        socket.getaddrinfo("github.invalid", 443, type=socket.SOCK_STREAM)
+        return Response()
+
+    monkeypatch.setattr("socket.getaddrinfo", stalled_getaddrinfo)
+    monkeypatch.setattr("urllib.request.urlopen", resolving_urlopen)
+    client = GitHubClient(
+        "placeholder-token",
+        transport_timeout=0.08,
+        http_transport_max_workers=capacity,
+    )
+    errors = []
+
+    def request():
+        try:
+            client.repository("acme/stalled")
+        except BaseException as error:
+            errors.append(error)
+
+    callers = [threading.Thread(target=request) for _ in range(6)]
+    started = time.monotonic()
+    for caller in callers:
+        caller.start()
+    resolver_started.wait(timeout=2)
+    for caller in callers:
+        caller.join(timeout=1)
+        assert not caller.is_alive()
+
+    assert time.monotonic() - started < 0.6
+    assert len(errors) == 6
+    assert all(isinstance(error, TimeoutError) for error in errors)
+    assert resolver_calls == capacity
+    assert len(client._http_transport_pool._workers) == capacity
+    assert sum(worker.is_alive() for worker in client._http_transport_pool._workers) == capacity
+    assert client._http_transport_pool._tasks.qsize() == 0
+
+    # Resolver completion after caller timeout has no callback or decoded result, but
+    # it releases the fixed slots for a later ordinary request.
+    successful_resolution[0] = True
+    release_resolver.set()
+    deadline = time.monotonic() + 2
+    while client._http_transport_pool._capacity._value < capacity:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+
+    recovered = client.repository("acme/recovered")
+    assert recovered["full_name"] == "acme/recovered"
+    assert resolver_calls == capacity + 1
+
+
+def test_dns_stalled_metadata_lookup_fails_authoritatively_and_recovers_capacity(
+    monkeypatch, tmp_path
+):
+    """A resolver-stalled add becomes FAILED and late DNS cannot commit."""
+    import socket
+
+    from repogents.application import Application, ApplicationConfig
+    from repogents.store import Store
+
+    resolver_started = threading.Event()
+    release_resolver = threading.Event()
+    resolver_finished = threading.Event()
+    resolver_calls = 0
+    request_calls = 0
+
+    def stalled_getaddrinfo(*_args, **_kwargs):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        resolver_started.set()
+        assert release_resolver.wait(timeout=3)
+        resolver_finished.set()
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+
+    class Response:
+        headers = {"Content-Type": "application/json"}
+
+        def __init__(self, repository):
+            self._repository = repository
+            self._consumed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size=-1):
+            assert size == 64 * 1024
+            if self._consumed:
+                return b""
+            self._consumed = True
+            return json.dumps(
+                {
+                    "full_name": self._repository,
+                    "default_branch": "main",
+                    "clone_url": f"https://github.test/{self._repository}.git",
+                }
+            ).encode("utf-8")
+
+    def urlopen(request, *, timeout):
+        nonlocal request_calls
+        request_calls += 1
+        if request_calls == 1:
+            socket.getaddrinfo("github.invalid", 443, type=socket.SOCK_STREAM)
+            repository = "acme/dns-stalled"
+        else:
+            repository = "acme/dns-recovered"
+        return Response(repository)
+
+    monkeypatch.setattr("socket.getaddrinfo", stalled_getaddrinfo)
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    github = GitHubClient(
+        "placeholder-token",
+        transport_timeout=0.06,
+        http_transport_max_workers=1,
+    )
+    store = Store(tmp_path / "dns-add.sqlite3")
+    app = Application(
+        store,
+        github,
+        object(),
+        object(),
+        ApplicationConfig(
+            data_dir=tmp_path / "runtime",
+            add_repository_lookup_timeout=0.5,
+            add_repository_lookup_max_workers=1,
+        ),
+    )
+    try:
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="total transport deadline"):
+            app.add_repository("acme/dns-stalled", operation_id="dns-stalled-add")
+        assert time.monotonic() - started < 0.4
+        assert resolver_started.is_set()
+        operation = app.repository_add_operation("dns-stalled-add")
+        assert operation is not None
+        assert operation["state"] == "FAILED"
+        assert operation["repository"] is None
+        assert store.list_repositories() == []
+
+        # The abandoned transport worker has no storage authority. Once DNS returns,
+        # it only releases fixed transport capacity for a later ordinary lookup.
+        release_resolver.set()
+        assert resolver_finished.wait(timeout=2)
+        deadline = time.monotonic() + 2
+        while github._http_transport_pool._capacity._value < 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        assert store.list_repositories() == []
+        assert app.repository_add_operation("dns-stalled-add")["state"] == "FAILED"
+
+        recovered = app.add_repository(
+            "acme/dns-recovered", operation_id="dns-recovered-add"
+        )
+        assert recovered["github_repository"] == "acme/dns-recovered"
+        assert app.repository_add_operation("dns-recovered-add")["state"] == "COMMITTED"
+        assert request_calls == 2
+        assert resolver_calls == 1
+    finally:
+        release_resolver.set()
+        app.close()
+
+
+def test_dns_stalled_poller_releases_service_ownership_after_deadline(
+    monkeypatch, tmp_path
+):
+    """Shutdown owns a DNS-stalled poller until its bounded caller exits."""
+    import socket
+
+    from repogents.http_api import HttpService
+    from repogents.service_ownership import (
+        ServiceOwnership,
+        ServiceOwnershipUnavailableError,
+    )
+
+    ownership_path = tmp_path / ".repogents-service.lock"
+    resolver_started = threading.Event()
+    release_resolver = threading.Event()
+    late_mutations = []
+
+    def stalled_getaddrinfo(*_args, **_kwargs):
+        resolver_started.set()
+        assert release_resolver.wait(timeout=3)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+
+    class Response:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size=-1):
+            return b"[]" if not hasattr(self, "consumed") else b""
+
+    def urlopen(_request, *, timeout):
+        socket.getaddrinfo("github.invalid", 443, type=socket.SOCK_STREAM)
+        response = Response()
+        response.consumed = False
+        original_read = response.read
+
+        def read(size=-1):
+            if response.consumed:
+                return b""
+            response.consumed = True
+            return original_read(size)
+
+        response.read = read
+        return response
+
+    monkeypatch.setattr("socket.getaddrinfo", stalled_getaddrinfo)
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    github = GitHubClient(
+        "placeholder-token",
+        transport_timeout=0.5,
+        http_transport_max_workers=1,
+    )
+
+    class PollingApplication:
+        def __init__(self):
+            self.ownership = ServiceOwnership(ownership_path)
+            self.closed = False
+
+        def acquire_service_ownership(self):
+            self.ownership.acquire()
+
+        def poll_once(self):
+            github._default_request("GET", "/repos/acme/widget/issues")
+            late_mutations.append("old-poller")
+
+        def state(self):
+            return {"repositories": []}
+
+        def close(self):
+            self.closed = True
+            self.ownership.close()
+
+    application = PollingApplication()
+    service = HttpService(application, "127.0.0.1", 0, 60)
+    serving = threading.Thread(target=service.serve_forever)
+    serving.start()
+    try:
+        assert resolver_started.wait(timeout=1)
+        service.shutdown()
+        serving.join(timeout=0.03)
+        assert serving.is_alive()
+        assert application.ownership.acquired is True
+
+        competitor = ServiceOwnership(ownership_path)
+        with pytest.raises(ServiceOwnershipUnavailableError):
+            competitor.acquire()
+
+        # The request caller reaches its absolute deadline even though the resolver
+        # worker remains blocked. Service teardown can then release ownership without
+        # waiting for DNS and no application callback runs after the timed-out call.
+        serving.join(timeout=1)
+        assert not serving.is_alive()
+        assert application.closed is True
+        assert application.ownership.acquired is False
+        assert late_mutations == []
+
+        replacement = ServiceOwnership(ownership_path)
+        replacement.acquire()
+        replacement.close()
+
+        # Eventual resolver completion cannot revive the old poll callback.
+        release_resolver.set()
+        deadline = time.monotonic() + 2
+        while github._http_transport_pool._capacity._value < 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        assert late_mutations == []
+    finally:
+        release_resolver.set()
+        if serving.is_alive():
+            serving.join(timeout=2)

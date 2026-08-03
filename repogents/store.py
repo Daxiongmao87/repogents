@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 RUN_STATES = frozenset(
@@ -33,6 +35,18 @@ CREATE TABLE IF NOT EXISTS repositories (
     target_branch TEXT NOT NULL,
     similarity_threshold REAL NOT NULL,
     tracked INTEGER NOT NULL DEFAULT 1 CHECK (tracked IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS repository_add_operations (
+    operation_id TEXT PRIMARY KEY,
+    github_repository TEXT NOT NULL,
+    target_branch TEXT,
+    state TEXT NOT NULL CHECK (state IN ('PENDING', 'COMMITTED', 'FAILED')),
+    repository_id INTEGER REFERENCES repositories(id),
+    error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    terminal_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS nodes (
@@ -163,8 +177,11 @@ CREATE TABLE IF NOT EXISTS adapted_runs (
 
 
 class Store:
-    def __init__(self, path: str | Path):
+    def __init__(
+        self, path: str | Path, *, clock: Callable[[], float] | None = None
+    ):
         self.path = str(path)
+        self._clock = clock or time.time
         connection = self._connect()
         try:
             connection.execute("PRAGMA journal_mode=WAL")
@@ -189,8 +206,95 @@ class Store:
                 connection.execute(
                     "ALTER TABLE feedback ADD COLUMN response_url TEXT"
                 )
+            operation_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(repository_add_operations)"
+                )
+            }
+            now = self._timestamp()
+            if "created_at" not in operation_columns:
+                connection.execute(
+                    "ALTER TABLE repository_add_operations ADD COLUMN created_at REAL"
+                )
+            if "updated_at" not in operation_columns:
+                connection.execute(
+                    "ALTER TABLE repository_add_operations ADD COLUMN updated_at REAL"
+                )
+            if "terminal_at" not in operation_columns:
+                connection.execute(
+                    "ALTER TABLE repository_add_operations ADD COLUMN terminal_at REAL"
+                )
+            # Legacy or incomplete rows receive a conservative age origin at
+            # migration time, so no retained idempotency result is immediately
+            # eligible for cleanup. The predicate is essential: once lifecycle
+            # metadata is complete, ordinary Store construction must not rewrite
+            # the retained operation history or fire update triggers for unchanged
+            # rows. MAX also repairs lifecycle floors from partially migrated data.
+            connection.execute(
+                """
+                UPDATE repository_add_operations
+                SET created_at = COALESCE(created_at, ?),
+                    updated_at = MAX(
+                        COALESCE(created_at, ?),
+                        COALESCE(updated_at, ?)
+                    ),
+                    terminal_at = CASE
+                        WHEN state IN ('COMMITTED', 'FAILED') THEN MAX(
+                            COALESCE(created_at, ?),
+                            COALESCE(updated_at, ?),
+                            COALESCE(terminal_at, ?)
+                        )
+                        ELSE NULL
+                    END
+                WHERE created_at IS NULL
+                   OR updated_at IS NULL
+                   OR updated_at < created_at
+                   OR (state = 'PENDING' AND terminal_at IS NOT NULL)
+                   OR (state IN ('COMMITTED', 'FAILED') AND
+                       (terminal_at IS NULL OR terminal_at < created_at
+                        OR terminal_at < updated_at))
+                """,
+                (now, now, now, now, now, now),
+            )
+            connection.execute(
+                """CREATE INDEX IF NOT EXISTS repository_add_operations_terminal_age
+                ON repository_add_operations(state, terminal_at)
+                WHERE state IN ('COMMITTED', 'FAILED')"""
+            )
+            connection.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS repository_add_operations_validate_insert
+                BEFORE INSERT ON repository_add_operations
+                WHEN NEW.created_at IS NULL OR NEW.updated_at IS NULL
+                    OR NEW.updated_at < NEW.created_at
+                    OR (NEW.state = 'PENDING' AND NEW.terminal_at IS NOT NULL)
+                    OR (NEW.state IN ('COMMITTED', 'FAILED') AND
+                        (NEW.terminal_at IS NULL OR NEW.terminal_at < NEW.created_at))
+                BEGIN
+                    SELECT RAISE(ABORT, 'invalid repository add operation lifecycle metadata');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS repository_add_operations_validate_update
+                BEFORE UPDATE ON repository_add_operations
+                WHEN NEW.created_at IS NULL OR NEW.updated_at IS NULL
+                    OR NEW.updated_at < NEW.created_at
+                    OR (NEW.state = 'PENDING' AND NEW.terminal_at IS NOT NULL)
+                    OR (NEW.state IN ('COMMITTED', 'FAILED') AND
+                        (NEW.terminal_at IS NULL OR NEW.terminal_at < NEW.created_at))
+                BEGIN
+                    SELECT RAISE(ABORT, 'invalid repository add operation lifecycle metadata');
+                END;
+                """
+            )
         finally:
             connection.close()
+
+    def _timestamp(self) -> float:
+        value = float(self._clock())
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("clock must return a finite nonnegative timestamp")
+        return value
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -248,6 +352,12 @@ class Store:
             if field in decoded:
                 decoded[field] = bool(decoded[field])
         return decoded
+
+    @classmethod
+    def _repository_add_operation_row(
+        cls, row: sqlite3.Row | None
+    ) -> dict[str, Any] | None:
+        return cls._decode(row)
 
     @classmethod
     def _repository_row(cls, row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -345,6 +455,180 @@ class Store:
         if missing:
             raise ValueError(f"{name} is missing {', '.join(missing)}")
         return value
+
+    def begin_repository_add_operation(
+        self, operation_id: str, github_repository: str, target_branch: str | None
+    ) -> dict:
+        """Register or recover an idempotent repository-add operation."""
+        self._nonempty_string(operation_id, "operation_id")
+        self._nonempty_string(github_repository, "github_repository")
+        now = self._timestamp()
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO repository_add_operations(
+                    operation_id, github_repository, target_branch, state,
+                    created_at, updated_at, terminal_at
+                ) VALUES (?, ?, ?, 'PENDING', ?, ?, NULL)
+                ON CONFLICT(operation_id) DO NOTHING
+                """,
+                (
+                    operation_id, github_repository, target_branch, now, now,
+                ),
+            )
+            row = self._fetch_one(
+                connection,
+                "SELECT * FROM repository_add_operations WHERE operation_id = ?",
+                (operation_id,),
+            )
+            if (
+                row["github_repository"] != github_repository
+                or row["target_branch"] != target_branch
+            ):
+                raise ValueError(
+                    "operation_id is already assigned to another repository add"
+                )
+        return self._repository_add_operation_row(row)
+
+    def recover_pending_repository_add_operations(self) -> int:
+        """Make interrupted adds terminal without regressing lifecycle time.
+
+        Wall clocks can move backward between process runs. Clamp each recovered
+        operation independently to its durable lifecycle floor so one old PENDING
+        row cannot violate the timestamp triggers and block service startup.
+        """
+        now = self._timestamp()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE repository_add_operations
+                SET state = 'FAILED',
+                    error = 'repository add was interrupted before storage commit',
+                    updated_at = MAX(?, created_at, updated_at),
+                    terminal_at = MAX(?, created_at, updated_at)
+                WHERE state = 'PENDING'
+                """,
+                (now, now),
+            )
+        return cursor.rowcount
+
+    def get_repository_add_operation(self, operation_id: str) -> dict | None:
+        self._nonempty_string(operation_id, "operation_id")
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT * FROM repository_add_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        return self._repository_add_operation_row(row)
+
+    def purge_expired_repository_add_operations(
+        self, retention_seconds: float, *, limit: int
+    ) -> int:
+        """Delete one bounded batch of expired terminal add operations.
+
+        PENDING rows are deliberately excluded regardless of age. Repository rows are
+        not owned by the operation foreign key, so deleting a COMMITTED operation
+        cannot cascade into repository, graph, run, or work state. The immediate
+        transaction serializes selection and deletion with concurrent terminal
+        transitions, making each operation either observably retained or atomically
+        absent after its configured idempotency window.
+        """
+        retention_seconds = float(retention_seconds)
+        if not math.isfinite(retention_seconds) or retention_seconds <= 0:
+            raise ValueError("retention_seconds must be finite and positive")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        cutoff = self._timestamp() - retention_seconds
+        if cutoff < 0:
+            return 0
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM repository_add_operations
+                WHERE operation_id IN (
+                    SELECT operation_id
+                    FROM repository_add_operations
+                    WHERE state IN ('COMMITTED', 'FAILED')
+                      AND terminal_at <= ?
+                    ORDER BY terminal_at, operation_id
+                    LIMIT ?
+                )
+                """,
+                (cutoff, limit),
+            )
+        return cursor.rowcount
+
+    def fail_repository_add_operation(self, operation_id: str, error: str) -> dict:
+        self._nonempty_string(error, "error")
+        now = self._timestamp()
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                UPDATE repository_add_operations
+                SET state = 'FAILED', error = ?,
+                    updated_at = MAX(?, created_at, updated_at),
+                    terminal_at = MAX(?, created_at, updated_at)
+                WHERE operation_id = ? AND state = 'PENDING'
+                """,
+                (error, now, now, operation_id),
+            )
+            row = self._fetch_one(
+                connection,
+                "SELECT * FROM repository_add_operations WHERE operation_id = ?",
+                (operation_id,),
+            )
+        return self._repository_add_operation_row(row)
+
+    def add_repository_for_operation(
+        self, operation_id: str, github_repository: str, target_branch: str,
+        similarity_threshold: float,
+    ) -> dict:
+        """Atomically commit repository state and the authoritative operation result."""
+        self._nonempty_string(target_branch, "target_branch")
+        now = self._timestamp()
+        with self._transaction() as connection:
+            operation = self._fetch_one(
+                connection,
+                "SELECT * FROM repository_add_operations WHERE operation_id = ?",
+                (operation_id,),
+            )
+            if operation["state"] == "COMMITTED":
+                return self._repository_row(
+                    self._fetch_one(
+                        connection,
+                        "SELECT * FROM repositories WHERE id = ?",
+                        (operation["repository_id"],),
+                    )
+                )
+            if operation["state"] != "PENDING":
+                raise ValueError("repository add operation has already failed")
+            transition_time = max(
+                now, float(operation["created_at"]), float(operation["updated_at"])
+            )
+            cursor = connection.execute(
+                """INSERT INTO repositories(
+                    github_repository, target_branch, similarity_threshold
+                ) VALUES (?, ?, ?)""",
+                (github_repository, target_branch, float(similarity_threshold)),
+            )
+            repository_id = cursor.lastrowid
+            connection.executemany(
+                """INSERT INTO nodes(
+                    repository_id, classification, vector, role_prompt, persistence
+                ) VALUES (?, ?, NULL, '', 'PERMANENT')""",
+                ((repository_id, "Specify"), (repository_id, "Validate")),
+            )
+            connection.execute(
+                """UPDATE repository_add_operations
+                SET state = 'COMMITTED', repository_id = ?, error = NULL,
+                    updated_at = ?, terminal_at = ?
+                WHERE operation_id = ? AND state = 'PENDING'""",
+                (repository_id, transition_time, transition_time, operation_id),
+            )
+            row = self._fetch_one(
+                connection, "SELECT * FROM repositories WHERE id = ?", (repository_id,)
+            )
+        return self._repository_row(row)
 
     def add_repository(
         self,

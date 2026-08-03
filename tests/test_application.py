@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from pathlib import Path
 
 from repogents.application import Application, ApplicationConfig
+from repogents.errors import RepositoryLookupTimeoutError
+from repogents.http_api import HttpService
 from repogents.github import FeedbackAddress, GitHubFeedback, GitHubIssue, PullRequest
 from repogents.semantic import SemanticRouter
 from repogents.store import Store
@@ -967,6 +973,7 @@ def test_startup_recovers_running_work_and_state_exposes_durable_history(tmp_pat
         SemanticRouter(MapEmbedder({"backend/api": [1.0, 0.0]})),
         ApplicationConfig(data_dir=tmp_path / "runtime"),
     )
+    app.acquire_service_ownership()
 
     assert store.list_work_items(run["id"])[0]["state"] == "QUEUED"
     duplicate, created = store.create_run(repository["id"], 7, run["issue_json"])
@@ -1234,3 +1241,1165 @@ def test_routing_reuses_persisted_classification_vector_without_embedding(tmp_pa
     assert routed["id"] == saved["work_items"][0]["id"]
     assert routed["node_id"] == node["id"]
     app.close()
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    [float("nan"), float("inf"), float("-inf"), 0.0, -0.01],
+)
+def test_application_config_rejects_non_finite_or_non_positive_repository_lookup_timeout(
+    tmp_path, timeout
+):
+    with pytest.raises(
+        ValueError, match="add_repository_lookup_timeout must be finite and positive"
+    ):
+        ApplicationConfig(
+            data_dir=tmp_path / "runtime",
+            add_repository_lookup_timeout=timeout,
+        )
+
+
+@pytest.mark.parametrize("timeout", [0.001, 0.5, 14.0])
+def test_application_config_accepts_finite_positive_repository_lookup_timeout(
+    tmp_path, timeout
+):
+    config = ApplicationConfig(
+        data_dir=tmp_path / "runtime",
+        add_repository_lookup_timeout=timeout,
+    )
+
+    assert config.add_repository_lookup_timeout == timeout
+
+
+def test_add_repository_lookup_timeout_establishes_non_commit_boundary(tmp_path):
+    """A GitHub response arriving after the local deadline cannot reach storage."""
+    app, store, github, _ = make_app(
+        tmp_path, add_repository_lookup_timeout=0.05
+    )
+    lookup_started = threading.Event()
+    release_lookup = threading.Event()
+
+    lookup_finished = threading.Event()
+
+    def blocked_repository(github_repository):
+        lookup_started.set()
+        assert release_lookup.wait(timeout=2)
+        lookup_finished.set()
+        return {
+            "full_name": github_repository,
+            "default_branch": "main",
+            "clone_url": f"https://github.test/{github_repository}.git",
+        }
+
+    github.repository = blocked_repository
+    started = time.monotonic()
+    with pytest.raises(
+        TimeoutError,
+        match="metadata lookup timed out.*no repository was added",
+    ):
+        app.add_repository("acme/late")
+    elapsed = time.monotonic() - started
+
+    assert lookup_started.is_set()
+    assert elapsed < 0.5
+    assert store.list_repositories() == []
+
+    # Let the upstream call finish well after the caller crossed its deadline.
+    # The daemon lookup has no persistence authority, so the repository stays absent.
+    release_lookup.set()
+    assert lookup_finished.wait(timeout=2)
+    assert store.list_repositories() == []
+    app.close()
+
+
+def test_add_repository_commits_normally_before_lookup_boundary(tmp_path):
+    app, store, github, _ = make_app(
+        tmp_path, add_repository_lookup_timeout=0.5
+    )
+
+    repository = app.add_repository("acme/on-time", "release")
+
+    assert repository["github_repository"] == "acme/on-time"
+    assert repository["target_branch"] == "release"
+    assert [item["github_repository"] for item in store.list_repositories()] == [
+        "acme/on-time"
+    ]
+    app.close()
+
+
+def test_repository_add_operation_stays_pending_until_delayed_storage_commit(tmp_path):
+    """Storage contention cannot expose non-commit before the final transaction."""
+    app, store, github, _ = make_app(tmp_path, add_repository_lookup_timeout=0.5)
+    commit_entered = threading.Event()
+    release_commit = threading.Event()
+    original_commit = store.add_repository_for_operation
+
+    def delayed_commit(*args, **kwargs):
+        commit_entered.set()
+        assert release_commit.wait(timeout=2)
+        return original_commit(*args, **kwargs)
+
+    store.add_repository_for_operation = delayed_commit
+    outcome = {}
+
+    def add():
+        try:
+            outcome["repository"] = app.add_repository(
+                "acme/storage-delayed", "release", operation_id="operation-storage-delay"
+            )
+        except BaseException as error:
+            outcome["error"] = error
+
+    thread = threading.Thread(target=add)
+    thread.start()
+    assert commit_entered.wait(timeout=2)
+
+    pending = app.repository_add_operation("operation-storage-delay")
+    assert {
+        key: pending[key]
+        for key in (
+            "operation_id", "github_repository", "target_branch", "state",
+            "repository_id", "error", "repository",
+        )
+    } == {
+        "operation_id": "operation-storage-delay",
+        "github_repository": "acme/storage-delayed",
+        "target_branch": "release",
+        "state": "PENDING",
+        "repository_id": None,
+        "error": None,
+        "repository": None,
+    }
+    assert pending["created_at"] <= pending["updated_at"]
+    assert pending["terminal_at"] is None
+    assert store.list_repositories() == []
+
+    release_commit.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert "error" not in outcome
+    assert outcome["repository"]["github_repository"] == "acme/storage-delayed"
+
+    committed = app.repository_add_operation("operation-storage-delay")
+    assert committed["state"] == "COMMITTED"
+    assert committed["repository_id"] == outcome["repository"]["id"]
+    assert committed["repository"] == outcome["repository"]
+
+    # Replaying the same operation identity is idempotent and cannot insert twice.
+    replayed = app.add_repository(
+        "acme/storage-delayed", "release", operation_id="operation-storage-delay"
+    )
+    assert replayed == outcome["repository"]
+    assert [item["github_repository"] for item in store.list_repositories()] == [
+        "acme/storage-delayed"
+    ]
+    assert app._repository_add_locks == {}
+    app.close()
+
+
+def test_repository_add_operation_failure_is_terminal_before_late_lookup_finishes(tmp_path):
+    """A FAILED operation cannot later transition to a repository commit."""
+    app, store, github, _ = make_app(
+        tmp_path, add_repository_lookup_timeout=0.05
+    )
+    lookup_started = threading.Event()
+    release_lookup = threading.Event()
+    lookup_finished = threading.Event()
+
+    def blocked_repository(github_repository):
+        lookup_started.set()
+        assert release_lookup.wait(timeout=2)
+        lookup_finished.set()
+        return {
+            "full_name": github_repository,
+            "default_branch": "main",
+            "clone_url": f"https://github.test/{github_repository}.git",
+        }
+
+    github.repository = blocked_repository
+    with pytest.raises(RepositoryLookupTimeoutError):
+        app.add_repository(
+            "acme/terminal-failure", operation_id="operation-terminal-failure"
+        )
+    assert lookup_started.is_set()
+
+    failed = app.repository_add_operation("operation-terminal-failure")
+    assert failed["state"] == "FAILED"
+    assert failed["repository_id"] is None
+    assert "metadata lookup timed out" in failed["error"]
+    assert failed["repository"] is None
+
+    release_lookup.set()
+    assert lookup_finished.wait(timeout=2)
+    assert app.repository_add_operation("operation-terminal-failure")["state"] == "FAILED"
+    assert store.list_repositories() == []
+    assert app._repository_add_locks == {}
+    app.close()
+
+
+def test_application_restart_makes_interrupted_repository_add_definitively_failed(tmp_path):
+    """No prior-process PENDING operation can retain imaginary commit authority."""
+    store = Store(tmp_path / "state.sqlite3")
+    store.begin_repository_add_operation(
+        "operation-interrupted", "acme/interrupted", None
+    )
+    github = FakeGitHub()
+    runtime = ScriptedRuntime()
+    router = SemanticRouter(MapEmbedder({}))
+    app = Application(
+        store,
+        github,
+        runtime,
+        router,
+        ApplicationConfig(data_dir=tmp_path / "runtime"),
+    )
+    app.acquire_service_ownership()
+
+    operation = app.repository_add_operation("operation-interrupted")
+    assert operation["state"] == "FAILED"
+    assert operation["repository_id"] is None
+    assert operation["error"] == "repository add was interrupted before storage commit"
+    assert operation["repository"] is None
+    assert store.list_repositories() == []
+    app.close()
+
+
+def test_concurrent_repository_add_replay_waits_for_authoritative_first_outcome(tmp_path):
+    """One operation identity cannot race itself into conflicting terminal states."""
+    app, store, github, _ = make_app(tmp_path, add_repository_lookup_timeout=0.5)
+    first_lookup_started = threading.Event()
+    release_first_lookup = threading.Event()
+    lookup_calls = 0
+    lookup_lock = threading.Lock()
+
+    def repository_metadata(github_repository):
+        nonlocal lookup_calls
+        with lookup_lock:
+            lookup_calls += 1
+        first_lookup_started.set()
+        assert release_first_lookup.wait(timeout=2)
+        return {
+            "full_name": github_repository,
+            "default_branch": "main",
+            "clone_url": f"https://github.test/{github_repository}.git",
+        }
+
+    github.repository = repository_metadata
+    results = []
+    errors = []
+
+    def add():
+        try:
+            results.append(
+                app.add_repository(
+                    "acme/idempotent", operation_id="operation-idempotent"
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    first = threading.Thread(target=add)
+    second = threading.Thread(target=add)
+    first.start()
+    assert first_lookup_started.wait(timeout=2)
+    second.start()
+    release_first_lookup.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert errors == []
+    assert len(results) == 2
+    assert results[0] == results[1]
+    assert lookup_calls == 1
+    assert len(store.list_repositories()) == 1
+    assert app.repository_add_operation("operation-idempotent")["state"] == "COMMITTED"
+    assert app._repository_add_locks == {}
+    app.close()
+
+
+def test_repository_add_lock_retirement_waits_for_all_replay_callers(tmp_path):
+    """The shared entry survives its owner and every waiter, then retires."""
+    app, store, github, _ = make_app(tmp_path, add_repository_lookup_timeout=0.5)
+    lookup_started = threading.Event()
+    release_lookup = threading.Event()
+    lookup_calls = 0
+    lookup_guard = threading.Lock()
+
+    def repository_metadata(github_repository):
+        nonlocal lookup_calls
+        with lookup_guard:
+            lookup_calls += 1
+        lookup_started.set()
+        assert release_lookup.wait(timeout=2)
+        return {
+            "full_name": github_repository,
+            "default_branch": "main",
+            "clone_url": f"https://github.test/{github_repository}.git",
+        }
+
+    github.repository = repository_metadata
+    caller_count = 6
+    results = []
+    errors = []
+
+    def add():
+        try:
+            results.append(
+                app.add_repository(
+                    "acme/many-replays", operation_id="operation-many-replays"
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    callers = [threading.Thread(target=add) for _ in range(caller_count)]
+    callers[0].start()
+    assert lookup_started.wait(timeout=2)
+    for caller in callers[1:]:
+        caller.start()
+
+    # Observe the intentional registry contract rather than relying on scheduler
+    # timing: the owner and every waiter have registered a reference before release.
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with app._repository_add_lock_guard:
+            entry = app._repository_add_locks.get("operation-many-replays")
+            references = entry.references if entry is not None else 0
+        if references == caller_count:
+            break
+        time.sleep(0.005)
+    assert references == caller_count
+
+    release_lookup.set()
+    for caller in callers:
+        caller.join(timeout=2)
+        assert not caller.is_alive()
+
+    assert errors == []
+    assert len(results) == caller_count
+    assert all(result == results[0] for result in results)
+    assert lookup_calls == 1
+    assert len(store.list_repositories()) == 1
+    assert app._repository_add_locks == {}
+    app.close()
+
+
+def test_repository_add_lock_retirement_serializes_new_arrival_at_delete_boundary(tmp_path):
+    """A new caller cannot acquire a replacement lock while retirement is in flight."""
+    app, _, _, _ = make_app(tmp_path, add_repository_lookup_timeout=0.5)
+    deletion_started = threading.Event()
+    allow_deletion = threading.Event()
+    first_execution_started = threading.Event()
+    release_first_execution = threading.Event()
+    execution_guard = threading.Lock()
+    active_executions = 0
+    maximum_active_executions = 0
+    lock_entry_ids = []
+
+    class RetirementBoundaryRegistry(dict):
+        def __delitem__(self, key):
+            deletion_started.set()
+            assert allow_deletion.wait(timeout=2)
+            super().__delitem__(key)
+
+    app._repository_add_locks = RetirementBoundaryRegistry()
+
+    def execute(operation_id, github_repository, target_branch):
+        nonlocal active_executions, maximum_active_executions
+        with execution_guard:
+            active_executions += 1
+            maximum_active_executions = max(
+                maximum_active_executions, active_executions
+            )
+            lock_entry_ids.append(id(app._repository_add_locks[operation_id]))
+        if not first_execution_started.is_set():
+            first_execution_started.set()
+            assert release_first_execution.wait(timeout=2)
+        with execution_guard:
+            active_executions -= 1
+        return {"github_repository": github_repository}
+
+    app._execute_repository_add = execute
+    results = []
+    errors = []
+
+    def add():
+        try:
+            results.append(
+                app.add_repository(
+                    "acme/retirement-boundary",
+                    operation_id="operation-retirement-boundary",
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    owner = threading.Thread(target=add)
+    owner.start()
+    assert first_execution_started.wait(timeout=2)
+    release_first_execution.set()
+    assert deletion_started.wait(timeout=2)
+
+    # Retirement holds the registry guard. The arriving replay cannot create or
+    # acquire another lock until the old execution has finished and deletion commits.
+    arriving_replay = threading.Thread(target=add)
+    arriving_replay.start()
+    assert arriving_replay.is_alive()
+    allow_deletion.set()
+
+    owner.join(timeout=2)
+    arriving_replay.join(timeout=2)
+    assert not owner.is_alive()
+    assert not arriving_replay.is_alive()
+    assert errors == []
+    assert len(results) == 2
+    assert maximum_active_executions == 1
+    assert len(set(lock_entry_ids)) == 2
+    assert app._repository_add_locks == {}
+    app.close()
+
+def test_empty_repository_lookup_error_records_nonempty_terminal_operation_failure(tmp_path):
+    """An empty lookup exception remains original while durable status becomes FAILED."""
+    app, store, github, _ = make_app(tmp_path, add_repository_lookup_timeout=0.5)
+    original_error = TimeoutError()
+
+    def empty_failure(_github_repository):
+        raise original_error
+
+    github.repository = empty_failure
+    with pytest.raises(TimeoutError) as captured:
+        app.add_repository("acme/empty-lookup", operation_id="empty-lookup")
+
+    assert captured.value is original_error
+    operation = app.repository_add_operation("empty-lookup")
+    assert operation["state"] == "FAILED"
+    assert operation["repository_id"] is None
+    assert operation["repository"] is None
+    assert operation["error"] == "TimeoutError: repository add failed"
+    assert store.list_repositories() == []
+    app.close()
+
+
+def test_whitespace_repository_lookup_error_uses_exception_type_fallback(tmp_path):
+    """Whitespace-only exception text is not accepted as a durable diagnostic."""
+    app, _, github, _ = make_app(tmp_path, add_repository_lookup_timeout=0.5)
+
+    class WhitespaceError(Exception):
+        def __str__(self):
+            return "  \t "
+
+    original_error = WhitespaceError()
+
+    def whitespace_failure(_github_repository):
+        raise original_error
+
+    github.repository = whitespace_failure
+    with pytest.raises(WhitespaceError) as captured:
+        app.add_repository("acme/whitespace", operation_id="whitespace-error")
+
+    assert captured.value is original_error
+    operation = app.repository_add_operation("whitespace-error")
+    assert operation["state"] == "FAILED"
+    assert operation["error"] == "WhitespaceError: repository add failed"
+    app.close()
+
+
+def test_empty_storage_error_records_nonempty_terminal_operation_failure(tmp_path):
+    """An empty storage-adjacent exception cannot leave the operation PENDING."""
+    app, store, github, _ = make_app(tmp_path, add_repository_lookup_timeout=0.5)
+    original_error = RuntimeError()
+
+    def empty_failure(*_args, **_kwargs):
+        raise original_error
+
+    store.add_repository_for_operation = empty_failure
+    with pytest.raises(RuntimeError) as captured:
+        app.add_repository("acme/empty-storage", operation_id="empty-storage")
+
+    assert captured.value is original_error
+    operation = app.repository_add_operation("empty-storage")
+    assert operation["state"] == "FAILED"
+    assert operation["repository_id"] is None
+    assert operation["repository"] is None
+    assert operation["error"] == "RuntimeError: repository add failed"
+    assert store.list_repositories() == []
+    app.close()
+
+
+def test_repository_add_failure_normalization_preserves_meaningful_message(tmp_path):
+    """Existing useful diagnostics are stored byte-for-byte rather than rewritten."""
+    app, _, github, _ = make_app(tmp_path, add_repository_lookup_timeout=0.5)
+    original_error = ValueError("repository metadata was rejected")
+
+    def meaningful_failure(_github_repository):
+        raise original_error
+
+    github.repository = meaningful_failure
+    with pytest.raises(ValueError) as captured:
+        app.add_repository("acme/meaningful", operation_id="meaningful-error")
+
+    assert captured.value is original_error
+    operation = app.repository_add_operation("meaningful-error")
+    assert operation["state"] == "FAILED"
+    assert operation["error"] == "repository metadata was rejected"
+    app.close()
+
+
+
+def test_http_empty_message_repository_add_failures_expose_terminal_status(tmp_path):
+    """POST keeps original 500 semantics while status lookup exposes durable FAILED."""
+
+    def exercise(case_name, configure_failure, expected_error):
+        case_path = tmp_path / case_name
+        case_path.mkdir(parents=True, exist_ok=True)
+        app, store, github, _ = make_app(
+            case_path, add_repository_lookup_timeout=0.5
+        )
+        original_error = configure_failure(store, github)
+        service = HttpService(app, "127.0.0.1", 0, 60)
+        thread = threading.Thread(target=service.serve_forever, daemon=True)
+        thread.start()
+        host, port = service.address
+        base = f"http://{host}:{port}"
+        operation_id = f"empty-http-{case_name}"
+        request = urllib.request.Request(
+            base + "/api/repositories",
+            data=json.dumps({"github_repository": f"acme/{case_name}"}).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Repogents-Operation-Id": operation_id,
+            },
+        )
+        try:
+            with pytest.raises(urllib.error.HTTPError) as captured:
+                urllib.request.urlopen(request, timeout=3)
+            assert captured.value.code == 500
+            # The transport still reflects the original empty-message exception;
+            # durable normalization must not replace or mask that failure path.
+            assert json.loads(captured.value.read()) == {"error": ""}
+
+            with urllib.request.urlopen(
+                base + f"/api/repository-add-operations/{operation_id}", timeout=3
+            ) as response:
+                operation = json.loads(response.read())
+            assert operation["state"] == "FAILED"
+            assert operation["repository_id"] is None
+            assert operation["repository"] is None
+            assert operation["error"] == expected_error
+            assert operation["error"].strip()
+            assert store.list_repositories() == []
+
+            # Replaying the same durable identity cannot revive a FAILED operation.
+            with pytest.raises(urllib.error.HTTPError) as replayed:
+                urllib.request.urlopen(request, timeout=3)
+            assert replayed.value.code == 400
+            assert store.list_repositories() == []
+            assert app.repository_add_operation(operation_id)["state"] == "FAILED"
+            assert original_error is not None
+        finally:
+            service.shutdown()
+            thread.join(timeout=3)
+            app.close()
+
+    def empty_lookup(_store, github):
+        error = TimeoutError()
+
+        def fail(_repository):
+            raise error
+
+        github.repository = fail
+        return error
+
+    def empty_storage(store, _github):
+        error = RuntimeError()
+
+        def fail(*_args, **_kwargs):
+            raise error
+
+        store.add_repository_for_operation = fail
+        return error
+
+    exercise("lookup", empty_lookup, "TimeoutError: repository add failed")
+    exercise("storage", empty_storage, "RuntimeError: repository add failed")
+
+
+def test_empty_post_commit_error_does_not_overwrite_committed_operation(tmp_path):
+    """An exceptional response after atomic commit still returns durable COMMITTED state."""
+    app, store, github, _ = make_app(tmp_path, add_repository_lookup_timeout=0.5)
+    original_commit = store.add_repository_for_operation
+    late_error = RuntimeError()
+
+    def commit_then_fail(*args, **kwargs):
+        original_commit(*args, **kwargs)
+        raise late_error
+
+    store.add_repository_for_operation = commit_then_fail
+    repository = app.add_repository(
+        "acme/committed-before-error", operation_id="committed-before-empty-error"
+    )
+
+    operation = app.repository_add_operation("committed-before-empty-error")
+    assert operation["state"] == "COMMITTED"
+    assert operation["error"] is None
+    assert operation["repository_id"] == repository["id"]
+    assert operation["repository"] == repository
+    assert [item["id"] for item in store.list_repositories()] == [repository["id"]]
+    app.close()
+
+
+def test_application_cleanup_trigger_expires_terminal_operations_in_batches(tmp_path):
+    now = [3000.0]
+    store = Store(tmp_path / "retention-application.sqlite3", clock=lambda: now[0])
+    github = FakeGitHub()
+    runtime = ScriptedRuntime()
+    router = SemanticRouter(MapEmbedder({}))
+    config = ApplicationConfig(
+        data_dir=tmp_path / "runtime-retention",
+        repository_add_operation_retention_seconds=100.0,
+        repository_add_operation_cleanup_batch_size=2,
+    )
+    app = Application(store, github, runtime, router, config)
+    app.acquire_service_ownership()
+
+    for index in range(5):
+        operation_id = f"expired-{index}"
+        store.begin_repository_add_operation(operation_id, f"acme/expired-{index}", None)
+        store.fail_repository_add_operation(operation_id, "not found")
+    store.begin_repository_add_operation("old-pending", "acme/pending", None)
+
+    now[0] = 3101.0
+    # Status lookup is a centrally owned cleanup trigger and deletes only one
+    # configured batch before serving the retained operation result.
+    retained = app.repository_add_operation("expired-4")
+    assert retained is not None
+    with sqlite3.connect(store.path) as connection:
+        terminal_count = connection.execute(
+            "SELECT COUNT(*) FROM repository_add_operations WHERE state != 'PENDING'"
+        ).fetchone()[0]
+    assert terminal_count == 3
+    assert store.get_repository_add_operation("old-pending")["state"] == "PENDING"
+
+    # Registration triggers another bounded batch, then the new operation commits.
+    repository = app.add_repository(
+        "acme/current", "main", operation_id="current-operation"
+    )
+    assert repository["github_repository"] == "acme/current"
+    with sqlite3.connect(store.path) as connection:
+        rows = connection.execute(
+            "SELECT operation_id, state FROM repository_add_operations ORDER BY operation_id"
+        ).fetchall()
+    assert ("old-pending", "PENDING") in rows
+    assert ("current-operation", "COMMITTED") in rows
+    assert sum(state in {"COMMITTED", "FAILED"} for _, state in rows) == 2
+    app.close()
+
+
+def test_application_config_rejects_invalid_operation_retention_policy(tmp_path):
+    for overrides in (
+        {"repository_add_operation_retention_seconds": 0},
+        {"repository_add_operation_cleanup_batch_size": 0},
+    ):
+        with pytest.raises(ValueError):
+            ApplicationConfig(data_dir=tmp_path, **overrides)
+
+
+def test_application_cleanup_drains_large_expired_failure_history_in_bounded_batches(tmp_path):
+    """Normal application activity steadily bounds hostile terminal history growth."""
+    now = [4000.0]
+    store = Store(tmp_path / "retention-growth.sqlite3", clock=lambda: now[0])
+    for index in range(105):
+        operation_id = f"hostile-failure-{index:03d}"
+        store.begin_repository_add_operation(
+            operation_id, f"acme/hostile-{index}", None
+        )
+        store.fail_repository_add_operation(operation_id, "repository unavailable")
+
+    now[0] = 4101.0
+    github = FakeGitHub()
+    app = Application(
+        store,
+        github,
+        ScriptedRuntime(),
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(
+            data_dir=tmp_path / "runtime-retention-growth",
+            repository_add_operation_retention_seconds=100.0,
+            repository_add_operation_cleanup_batch_size=25,
+        ),
+    )
+    app.acquire_service_ownership()
+
+    # Startup owns one bounded batch, not an unbounded writer lock.
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM repository_add_operations"
+        ).fetchone()[0] == 80
+
+    store.begin_repository_add_operation("active-pending", "acme/active", None)
+    store.begin_repository_add_operation("recent-status", "acme/recent", None)
+    store.fail_repository_add_operation("recent-status", "recent failure")
+
+    remaining_expired = []
+    for _ in range(4):
+        assert app.repository_add_operation("recent-status")["state"] == "FAILED"
+        with sqlite3.connect(store.path) as connection:
+            remaining_expired.append(
+                connection.execute(
+                    """SELECT COUNT(*) FROM repository_add_operations
+                    WHERE operation_id LIKE 'hostile-failure-%'"""
+                ).fetchone()[0]
+            )
+
+    assert remaining_expired == [55, 30, 5, 0]
+    assert app.repository_add_operation("active-pending")["state"] == "PENDING"
+    assert app.repository_add_operation("recent-status")["error"] == "recent failure"
+    app.close()
+
+
+def test_legacy_terminal_operations_receive_full_window_before_startup_expiration(tmp_path):
+    """Migration age starts locally and later application startup may expire it."""
+    path = tmp_path / "legacy-retention-startup.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE repositories (
+            id INTEGER PRIMARY KEY,
+            github_repository TEXT NOT NULL UNIQUE,
+            target_branch TEXT NOT NULL,
+            similarity_threshold REAL NOT NULL,
+            tracked INTEGER NOT NULL DEFAULT 1 CHECK (tracked IN (0, 1))
+        );
+        CREATE TABLE repository_add_operations (
+            operation_id TEXT PRIMARY KEY,
+            github_repository TEXT NOT NULL,
+            target_branch TEXT,
+            state TEXT NOT NULL CHECK (state IN ('PENDING', 'COMMITTED', 'FAILED')),
+            repository_id INTEGER REFERENCES repositories(id),
+            error TEXT
+        );
+        INSERT INTO repository_add_operations VALUES
+            ('legacy-failed', 'acme/legacy-failed', NULL, 'FAILED', NULL, 'missing');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    now = [5000.0]
+    store = Store(path, clock=lambda: now[0])
+    config = ApplicationConfig(
+        data_dir=tmp_path / "runtime-legacy-retention",
+        repository_add_operation_retention_seconds=100.0,
+        repository_add_operation_cleanup_batch_size=10,
+    )
+    app = Application(
+        store, FakeGitHub(), ScriptedRuntime(), SemanticRouter(MapEmbedder({})), config
+    )
+    app.acquire_service_ownership()
+    assert app.repository_add_operation("legacy-failed")["error"] == "missing"
+    app.close()
+
+    now[0] = 5100.0
+    restarted = Application(
+        store, FakeGitHub(), ScriptedRuntime(), SemanticRouter(MapEmbedder({})), config
+    )
+    restarted.acquire_service_ownership()
+    assert restarted.repository_add_operation("legacy-failed") is None
+    restarted.close()
+
+
+def test_application_retains_committed_lookup_and_replay_then_expires_only_operation(tmp_path):
+    """Application status and idempotent replay remain authoritative until expiry."""
+    now = [6000.0]
+    store = Store(tmp_path / "retention-replay.sqlite3", clock=lambda: now[0])
+    app = Application(
+        store,
+        FakeGitHub(),
+        ScriptedRuntime(),
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(
+            data_dir=tmp_path / "runtime-retention-replay",
+            repository_add_operation_retention_seconds=100.0,
+            repository_add_operation_cleanup_batch_size=10,
+        ),
+    )
+    repository = app.add_repository(
+        "acme/replay-window", "release", operation_id="retained-commit"
+    )
+
+    now[0] = 6099.999
+    operation = app.repository_add_operation("retained-commit")
+    assert operation["state"] == "COMMITTED"
+    assert operation["repository"] == repository
+    assert app.add_repository(
+        "acme/replay-window", "release", operation_id="retained-commit"
+    ) == repository
+
+    now[0] = 6100.0
+    assert app.repository_add_operation("retained-commit") is None
+    assert store.get_repository(repository["id"])["github_repository"] == (
+        "acme/replay-window"
+    )
+    assert len(store.list_nodes(repository["id"])) == 2
+    app.close()
+
+
+def test_duplicate_service_startup_does_not_recover_live_pending_add(tmp_path):
+    """Only a listener-owning data-directory owner may recover pending adds."""
+    database = tmp_path / "owned-state.sqlite3"
+    data_dir = tmp_path / "owned-runtime"
+
+    def application():
+        return Application(
+            Store(database),
+            FakeGitHub(),
+            ScriptedRuntime(),
+            SemanticRouter(MapEmbedder({})),
+            ApplicationConfig(data_dir=data_dir),
+        )
+
+    live_app = application()
+    live_service = HttpService(live_app, "127.0.0.1", 0, 60)
+    live_thread = threading.Thread(
+        target=live_service.serve_forever, daemon=True
+    )
+    live_thread.start()
+    host, port = live_service.address
+
+    # Model a mutation registered by the active owner after startup recovery.
+    live_app.store.begin_repository_add_operation(
+        "live-pending", "acme/live", None
+    )
+    assert live_app.repository_add_operation("live-pending")["state"] == "PENDING"
+
+    competing_app = application()
+    with pytest.raises(OSError):
+        HttpService(competing_app, host, port, 60)
+    # Binding failed before ownership acquisition, so the live operation and all
+    # durable repository state remain untouched. The failed app was also closed.
+    assert live_app.repository_add_operation("live-pending")["state"] == "PENDING"
+    assert competing_app._closed is True
+
+    # Even a different listener cannot serve or mutate the same data directory.
+    ownership_competitor = application()
+    with pytest.raises(RuntimeError, match="data directory is already owned"):
+        HttpService(ownership_competitor, "127.0.0.1", 0, 60)
+    assert ownership_competitor._closed is True
+    assert live_app.repository_add_operation("live-pending")["state"] == "PENDING"
+
+    live_service.shutdown()
+    live_thread.join(timeout=3)
+    assert not live_thread.is_alive()
+
+    restarted_app = application()
+    restarted_service = HttpService(restarted_app, host, port, 60)
+    try:
+        recovered = restarted_app.repository_add_operation("live-pending")
+        assert recovered["state"] == "FAILED"
+        assert recovered["error"] == (
+            "repository add was interrupted before storage commit"
+        )
+        assert restarted_app.store.list_repositories() == []
+    finally:
+        # serve_forever was never entered, so close the bound listener and owner
+        # explicitly to prove a later restart can reacquire both boundaries.
+        restarted_service._server.server_close()
+        restarted_app.close()
+
+    final_app = application()
+    final_service = HttpService(final_app, host, port, 60)
+    final_service._server.server_close()
+    final_app.close()
+
+
+@pytest.mark.parametrize("workers", [0, -1, True, 1.5])
+def test_application_config_rejects_invalid_repository_lookup_worker_capacity(
+    tmp_path, workers
+):
+    with pytest.raises(
+        ValueError, match="add_repository_lookup_max_workers must be a positive integer"
+    ):
+        ApplicationConfig(
+            data_dir=tmp_path / "runtime",
+            add_repository_lookup_max_workers=workers,
+        )
+
+
+def test_repository_metadata_lookup_workers_bound_hung_requests_and_recover_capacity(
+    tmp_path,
+):
+    """Hung metadata calls consume only fixed capacity and late results never commit."""
+    capacity = 2
+    app, store, github, _ = make_app(
+        tmp_path,
+        add_repository_lookup_timeout=0.08,
+        add_repository_lookup_max_workers=capacity,
+    )
+    release = threading.Event()
+    started = threading.Barrier(capacity + 1)
+    lookup_calls = 0
+    lookup_lock = threading.Lock()
+
+    def blocked_repository(github_repository):
+        nonlocal lookup_calls
+        with lookup_lock:
+            lookup_calls += 1
+            call = lookup_calls
+        if call <= capacity:
+            started.wait(timeout=2)
+            assert release.wait(timeout=3)
+        return {
+            "full_name": github_repository,
+            "default_branch": "main",
+            "clone_url": f"https://github.test/{github_repository}.git",
+        }
+
+    github.repository = blocked_repository
+    errors = []
+    begun = time.monotonic()
+
+    def add(index):
+        try:
+            app.add_repository(
+                f"acme/hung-{index}", operation_id=f"bounded-hung-{index}"
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=add, args=(index,)) for index in range(6)]
+    for thread in threads:
+        thread.start()
+    started.wait(timeout=2)
+    for thread in threads:
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+
+    elapsed = time.monotonic() - begun
+    assert elapsed < 0.6
+    assert len(errors) == 6
+    assert all(isinstance(error, RepositoryLookupTimeoutError) for error in errors)
+    assert lookup_calls == capacity
+    assert len(app._repository_lookup_pool._workers) == capacity
+    assert sum(worker.is_alive() for worker in app._repository_lookup_pool._workers) == capacity
+    assert app._repository_lookup_pool._tasks.qsize() == 0
+    assert store.list_repositories() == []
+    assert all(
+        app.repository_add_operation(f"bounded-hung-{index}")["state"] == "FAILED"
+        for index in range(6)
+    )
+
+    # Releasing the fixed blocked calls cannot commit their abandoned results, but
+    # it does return both slots for ordinary later repository additions.
+    release.set()
+    deadline = time.monotonic() + 2
+    while lookup_calls < capacity or app._repository_lookup_pool._capacity._value < capacity:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    assert store.list_repositories() == []
+
+    recovered = app.add_repository(
+        "acme/recovered-capacity", operation_id="bounded-capacity-recovered"
+    )
+    assert recovered["github_repository"] == "acme/recovered-capacity"
+    assert app.repository_add_operation("bounded-capacity-recovered")["state"] == "COMMITTED"
+    app.close()
+
+
+def test_repository_metadata_lookup_pool_stops_admission_after_application_close(tmp_path):
+    app, store, github, _ = make_app(
+        tmp_path,
+        add_repository_lookup_timeout=0.1,
+        add_repository_lookup_max_workers=1,
+    )
+    workers = list(app._repository_lookup_pool._workers)
+    app.close()
+
+    for worker in workers:
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+    with pytest.raises(RuntimeError, match="application is closed"):
+        app.add_repository("acme/after-close", operation_id="after-close")
+    assert store.list_repositories() == []
+
+
+def test_repository_metadata_lookup_released_after_close_cannot_commit(tmp_path):
+    app, store, github, _ = make_app(
+        tmp_path,
+        add_repository_lookup_timeout=1.0,
+        add_repository_lookup_max_workers=1,
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_repository(github_repository):
+        started.set()
+        assert release.wait(timeout=2)
+        return {
+            "full_name": github_repository,
+            "default_branch": "main",
+            "clone_url": f"https://github.test/{github_repository}.git",
+        }
+
+    github.repository = blocked_repository
+    outcome = []
+
+    def add():
+        try:
+            app.add_repository("acme/closing", operation_id="closing-lookup")
+        except BaseException as error:
+            outcome.append(error)
+
+    thread = threading.Thread(target=add)
+    thread.start()
+    assert started.wait(timeout=2)
+    app.close()
+    release.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], RuntimeError)
+    assert str(outcome[0]) == "application is closed"
+    assert store.list_repositories() == []
+    assert store.get_repository_add_operation("closing-lookup")["state"] == "FAILED"
+
+
+def test_service_startup_recovers_pending_add_after_clock_rollback(tmp_path):
+    """Ownership-gated startup recovery tolerates a host clock moving backward."""
+    now = [1000.0]
+    database = tmp_path / "rollback-startup.sqlite3"
+    store = Store(database, clock=lambda: now[0])
+    store.begin_repository_add_operation(
+        "rollback-startup", "acme/rollback-startup", None
+    )
+    now[0] = 900.0
+    app = Application(
+        store,
+        FakeGitHub(),
+        ScriptedRuntime(),
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(data_dir=tmp_path / "rollback-runtime"),
+    )
+    service = HttpService(app, "127.0.0.1", 0, 60)
+    try:
+        recovered = app.repository_add_operation("rollback-startup")
+        assert recovered["state"] == "FAILED"
+        assert recovered["created_at"] == 1000.0
+        assert recovered["updated_at"] == 1000.0
+        assert recovered["terminal_at"] == 1000.0
+        assert recovered["repository"] is None
+        assert store.list_repositories() == []
+    finally:
+        service._server.server_close()
+        app.close()
+
+
+def test_failed_startup_recovery_releases_portable_service_ownership(tmp_path):
+    """Recovery failure closes ownership so a later rightful owner can start."""
+    database = tmp_path / "failed-recovery.sqlite3"
+    data_dir = tmp_path / "failed-recovery-runtime"
+
+    failed_app = Application(
+        Store(database),
+        FakeGitHub(),
+        ScriptedRuntime(),
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(data_dir=data_dir),
+    )
+
+    def fail_recovery():
+        raise RuntimeError("recovery failed")
+
+    failed_app.store.recover_interrupted_work = fail_recovery
+    with pytest.raises(RuntimeError, match="recovery failed"):
+        failed_app.acquire_service_ownership()
+    assert failed_app._service_ownership is None
+    failed_app.close()
+
+    rightful_app = Application(
+        Store(database),
+        FakeGitHub(),
+        ScriptedRuntime(),
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(data_dir=data_dir),
+    )
+    rightful_app.acquire_service_ownership()
+    assert rightful_app._service_ownership is not None
+    rightful_app.close()
+
+
+def test_borrowed_executor_workers_finish_before_service_ownership_release(tmp_path):
+    """Close joins tracked work but leaves the injected executor caller-owned."""
+    from repogents.service_ownership import (
+        ServiceOwnership,
+        ServiceOwnershipUnavailableError,
+    )
+
+    store = Store(tmp_path / "borrowed-worker.sqlite3")
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="borrowed-test")
+    app = Application(
+        store,
+        FakeGitHub(),
+        ScriptedRuntime(),
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(data_dir=tmp_path / "borrowed-runtime"),
+        executor=executor,
+    )
+    app.acquire_service_ownership()
+    ownership_path = app.data_dir / ".repogents-service.lock"
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    worker_finished = threading.Event()
+    mutation_order = []
+    order_guard = threading.Lock()
+
+    def mutation_capable_work():
+        worker_started.set()
+        assert release_worker.wait(timeout=3)
+        repository = store.add_repository("acme/old-generation", "main", 0.75)
+        with order_guard:
+            mutation_order.append("old-worker")
+        worker_finished.set()
+        return repository
+
+    future = executor.submit(mutation_capable_work)
+    with app._worker_lock:
+        app._workers[101] = future
+    assert worker_started.wait(timeout=2)
+
+    close_thread = threading.Thread(target=app.close)
+    concurrent_close_thread = threading.Thread(target=app.close)
+    close_thread.start()
+    concurrent_close_thread.start()
+    close_thread.join(timeout=0.05)
+    concurrent_close_thread.join(timeout=0.05)
+    assert close_thread.is_alive()
+    assert concurrent_close_thread.is_alive()
+    assert app._service_ownership is not None
+
+    competitor = ServiceOwnership(ownership_path)
+    with pytest.raises(ServiceOwnershipUnavailableError):
+        competitor.acquire()
+
+    release_worker.set()
+    close_thread.join(timeout=2)
+    concurrent_close_thread.join(timeout=2)
+    assert not close_thread.is_alive()
+    assert not concurrent_close_thread.is_alive()
+    assert worker_finished.is_set()
+    assert app._close_complete.is_set()
+    assert app._service_ownership is None
+    assert app._workers == {}
+
+    replacement = ServiceOwnership(ownership_path)
+    replacement.acquire()
+    with order_guard:
+        mutation_order.append("replacement-acquired")
+    assert [item["github_repository"] for item in store.list_repositories()] == [
+        "acme/old-generation"
+    ]
+    assert mutation_order == ["old-worker", "replacement-acquired"]
+
+    # Application.close does not take lifecycle ownership of the borrowed pool.
+    assert executor.submit(lambda: "still-usable").result(timeout=2) == "still-usable"
+    replacement.close()
+    executor.shutdown(wait=True)

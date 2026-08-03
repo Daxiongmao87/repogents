@@ -12,7 +12,11 @@ from repogents.store import Store
 def build_service(config: ServiceConfig) -> HttpService:
     config.data_dir.mkdir(parents=True, exist_ok=True)
     store = Store(config.data_dir / "repogents.sqlite3")
-    github = GitHubClient(config.github_token)
+    github = GitHubClient(
+        config.github_token,
+        transport_timeout=config.github_request_timeout,
+        git_command_timeout=config.git_command_timeout,
+    )
     runtime = MiniSweRuntime(
         RuntimeConfig(api_base=config.codex_api_base, model=config.model)
     )
@@ -27,9 +31,18 @@ def build_service(config: ServiceConfig) -> HttpService:
             default_similarity_threshold=config.similarity_threshold,
             promotion_threshold=config.promotion_threshold,
             stale_run_threshold=config.stale_run_threshold,
+            repository_add_operation_retention_seconds=(
+                config.repository_add_operation_retention_seconds
+            ),
+            repository_add_operation_cleanup_batch_size=(
+                config.repository_add_operation_cleanup_batch_size
+            ),
         ),
     )
-    return HttpService(application, config.host, config.port, config.poll_seconds)
+    return HttpService(
+        application, config.host, config.port, config.poll_seconds,
+        request_io_timeout=config.http_request_io_timeout,
+    )
 
 
 def main() -> None:

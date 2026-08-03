@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import json
+import math
+import queue
 import shutil
+import time
 import tempfile
 import threading
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from repogents.errors import RepositoryLookupTimeoutError
 from repogents.github import GitHubFeedback, PullRequest
 from repogents.semantic import SemanticRouter, validate_classification
+from repogents.service_ownership import (
+    ServiceOwnership,
+    ServiceOwnershipUnavailableError,
+)
 from repogents.store import TERMINAL_RUN_STATES, Store
 
 
@@ -21,6 +30,10 @@ class ApplicationConfig:
     promotion_threshold: int = 3
     stale_run_threshold: int = 3
     max_workers: int = 8
+    add_repository_lookup_timeout: float = 14.0
+    add_repository_lookup_max_workers: int = 4
+    repository_add_operation_retention_seconds: float = 7 * 24 * 60 * 60
+    repository_add_operation_cleanup_batch_size: int = 100
 
     def __post_init__(self) -> None:
         if not 0 <= self.default_similarity_threshold < 1:
@@ -33,6 +46,36 @@ class ApplicationConfig:
             raise ValueError("stale_run_threshold must be positive")
         if self.max_workers <= 0:
             raise ValueError("max_workers must be positive")
+        if (
+            not math.isfinite(self.add_repository_lookup_timeout)
+            or self.add_repository_lookup_timeout <= 0
+        ):
+            raise ValueError(
+                "add_repository_lookup_timeout must be finite and positive"
+            )
+        if (
+            isinstance(self.add_repository_lookup_max_workers, bool)
+            or not isinstance(self.add_repository_lookup_max_workers, int)
+            or self.add_repository_lookup_max_workers <= 0
+        ):
+            raise ValueError(
+                "add_repository_lookup_max_workers must be a positive integer"
+            )
+        if (
+            not math.isfinite(self.repository_add_operation_retention_seconds)
+            or self.repository_add_operation_retention_seconds <= 0
+        ):
+            raise ValueError(
+                "repository_add_operation_retention_seconds must be finite and positive"
+            )
+        if (
+            isinstance(self.repository_add_operation_cleanup_batch_size, bool)
+            or not isinstance(self.repository_add_operation_cleanup_batch_size, int)
+            or self.repository_add_operation_cleanup_batch_size <= 0
+        ):
+            raise ValueError(
+                "repository_add_operation_cleanup_batch_size must be a positive integer"
+            )
 
 
 _CLASSIFICATION_GUIDANCE = (
@@ -103,6 +146,107 @@ _VALIDATION_SCHEMA = {
 }
 
 
+@dataclass(slots=True)
+class _RepositoryLookupTask:
+    repository: str
+    outcome: queue.Queue[tuple[bool, object]]
+
+
+class _BoundedRepositoryLookupPool:
+    """Run repository metadata calls on a fixed set of daemon workers.
+
+    Capacity represents executing or worker-owned calls, not merely Python thread
+    objects. A caller must reserve a slot before queueing work, so an upstream call
+    that never returns can consume at most one of the configured fixed slots and
+    repeated requests cannot build an unbounded executor queue. Workers are daemon
+    threads because Python cannot cancel an arbitrary blocked transport call; close
+    stops admission and abandons only that fixed, process-exitable worker set.
+    """
+
+    def __init__(self, github, max_workers: int):
+        self._github = github
+        self._capacity = threading.BoundedSemaphore(max_workers)
+        self._tasks: queue.Queue[_RepositoryLookupTask | None] = queue.Queue()
+        self._lock = threading.Lock()
+        self._closed = False
+        self._workers = []
+        for index in range(max_workers):
+            worker = threading.Thread(
+                target=self._run,
+                name=f"repogents-add-repository-lookup-{index + 1}",
+                daemon=True,
+            )
+            worker.start()
+            self._workers.append(worker)
+
+    def submit(self, repository: str, timeout: float) -> _RepositoryLookupTask:
+        deadline = time.monotonic() + timeout
+        if not self._capacity.acquire(timeout=timeout):
+            raise RepositoryLookupTimeoutError(
+                "GitHub repository metadata lookup timed out while waiting for "
+                "bounded lookup capacity before Repogents could add the repository; "
+                "no repository was added"
+            )
+        task = _RepositoryLookupTask(repository, queue.Queue(maxsize=1))
+        try:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("application is closed")
+                remaining = max(0.0, deadline - time.monotonic())
+                self._tasks.put(task, timeout=remaining)
+        except BaseException:
+            self._capacity.release()
+            raise
+        return task
+
+    def _run(self) -> None:
+        while True:
+            task = self._tasks.get()
+            if task is None:
+                self._tasks.task_done()
+                return
+            try:
+                try:
+                    value = self._github.repository(task.repository)
+                except BaseException as error:
+                    task.outcome.put((False, error))
+                else:
+                    task.outcome.put((True, value))
+            finally:
+                self._capacity.release()
+                self._tasks.task_done()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            # Cancel work that was admitted but not yet claimed by a worker. Calls
+            # already inside third-party transport remain bounded by the fixed worker
+            # count and lose commit authority through Application._closed.
+            while True:
+                try:
+                    task = self._tasks.get_nowait()
+                except queue.Empty:
+                    break
+                if task is not None:
+                    task.outcome.put((False, RuntimeError("application is closed")))
+                    self._capacity.release()
+                self._tasks.task_done()
+            # Idle workers exit promptly. A worker blocked in third-party transport
+            # sees its sentinel only after that fixed live call eventually returns.
+            for _ in self._workers:
+                self._tasks.put_nowait(None)
+
+
+@dataclass(slots=True)
+class _RepositoryAddLockEntry:
+    """One same-identity serialization lock plus every live caller reference."""
+
+    lock: threading.Lock
+    references: int = 0
+
+
 class Application:
     def __init__(
         self,
@@ -120,7 +264,6 @@ class Application:
         self.config = config
         self.data_dir = Path(config.data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.store.recover_interrupted_work()
         self._executor = executor or ThreadPoolExecutor(
             max_workers=config.max_workers,
             thread_name_prefix="repogents-node",
@@ -128,18 +271,198 @@ class Application:
         self._owns_executor = executor is None
         self._workers: dict[int, Future] = {}
         self._worker_lock = threading.Lock()
+        self._repository_add_lock_guard = threading.Lock()
+        self._repository_add_locks: dict[str, _RepositoryAddLockEntry] = {}
+        self._repository_lookup_pool = _BoundedRepositoryLookupPool(
+            github, config.add_repository_lookup_max_workers
+        )
+        self._service_ownership: ServiceOwnership | None = None
+        self._service_ownership_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._close_complete = threading.Event()
         self._closed = False
 
-    def add_repository(
-        self, github_repository: str, target_branch: str | None = None
-    ) -> dict:
-        metadata = self.github.repository(github_repository)
-        branch = target_branch or metadata["default_branch"]
-        return self.store.add_repository(
-            github_repository,
-            branch,
-            self.config.default_similarity_threshold,
+    def _purge_expired_repository_add_operations(self) -> int:
+        """Run one short, centrally configured terminal-operation cleanup batch."""
+        return self.store.purge_expired_repository_add_operations(
+            self.config.repository_add_operation_retention_seconds,
+            limit=self.config.repository_add_operation_cleanup_batch_size,
         )
+
+    def acquire_service_ownership(self) -> None:
+        """Acquire exclusive data-directory ownership, then perform startup recovery.
+
+        Application construction is deliberately side-effect free with respect to
+        durable recovery. The HTTP service calls this only after its listener has
+        bound successfully, so a duplicate startup that loses either boundary cannot
+        rewrite state owned by the live process. The advisory lock is held until
+        :meth:`close` and is released automatically by the OS after process death.
+        """
+        with self._service_ownership_lock:
+            if self._service_ownership is not None:
+                return
+            ownership = ServiceOwnership(
+                self.data_dir / ".repogents-service.lock"
+            )
+            try:
+                ownership.acquire()
+            except ServiceOwnershipUnavailableError as error:
+                raise RuntimeError(
+                    f"Repogents data directory is already owned: {self.data_dir}"
+                ) from error
+            self._service_ownership = ownership
+            try:
+                self.store.recover_interrupted_work()
+                self.store.recover_pending_repository_add_operations()
+                self._purge_expired_repository_add_operations()
+            except BaseException:
+                self._release_service_ownership_locked()
+                raise
+
+    def _release_service_ownership_locked(self) -> None:
+        ownership = self._service_ownership
+        self._service_ownership = None
+        if ownership is not None:
+            ownership.close()
+
+    def add_repository(
+        self, github_repository: str, target_branch: str | None = None,
+        operation_id: str | None = None,
+    ) -> dict:
+        """Add a repository under a durable, idempotent completion identity."""
+        if self._closed:
+            raise RuntimeError("application is closed")
+        self._purge_expired_repository_add_operations()
+        operation_id = operation_id or str(uuid.uuid4())
+        with self._repository_add_lock_guard:
+            operation_lock = self._repository_add_locks.get(operation_id)
+            if operation_lock is None:
+                operation_lock = _RepositoryAddLockEntry(threading.Lock())
+                self._repository_add_locks[operation_id] = operation_lock
+            # Count callers before releasing the registry guard. This includes the
+            # current executor and every waiter, so an entry cannot be retired while
+            # another caller can still acquire its lock.
+            operation_lock.references += 1
+        try:
+            # Concurrent replay of one idempotency identity must observe the first
+            # execution's terminal state, not race it by performing upstream work twice.
+            with operation_lock.lock:
+                return self._execute_repository_add(
+                    operation_id, github_repository, target_branch
+                )
+        finally:
+            with self._repository_add_lock_guard:
+                operation_lock.references -= 1
+                if (
+                    operation_lock.references == 0
+                    and self._repository_add_locks.get(operation_id) is operation_lock
+                ):
+                    # The identity may be used again later, but no caller can still
+                    # reference this entry. A future replay will create a fresh lock
+                    # only after this execution and all of its waiters have released.
+                    del self._repository_add_locks[operation_id]
+
+    def _execute_repository_add(
+        self, operation_id: str, github_repository: str, target_branch: str | None
+    ) -> dict:
+        """Own upstream lookup and atomic storage completion for one operation."""
+        operation = self.store.begin_repository_add_operation(
+            operation_id, github_repository, target_branch
+        )
+        if operation["state"] == "COMMITTED":
+            repository = self.store.get_repository(operation["repository_id"])
+            if repository is None:
+                raise RuntimeError("committed repository add is missing its repository")
+            return repository
+        if operation["state"] == "FAILED":
+            raise ValueError(operation["error"] or "repository add operation failed")
+        try:
+            metadata = self._repository_metadata_with_commit_boundary(github_repository)
+            if self._closed:
+                raise RuntimeError("application is closed")
+            branch = target_branch or metadata["default_branch"]
+            return self.store.add_repository_for_operation(
+                operation_id,
+                github_repository,
+                branch,
+                self.config.default_similarity_threshold,
+            )
+        except BaseException as error:
+            # A transaction may have committed immediately before an exceptional
+            # response path. Consult durable operation state before exposing failure.
+            current = self.store.get_repository_add_operation(operation_id)
+            if current and current["state"] == "COMMITTED":
+                repository = self.store.get_repository(current["repository_id"])
+                if repository is not None:
+                    return repository
+            if current and current["state"] == "PENDING":
+                self.store.fail_repository_add_operation(
+                    operation_id, self._repository_add_failure_message(error)
+                )
+            raise
+
+    @staticmethod
+    def _repository_add_failure_message(error: BaseException) -> str:
+        """Return a stable, nonempty diagnostic without replacing the exception.
+
+        Some exception types, including a bare ``TimeoutError()``, stringify to an
+        empty value. Durable operation failures cannot store that value, because the
+        store deliberately rejects empty diagnostics. Preserve meaningful messages
+        exactly; otherwise identify the local exception type with a concise fallback.
+        A broken custom ``__str__`` is treated the same way so failure normalization
+        cannot obscure the exception that the caller is meant to receive.
+        """
+        try:
+            message = str(error)
+        except BaseException:
+            message = ""
+        if message.strip():
+            return message
+        error_type = type(error).__name__.strip() or "Exception"
+        return f"{error_type}: repository add failed"
+
+    def repository_add_operation(self, operation_id: str) -> dict | None:
+        """Return authoritative completion while opportunistically bounding history."""
+        self._purge_expired_repository_add_operations()
+        operation = self.store.get_repository_add_operation(operation_id)
+        if operation is None:
+            return None
+        projected = dict(operation)
+        projected["repository"] = (
+            self.store.get_repository(operation["repository_id"])
+            if operation["state"] == "COMMITTED"
+            else None
+        )
+        return projected
+
+    def _repository_metadata_with_commit_boundary(
+        self, github_repository: str
+    ) -> dict:
+        """Bound metadata lookup concurrency and abandon persistence after timeout.
+
+        The fixed daemon-worker pool prevents repeated hung upstream calls from
+        creating unbounded threads or queued operations. A timed-out caller remains
+        the only authority that could have committed its result, so late completion
+        merely releases pool capacity and can never reach repository storage.
+        """
+        deadline = time.monotonic() + self.config.add_repository_lookup_timeout
+        task = self._repository_lookup_pool.submit(
+            github_repository, self.config.add_repository_lookup_timeout
+        )
+        try:
+            succeeded, value = task.outcome.get(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+        except queue.Empty as error:
+            raise RepositoryLookupTimeoutError(
+                "GitHub repository metadata lookup timed out before Repogents "
+                "could add the repository; no repository was added"
+            ) from error
+        if not succeeded:
+            raise value
+        if not isinstance(value, dict):
+            raise RuntimeError("GitHub returned an invalid repository")
+        return value
 
     def remove_repository(self, repository_id: int) -> None:
         self.store.remove_repository(repository_id)
@@ -196,12 +519,32 @@ class Application:
         self._start_workers()
 
     def close(self) -> None:
-        if self._closed:
+        # One caller owns teardown; concurrent close callers wait for the same
+        # ownership-release boundary instead of returning while workers remain live.
+        with self._close_lock:
+            if self._close_complete.is_set():
+                return
+            if self._closed:
+                wait_for_close = True
+            else:
+                self._closed = True
+                wait_for_close = False
+        if wait_for_close:
+            self._close_complete.wait()
             return
-        self._closed = True
-        if self._owns_executor:
-            self._executor.shutdown(wait=True)
-        self._reap_workers()
+
+        try:
+            self._repository_lookup_pool.close()
+            if self._owns_executor:
+                self._executor.shutdown(wait=True)
+            # A borrowed executor remains caller-owned, but every future submitted
+            # by this application remains our mutation authority. Join those futures
+            # explicitly before releasing data-directory service ownership.
+            self._wait_for_workers()
+        finally:
+            with self._service_ownership_lock:
+                self._release_service_ownership_locked()
+            self._close_complete.set()
 
     def _workspace(self, repository_id: int, run_id: int) -> Path:
         return self.data_dir / "workspaces" / str(repository_id) / str(run_id)
@@ -398,6 +741,8 @@ class Application:
         for repository in self.store.list_repositories():
             for node in self.store.list_dynamic_nodes(repository["id"]):
                 with self._worker_lock:
+                    if self._closed:
+                        return
                     if node["id"] in self._workers:
                         continue
                     work = self.store.claim_node_work(node["id"])
@@ -415,6 +760,22 @@ class Application:
                 future.result()
             except Exception:
                 pass
+
+    def _wait_for_workers(self) -> None:
+        """Join all application-tracked work without owning a borrowed executor."""
+        while True:
+            with self._worker_lock:
+                futures = list(self._workers.values())
+            if not futures:
+                return
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:
+                    # _run_work already persists its failure outcome where possible;
+                    # shutdown must still collect the future and continue draining.
+                    pass
+            self._reap_workers()
 
     def _run_work(self, node: dict, work: dict) -> None:
         run = self.store.get_run(work["run_id"])
