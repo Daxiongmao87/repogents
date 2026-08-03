@@ -10,6 +10,7 @@ import pytest
 from pathlib import Path
 
 from repogents.application import Application, ApplicationConfig
+from repogents.errors import PublicationRebaseConflictError
 from repogents.github import (
     FeedbackAddress,
     GitHubClient,
@@ -2353,6 +2354,80 @@ def test_validation_requires_complete_typed_failure_evidence(tmp_path):
         app.poll_once()
 
     assert store.list_validations(run["id"]) == []
+    app.close()
+
+
+def test_publication_rebase_conflict_records_failed_validation_without_validate_runtime(
+    tmp_path,
+):
+    store = Store(tmp_path / "state.sqlite3")
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    run, _ = store.create_run(
+        repository["id"],
+        7,
+        {"number": 7, "title": "Validate", "body": "work"},
+    )
+    execution_pass = store.create_pass(run["id"], "issue", run["issue_json"])
+    saved = store.save_specification_package(
+        run["id"],
+        execution_pass["id"],
+        package(("validate-work", "backend/api")),
+    )
+    node = store.create_dynamic_node(
+        repository["id"],
+        "backend/api",
+        [1.0, 0.0],
+        "Own API work.",
+    )
+    store.assign_work(saved["work_items"][0]["id"], node["id"])
+    claimed = store.claim_node_work(node["id"], run["id"])
+    store.complete_work(
+        claimed["id"],
+        {
+            "output": "done",
+            "artifacts": [],
+            "test_results": [],
+            "repository_state": {},
+        },
+    )
+    store.transition_run(run["id"], "VALIDATING")
+    (
+        tmp_path / "runtime" / "workspaces" / str(repository["id"]) / str(run["id"])
+    ).mkdir(parents=True)
+    github = FakeGitHub()
+    conflict_message = "git rebase origin/main conflicted"
+
+    def raise_conflict(issue_number, target_branch, workspace):
+        github.prepare_publication_calls.append(
+            (issue_number, target_branch, Path(workspace))
+        )
+        raise PublicationRebaseConflictError(conflict_message)
+
+    github.prepare_publication = raise_conflict
+    runtime = ScriptedRuntime()
+    app = Application(
+        store,
+        github,
+        runtime,
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(data_dir=tmp_path / "runtime"),
+    )
+
+    app.poll_once()
+
+    validations = store.list_validations(run["id"])
+    assert len(validations) == 1
+    assert validations[0]["pass_id"] == execution_pass["id"]
+    validation_result = validations[0]["result"]
+    assert validation_result["passed"] is False
+    assert validation_result["code_review_findings"] == [conflict_message]
+    assert validation_result["publication_candidate"] is None
+    assert runtime.calls == []
+    assert [
+        execution_pass["trigger_type"]
+        for execution_pass in store.list_passes(run["id"])
+    ] == ["issue", "validation_failure"]
+    assert store.get_run(run["id"])["state"] == "SPECIFYING"
     app.close()
 
 

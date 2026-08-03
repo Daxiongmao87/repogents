@@ -9,6 +9,8 @@ import subprocess
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
+from repogents.errors import PublicationRebaseConflictError
+
 
 _REVIEW_THREADS_QUERY = """
 query ReviewThreads(
@@ -678,6 +680,32 @@ class GitHubClient:
             )
         return True
 
+    def _abort_rebase_if_in_progress(self, workspace_path: Path) -> bool:
+        """Abort an interrupted rebase and verify workspace restoration."""
+        rebase_states = (
+            workspace_path / ".git" / "rebase-merge",
+            workspace_path / ".git" / "rebase-apply",
+        )
+        if not any(state.exists() for state in rebase_states):
+            return False
+
+        abort_error = None
+        try:
+            self._command_runner(
+                ["git", "rebase", "--abort"],
+                cwd=workspace_path,
+                env=self._git_identity_env,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+            abort_error = error
+
+        if any(state.exists() for state in rebase_states):
+            detail = "git rebase --abort did not restore the workspace"
+            if abort_error is not None:
+                detail = f"{detail}: {abort_error}"
+            raise OSError(detail) from abort_error
+        return True
+
     def _prepare_issue_branch(
         self,
         issue_number: int,
@@ -685,6 +713,7 @@ class GitHubClient:
         workspace_path: Path,
     ) -> tuple[str, str]:
         branch = f"agent/issue-{issue_number}"
+        self._abort_rebase_if_in_progress(workspace_path)
         self._command_runner(
             ["git", "checkout", "-B", branch],
             cwd=workspace_path,
@@ -718,11 +747,18 @@ class GitHubClient:
                 cwd=workspace_path,
                 env=self._git_identity_env,
             )
-        self._command_runner(
-            ["git", "rebase", f"origin/{target_branch}"],
-            cwd=workspace_path,
-            env=self._git_identity_env,
-        )
+        try:
+            self._command_runner(
+                ["git", "rebase", f"origin/{target_branch}"],
+                cwd=workspace_path,
+                env=self._git_identity_env,
+            )
+        except subprocess.CalledProcessError as error:
+            if not self._abort_rebase_if_in_progress(workspace_path):
+                raise
+            raise PublicationRebaseConflictError(
+                f"publication rebase onto target branch {target_branch!r} conflicted"
+            ) from error
         local_head = self._rev_parse_commit("HEAD", workspace_path)
         if not remote_head or local_head != remote_head:
             self._command_runner(

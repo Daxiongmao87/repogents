@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from repogents.errors import PublicationRebaseConflictError
 from repogents.github import GitHubFeedback, PublicationCandidate, PullRequest
 from repogents.semantic import SemanticRouter, validate_classification
 from repogents.store import TERMINAL_RUN_STATES, Store
@@ -1350,46 +1351,71 @@ class Application:
             None,
         )
         if recorded is None:
-            candidate, _ = self.github.prepare_publication(
-                run["issue_number"],
-                repository["target_branch"],
-                self._workspace(repository["id"], run["id"]),
-            )
-            with tempfile.TemporaryDirectory(
-                prefix="repogents-validate-",
-                dir=self.data_dir,
-            ) as temporary_directory:
-                validation_workspace = Path(temporary_directory) / "workspace"
-                shutil.copytree(
-                    self._workspace(repository["id"], run["id"]),
-                    validation_workspace,
-                    symlinks=True,
-                )
-                candidate_diff = self.github.candidate_diff(
+            try:
+                candidate, _ = self.github.prepare_publication(
+                    run["issue_number"],
                     repository["target_branch"],
-                    validation_workspace,
-                    candidate=candidate,
+                    self._workspace(repository["id"], run["id"]),
                 )
-                result = self.runtime.run(
-                    self._task(
-                        "validate",
-                        "Judge the completed result against every atomic specification, acceptance criterion, and the intent of the original issue. Independently review the complete staged target-to-candidate diff for branch-introduced correctness defects, regressions, and changes not mapped to the issue, specifications, necessary prerequisites, or current in-scope feedback. Do not audit unrelated pre-existing code. Do not modify repository files or implement corrections. Return a failed validation result for any failed specification, failed criterion, or code-review finding.",
-                        self._validation_context(
-                            repository,
-                            run,
-                            execution_pass,
-                            candidate_diff,
+            except PublicationRebaseConflictError as error:
+                conflict_message = str(error)
+                result = {
+                    "passed": False,
+                    "failed_specifications": [],
+                    "failed_criteria": [],
+                    "code_review_findings": [conflict_message],
+                    "explanation": (
+                        "Publication candidate preparation could not rebase "
+                        "the issue work onto the current target branch."
+                    ),
+                    "evidence": [
+                        "Publication preparation aborted after the target "
+                        "rebase entered a conflict state."
+                    ],
+                    "repository_state": {},
+                    "completed_work": [],
+                    "publication_candidate": None,
+                }
+            else:
+                with tempfile.TemporaryDirectory(
+                    prefix="repogents-validate-",
+                    dir=self.data_dir,
+                ) as temporary_directory:
+                    validation_workspace = (
+                        Path(temporary_directory) / "workspace"
+                    )
+                    shutil.copytree(
+                        self._workspace(repository["id"], run["id"]),
+                        validation_workspace,
+                        symlinks=True,
+                    )
+                    candidate_diff = self.github.candidate_diff(
+                        repository["target_branch"],
+                        validation_workspace,
+                        candidate=candidate,
+                    )
+                    result = self.runtime.run(
+                        self._task(
+                            "validate",
+                            "Judge the completed result against every atomic specification, acceptance criterion, and the intent of the original issue. Independently review the complete staged target-to-candidate diff for branch-introduced correctness defects, regressions, and changes not mapped to the issue, specifications, necessary prerequisites, or current in-scope feedback. Do not audit unrelated pre-existing code. Do not modify repository files or implement corrections. Return a failed validation result for any failed specification, failed criterion, or code-review finding.",
+                            self._validation_context(
+                                repository,
+                                run,
+                                execution_pass,
+                                candidate_diff,
+                            ),
                         ),
-                    ),
-                    validation_workspace,
-                    result_schema=_VALIDATION_SCHEMA,
-                    trajectory_path=self._trajectory(
-                        run["id"], f"validate-{execution_pass['id']}"
-                    ),
-                )
-            result = self._validated_validation_result(result)
-            result["publication_candidate"] = asdict(candidate)
-            self.store.record_validation(run["id"], execution_pass["id"], result)
+                        validation_workspace,
+                        result_schema=_VALIDATION_SCHEMA,
+                        trajectory_path=self._trajectory(
+                            run["id"], f"validate-{execution_pass['id']}"
+                        ),
+                    )
+                result = self._validated_validation_result(result)
+                result["publication_candidate"] = asdict(candidate)
+            self.store.record_validation(
+                run["id"], execution_pass["id"], result
+            )
         else:
             if not self._is_current_persisted_validation(recorded):
                 self._start_publication_revalidation(

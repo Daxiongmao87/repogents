@@ -5,6 +5,7 @@ import subprocess
 
 import pytest
 
+from repogents.errors import PublicationRebaseConflictError
 from repogents.github import (
     FeedbackAddress,
     GitHubClient,
@@ -770,6 +771,103 @@ def test_prepare_publication_returns_exact_frozen_candidate_and_diff_without_rem
     assert not any(args[:2] == ["git", "push"] for args in commands)
     assert all(call[1] == workspace for call in command_calls)
 
+
+
+def test_prepare_publication_recovers_stale_rebase_then_bounds_reproducible_conflict(
+    tmp_path,
+):
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    workspace = tmp_path / "workspace"
+    issue_branch = "agent/issue-7"
+
+    def git(*args, cwd=tmp_path):
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "--bare", str(remote))
+    git("init", "-b", "main", str(seed))
+    (seed / "shared.txt").write_text("base content\n")
+    git("add", "shared.txt", cwd=seed)
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "Base",
+        cwd=seed,
+    )
+    git("remote", "add", "origin", str(remote), cwd=seed)
+    git("push", "--set-upstream", "origin", "main", cwd=seed)
+
+    git("clone", "--branch", "main", str(remote), str(workspace))
+    git("checkout", "-b", issue_branch, cwd=workspace)
+    (workspace / "shared.txt").write_text("issue content\n")
+    git("add", "shared.txt", cwd=workspace)
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "Issue work",
+        cwd=workspace,
+    )
+    issue_head = git("rev-parse", "HEAD", cwd=workspace)
+
+    (seed / "shared.txt").write_text("target content\n")
+    git("add", "shared.txt", cwd=seed)
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "Advance target",
+        cwd=seed,
+    )
+    git("push", "origin", "main", cwd=seed)
+    git("fetch", "origin", "main", cwd=workspace)
+
+    stale_rebase = subprocess.run(
+        ["git", "rebase", "origin/main"],
+        cwd=workspace,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert stale_rebase.returncode != 0
+    assert any(
+        (workspace / ".git" / metadata).exists()
+        for metadata in ("rebase-merge", "rebase-apply")
+    )
+    assert git("ls-files", "--unmerged", cwd=workspace)
+
+    with pytest.raises(PublicationRebaseConflictError):
+        GitHubClient("placeholder-token").prepare_publication(
+            7,
+            "main",
+            workspace,
+        )
+
+    assert not any(
+        (workspace / ".git" / metadata).exists()
+        for metadata in ("rebase-merge", "rebase-apply")
+    )
+    assert git("ls-files", "--unmerged", cwd=workspace) == ""
+    assert git("status", "--porcelain", cwd=workspace) == ""
+    assert git("branch", "--show-current", cwd=workspace) == issue_branch
+    assert git("rev-parse", "HEAD", cwd=workspace) == issue_head
+    assert git("show", "HEAD:shared.txt", cwd=workspace) == "issue content"
 
 
 def test_prepare_publication_preserves_unfetched_remote_issue_head_ancestry_and_exact_diff(
