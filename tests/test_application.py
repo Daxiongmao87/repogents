@@ -258,6 +258,66 @@ def test_repository_tracking_state_and_history_preserving_removal(tmp_path):
     app.close()
 
 
+def test_agent_prompts_request_repository_reusable_capabilities(tmp_path):
+    runtime = ScriptedRuntime()
+    classification = "frontend/mutation-reconciliation"
+    runtime.queue("specify", package(("mutation", classification)))
+    runtime.queue(
+        "node_role",
+        {"role_prompt": "Handle repository mutation reconciliation flexibly."},
+    )
+    runtime.queue("work", ready_result("mutation reconciliation complete"))
+    app, _, github, runtime = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={classification: [1.0, 0.0]},
+    )
+    app.add_repository("acme/widget")
+    github.issues = [
+        GitHubIssue(7, "Reconcile mutations", "Handle uncertain outcomes", "https://issue/7")
+    ]
+
+    drive_until(
+        app,
+        lambda: {"specify", "node_role", "work"}.issubset(
+            {call["payload"]["kind"] for call in runtime.calls}
+        ),
+    )
+
+    calls = {call["payload"]["kind"]: call for call in runtime.calls}
+    for kind in ("specify", "work"):
+        instruction = calls[kind]["payload"]["instruction"]
+        assert "repository-reusable agent queue, not the current task" in instruction
+        assert "first level names the concise kind of action" in instruction
+        assert "second level names the broad stable repository capability" in instruction
+        assert "shortest lowercase label" in instruction
+        assert "meaningfully different suitable agent" in instruction
+        assert "durable area of repository ownership" in instruction
+        assert "not the object, technology, or deliverable" in instruction
+        assert "Related action levels should use the same capability" in instruction
+        assert "stable repository ownership boundary" in instruction
+        assert "Prefer the repository subsystem or professional discipline that owns the work" in instruction
+        assert "Different issue outcomes in the same ownership boundary should share the capability" in instruction
+        assert "Verification of a change should keep the changed area's capability" in instruction
+        assert "unless it requires a genuinely different specialist" in instruction
+        assert "no vocabulary or taxonomy is prescribed" in instruction
+
+    specify_classification_schema = calls["specify"]["result_schema"]["specifications"][0][
+        "work_items"
+    ][0]["classification"]
+    assert specify_classification_schema == "agent-chosen concise action/capability"
+    assert (
+        calls["work"]["result_schema"]["classification"]
+        == "agent-chosen concise action/capability required only for continue_work"
+    )
+
+    role_instruction = calls["node_role"]["payload"]["instruction"]
+    assert "repository-reusable agent queue" in role_instruction
+    assert "serve this classification across repository issues" in role_instruction
+    assert "do not narrow the role to this issue or work item" in role_instruction
+    app.close()
+
+
 def test_intake_specify_multi_item_semantic_routing_role_creation_and_deduplication(tmp_path):
     runtime = ScriptedRuntime()
     runtime.queue("specify", package(("frontend", "frontend/component"), ("database", "database/migration")))

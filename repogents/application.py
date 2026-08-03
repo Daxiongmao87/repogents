@@ -36,13 +36,26 @@ class ApplicationConfig:
 
 
 _CLASSIFICATION_GUIDANCE = (
-    "Name every classification as work-kind/capability. The first level states "
-    "the kind of work required. The second level states the open-ended "
-    "capability that distinguishes a suitable agent. A capability may "
-    "incorporate the relevant subsystem, technique, artifact, concern, or "
-    "failure mode. Do not reduce it to a bare product subject when context "
-    "identifies a more specific capability. Choose both levels semantically; "
-    "no vocabulary or taxonomy is prescribed."
+    "Name every classification as action/capability. A classification names a "
+    "repository-reusable agent queue, not the current task. The first level "
+    "names the concise kind of action the agent performs. The second level "
+    "names the broad stable repository capability that distinguishes the "
+    "agent. The capability is a stable repository ownership boundary and a "
+    "durable area of repository ownership, not the object, technology, or "
+    "deliverable mentioned by the task. Prefer the repository subsystem or "
+    "professional discipline that owns the work over the behavior or outcome "
+    "requested by the issue. Different issue outcomes in the same ownership "
+    "boundary should share the capability. Related action levels should use "
+    "the same capability when they serve the same repository area and do not "
+    "require different specialists. Verification of a change should keep the "
+    "changed area's capability unless it requires a genuinely different "
+    "specialist. Choose the shortest lowercase label that "
+    "still routes work to a meaningfully different suitable agent; use hyphens "
+    "only when a level needs multiple words. Do not summarize the issue, work "
+    "item, method, artifact, acceptance criterion, or failure instance. "
+    "Include such detail only when it would select a meaningfully different "
+    "suitable agent than the broader capability. Choose both levels "
+    "semantically; no vocabulary or taxonomy is prescribed."
 )
 
 
@@ -60,7 +73,7 @@ _SPECIFY_SCHEMA = {
                     "key": "string",
                     "title": "string",
                     "description": "string",
-                    "classification": "agent-chosen work-kind/capability",
+                    "classification": "agent-chosen concise action/capability",
                     "dependencies": ["work item key"],
                 }
             ],
@@ -74,7 +87,7 @@ _WORK_SCHEMA = {
     "artifacts": [],
     "test_results": [],
     "repository_state": {},
-    "classification": "agent-chosen work-kind/capability required only for continue_work",
+    "classification": "agent-chosen concise action/capability required only for continue_work",
     "context": {},
     "dependencies": [],
     "blocking": None,
@@ -350,7 +363,7 @@ class Application:
                 role_result = self.runtime.run(
                     self._task(
                         "node_role",
-                        "Generate a flexible role prompt describing this classification's work kind and capability responsibilities without prescribing a fixed implementation workflow.",
+                        "Generate a flexible role prompt for this repository-reusable agent queue. Describe responsibilities broad enough to serve this classification across repository issues without prescribing a fixed implementation workflow. Use the current work only as context; do not narrow the role to this issue or work item.",
                         {
                             "classification": classification,
                             "work_item": work,
