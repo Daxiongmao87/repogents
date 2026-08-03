@@ -2409,7 +2409,7 @@ def test_publication_rebase_conflict_records_failed_validation_without_validate_
         store,
         github,
         runtime,
-        SemanticRouter(MapEmbedder({})),
+        SemanticRouter(MapEmbedder({"backend/api": [1.0, 0.0]})),
         ApplicationConfig(data_dir=tmp_path / "runtime"),
     )
 
@@ -2422,12 +2422,32 @@ def test_publication_rebase_conflict_records_failed_validation_without_validate_
     assert validation_result["passed"] is False
     assert validation_result["code_review_findings"] == [conflict_message]
     assert validation_result["publication_candidate"] is None
+    assert validation_result["failure_kind"] == "publication_rebase_conflict"
     assert runtime.calls == []
     assert [
         execution_pass["trigger_type"]
         for execution_pass in store.list_passes(run["id"])
     ] == ["issue", "validation_failure"]
     assert store.get_run(run["id"])["state"] == "SPECIFYING"
+    legacy_pass = dict(store.list_passes(run["id"])[-1])
+    legacy_trigger = dict(legacy_pass["trigger_json"])
+    legacy_trigger.pop("failure_kind")
+    legacy_pass["trigger_json"] = legacy_trigger
+    legacy_instruction = app._specify_instruction(repository, legacy_pass)
+    assert "repository-state integration conflict" in legacy_instruction
+    assert "origin/main" in legacy_instruction
+    runtime.queue(
+        "specify",
+        package(("integrate-target", "backend/api"), prefix="integration"),
+    )
+    app.poll_once()
+    specify_call = next(
+        call for call in runtime.calls if call["payload"]["kind"] == "specify"
+    )
+    instruction = specify_call["payload"]["instruction"]
+    assert "repository-state integration conflict" in instruction
+    assert "origin/main" in instruction
+    assert "not a request to change Repogents publication behavior" in instruction
     app.close()
 
 

@@ -68,6 +68,12 @@ _CLASSIFICATION_GUIDANCE = (
     "semantically; no vocabulary or taxonomy is prescribed."
 )
 
+_PUBLICATION_REBASE_CONFLICT_KIND = "publication_rebase_conflict"
+_PUBLICATION_REBASE_CONFLICT_EXPLANATION = (
+    "Publication candidate preparation could not rebase the issue work onto "
+    "the current target branch."
+)
+
 
 _SPECIFY_SCHEMA = {
     "specifications": [
@@ -605,6 +611,43 @@ class Application:
             ),
         }
 
+    @staticmethod
+    def _is_publication_rebase_conflict(execution_pass: dict) -> bool:
+        if execution_pass.get("trigger_type") != "validation_failure":
+            return False
+        trigger = execution_pass.get("trigger_json")
+        if not isinstance(trigger, dict):
+            return False
+        if trigger.get("failure_kind") == _PUBLICATION_REBASE_CONFLICT_KIND:
+            return True
+        return (
+            trigger.get("passed") is False
+            and trigger.get("publication_candidate") is None
+            and trigger.get("explanation")
+            == _PUBLICATION_REBASE_CONFLICT_EXPLANATION
+        )
+
+    def _specify_instruction(
+        self, repository: dict, execution_pass: dict
+    ) -> str:
+        if self._is_publication_rebase_conflict(execution_pass):
+            target_branch = repository["target_branch"]
+            return (
+                "The validation deficiency in context is a repository-state "
+                "integration conflict, not a request to change Repogents "
+                "publication behavior. Create only the atomic work needed to "
+                f"reconcile the current issue workspace with origin/{target_branch}, "
+                "preserving both current target behavior and issue-required "
+                "changes, and verify the integrated branch. "
+                + _CLASSIFICATION_GUIDANCE
+            )
+        return (
+            "Convert only the issue, validation deficiency, or feedback in "
+            "context into atomic specifications, acceptance criteria, "
+            "classified work items, and dependencies. "
+            + _CLASSIFICATION_GUIDANCE
+        )
+
     def _specify(self, repository: dict, run: dict) -> None:
         execution_passes = self.store.list_passes(run["id"])
         if not execution_passes:
@@ -707,8 +750,7 @@ class Application:
             result = self.runtime.run(
                 self._task(
                     "specify",
-                    "Convert only the issue, validation deficiency, or feedback in context into atomic specifications, acceptance criteria, classified work items, and dependencies. "
-                    + _CLASSIFICATION_GUIDANCE,
+                    self._specify_instruction(repository, execution_pass),
                     self._specify_context(repository, run, execution_pass),
                 ),
                 self._workspace(repository["id"], run["id"]),
@@ -1364,10 +1406,7 @@ class Application:
                     "failed_specifications": [],
                     "failed_criteria": [],
                     "code_review_findings": [conflict_message],
-                    "explanation": (
-                        "Publication candidate preparation could not rebase "
-                        "the issue work onto the current target branch."
-                    ),
+                    "explanation": _PUBLICATION_REBASE_CONFLICT_EXPLANATION,
                     "evidence": [
                         "Publication preparation aborted after the target "
                         "rebase entered a conflict state."
@@ -1375,6 +1414,7 @@ class Application:
                     "repository_state": {},
                     "completed_work": [],
                     "publication_candidate": None,
+                    "failure_kind": _PUBLICATION_REBASE_CONFLICT_KIND,
                 }
             else:
                 with tempfile.TemporaryDirectory(
