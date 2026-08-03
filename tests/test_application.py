@@ -487,6 +487,20 @@ def feedback_specify(
     }
 
 
+def lean_specification_definition(specification: dict) -> dict:
+    return {
+        field: specification[field]
+        for field in (
+            "key",
+            "title",
+            "description",
+            "acceptance_criteria",
+            "dependencies",
+            "executable",
+        )
+    }
+
+
 class ControlledClock:
     def __init__(self, value: float):
         self.value = value
@@ -641,6 +655,933 @@ def test_intake_specify_multi_item_semantic_routing_role_creation_and_deduplicat
     app.close()
 
 
+def test_feedback_specify_context_keeps_only_lean_current_evidence(tmp_path):
+    old_title = "SPECIFY_OLD_WORK_TITLE_SENTINEL_" + ("L" * 2048)
+    old_description = "SPECIFY_OLD_WORK_DESCRIPTION_SENTINEL_" + ("D" * 2048)
+    old_artifact = "SPECIFY_OLD_ARTIFACT_SENTINEL_" + ("A" * 2048)
+    old_test_result = "SPECIFY_OLD_TEST_RESULT_SENTINEL_" + ("T" * 2048)
+    old_repository_state = "SPECIFY_OLD_REPOSITORY_STATE_SENTINEL_" + ("R" * 2048)
+    obsolete_validation_evidence = (
+        "SPECIFY_OBSOLETE_VALIDATION_SENTINEL_" + ("V" * 2048)
+    )
+    latest_validation_snapshot = (
+        "SPECIFY_LATEST_VALIDATION_SNAPSHOT_SENTINEL_" + ("S" * 2048)
+    )
+    latest_completed_work = (
+        "SPECIFY_LATEST_COMPLETED_WORK_SENTINEL_" + ("C" * 2048)
+    )
+    current_diff = "SPECIFY_CURRENT_PULL_REQUEST_DIFF_SENTINEL"
+    current_head = "specify-current-head"
+    current_feedback_body = "SPECIFY_CURRENT_FEEDBACK_BODY_SENTINEL"
+    latest_validation_explanation = "SPECIFY_LATEST_PRIOR_VALIDATION_EVIDENCE"
+
+    store = Store(tmp_path / "state.sqlite3")
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    issue = {
+        "number": 7,
+        "title": "Bound feedback context",
+        "body": "Keep only evidence needed for the feedback pass.",
+        "url": "https://issue/7",
+    }
+    run, _ = store.create_run(repository["id"], 7, issue)
+    old_pass = store.create_pass(run["id"], "issue", issue)
+    old_package = package(
+        ("legacy-rich-work", "backend/context"),
+        prefix="accepted-base",
+    )
+    old_package["specifications"][0]["work_items"][0]["title"] = old_title
+    old_package["specifications"][0]["work_items"][0][
+        "description"
+    ] = old_description
+    old_saved = store.save_specification_package(
+        run["id"],
+        old_pass["id"],
+        old_package,
+    )
+    node = store.create_dynamic_node(
+        repository["id"],
+        "backend/context",
+        [1.0, 0.0],
+        "Own backend context work.",
+    )
+    old_work = old_saved["work_items"][0]
+    store.assign_work(old_work["id"], node["id"])
+    claimed = store.claim_node_work(node["id"], run["id"])
+    assert claimed is not None and claimed["id"] == old_work["id"]
+    store.complete_work(
+        claimed["id"],
+        {
+            "output": "SPECIFY_PRIOR_WORK_OUTCOME",
+            "artifacts": [old_artifact],
+            "test_results": [old_test_result],
+            "repository_state": {"snapshot": old_repository_state},
+        },
+    )
+    obsolete_validation = validation(False, obsolete_validation_evidence)
+    obsolete_validation["repository_state"] = {
+        "snapshot": "SPECIFY_OBSOLETE_VALIDATION_REPOSITORY_STATE"
+    }
+    obsolete_validation["completed_work"] = [
+        {"marker": "SPECIFY_OBSOLETE_VALIDATION_COMPLETED_WORK"}
+    ]
+    store.record_validation(run["id"], old_pass["id"], obsolete_validation)
+
+    latest_pass = store.create_pass(
+        run["id"], "validation_failure", obsolete_validation
+    )
+    latest_saved = store.save_specification_package(
+        run["id"],
+        latest_pass["id"],
+        package(
+            ("latest-prior-work", "backend/context"),
+            prefix="accepted-correction",
+        ),
+    )
+    latest_work = latest_saved["work_items"][0]
+    store.assign_work(latest_work["id"], node["id"])
+    claimed = store.claim_node_work(node["id"], run["id"])
+    assert claimed is not None and claimed["id"] == latest_work["id"]
+    store.complete_work(
+        claimed["id"],
+        {
+            "output": "SPECIFY_LATEST_PRIOR_WORK_OUTCOME",
+            "artifacts": [],
+            "test_results": [],
+            "repository_state": {},
+        },
+    )
+    latest_validation_result = validation(
+        True,
+        latest_validation_explanation,
+    )
+    latest_validation_result["repository_state"] = {
+        "snapshot": latest_validation_snapshot
+    }
+    latest_validation_result["completed_work"] = [
+        {"marker": latest_completed_work}
+    ]
+    latest_validation = store.record_validation(
+        run["id"],
+        latest_pass["id"],
+        latest_validation_result,
+    )
+
+    feedback_package = {
+        "external_id": "inline:bounded-specify",
+        "kind": "inline",
+        "body": current_feedback_body,
+        "path": "context.py",
+        "line": 41,
+        "review_thread_id": "PRRT_bounded_specify",
+        "top_level_comment_id": 901,
+        "diff": current_diff,
+    }
+    store.add_feedback(
+        run["id"],
+        feedback_package["external_id"],
+        feedback_package,
+    )
+    store.create_pass(
+        run["id"],
+        "feedback",
+        {"feedback": [feedback_package]},
+    )
+    pull_request = {
+        "number": 17,
+        "url": "https://github.test/acme/widget/pull/17",
+        "branch": "agent/issue-7",
+        "state": "open",
+        "merged": False,
+        "diff": current_diff,
+        "head_sha": current_head,
+    }
+    store.transition_run(
+        run["id"],
+        "SPECIFYING",
+        branch=pull_request["branch"],
+        pull_request=pull_request,
+    )
+    github = FakeGitHub()
+    github.pull = PullRequest(
+        number=17,
+        url=pull_request["url"],
+        branch=pull_request["branch"],
+        state="open",
+        merged=False,
+        diff=current_diff,
+        head_sha=current_head,
+    )
+    runtime = ScriptedRuntime()
+    runtime.queue(
+        "specify",
+        feedback_specify(
+            [
+                feedback_disposition(
+                    feedback_package["external_id"],
+                    valid=True,
+                    in_scope=True,
+                    specification_keys=["feedback-current-1"],
+                )
+            ],
+            ("current-feedback-fix", "backend/context"),
+            prefix="feedback-current",
+        ),
+    )
+    runtime.queue("work", ready_result("current feedback correction"))
+    app, _, _, _ = make_app(
+        tmp_path,
+        store=store,
+        github=github,
+        runtime=runtime,
+        vectors={"backend/context": [1.0, 0.0]},
+    )
+
+    app.poll_once()
+
+    specify_call = next(
+        call
+        for call in runtime.calls
+        if call["payload"]["kind"] == "specify"
+    )
+    context = specify_call["payload"]["context"]
+    assert context["original_issue"] == issue
+    assert context["repository"]["github_repository"] == "acme/widget"
+    assert context["existing_specifications"] == [
+        lean_specification_definition(old_saved["specifications"][0]),
+        lean_specification_definition(latest_saved["specifications"][0]),
+    ]
+    prior_work = {item["key"]: item for item in context["existing_work"]}
+    assert prior_work == {
+        "legacy-rich-work": {
+            "key": "legacy-rich-work",
+            "classification": "backend/context",
+            "dependencies": [],
+            "state": "COMPLETED",
+        },
+        "latest-prior-work": {
+            "key": "latest-prior-work",
+            "classification": "backend/context",
+            "dependencies": [],
+            "state": "COMPLETED",
+        },
+    }
+    relevant_validation = context["relevant_validation"]
+    assert relevant_validation["pass_id"] == latest_validation["pass_id"]
+    assert relevant_validation["result"] == {
+        field: latest_validation_result[field]
+        for field in (
+            "passed",
+            "failed_specifications",
+            "failed_criteria",
+            "code_review_findings",
+            "explanation",
+            "evidence",
+        )
+    }
+    assert context["feedback"] == [
+        {
+            "external_id": feedback_package["external_id"],
+            "kind": "inline",
+            "body": current_feedback_body,
+            "path": "context.py",
+            "line": 41,
+            "review_thread_id": "PRRT_bounded_specify",
+            "top_level_comment_id": 901,
+        }
+    ]
+    assert context["pull_request_diff"] == current_diff
+    assert context["pull_request_head_sha"] == current_head
+    assert "prior_validation_failures" not in context
+    assert "validation_history" not in context
+    serialized_context = json.dumps(context, sort_keys=True)
+    assert serialized_context.count(current_diff) == 1
+    assert serialized_context.count(latest_validation_explanation) == 1
+    for excluded in (
+        old_title,
+        old_description,
+        "SPECIFY_PRIOR_WORK_OUTCOME",
+        "SPECIFY_LATEST_PRIOR_WORK_OUTCOME",
+        old_artifact,
+        old_test_result,
+        old_repository_state,
+        obsolete_validation_evidence,
+        latest_validation_snapshot,
+        latest_completed_work,
+        "SPECIFY_OBSOLETE_VALIDATION_REPOSITORY_STATE",
+        "SPECIFY_OBSOLETE_VALIDATION_COMPLETED_WORK",
+    ):
+        assert excluded not in serialized_context
+    app.close()
+
+
+def test_node_role_context_contains_only_current_routing_inputs(tmp_path):
+    old_run_sentinel = "NODE_ROLE_OLD_RUN_SENTINEL_" + ("H" * 2048)
+    store = Store(tmp_path / "state.sqlite3")
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    issue = {"number": 7, "title": "Route work", "body": "Create a reusable role."}
+    run, _ = store.create_run(repository["id"], 7, issue)
+    old_pass = store.create_pass(run["id"], "issue", issue)
+    old_saved = store.save_specification_package(
+        run["id"],
+        old_pass["id"],
+        package(("old-role-history", "legacy/context"), prefix="old-role"),
+    )
+    old_node = store.create_dynamic_node(
+        repository["id"],
+        "legacy/context",
+        [0.0, 1.0],
+        "Own legacy context work.",
+    )
+    old_work = old_saved["work_items"][0]
+    store.assign_work(old_work["id"], old_node["id"])
+    claimed = store.claim_node_work(old_node["id"], run["id"])
+    assert claimed is not None and claimed["id"] == old_work["id"]
+    store.complete_work(
+        claimed["id"],
+        {
+            "output": old_run_sentinel,
+            "artifacts": [old_run_sentinel],
+            "test_results": [old_run_sentinel],
+            "repository_state": {"snapshot": old_run_sentinel},
+        },
+    )
+    store.record_validation(
+        run["id"],
+        old_pass["id"],
+        validation(False, old_run_sentinel),
+    )
+    current_pass = store.create_pass(
+        run["id"],
+        "validation_failure",
+        {"explanation": "Route the current correction."},
+    )
+    current_saved = store.save_specification_package(
+        run["id"],
+        current_pass["id"],
+        package(("current-role-work", "routing/current"), prefix="current-role"),
+    )
+    current_work = current_saved["work_items"][0]
+    store.transition_run(run["id"], "SPECIFYING")
+    runtime = ScriptedRuntime()
+    runtime.queue(
+        "node_role",
+        {"role_prompt": "Own current routing work across repository issues."},
+    )
+    runtime.queue("work", ready_result("current routed work"))
+    app, _, _, _ = make_app(
+        tmp_path,
+        store=store,
+        runtime=runtime,
+        vectors={"routing/current": [1.0, 0.0]},
+    )
+
+    app.poll_once()
+
+    role_call = next(
+        call
+        for call in runtime.calls
+        if call["payload"]["kind"] == "node_role"
+    )
+    context = role_call["payload"]["context"]
+    assert context == {
+        "classification": "routing/current",
+        "work_item": current_work,
+        "repository": repository,
+    }
+    assert old_run_sentinel not in json.dumps(context, sort_keys=True)
+    app.close()
+
+
+def test_reopened_work_context_uses_current_pass_dependency_closure(tmp_path):
+    old_specification_sentinel = "WORK_OLD_PASS_SPECIFICATION_SENTINEL"
+    old_work_sentinel = "WORK_OLD_PASS_RESULT_SENTINEL_" + ("O" * 2048)
+    unrelated_specification_sentinel = (
+        "WORK_UNRELATED_CURRENT_SPECIFICATION_SENTINEL"
+    )
+    unrelated_work_sentinel = "WORK_UNRELATED_CURRENT_WORK_SENTINEL"
+    dependency_result_sentinel = "WORK_DECLARED_DEPENDENCY_RESULT_SENTINEL"
+    handoff_context_sentinel = "WORK_CURRENT_HANDOFF_CONTEXT_SENTINEL"
+    current_diff = "WORK_CURRENT_FEEDBACK_DIFF_SENTINEL"
+    database = tmp_path / "state.sqlite3"
+    store = Store(database)
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    issue = {
+        "number": 7,
+        "title": "Resume bounded work",
+        "body": "Use only current-pass dependencies after restart.",
+    }
+    run, _ = store.create_run(repository["id"], 7, issue)
+    old_pass = store.create_pass(run["id"], "issue", issue)
+    old_package = package(("old-pass-work", "legacy/context"), prefix="old-pass")
+    old_package["specifications"][0]["description"] = old_specification_sentinel
+    old_saved = store.save_specification_package(
+        run["id"],
+        old_pass["id"],
+        old_package,
+    )
+    old_node = store.create_dynamic_node(
+        repository["id"],
+        "legacy/context",
+        [0.0, 0.0, 1.0, 0.0],
+        "Own legacy context work.",
+    )
+    old_work = old_saved["work_items"][0]
+    store.assign_work(old_work["id"], old_node["id"])
+    claimed = store.claim_node_work(old_node["id"], run["id"])
+    assert claimed is not None and claimed["id"] == old_work["id"]
+    store.complete_work(
+        claimed["id"],
+        {
+            "output": old_work_sentinel,
+            "artifacts": [old_work_sentinel],
+            "test_results": [old_work_sentinel],
+            "repository_state": {"snapshot": old_work_sentinel},
+        },
+    )
+
+    feedback_package = {
+        "external_id": "inline:bounded-work",
+        "kind": "inline",
+        "body": "WORK_CURRENT_FEEDBACK_BODY_SENTINEL",
+        "path": "worker.py",
+        "line": 73,
+        "review_thread_id": "PRRT_bounded_work",
+        "top_level_comment_id": 902,
+        "diff": current_diff,
+    }
+    store.add_feedback(
+        run["id"],
+        feedback_package["external_id"],
+        feedback_package,
+    )
+    current_pass = store.create_pass(
+        run["id"],
+        "feedback",
+        {"feedback": [feedback_package]},
+    )
+    current_package = {
+        "specifications": [
+            {
+                "key": "closure-root",
+                "title": "Closure root",
+                "description": "WORK_CLOSURE_ROOT_DEFINITION",
+                "acceptance_criteria": ["Root evidence remains available."],
+                "dependencies": [],
+                "executable": False,
+                "work_items": [],
+            },
+            {
+                "key": "closure-middle",
+                "title": "Closure middle",
+                "description": "WORK_CLOSURE_MIDDLE_DEFINITION",
+                "acceptance_criteria": ["Middle evidence remains available."],
+                "dependencies": ["closure-root"],
+                "executable": False,
+                "work_items": [],
+            },
+            {
+                "key": "current-target",
+                "title": "Current target",
+                "description": "WORK_CURRENT_TARGET_DEFINITION",
+                "acceptance_criteria": ["The current handoff is completed."],
+                "dependencies": ["closure-middle"],
+                "executable": True,
+                "work_items": [
+                    {
+                        "key": "declared-dependency",
+                        "title": "Declared dependency",
+                        "description": "Prepare the declared dependency.",
+                        "classification": "prepare/current",
+                        "dependencies": [],
+                    },
+                    {
+                        "key": "current-parent",
+                        "title": "Current parent",
+                        "description": "Produce the durable handoff.",
+                        "classification": "implement/current",
+                        "dependencies": ["declared-dependency"],
+                    },
+                ],
+            },
+            {
+                "key": "unrelated-current",
+                "title": "Unrelated current specification",
+                "description": unrelated_specification_sentinel,
+                "acceptance_criteria": ["Unrelated work is complete."],
+                "dependencies": [],
+                "executable": True,
+                "work_items": [
+                    {
+                        "key": "unrelated-current-work",
+                        "title": "Unrelated current work",
+                        "description": unrelated_work_sentinel,
+                        "classification": "unrelated/current",
+                        "dependencies": [],
+                    }
+                ],
+            },
+        ]
+    }
+    current_saved = store.save_specification_package(
+        run["id"],
+        current_pass["id"],
+        current_package,
+    )
+    current_work = {item["key"]: item for item in current_saved["work_items"]}
+    dependency_node = store.create_dynamic_node(
+        repository["id"],
+        "prepare/current",
+        [0.0, 0.0, 0.0, 1.0],
+        "Prepare current dependencies.",
+    )
+    parent_node = store.create_dynamic_node(
+        repository["id"],
+        "implement/current",
+        [0.0, 0.0, 1.0, 1.0],
+        "Implement current work.",
+    )
+    store.assign_work(
+        current_work["declared-dependency"]["id"],
+        dependency_node["id"],
+    )
+    claimed = store.claim_node_work(dependency_node["id"], run["id"])
+    assert claimed is not None
+    store.complete_work(
+        claimed["id"],
+        {
+            "output": dependency_result_sentinel,
+            "artifacts": ["WORK_DECLARED_DEPENDENCY_ARTIFACT"],
+            "test_results": ["WORK_DECLARED_DEPENDENCY_TEST_RESULT"],
+            "repository_state": {"state": "dependency-ready"},
+        },
+    )
+    store.assign_work(current_work["current-parent"]["id"], parent_node["id"])
+    claimed = store.claim_node_work(parent_node["id"], run["id"])
+    assert claimed is not None
+    handoff = {
+        "classification": "verify/current",
+        "context": {"request": handoff_context_sentinel},
+        "artifacts": ["WORK_CURRENT_HANDOFF_ARTIFACT"],
+        "dependencies": ["declared-dependency"],
+        "blocking": {"reason": "WORK_CURRENT_HANDOFF_BLOCKING_EVIDENCE"},
+    }
+    child = store.complete_work(
+        claimed["id"],
+        {
+            "output": "WORK_CURRENT_PARENT_RESULT",
+            "artifacts": ["WORK_CURRENT_PARENT_ARTIFACT"],
+            "test_results": ["WORK_CURRENT_PARENT_TEST_RESULT"],
+            "repository_state": {"state": "handoff-ready"},
+        },
+        handoff,
+    )
+    assert child is not None
+    store.create_dynamic_node(
+        repository["id"],
+        "verify/current",
+        [1.0, 0.0, 0.0, 0.0],
+        "Verify current work.",
+    )
+    store.create_dynamic_node(
+        repository["id"],
+        "unrelated/current",
+        [0.0, 1.0, 0.0, 0.0],
+        "Own unrelated current work.",
+    )
+    current_head = "work-current-head"
+    store.record_feedback_scope_result(
+        run["id"],
+        current_pass["id"],
+        {
+            "dispositions": [
+                feedback_disposition(
+                    feedback_package["external_id"],
+                    valid=True,
+                    in_scope=True,
+                )
+            ],
+            "specifications": [],
+            "head_sha": current_head,
+        },
+    )
+    pull_request = {
+        "number": 17,
+        "url": "https://github.test/acme/widget/pull/17",
+        "branch": "agent/issue-7",
+        "state": "open",
+        "merged": False,
+        "diff": current_diff,
+        "head_sha": current_head,
+    }
+    store.transition_run(
+        run["id"],
+        "WAITING_FOR_WORK_COMPLETION",
+        branch=pull_request["branch"],
+        pull_request=pull_request,
+    )
+
+    reopened_store = Store(database)
+    github = FakeGitHub()
+    github.pull = PullRequest(
+        number=17,
+        url=pull_request["url"],
+        branch=pull_request["branch"],
+        state="open",
+        merged=False,
+        diff=current_diff,
+        head_sha=current_head,
+    )
+    runtime = ScriptedRuntime()
+    runtime.queue(
+        "work",
+        ready_result("WORK_CURRENT_CHILD_RESULT"),
+        ready_result("WORK_UNRELATED_RUNTIME_RESULT"),
+    )
+    app, _, _, _ = make_app(
+        tmp_path,
+        store=reopened_store,
+        github=github,
+        runtime=runtime,
+        vectors={
+            "verify/current": [1.0, 0.0, 0.0, 0.0],
+            "unrelated/current": [0.0, 1.0, 0.0, 0.0],
+        },
+        max_workers=1,
+    )
+
+    drive_until(
+        app,
+        lambda: any(
+            call["payload"]["kind"] == "work"
+            and call["payload"]["context"]["work_item"]["key"] == child["key"]
+            for call in runtime.calls
+        ),
+    )
+
+    work_call = next(
+        call
+        for call in runtime.calls
+        if call["payload"]["kind"] == "work"
+        and call["payload"]["context"]["work_item"]["key"] == child["key"]
+    )
+    context = work_call["payload"]["context"]
+    assert context["work_item"]["key"] == child["key"]
+    assert context["work_item"]["handoff"] == handoff
+    assert lean_specification_definition(context["specification"]) == (
+        lean_specification_definition(
+            next(
+                item
+                for item in current_saved["specifications"]
+                if item["key"] == "current-target"
+            )
+        )
+    )
+    assert context["specification_dependencies"] == [
+        lean_specification_definition(
+            next(
+                item
+                for item in current_saved["specifications"]
+                if item["key"] == key
+            )
+        )
+        for key in ("closure-root", "closure-middle")
+    ]
+    assert [item["key"] for item in context["dependency_results"]] == [
+        "declared-dependency"
+    ]
+    assert (
+        context["dependency_results"][0]["result"]["output"]
+        == dependency_result_sentinel
+    )
+    assert context["feedback"] == [
+        {
+            "external_id": feedback_package["external_id"],
+            "kind": "inline",
+            "body": "WORK_CURRENT_FEEDBACK_BODY_SENTINEL",
+            "path": "worker.py",
+            "line": 73,
+            "review_thread_id": "PRRT_bounded_work",
+            "top_level_comment_id": 902,
+        }
+    ]
+    assert context["pull_request_diff"] == current_diff
+    assert "prior_specifications" not in context
+    assert "prior_work" not in context
+    serialized_context = json.dumps(context, sort_keys=True)
+    for excluded in (
+        old_specification_sentinel,
+        old_work_sentinel,
+        unrelated_specification_sentinel,
+        unrelated_work_sentinel,
+    ):
+        assert excluded not in serialized_context
+    app.close()
+
+
+def test_validate_context_keeps_current_pass_and_latest_prior_evidence(tmp_path):
+    old_artifact = "VALIDATE_OLD_WORK_ARTIFACT_SENTINEL_" + ("A" * 2048)
+    old_test_result = "VALIDATE_OLD_WORK_TEST_SENTINEL_" + ("T" * 2048)
+    old_repository_state = "VALIDATE_OLD_WORK_REPOSITORY_SENTINEL_" + ("R" * 2048)
+    obsolete_validation = "VALIDATE_OBSOLETE_VALIDATION_SENTINEL_" + ("V" * 2048)
+    latest_validation_snapshot = (
+        "VALIDATE_LATEST_VALIDATION_SNAPSHOT_SENTINEL_" + ("S" * 2048)
+    )
+    latest_completed_work = (
+        "VALIDATE_LATEST_COMPLETED_WORK_SENTINEL_" + ("C" * 2048)
+    )
+    latest_validation_explanation = "VALIDATE_LATEST_PRIOR_VALIDATION_EVIDENCE"
+    duplicate_pull_request_diff = "VALIDATE_DUPLICATE_PULL_REQUEST_DIFF_SENTINEL"
+    complete_candidate_diff = (
+        "diff --git a/current.py b/current.py\n"
+        "+VALIDATE_COMPLETE_CANDIDATE_DIFF_SENTINEL"
+    )
+    current_head = "validate-current-head"
+
+    store = Store(tmp_path / "state.sqlite3")
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    issue = {
+        "number": 7,
+        "title": "Validate bounded context",
+        "body": "Review the complete candidate with bounded history.",
+    }
+    run, _ = store.create_run(repository["id"], 7, issue)
+    node = store.create_dynamic_node(
+        repository["id"],
+        "backend/validation",
+        [1.0, 0.0],
+        "Own validation setup work.",
+    )
+
+    old_pass = store.create_pass(run["id"], "issue", issue)
+    old_saved = store.save_specification_package(
+        run["id"],
+        old_pass["id"],
+        package(("validate-old-work", "backend/validation"), prefix="accepted-old"),
+    )
+    old_work = old_saved["work_items"][0]
+    store.assign_work(old_work["id"], node["id"])
+    claimed = store.claim_node_work(node["id"], run["id"])
+    assert claimed is not None
+    store.complete_work(
+        claimed["id"],
+        {
+            "output": "VALIDATE_OLD_WORK_OUTPUT",
+            "artifacts": [old_artifact],
+            "test_results": [old_test_result],
+            "repository_state": {"snapshot": old_repository_state},
+        },
+    )
+    old_validation_result = validation(False, obsolete_validation)
+    store.record_validation(run["id"], old_pass["id"], old_validation_result)
+
+    prior_pass = store.create_pass(
+        run["id"],
+        "validation_failure",
+        old_validation_result,
+    )
+    prior_saved = store.save_specification_package(
+        run["id"],
+        prior_pass["id"],
+        package(
+            ("validate-prior-work", "backend/validation"),
+            prefix="accepted-prior",
+        ),
+    )
+    prior_work = prior_saved["work_items"][0]
+    store.assign_work(prior_work["id"], node["id"])
+    claimed = store.claim_node_work(node["id"], run["id"])
+    assert claimed is not None
+    store.complete_work(
+        claimed["id"],
+        {
+            "output": "VALIDATE_PRIOR_WORK_OUTPUT",
+            "artifacts": [],
+            "test_results": [],
+            "repository_state": {},
+        },
+    )
+    latest_validation_result = validation(
+        True,
+        latest_validation_explanation,
+    )
+    latest_validation_result["repository_state"] = {
+        "snapshot": latest_validation_snapshot
+    }
+    latest_validation_result["completed_work"] = [
+        {"marker": latest_completed_work}
+    ]
+    latest_validation = store.record_validation(
+        run["id"],
+        prior_pass["id"],
+        latest_validation_result,
+    )
+
+    feedback_package = {
+        "external_id": "inline:bounded-validate",
+        "kind": "inline",
+        "body": "VALIDATE_CURRENT_FEEDBACK_BODY_SENTINEL",
+        "path": "current.py",
+        "line": 88,
+        "review_thread_id": "PRRT_bounded_validate",
+        "top_level_comment_id": 903,
+        "diff": duplicate_pull_request_diff,
+    }
+    store.add_feedback(
+        run["id"],
+        feedback_package["external_id"],
+        feedback_package,
+    )
+    current_pass = store.create_pass(
+        run["id"],
+        "feedback",
+        {"feedback": [feedback_package]},
+    )
+    current_saved = store.save_specification_package(
+        run["id"],
+        current_pass["id"],
+        package(
+            ("validate-current-work", "backend/validation"),
+            prefix="accepted-current",
+        ),
+    )
+    current_work = current_saved["work_items"][0]
+    store.assign_work(current_work["id"], node["id"])
+    claimed = store.claim_node_work(node["id"], run["id"])
+    assert claimed is not None
+    store.complete_work(
+        claimed["id"],
+        {
+            "output": "VALIDATE_CURRENT_PASS_WORK_OUTPUT",
+            "artifacts": ["VALIDATE_CURRENT_PASS_ARTIFACT"],
+            "test_results": ["VALIDATE_CURRENT_PASS_TEST_RESULT"],
+            "repository_state": {"state": "current-pass-ready"},
+        },
+    )
+    store.record_feedback_scope_result(
+        run["id"],
+        current_pass["id"],
+        {
+            "dispositions": [
+                feedback_disposition(
+                    feedback_package["external_id"],
+                    valid=True,
+                    in_scope=True,
+                )
+            ],
+            "specifications": [],
+            "head_sha": current_head,
+        },
+    )
+    pull_request = {
+        "number": 17,
+        "url": "https://github.test/acme/widget/pull/17",
+        "branch": "agent/issue-7",
+        "state": "open",
+        "merged": False,
+        "diff": duplicate_pull_request_diff,
+        "head_sha": current_head,
+    }
+    store.transition_run(
+        run["id"],
+        "VALIDATING",
+        branch=pull_request["branch"],
+        pull_request=pull_request,
+    )
+    (
+        tmp_path
+        / "runtime"
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    ).mkdir(parents=True)
+    github = FakeGitHub()
+    github.pull = PullRequest(
+        number=17,
+        url=pull_request["url"],
+        branch=pull_request["branch"],
+        state="open",
+        merged=False,
+        diff=duplicate_pull_request_diff,
+        head_sha=current_head,
+    )
+    github.candidate_diff_text = complete_candidate_diff
+    runtime = ScriptedRuntime()
+    runtime.queue(
+        "validate",
+        validation(True, "VALIDATE_CURRENT_RESULT"),
+    )
+    app, _, _, _ = make_app(
+        tmp_path,
+        store=store,
+        github=github,
+        runtime=runtime,
+    )
+
+    app.poll_once()
+
+    validate_call = next(
+        call
+        for call in runtime.calls
+        if call["payload"]["kind"] == "validate"
+    )
+    context = validate_call["payload"]["context"]
+    assert context["original_issue"] == issue
+    assert context["repository"]["github_repository"] == "acme/widget"
+    assert context["specifications"] == [
+        lean_specification_definition(item)
+        for item in (
+            old_saved["specifications"][0],
+            prior_saved["specifications"][0],
+            current_saved["specifications"][0],
+        )
+    ]
+    assert [item["key"] for item in context["work_items"]] == [
+        "validate-current-work"
+    ]
+    assert (
+        context["work_items"][0]["result"]["output"]
+        == "VALIDATE_CURRENT_PASS_WORK_OUTPUT"
+    )
+    latest_prior_validation = context["latest_prior_validation"]
+    assert latest_prior_validation["pass_id"] == latest_validation["pass_id"]
+    assert latest_prior_validation["result"] == {
+        field: latest_validation_result[field]
+        for field in (
+            "passed",
+            "failed_specifications",
+            "failed_criteria",
+            "code_review_findings",
+            "explanation",
+            "evidence",
+        )
+    }
+    assert context["feedback"] == [
+        {
+            "external_id": feedback_package["external_id"],
+            "kind": "inline",
+            "body": "VALIDATE_CURRENT_FEEDBACK_BODY_SENTINEL",
+            "path": "current.py",
+            "line": 88,
+            "review_thread_id": "PRRT_bounded_validate",
+            "top_level_comment_id": 903,
+        }
+    ]
+    assert context["candidate_diff"] == complete_candidate_diff
+    assert "pull_request_diff" not in context
+    assert "validation_history" not in context
+    serialized_context = json.dumps(context, sort_keys=True)
+    assert serialized_context.count(latest_validation_explanation) == 1
+    for excluded in (
+        old_artifact,
+        old_test_result,
+        old_repository_state,
+        obsolete_validation,
+        latest_validation_snapshot,
+        latest_completed_work,
+        duplicate_pull_request_diff,
+    ):
+        assert excluded not in serialized_context
+    app.close()
 
 
 def test_dynamic_nodes_run_concurrently_keep_busy_queue_and_hold_validation_barrier(tmp_path):
@@ -732,7 +1673,7 @@ def test_validation_failure_feedback_reentry_same_pr_update_and_merge_completion
     assert len(store.list_validations(run["id"])) == 2
     assert github.publish_existing == [None]
     second_specify = [call for call in runtime.calls if call["payload"]["kind"] == "specify"][1]
-    assert second_specify["payload"]["context"]["prior_validation_failures"][0]["result"]["passed"] is False
+    assert second_specify["payload"]["context"]["relevant_validation"]["result"]["passed"] is False
     assert second_specify["payload"]["context"]["existing_work"]
 
     github.feedback = [GitHubFeedback("inline:44", "inline", "Please change this", "api.py", 12)]
@@ -751,7 +1692,7 @@ def test_validation_failure_feedback_reentry_same_pr_update_and_merge_completion
     assert "package" not in feedback_context["feedback"][0]
     assert "diff" not in feedback_context["feedback"][0]
     assert feedback_context["pull_request_diff"] == github.pull.diff
-    assert feedback_context["validation_history"]
+    assert feedback_context["relevant_validation"]
     validation_calls = [
         call for call in runtime.calls if call["payload"]["kind"] == "validate"
     ]
@@ -1008,7 +1949,7 @@ def test_feedback_validation_failure_then_two_successful_same_pr_passes(tmp_path
         assert context["original_issue"]["number"] == 7
         assert context["existing_specifications"]
         assert context["existing_work"]
-        assert context["validation_history"]
+        assert context["relevant_validation"]
         assert all("package" not in item and "diff" not in item for item in context["feedback"])
     work_calls = [
         call for call in runtime.calls if call["payload"]["kind"] == "work"
@@ -1025,8 +1966,10 @@ def test_feedback_validation_failure_then_two_successful_same_pr_passes(tmp_path
     for context in (first_feedback_work, later_feedback_work):
         assert context["pull_request_diff"] == github.pull.diff
         assert context["original_issue"]["number"] == 7
-        assert context["prior_specifications"]
-        assert context["prior_work"]
+        assert context["specification"]
+        assert context["specification_dependencies"] == []
+        assert "prior_specifications" not in context
+        assert "prior_work" not in context
         assert all("package" not in item and "diff" not in item for item in context["feedback"])
     validation_calls = [
         call for call in runtime.calls if call["payload"]["kind"] == "validate"
@@ -1041,11 +1984,12 @@ def test_feedback_validation_failure_then_two_successful_same_pr_passes(tmp_path
         item["external_id"] for item in later_feedback_validation["feedback"]
     ] == ["review:91"]
     for context in (first_feedback_validation, later_feedback_validation):
-        assert context["pull_request_diff"] == github.pull.diff
+        assert "pull_request_diff" not in context
+        assert context["candidate_diff"] == github.candidate_diff_text
         assert context["original_issue"]["number"] == 7
         assert context["specifications"]
         assert context["work_items"]
-        assert context["validation_history"]
+        assert context["latest_prior_validation"]
         assert all("package" not in item and "diff" not in item for item in context["feedback"])
     app.close()
 

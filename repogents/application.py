@@ -492,6 +492,77 @@ class Application:
             )
         return claimed_feedback_ids
 
+    @staticmethod
+    def _specification_definition(specification: dict) -> dict:
+        return {
+            field: specification[field]
+            for field in (
+                "key",
+                "title",
+                "description",
+                "acceptance_criteria",
+                "dependencies",
+                "executable",
+            )
+        }
+
+    @staticmethod
+    def _work_identity_and_outcome(work: dict) -> dict:
+        return {
+            field: work[field]
+            for field in (
+                "key",
+                "classification",
+                "dependencies",
+                "state",
+            )
+        }
+
+    @staticmethod
+    def _validation_evidence(validation: dict) -> dict:
+        result = validation.get("result")
+        if not isinstance(result, dict):
+            result = {}
+        return {
+            "pass_id": validation["pass_id"],
+            "result": {
+                field: result.get(field)
+                for field in (
+                    "passed",
+                    "failed_specifications",
+                    "failed_criteria",
+                    "code_review_findings",
+                    "explanation",
+                    "evidence",
+                )
+            },
+        }
+
+    @classmethod
+    def _specification_dependency_closure(
+        cls,
+        specifications: list[dict],
+        specification: dict,
+    ) -> list[dict]:
+        specifications_by_key = {
+            item["key"]: item for item in specifications
+        }
+        dependency_keys: set[str] = set()
+        pending = list(specification["dependencies"])
+        while pending:
+            dependency_key = pending.pop()
+            if dependency_key in dependency_keys:
+                continue
+            dependency_keys.add(dependency_key)
+            dependency = specifications_by_key.get(dependency_key)
+            if dependency is not None:
+                pending.extend(dependency["dependencies"])
+        return [
+            cls._specification_definition(item)
+            for item in specifications
+            if item["key"] in dependency_keys
+        ]
+
     def _specify_context(
         self,
         repository: dict,
@@ -515,17 +586,22 @@ class Application:
         return {
             "original_issue": run["issue_json"],
             "repository": repository,
-            "prior_validation_failures": [
-                item
-                for item in validations
-                if item.get("result", {}).get("passed") is False
-            ],
-            "validation_history": validations,
             "feedback": feedback,
             "pull_request_diff": pull_request_diff,
             "pull_request_head_sha": pull_request_head_sha,
-            "existing_specifications": self.store.list_specifications(run["id"]),
-            "existing_work": self.store.list_work_items(run["id"]),
+            "existing_specifications": [
+                self._specification_definition(item)
+                for item in self.store.list_specifications(run["id"])
+            ],
+            "existing_work": [
+                self._work_identity_and_outcome(item)
+                for item in self.store.list_work_items(run["id"])
+            ],
+            "relevant_validation": (
+                self._validation_evidence(validations[-1])
+                if validations
+                else None
+            ),
         }
 
     def _specify(self, repository: dict, run: dict) -> None:
@@ -1020,9 +1096,6 @@ class Application:
                             "classification": classification,
                             "work_item": work,
                             "repository": repository,
-                            "repository_context": self._specify_context(
-                                repository, run, execution_pass
-                            ),
                         },
                     ),
                     self._workspace(repository["id"], run["id"]),
@@ -1090,12 +1163,21 @@ class Application:
             run["id"],
             execution_pass,
         )
-        specifications = {
-            item["id"]: item for item in self.store.list_specifications(run["id"])
-        }
+        pass_specifications = [
+            item
+            for item in self.store.list_specifications(run["id"])
+            if item["pass_id"] == work["pass_id"]
+        ]
+        specifications = {item["id"]: item for item in pass_specifications}
+        specification = specifications[work["specification_id"]]
+        specification_dependencies = self._specification_dependency_closure(
+            pass_specifications,
+            specification,
+        )
         all_work = self.store.list_work_items(run["id"], work["pass_id"])
+        dependency_keys = set(work["dependencies"])
         dependencies = [
-            item for item in all_work if item["key"] in set(work["dependencies"])
+            item for item in all_work if item["key"] in dependency_keys
         ]
         try:
             result = self.runtime.run(
@@ -1106,11 +1188,12 @@ class Application:
                     {
                         "original_issue": run["issue_json"],
                         "repository": repository,
-                        "specification": specifications[work["specification_id"]],
+                        "specification": self._specification_definition(
+                            specification
+                        ),
                         "work_item": work,
                         "dependency_results": dependencies,
-                        "prior_specifications": self.store.list_specifications(run["id"]),
-                        "prior_work": self.store.list_work_items(run["id"]),
+                        "specification_dependencies": specification_dependencies,
                         "feedback": feedback,
                         "pull_request_diff": pull_request_diff,
                     },
@@ -1162,18 +1245,28 @@ class Application:
         execution_pass: dict,
         candidate_diff: str,
     ) -> dict:
-        feedback, pull_request_diff = self._pass_feedback_context(
+        feedback, _ = self._pass_feedback_context(
             run["id"],
             execution_pass,
         )
+        validations = self.store.list_validations(run["id"])
         return {
             "original_issue": run["issue_json"],
             "repository": repository,
-            "specifications": self.store.list_specifications(run["id"]),
-            "work_items": self.store.list_work_items(run["id"]),
-            "validation_history": self.store.list_validations(run["id"]),
+            "specifications": [
+                self._specification_definition(item)
+                for item in self.store.list_specifications(run["id"])
+            ],
+            "work_items": self.store.list_work_items(
+                run["id"],
+                execution_pass["id"],
+            ),
+            "latest_prior_validation": (
+                self._validation_evidence(validations[-1])
+                if validations
+                else None
+            ),
             "feedback": feedback,
-            "pull_request_diff": pull_request_diff,
             "candidate_diff": candidate_diff,
         }
 
