@@ -87,6 +87,7 @@ mutation ResolveThread($input: ResolveReviewThreadInput!) {
 """
 
 _FEEDBACK_MARKER_PREFIX = "<!-- repogents-feedback:"
+_FOLLOW_UP_MARKER_PREFIX = "<!-- repogents-follow-up:"
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,14 @@ class PullRequest:
     merged: bool
     diff: str
     head_sha: str = ""
+
+
+@dataclass(frozen=True)
+class PublicationCandidate:
+    branch: str
+    head_sha: str
+    target_head_sha: str
+    remote_head_sha: str
 
 
 @dataclass(frozen=True)
@@ -234,6 +243,83 @@ class GitHubClient:
             if "pull_request" not in issue
         ]
 
+    def ensure_follow_up_issue(
+        self,
+        github_repository: str,
+        external_id: str,
+        title: str,
+        body: str,
+    ) -> GitHubIssue:
+        self._validate_github_repository(github_repository)
+        self._validate_feedback_external_id(external_id)
+        if not isinstance(title, str):
+            raise TypeError("title must be a string")
+        if not title.strip():
+            raise ValueError("title must not be empty")
+        if not isinstance(body, str):
+            raise TypeError("body must be a string")
+        if not body.strip():
+            raise ValueError("body must not be empty")
+        if _FOLLOW_UP_MARKER_PREFIX in body:
+            raise ValueError("body cannot contain a follow-up marker")
+
+        marker = f"{_FOLLOW_UP_MARKER_PREFIX}{external_id} -->"
+        marked_body = f"{body}\n\n{marker}"
+        issues_path = f"/repos/{github_repository}/issues"
+        matching_issue = None
+        page = 1
+        while True:
+            page_issues = self._request(
+                "GET",
+                issues_path,
+                query={"state": "all", "per_page": 100, "page": page},
+            )
+            if not isinstance(page_issues, list):
+                raise RuntimeError("GitHub returned an invalid issues page")
+            for issue in page_issues:
+                if not isinstance(issue, dict):
+                    raise RuntimeError("GitHub returned an invalid issue")
+                if "pull_request" in issue:
+                    continue
+                issue_body = issue.get("body") or ""
+                if not isinstance(issue_body, str):
+                    raise RuntimeError("GitHub returned an invalid issue body")
+                if marker not in issue_body:
+                    continue
+                if issue_body.count(_FOLLOW_UP_MARKER_PREFIX) != 1:
+                    raise RuntimeError(
+                        "GitHub follow-up issue has invalid marker content"
+                    )
+                candidate = self._parse_github_issue(issue)
+                if (
+                    matching_issue is not None
+                    and matching_issue.number != candidate.number
+                ):
+                    raise RuntimeError(
+                        "GitHub returned duplicate follow-up issues"
+                    )
+                matching_issue = candidate
+            if len(page_issues) < 100:
+                break
+            page += 1
+
+        if matching_issue is not None:
+            return matching_issue
+
+        created = self._request(
+            "POST",
+            issues_path,
+            json_body={
+                "title": title,
+                "body": marked_body,
+                "labels": ["agent:ready"],
+            },
+        )
+        created_issue = self._parse_github_issue(created)
+        if created_issue.title != title or created_issue.body != marked_body:
+            raise RuntimeError("GitHub returned a mismatched follow-up issue")
+        return created_issue
+
     def checkout(
         self,
         github_repository: str,
@@ -268,6 +354,109 @@ class GitHubClient:
         )
         return workspace_path
 
+    def candidate_diff(
+        self,
+        target_branch: str,
+        workspace: str | Path,
+    ) -> str:
+        self._validate_target_branch(target_branch)
+        if not isinstance(workspace, (str, Path)):
+            raise TypeError("workspace must be a string or Path")
+        if isinstance(workspace, str) and not workspace:
+            raise ValueError("workspace must not be empty")
+
+        workspace_path = Path(workspace)
+        target_ref = f"refs/remotes/origin/{target_branch}"
+        self._command_runner(
+            [
+                "git",
+                "fetch",
+                "origin",
+                f"+refs/heads/{target_branch}:{target_ref}",
+            ],
+            cwd=workspace_path,
+            env=self._git_auth_env,
+        )
+        self._command_runner(
+            ["git", "add", "--all"],
+            cwd=workspace_path,
+            env=self._git_command_env,
+        )
+        candidate = self._command_runner(
+            ["git", "diff", "--cached", "--no-color", target_ref, "--"],
+            cwd=workspace_path,
+            env=self._git_command_env,
+        )
+        if not isinstance(candidate.stdout, str):
+            raise RuntimeError("git diff returned invalid output")
+        return candidate.stdout
+
+    def publish_validated_to_target(
+        self,
+        target_branch: str,
+        workspace: str | Path,
+        expected_head: str,
+    ) -> bool:
+        self._validate_target_branch(target_branch)
+        if not isinstance(workspace, (str, Path)):
+            raise TypeError("workspace must be a string or Path")
+        if isinstance(workspace, str) and not workspace:
+            raise ValueError("workspace must not be empty")
+        if (
+            not isinstance(expected_head, str)
+            or len(expected_head) != 40
+            or any(
+                character not in "0123456789abcdefABCDEF"
+                for character in expected_head
+            )
+        ):
+            raise ValueError(
+                "expected_head must be a full hexadecimal commit SHA"
+            )
+
+        workspace_path = Path(workspace)
+        local_head = self._command_runner(
+            ["git", "rev-parse", "HEAD"],
+            cwd=workspace_path,
+            env=self._git_command_env,
+        ).stdout.strip()
+        if local_head != expected_head:
+            raise RuntimeError(
+                "workspace HEAD does not match the validated head"
+            )
+        self._command_runner(
+            ["git", "fetch", "origin", target_branch],
+            cwd=workspace_path,
+            env=self._git_auth_env,
+        )
+        try:
+            self._command_runner(
+                [
+                    "git",
+                    "merge-base",
+                    "--is-ancestor",
+                    f"origin/{target_branch}",
+                    expected_head,
+                ],
+                cwd=workspace_path,
+                env=self._git_command_env,
+            )
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 1:
+                return False
+            raise
+        self._command_runner(
+            [
+                "git",
+                "push",
+                "origin",
+                f"{expected_head}:refs/heads/{target_branch}",
+            ],
+            cwd=workspace_path,
+            env=self._git_auth_env,
+        )
+        return True
+
     def pull_request(self, github_repository: str, number: int) -> PullRequest:
         path = f"/repos/{github_repository}/pulls/{number}"
         pull = self._request("GET", path)
@@ -286,45 +475,114 @@ class GitHubClient:
             head_sha=pull["head"]["sha"],
         )
 
-    def publish(
+    @staticmethod
+    def _is_commit_sha(value) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 40
+            and all(
+                character in "0123456789abcdefABCDEF"
+                for character in value
+            )
+        )
+
+    @staticmethod
+    def _validate_issue_number(issue_number: int) -> None:
+        if type(issue_number) is not int or issue_number <= 0:
+            raise ValueError("issue_number must be a positive integer")
+
+    @staticmethod
+    def _publication_workspace(workspace: str | Path) -> Path:
+        if not isinstance(workspace, (str, Path)):
+            raise TypeError("workspace must be a string or Path")
+        if isinstance(workspace, str) and not workspace:
+            raise ValueError("workspace must not be empty")
+        return Path(workspace)
+
+    @classmethod
+    def _validate_publication_candidate(
+        cls,
+        candidate: PublicationCandidate,
+        issue_number: int,
+    ) -> None:
+        if not isinstance(candidate, PublicationCandidate):
+            raise TypeError("candidate must be a PublicationCandidate")
+        expected_branch = f"agent/issue-{issue_number}"
+        if candidate.branch != expected_branch:
+            raise ValueError("candidate branch does not match issue_number")
+        for name, value in (
+            ("head_sha", candidate.head_sha),
+            ("target_head_sha", candidate.target_head_sha),
+        ):
+            if not cls._is_commit_sha(value):
+                raise ValueError(
+                    f"candidate {name} must be a full hexadecimal commit SHA"
+                )
+        if (
+            candidate.remote_head_sha
+            and not cls._is_commit_sha(candidate.remote_head_sha)
+        ):
+            raise ValueError(
+                "candidate remote_head_sha must be empty or a full "
+                "hexadecimal commit SHA"
+            )
+        if not isinstance(candidate.remote_head_sha, str):
+            raise ValueError(
+                "candidate remote_head_sha must be empty or a full "
+                "hexadecimal commit SHA"
+            )
+
+    def _rev_parse_commit(
         self,
-        github_repository: str,
+        revision: str,
+        workspace_path: Path,
+    ) -> str:
+        result = self._command_runner(
+            ["git", "rev-parse", revision],
+            cwd=workspace_path,
+            env=self._git_command_env,
+        )
+        stdout = getattr(result, "stdout", None)
+        commit_sha = stdout.strip() if isinstance(stdout, str) else ""
+        if not self._is_commit_sha(commit_sha):
+            raise RuntimeError(
+                f"git rev-parse {revision} returned an invalid commit SHA"
+            )
+        return commit_sha
+
+    def _remote_issue_branch_head(
+        self,
+        branch: str,
+        workspace_path: Path,
+    ) -> str:
+        remote_ref = f"refs/heads/{branch}"
+        result = self._command_runner(
+            ["git", "ls-remote", "--heads", "origin", remote_ref],
+            cwd=workspace_path,
+            env=self._git_auth_env,
+        )
+        stdout = getattr(result, "stdout", None)
+        if not isinstance(stdout, str):
+            raise RuntimeError("git ls-remote returned an invalid branch ref")
+        remote_branch = stdout.strip()
+        if not remote_branch:
+            return ""
+        fields = remote_branch.split()
+        if (
+            len(fields) != 2
+            or fields[1] != remote_ref
+            or not self._is_commit_sha(fields[0])
+        ):
+            raise RuntimeError("git ls-remote returned an invalid branch ref")
+        return fields[0]
+
+    def _prepare_issue_branch(
+        self,
         issue_number: int,
         target_branch: str,
-        workspace: str | Path,
-        existing_pr: int | None = None,
-    ) -> PullRequest:
+        workspace_path: Path,
+    ) -> tuple[str, str]:
         branch = f"agent/issue-{issue_number}"
-        pull_number = existing_pr
-        if pull_number is None:
-            open_pulls = []
-            page = 1
-            while True:
-                page_pulls = self._request(
-                    "GET",
-                    f"/repos/{github_repository}/pulls",
-                    query={"state": "open", "per_page": 100, "page": page},
-                )
-                if not isinstance(page_pulls, list):
-                    raise RuntimeError("GitHub returned an invalid pulls page")
-                open_pulls.extend(page_pulls)
-                if len(page_pulls) < 100:
-                    break
-                page += 1
-            for pull in open_pulls:
-                head = pull.get("head", {})
-                head_repository = (head.get("repo") or {}).get("full_name")
-                if (
-                    head.get("ref") == branch
-                    and pull.get("base", {}).get("ref") == target_branch
-                    and (
-                        head_repository is None
-                        or head_repository == github_repository
-                    )
-                ):
-                    pull_number = pull["number"]
-                    break
-        workspace_path = Path(workspace)
         self._command_runner(
             ["git", "checkout", "-B", branch],
             cwd=workspace_path,
@@ -335,26 +593,7 @@ class GitHubClient:
             cwd=workspace_path,
             env=self._git_auth_env,
         )
-        remote_ref = f"refs/heads/{branch}"
-        remote_branch = self._command_runner(
-            ["git", "ls-remote", "--heads", "origin", remote_ref],
-            cwd=workspace_path,
-            env=self._git_auth_env,
-        ).stdout.strip()
-        expected_head = ""
-        if remote_branch:
-            fields = remote_branch.split()
-            if (
-                len(fields) != 2
-                or fields[1] != remote_ref
-                or len(fields[0]) != 40
-                or any(
-                    character not in "0123456789abcdefABCDEF"
-                    for character in fields[0]
-                )
-            ):
-                raise RuntimeError("git ls-remote returned an invalid branch ref")
-            expected_head = fields[0]
+        remote_head = self._remote_issue_branch_head(branch, workspace_path)
         self._command_runner(
             ["git", "add", "--all"],
             cwd=workspace_path,
@@ -376,22 +615,8 @@ class GitHubClient:
             cwd=workspace_path,
             env=self._git_identity_env,
         )
-        local_head = self._command_runner(
-            ["git", "rev-parse", "HEAD"],
-            cwd=workspace_path,
-            env=self._git_command_env,
-        ).stdout.strip()
-        if (
-            len(local_head) != 40
-            or any(
-                character not in "0123456789abcdefABCDEF"
-                for character in local_head
-            )
-        ):
-            raise RuntimeError(
-                "git rev-parse HEAD returned an invalid commit SHA"
-            )
-        if not expected_head or local_head != expected_head:
+        local_head = self._rev_parse_commit("HEAD", workspace_path)
+        if not remote_head or local_head != remote_head:
             self._command_runner(
                 ["git", "reset", "--soft", f"origin/{target_branch}"],
                 cwd=workspace_path,
@@ -408,32 +633,51 @@ class GitHubClient:
                     cwd=workspace_path,
                     env=self._git_identity_env,
                 )
-        self._command_runner(
-            [
-                "git",
-                "push",
-                f"--force-with-lease={remote_ref}:{expected_head}",
-                "--set-upstream",
-                "origin",
-                branch,
-            ],
-            cwd=workspace_path,
-            env=self._git_auth_env,
-        )
-        pushed_head = self._command_runner(
-            ["git", "rev-parse", "HEAD"],
-            cwd=workspace_path,
-            env=self._git_command_env,
-        ).stdout.strip()
-        if (
-            len(pushed_head) != 40
-            or any(
-                character not in "0123456789abcdefABCDEF"
-                for character in pushed_head
-            )
-        ):
-            raise RuntimeError("git rev-parse HEAD returned an invalid commit SHA")
+        return branch, remote_head
 
+    def _find_open_pull_number(
+        self,
+        github_repository: str,
+        branch: str,
+        target_branch: str,
+    ) -> int | None:
+        open_pulls = []
+        page = 1
+        while True:
+            page_pulls = self._request(
+                "GET",
+                f"/repos/{github_repository}/pulls",
+                query={"state": "open", "per_page": 100, "page": page},
+            )
+            if not isinstance(page_pulls, list):
+                raise RuntimeError("GitHub returned an invalid pulls page")
+            open_pulls.extend(page_pulls)
+            if len(page_pulls) < 100:
+                break
+            page += 1
+        for pull in open_pulls:
+            head = pull.get("head", {})
+            head_repository = (head.get("repo") or {}).get("full_name")
+            if (
+                head.get("ref") == branch
+                and pull.get("base", {}).get("ref") == target_branch
+                and (
+                    head_repository is None
+                    or head_repository == github_repository
+                )
+            ):
+                return pull["number"]
+        return None
+
+    def _finish_publication(
+        self,
+        github_repository: str,
+        issue_number: int,
+        target_branch: str,
+        branch: str,
+        head_sha: str,
+        pull_number: int | None,
+    ) -> PullRequest:
         if pull_number is None:
             created = self._request(
                 "POST",
@@ -446,8 +690,15 @@ class GitHubClient:
                 },
             )
             if not isinstance(created, dict):
-                raise RuntimeError("GitHub returned an invalid created pull request")
-            pull_number = created["number"]
+                raise RuntimeError(
+                    "GitHub returned an invalid created pull request"
+                )
+            created_number = created.get("number")
+            if not isinstance(created_number, int) or created_number <= 0:
+                raise RuntimeError(
+                    "GitHub returned an invalid created pull request"
+                )
+            pull_number = created_number
         pull = self.pull_request(github_repository, pull_number)
         return PullRequest(
             number=pull.number,
@@ -456,7 +707,166 @@ class GitHubClient:
             state=pull.state,
             merged=pull.merged,
             diff=pull.diff,
-            head_sha=pushed_head,
+            head_sha=head_sha,
+        )
+
+    def prepare_publication(
+        self,
+        issue_number: int,
+        target_branch: str,
+        workspace: str | Path,
+    ) -> tuple[PublicationCandidate, str]:
+        self._validate_issue_number(issue_number)
+        self._validate_target_branch(target_branch)
+        workspace_path = self._publication_workspace(workspace)
+
+        branch, remote_head = self._prepare_issue_branch(
+            issue_number,
+            target_branch,
+            workspace_path,
+        )
+        target_head = self._rev_parse_commit(
+            f"origin/{target_branch}",
+            workspace_path,
+        )
+        head = self._rev_parse_commit("HEAD", workspace_path)
+        candidate_diff = self._command_runner(
+            ["git", "diff", "--no-color", target_head, head, "--"],
+            cwd=workspace_path,
+            env=self._git_command_env,
+        )
+        if not isinstance(candidate_diff.stdout, str):
+            raise RuntimeError("git diff returned invalid output")
+        return (
+            PublicationCandidate(
+                branch=branch,
+                head_sha=head,
+                target_head_sha=target_head,
+                remote_head_sha=remote_head,
+            ),
+            candidate_diff.stdout,
+        )
+
+    def publish(
+        self,
+        github_repository: str,
+        issue_number: int,
+        target_branch: str,
+        workspace: str | Path,
+        existing_pr: int | None = None,
+    ) -> PullRequest:
+        branch = f"agent/issue-{issue_number}"
+        pull_number = existing_pr
+        if pull_number is None:
+            pull_number = self._find_open_pull_number(
+                github_repository,
+                branch,
+                target_branch,
+            )
+        workspace_path = Path(workspace)
+        branch, remote_head = self._prepare_issue_branch(
+            issue_number,
+            target_branch,
+            workspace_path,
+        )
+        remote_ref = f"refs/heads/{branch}"
+        self._command_runner(
+            [
+                "git",
+                "push",
+                f"--force-with-lease={remote_ref}:{remote_head}",
+                "--set-upstream",
+                "origin",
+                branch,
+            ],
+            cwd=workspace_path,
+            env=self._git_auth_env,
+        )
+        pushed_head = self._rev_parse_commit("HEAD", workspace_path)
+        return self._finish_publication(
+            github_repository,
+            issue_number,
+            target_branch,
+            branch,
+            pushed_head,
+            pull_number,
+        )
+
+    def publish_prepared(
+        self,
+        github_repository: str,
+        issue_number: int,
+        target_branch: str,
+        workspace: str | Path,
+        candidate: PublicationCandidate,
+        existing_pr: int | None = None,
+    ) -> PullRequest | None:
+        self._validate_github_repository(github_repository)
+        self._validate_issue_number(issue_number)
+        self._validate_target_branch(target_branch)
+        workspace_path = self._publication_workspace(workspace)
+        self._validate_publication_candidate(candidate, issue_number)
+        if existing_pr is not None and (
+            type(existing_pr) is not int or existing_pr <= 0
+        ):
+            raise ValueError("existing_pr must be a positive integer or None")
+
+        if (
+            self._rev_parse_commit("HEAD", workspace_path)
+            != candidate.head_sha
+        ):
+            return None
+        self._command_runner(
+            ["git", "fetch", "origin", target_branch],
+            cwd=workspace_path,
+            env=self._git_auth_env,
+        )
+        if (
+            self._rev_parse_commit(
+                f"origin/{target_branch}",
+                workspace_path,
+            )
+            != candidate.target_head_sha
+        ):
+            return None
+        remote_head = self._remote_issue_branch_head(
+            candidate.branch,
+            workspace_path,
+        )
+        if remote_head not in {
+            candidate.remote_head_sha,
+            candidate.head_sha,
+        }:
+            return None
+
+        if remote_head != candidate.head_sha:
+            remote_ref = f"refs/heads/{candidate.branch}"
+            self._command_runner(
+                [
+                    "git",
+                    "push",
+                    f"--force-with-lease={remote_ref}:{remote_head}",
+                    "--set-upstream",
+                    "origin",
+                    f"{candidate.head_sha}:{remote_ref}",
+                ],
+                cwd=workspace_path,
+                env=self._git_auth_env,
+            )
+        pull_number = existing_pr
+        if pull_number is None:
+            pull_number = self._find_open_pull_number(
+                github_repository,
+                candidate.branch,
+                target_branch,
+            )
+        return self._finish_publication(
+            github_repository,
+            issue_number,
+            target_branch,
+            candidate.branch,
+            candidate.head_sha,
+            pull_number,
         )
 
     def list_feedback(
@@ -780,12 +1190,7 @@ class GitHubClient:
         return thread_ids
 
     @staticmethod
-    def _validate_address_feedback_inputs(
-        github_repository: str,
-        pull_number: int,
-        feedback: GitHubFeedback,
-        head_sha: str,
-    ) -> None:
+    def _validate_github_repository(github_repository: str) -> None:
         repository_parts = (
             github_repository.split("/")
             if isinstance(github_repository, str)
@@ -798,36 +1203,97 @@ class GitHubClient:
             or github_repository.strip() != github_repository
         ):
             raise ValueError("github_repository must be in owner/name form")
+
+    @staticmethod
+    def _validate_target_branch(target_branch: str) -> None:
+        if not isinstance(target_branch, str):
+            raise TypeError("target_branch must be a string")
+        forbidden_characters = {" ", "~", "^", ":", "?", "*", "[", "\\"}
+        components = target_branch.split("/")
+        if (
+            not target_branch
+            or target_branch.strip() != target_branch
+            or target_branch.startswith("-")
+            or target_branch.endswith(".")
+            or ".." in target_branch
+            or "@{" in target_branch
+            or target_branch == "@"
+            or any(
+                not component
+                or component.startswith(".")
+                or component.endswith(".lock")
+                for component in components
+            )
+            or any(
+                character in forbidden_characters
+                or ord(character) < 32
+                or ord(character) == 127
+                for character in target_branch
+            )
+        ):
+            raise ValueError("target_branch must be a valid branch name")
+
+    @staticmethod
+    def _validate_feedback_external_id(
+        external_id: str,
+        expected_kind: str | None = None,
+    ) -> None:
+        if not isinstance(external_id, str):
+            raise ValueError("feedback external_id is invalid")
+        kind, separator, numeric_id = external_id.partition(":")
+        if expected_kind is not None and kind != expected_kind:
+            raise ValueError("feedback external_id does not match its kind")
+        if (
+            separator != ":"
+            or kind not in {"inline", "review"}
+            or not numeric_id
+            or not numeric_id.isascii()
+            or not numeric_id.isdigit()
+            or int(numeric_id) <= 0
+        ):
+            raise ValueError("feedback external_id is invalid")
+
+    @staticmethod
+    def _parse_github_issue(issue) -> GitHubIssue:
+        if not isinstance(issue, dict):
+            raise RuntimeError("GitHub returned an invalid issue")
+        number = issue.get("number")
+        title = issue.get("title")
+        body = issue.get("body")
+        url = issue.get("html_url")
+        if type(number) is not int or number <= 0:
+            raise RuntimeError("GitHub issue is missing a valid number")
+        if not isinstance(title, str) or not title:
+            raise RuntimeError("GitHub issue is missing a valid title")
+        if not isinstance(body, str):
+            raise RuntimeError("GitHub issue is missing a valid body")
+        if not isinstance(url, str) or not url:
+            raise RuntimeError("GitHub issue is missing a valid URL")
+        return GitHubIssue(number=number, title=title, body=body, url=url)
+
+    @classmethod
+    def _validate_feedback_target_inputs(
+        cls,
+        github_repository: str,
+        pull_number: int,
+        feedback: GitHubFeedback,
+    ) -> None:
+        cls._validate_github_repository(github_repository)
         if type(pull_number) is not int or pull_number <= 0:
             raise ValueError("pull_number must be a positive integer")
         if not isinstance(feedback, GitHubFeedback):
             raise TypeError("feedback must be a GitHubFeedback")
         if feedback.kind not in {"inline", "review"}:
             raise ValueError("feedback kind is not addressable")
-        external_id_prefix = f"{feedback.kind}:"
-        if (
-            not isinstance(feedback.external_id, str)
-            or not feedback.external_id.startswith(external_id_prefix)
-        ):
-            raise ValueError("feedback external_id does not match its kind")
-        numeric_id = feedback.external_id.removeprefix(external_id_prefix)
-        if (
-            not numeric_id
-            or not numeric_id.isascii()
-            or not numeric_id.isdigit()
-            or int(numeric_id) <= 0
-        ):
-            raise ValueError("feedback external_id is invalid")
-        if (
-            not isinstance(head_sha, str)
-            or len(head_sha) != 40
-            or any(
-                character not in "0123456789abcdefABCDEF"
-                for character in head_sha
-            )
-        ):
-            raise ValueError("head_sha must be a full hexadecimal commit SHA")
+        cls._validate_feedback_external_id(
+            feedback.external_id,
+            expected_kind=feedback.kind,
+        )
 
+    @staticmethod
+    def _validate_feedback_thread_identity(
+        feedback: GitHubFeedback,
+    ) -> None:
         if feedback.kind == "inline":
             if (
                 not isinstance(feedback.review_thread_id, str)
@@ -847,23 +1313,39 @@ class GitHubClient:
         ):
             raise ValueError("non-thread feedback cannot carry thread identity")
 
-    def address_feedback(
-        self,
+    @classmethod
+    def _validate_address_feedback_inputs(
+        cls,
         github_repository: str,
         pull_number: int,
         feedback: GitHubFeedback,
         head_sha: str,
-    ) -> FeedbackAddress:
-        self._validate_address_feedback_inputs(
+    ) -> None:
+        cls._validate_feedback_target_inputs(
             github_repository,
             pull_number,
             feedback,
-            head_sha,
         )
+        if (
+            not isinstance(head_sha, str)
+            or len(head_sha) != 40
+            or any(
+                character not in "0123456789abcdefABCDEF"
+                for character in head_sha
+            )
+        ):
+            raise ValueError("head_sha must be a full hexadecimal commit SHA")
+        cls._validate_feedback_thread_identity(feedback)
+
+    def _ensure_feedback_response(
+        self,
+        github_repository: str,
+        pull_number: int,
+        feedback: GitHubFeedback,
+        response_body: str,
+        mismatch_error: str,
+    ) -> str:
         marker = f"{_FEEDBACK_MARKER_PREFIX}{feedback.external_id} -->"
-        acknowledgement = (
-            f"Addressed in validated commit `{head_sha}`.\n\n{marker}"
-        )
         if feedback.kind == "inline":
             comments_path = (
                 f"/repos/{github_repository}/pulls/{pull_number}/comments"
@@ -891,47 +1373,47 @@ class GitHubClient:
                     raise RuntimeError("GitHub returned an invalid comment body")
                 if marker not in body:
                     continue
-                if body != acknowledgement:
-                    raise RuntimeError(
-                        "GitHub acknowledgement does not match "
-                        "the current commit"
-                    )
+                if body != response_body:
+                    raise RuntimeError(mismatch_error)
                 if response_url is not None:
                     continue
                 candidate_url = comment.get("html_url")
                 if not isinstance(candidate_url, str) or not candidate_url:
                     raise RuntimeError(
-                        "GitHub acknowledgement is missing its response URL"
+                        "GitHub feedback response is missing its URL"
                     )
                 response_url = candidate_url
             if len(page_comments) < 100:
                 break
             page += 1
 
-        if response_url is None:
-            post_path = comments_path
-            if feedback.kind == "inline":
-                post_path = (
-                    f"{comments_path}/{feedback.top_level_comment_id}/replies"
-                )
-            created = self._request(
-                "POST",
-                post_path,
-                json_body={"body": acknowledgement},
-            )
-            if not isinstance(created, dict):
-                raise RuntimeError("GitHub returned no acknowledgement")
-            if created.get("body") != acknowledgement:
-                raise RuntimeError(
-                    "GitHub returned a mismatched acknowledgement"
-                )
-            candidate_url = created.get("html_url")
-            if not isinstance(candidate_url, str) or not candidate_url:
-                raise RuntimeError(
-                    "GitHub acknowledgement is missing its response URL"
-                )
-            response_url = candidate_url
+        if response_url is not None:
+            return response_url
 
+        post_path = comments_path
+        if feedback.kind == "inline":
+            post_path = (
+                f"{comments_path}/{feedback.top_level_comment_id}/replies"
+            )
+        created = self._request(
+            "POST",
+            post_path,
+            json_body={"body": response_body},
+        )
+        if not isinstance(created, dict):
+            raise RuntimeError("GitHub returned no feedback response")
+        if created.get("body") != response_body:
+            raise RuntimeError("GitHub returned a mismatched feedback response")
+        response_url = created.get("html_url")
+        if not isinstance(response_url, str) or not response_url:
+            raise RuntimeError("GitHub feedback response is missing its URL")
+        return response_url
+
+    def _finish_feedback_address(
+        self,
+        feedback: GitHubFeedback,
+        response_url: str,
+    ) -> FeedbackAddress:
         if feedback.kind != "inline":
             return FeedbackAddress(
                 status="ACKNOWLEDGED",
@@ -1002,3 +1484,60 @@ class GitHubClient:
             status="RESOLVED",
             response_url=response_url,
         )
+
+    def address_feedback(
+        self,
+        github_repository: str,
+        pull_number: int,
+        feedback: GitHubFeedback,
+        head_sha: str,
+    ) -> FeedbackAddress:
+        self._validate_address_feedback_inputs(
+            github_repository,
+            pull_number,
+            feedback,
+            head_sha,
+        )
+        marker = f"{_FEEDBACK_MARKER_PREFIX}{feedback.external_id} -->"
+        acknowledgement = (
+            f"Addressed in validated commit `{head_sha}`.\n\n{marker}"
+        )
+        response_url = self._ensure_feedback_response(
+            github_repository,
+            pull_number,
+            feedback,
+            acknowledgement,
+            "GitHub acknowledgement does not match the current commit",
+        )
+        return self._finish_feedback_address(feedback, response_url)
+
+    def resolve_feedback_without_code(
+        self,
+        github_repository: str,
+        pull_number: int,
+        feedback: GitHubFeedback,
+        response: str,
+    ) -> FeedbackAddress:
+        self._validate_feedback_target_inputs(
+            github_repository,
+            pull_number,
+            feedback,
+        )
+        self._validate_feedback_thread_identity(feedback)
+        if not isinstance(response, str):
+            raise TypeError("response must be a string")
+        if not response.strip():
+            raise ValueError("response must not be empty")
+        if _FEEDBACK_MARKER_PREFIX in response:
+            raise ValueError("response cannot contain a feedback marker")
+
+        marker = f"{_FEEDBACK_MARKER_PREFIX}{feedback.external_id} -->"
+        response_body = f"{response}\n\n{marker}"
+        response_url = self._ensure_feedback_response(
+            github_repository,
+            pull_number,
+            feedback,
+            response_body,
+            "GitHub feedback response does not match the current disposition",
+        )
+        return self._finish_feedback_address(feedback, response_url)

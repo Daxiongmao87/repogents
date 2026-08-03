@@ -27,6 +27,7 @@ def build_service(config: ServiceConfig) -> HttpService:
             default_similarity_threshold=config.similarity_threshold,
             promotion_threshold=config.promotion_threshold,
             stale_run_threshold=config.stale_run_threshold,
+            pr_silence_seconds=config.pr_silence_seconds,
         ),
     )
     return HttpService(application, config.host, config.port, config.poll_seconds)

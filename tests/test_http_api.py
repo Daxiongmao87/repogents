@@ -9,6 +9,7 @@ import urllib.request
 import pytest
 
 from repogents.config import ServiceConfig
+import repogents.main as main_module
 from repogents.http_api import HttpService
 
 
@@ -18,6 +19,7 @@ _ENV_NAMES = (
     "REPOGENTS_LAN_HOST",
     "REPOGENTS_LAN_PORT",
     "REPOGENTS_POLL_SECONDS",
+    "REPOGENTS_PR_SILENCE_SECONDS",
     "REPOGENTS_CODEX_API_BASE",
     "REPOGENTS_SIMILARITY_THRESHOLD",
     "REPOGENTS_NODE_PROMOTION_THRESHOLD",
@@ -110,6 +112,7 @@ def test_service_config_uses_subscription_bridge_and_required_mvp_defaults(monke
     assert config.host == "0.0.0.0"
     assert config.port == 8766
     assert config.poll_seconds == 60.0
+    assert config.pr_silence_seconds == 3600.0
     assert config.codex_api_base == "http://127.0.0.1:8787/v1"
     assert config.model == "gpt-5.6-sol"
     assert config.similarity_threshold == 0.75
@@ -130,13 +133,19 @@ def test_service_config_requires_github_token_and_parses_configurable_thresholds
     monkeypatch.setenv("REPOGENTS_LAN_HOST", "192.168.0.206")
     monkeypatch.setenv("REPOGENTS_LAN_PORT", "9000")
     monkeypatch.setenv("REPOGENTS_POLL_SECONDS", "2.5")
+    monkeypatch.setenv("REPOGENTS_PR_SILENCE_SECONDS", "1800.5")
     monkeypatch.setenv("REPOGENTS_CODEX_API_BASE", "http://127.0.0.1:8787/v1")
     monkeypatch.setenv("REPOGENTS_SIMILARITY_THRESHOLD", "0.61")
     monkeypatch.setenv("REPOGENTS_NODE_PROMOTION_THRESHOLD", "4")
     monkeypatch.setenv("REPOGENTS_NODE_STALE_RUN_THRESHOLD", "5")
 
     config = ServiceConfig.from_env()
-    assert (config.host, config.port, config.poll_seconds) == ("192.168.0.206", 9000, 2.5)
+    assert (config.host, config.port, config.poll_seconds, config.pr_silence_seconds) == (
+        "192.168.0.206",
+        9000,
+        2.5,
+        1800.5,
+    )
     assert (
         config.similarity_threshold,
         config.promotion_threshold,
@@ -155,6 +164,50 @@ def test_service_config_rejects_similarity_threshold_outside_routing_domain(
 
     with pytest.raises(ValueError, match="REPOGENTS_SIMILARITY_THRESHOLD"):
         ServiceConfig.from_env()
+
+
+@pytest.mark.parametrize("silence_seconds", ["0", "-1"])
+def test_service_config_rejects_nonpositive_pr_silence_seconds(
+    monkeypatch, silence_seconds
+):
+    for name in _ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("REPOGENTS_GITHUB_TOKEN", "token")
+    monkeypatch.setenv("REPOGENTS_PR_SILENCE_SECONDS", silence_seconds)
+
+    with pytest.raises(ValueError, match="REPOGENTS_PR_SILENCE_SECONDS"):
+        ServiceConfig.from_env()
+
+
+def test_build_service_passes_configured_pr_silence_seconds(monkeypatch, tmp_path):
+    class ComposedApplication:
+        def __init__(self, *args):
+            self.config = args[-1]
+
+    monkeypatch.setattr(main_module, "Store", lambda path: object())
+    monkeypatch.setattr(
+        main_module,
+        "GitHubClient",
+        lambda token, **kwargs: object(),
+    )
+    monkeypatch.setattr(main_module, "MiniSweRuntime", lambda config: object())
+    monkeypatch.setattr(main_module, "SentenceTransformerEmbedder", lambda: object())
+    monkeypatch.setattr(main_module, "SemanticRouter", lambda embedder: object())
+    monkeypatch.setattr(main_module, "Application", ComposedApplication)
+    monkeypatch.setattr(
+        main_module,
+        "HttpService",
+        lambda application, *args, **kwargs: application,
+    )
+    config = ServiceConfig(
+        data_dir=tmp_path,
+        github_token="token",
+        pr_silence_seconds=45.0,
+    )
+
+    service = main_module.build_service(config)
+
+    assert service.config.pr_silence_seconds == 45.0
 
 
 def test_http_service_exposes_client_state_repository_mutations_and_background_polling():

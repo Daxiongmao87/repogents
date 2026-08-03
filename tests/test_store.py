@@ -360,6 +360,30 @@ def test_active_run_deduplication_exact_states_and_terminal_release(store):
         store.transition_run(third["id"], "DONE")
 
 
+def test_pr_listening_since_is_nullable_and_durable(store, store_path):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+
+    assert run["pr_listening_since"] is None
+    listening = store.transition_run(
+        run["id"], "PR_LISTENING", pr_listening_since=1234.5
+    )
+
+    assert listening["pr_listening_since"] == pytest.approx(1234.5)
+    assert Store(store_path).get_run(run["id"])["pr_listening_since"] == pytest.approx(
+        1234.5
+    )
+
+    cleared = store.transition_run(
+        run["id"], "PR_LISTENING", pr_listening_since=None
+    )
+    assert cleared["pr_listening_since"] is None
+    with pytest.raises(ValueError, match="pr_listening_since"):
+        store.transition_run(
+            run["id"], "PR_LISTENING", pr_listening_since="not-a-timestamp"
+        )
+
+
 @pytest.mark.parametrize(
     ("case_name", "package"),
     invalid_package_cases(),
@@ -464,17 +488,17 @@ def test_node_queues_claim_dependency_ready_work_and_retain_busy_queue(store):
     queued_implement = store.assign_work(work_by_key["implement"]["id"], backend["id"])
     assert queued_verify["state"] == queued_implement["state"] == "QUEUED"
 
-    claimed_implement = store.claim_node_work(backend["id"])
+    claimed_implement = store.claim_node_work(backend["id"], run["id"])
     assert claimed_implement["key"] == "implement"
     assert claimed_implement["state"] == "RUNNING"
-    assert store.claim_node_work(backend["id"]) is None
+    assert store.claim_node_work(backend["id"], run["id"]) is None
 
     independent_pass = store.create_pass(run["id"], "ADDITIONAL_WORK", {})
     independent = store.save_specification_package(
         run["id"], independent_pass["id"], single_work_package("independent", "quality/testing")
     )["work_items"][0]
     store.assign_work(independent["id"], quality["id"])
-    claimed_independent = store.claim_node_work(quality["id"])
+    claimed_independent = store.claim_node_work(quality["id"], run["id"])
     assert claimed_independent["key"] == "independent"
     failed = store.fail_work(independent["id"], result_payload("failed"))
     assert failed["state"] == "FAILED"
@@ -483,7 +507,7 @@ def test_node_queues_claim_dependency_ready_work_and_retain_busy_queue(store):
     assert store.complete_work(
         claimed_implement["id"], result_payload("implemented")
     ) is None
-    claimed_verify = store.claim_node_work(backend["id"])
+    claimed_verify = store.claim_node_work(backend["id"], run["id"])
     assert claimed_verify["key"] == "verify"
     assert store.complete_work(claimed_verify["id"], result_payload("verified")) is None
 
@@ -492,6 +516,37 @@ def test_node_queues_claim_dependency_ready_work_and_retain_busy_queue(store):
     assert current["implement"]["result"]["repository_state"] == {"head": "sha-implemented"}
     assert current["verify"]["state"] == "COMPLETED"
     assert store.validation_barrier_ready(run["id"], execution_pass["id"]) is True
+
+
+def test_claim_node_work_requires_and_filters_the_exact_run(store):
+    repository = add_repository(store)
+    first_run = add_run(store, repository["id"], issue_number=1)
+    second_run = add_run(store, repository["id"], issue_number=2)
+    first_pass = store.create_pass(first_run["id"], "ISSUE", {})
+    second_pass = store.create_pass(second_run["id"], "ISSUE", {})
+    first_work = store.save_specification_package(
+        first_run["id"], first_pass["id"], single_work_package("first")
+    )["work_items"][0]
+    second_work = store.save_specification_package(
+        second_run["id"], second_pass["id"], single_work_package("second")
+    )["work_items"][0]
+    node = store.create_dynamic_node(
+        repository["id"], "backend/python", [1], "Handle focused backend work."
+    )
+    store.assign_work(first_work["id"], node["id"])
+    store.assign_work(second_work["id"], node["id"])
+
+    with pytest.raises(TypeError):
+        store.claim_node_work(node["id"])
+
+    claimed_second = store.claim_node_work(node["id"], second_run["id"])
+    assert claimed_second["id"] == second_work["id"]
+    assert claimed_second["run_id"] == second_run["id"]
+    store.complete_work(claimed_second["id"], result_payload("second"))
+
+    claimed_first = store.claim_node_work(node["id"], first_run["id"])
+    assert claimed_first["id"] == first_work["id"]
+    assert claimed_first["run_id"] == first_run["id"]
 
 
 def test_claim_waits_for_all_specification_work_and_accepts_terminal_failures(store):
@@ -510,20 +565,20 @@ def test_claim_waits_for_all_specification_work_and_accepts_terminal_failures(st
     for key in ("foundation", "dependent"):
         store.assign_work(work_by_key[key]["id"], quality["id"])
 
-    assert store.claim_node_work(quality["id"]) is None
-    first = store.claim_node_work(backend["id"])
+    assert store.claim_node_work(quality["id"], run["id"]) is None
+    first = store.claim_node_work(backend["id"], run["id"])
     assert first["key"] == "prepare-one"
     store.fail_work(first["id"], result_payload("prepare-one-failed"))
-    assert store.claim_node_work(quality["id"]) is None
+    assert store.claim_node_work(quality["id"], run["id"]) is None
 
-    second = store.claim_node_work(backend["id"])
+    second = store.claim_node_work(backend["id"], run["id"])
     assert second["key"] == "prepare-two"
     store.fail_work(second["id"], result_payload("prepare-two-failed"))
-    foundation = store.claim_node_work(quality["id"])
+    foundation = store.claim_node_work(quality["id"], run["id"])
     assert foundation["key"] == "foundation"
 
     store.fail_work(foundation["id"], result_payload("foundation-failed"))
-    assert store.claim_node_work(quality["id"])["key"] == "dependent"
+    assert store.claim_node_work(quality["id"], run["id"])["key"] == "dependent"
 
 
 def test_claim_satisfies_nonexecutable_specification_dependency_without_work(store):
@@ -540,7 +595,7 @@ def test_claim_satisfies_nonexecutable_specification_dependency_without_work(sto
 
     store.assign_work(implement["id"], node["id"])
 
-    assert store.claim_node_work(node["id"])["key"] == "implement"
+    assert store.claim_node_work(node["id"], run["id"])["key"] == "implement"
 
 
 def test_handoff_is_atomic_and_keeps_barrier_closed_until_child_finishes(store):
@@ -554,7 +609,7 @@ def test_handoff_is_atomic_and_keeps_barrier_closed_until_child_finishes(store):
         repository["id"], "backend/python", [0.3, 0.7], "Handle repository backend work."
     )
     store.assign_work(root["id"], node["id"])
-    store.claim_node_work(node["id"])
+    store.claim_node_work(node["id"], run["id"])
 
     with pytest.raises(ValueError):
         store.complete_work(
@@ -585,7 +640,7 @@ def test_handoff_is_atomic_and_keeps_barrier_closed_until_child_finishes(store):
     assert store.validation_barrier_ready(run["id"], execution_pass["id"]) is False
 
     store.assign_work(child["id"], node["id"])
-    claimed_child = store.claim_node_work(node["id"])
+    claimed_child = store.claim_node_work(node["id"], run["id"])
     assert claimed_child["id"] == child["id"]
     assert store.complete_work(child["id"], result_payload("handoff-complete")) is None
     assert store.validation_barrier_ready(run["id"], execution_pass["id"]) is True
@@ -601,7 +656,7 @@ def test_validation_barrier_rejects_outstanding_node_work_from_same_run(store):
         run["id"], first_pass["id"], single_work_package("first", "backend")
     )["work_items"][0]
     store.assign_work(first_work["id"], node["id"])
-    store.claim_node_work(node["id"])
+    store.claim_node_work(node["id"], run["id"])
     store.complete_work(first_work["id"], result_payload("first"))
     assert store.validation_barrier_ready(run["id"], first_pass["id"]) is True
 
@@ -611,7 +666,7 @@ def test_validation_barrier_rejects_outstanding_node_work_from_same_run(store):
     )["work_items"][0]
     store.assign_work(second_work["id"], node["id"])
     assert store.validation_barrier_ready(run["id"], first_pass["id"]) is False
-    store.claim_node_work(node["id"])
+    store.claim_node_work(node["id"], run["id"])
     store.fail_work(second_work["id"], result_payload("second-failed"))
     assert store.validation_barrier_ready(run["id"], first_pass["id"]) is True
 
@@ -657,6 +712,82 @@ def test_validation_and_feedback_are_deduplicated_with_decoded_payloads(store, s
         run["id"], execution_pass["id"], {"passed": True}
     ) == first_validation
     assert reopened.add_feedback(run["id"], "inline:101", {}) is False
+
+
+def test_feedback_scope_result_is_decoded_durable_and_rejects_conflicts(
+    store, store_path
+):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+    execution_pass = store.create_pass(
+        run["id"], "FEEDBACK", {"external_ids": ["inline:101"]}
+    )
+    result = {
+        "feedback_items": [
+            {
+                "external_id": "inline:101",
+                "valid": True,
+                "in_scope": False,
+                "pr_regression": False,
+            }
+        ],
+        "specifications": [],
+    }
+
+    assert store.get_feedback_scope_result(run["id"], execution_pass["id"]) is None
+    assert (
+        store.record_feedback_scope_result(run["id"], execution_pass["id"], result)
+        == result
+    )
+    assert (
+        store.record_feedback_scope_result(
+            run["id"], execution_pass["id"], copy.deepcopy(result)
+        )
+        == result
+    )
+    with pytest.raises(ValueError, match="different"):
+        store.record_feedback_scope_result(
+            run["id"],
+            execution_pass["id"],
+            {"feedback_items": [], "specifications": []},
+        )
+    with pytest.raises(ValueError, match="object"):
+        store.record_feedback_scope_result(run["id"], execution_pass["id"], [])
+
+    assert store.get_feedback_scope_result(run["id"], execution_pass["id"]) == result
+    assert Store(store_path).get_feedback_scope_result(
+        run["id"], execution_pass["id"]
+    ) == result
+
+
+def test_feedback_scope_result_rejects_invalid_specifications_before_persistence(
+    store,
+):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+    execution_pass = store.create_pass(
+        run["id"], "feedback", {"feedback": [{"external_id": "inline:101"}]}
+    )
+    result = {
+        "dispositions": [
+            {
+                "external_id": "inline:101",
+                "valid": True,
+                "in_scope": True,
+                "pr_regression": False,
+                "explanation": "The defect is in scope.",
+                "evidence": ["The current head still contains the defect."],
+                "specification_keys": ["spec-1"],
+                "follow_up_issue": None,
+            }
+        ],
+        "specifications": [{"key": "spec-1"}],
+    }
+
+    with pytest.raises(ValueError, match="missing"):
+        store.record_feedback_scope_result(run["id"], execution_pass["id"], result)
+
+    assert store.get_feedback_scope_result(run["id"], execution_pass["id"]) is None
 
 
 def test_feedback_addressing_is_durable_idempotent_and_preserves_state_on_duplicate(
@@ -732,6 +863,160 @@ def test_feedback_addressing_is_durable_idempotent_and_preserves_state_on_duplic
     ]
 
 
+def test_feedback_disposition_and_follow_up_are_decoded_durable_and_idempotent(
+    store, store_path
+):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+    external_id = "inline:outside"
+    assert store.add_feedback(
+        run["id"], external_id, {"feedback": {"kind": "inline", "body": "Existing bug"}}
+    )
+    disposition_result = {
+        "valid": True,
+        "in_scope": False,
+        "pr_regression": False,
+        "explanation": "The defect predates this pull request.",
+        "evidence": ["The target branch contains the same behavior."],
+        "specification_keys": [],
+    }
+    issue = {
+        "number": 88,
+        "title": "Repair the pre-existing defect",
+        "body": "Source-linked follow-up details",
+        "url": "https://example.test/issues/88",
+    }
+
+    disposition_row = store.record_feedback_disposition(
+        run["id"], external_id, "OUT_OF_SCOPE", disposition_result
+    )
+    assert disposition_row["disposition"] == "OUT_OF_SCOPE"
+    assert disposition_row["disposition_result"] == disposition_result
+    assert disposition_row["follow_up_issue"] is None
+    assert (
+        store.record_feedback_disposition(
+            run["id"], external_id, "OUT_OF_SCOPE", copy.deepcopy(disposition_result)
+        )
+        == disposition_row
+    )
+
+    followed_up = store.record_feedback_follow_up(run["id"], external_id, issue)
+    assert followed_up["follow_up_issue"] == issue
+    assert (
+        store.record_feedback_follow_up(
+            run["id"], external_id, copy.deepcopy(issue)
+        )
+        == followed_up
+    )
+
+    reopened = Store(store_path)
+    assert reopened.list_feedback(run["id"]) == [followed_up]
+
+
+@pytest.mark.parametrize(
+    ("disposition", "status"),
+    [("OUT_OF_SCOPE", "RESOLVED"), ("INVALID", "ACKNOWLEDGED")],
+)
+def test_feedback_without_code_is_addressed_without_a_sha(
+    store, store_path, disposition, status
+):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+    external_id = f"feedback:{disposition.lower()}"
+    response_url = f"https://example.test/responses/{disposition.lower()}"
+    store.add_feedback(run["id"], external_id, {"feedback": {"kind": "inline"}})
+    store.record_feedback_disposition(
+        run["id"],
+        external_id,
+        disposition,
+        {"explanation": "No current-branch code change is required."},
+    )
+
+    assert (
+        store.mark_feedback_without_code(
+            run["id"], external_id, status, response_url
+        )
+        is None
+    )
+    assert (
+        store.mark_feedback_without_code(
+            run["id"], external_id, status, response_url
+        )
+        is None
+    )
+
+    row = Store(store_path).list_feedback(run["id"])[0]
+    assert row["status"] == status
+    assert row["addressed_sha"] is None
+    assert row["response_url"] == response_url
+
+
+def test_feedback_writes_reject_conflicting_replays_without_overwriting(store):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+    external_id = "inline:conflict"
+    store.add_feedback(run["id"], external_id, {"feedback": {"kind": "inline"}})
+    disposition_result = {"explanation": "Outside the accepted specifications."}
+    issue = {
+        "number": 91,
+        "title": "Follow-up",
+        "body": "Original body",
+        "url": "https://example.test/issues/91",
+    }
+    response_url = "https://example.test/replies/original"
+    store.record_feedback_disposition(
+        run["id"], external_id, "OUT_OF_SCOPE", disposition_result
+    )
+    store.record_feedback_follow_up(run["id"], external_id, issue)
+    store.mark_feedback_without_code(
+        run["id"], external_id, "RESOLVED", response_url
+    )
+
+    with pytest.raises(ValueError, match="different"):
+        store.record_feedback_disposition(
+            run["id"],
+            external_id,
+            "OUT_OF_SCOPE",
+            {"explanation": "Conflicting replacement."},
+        )
+    with pytest.raises(ValueError, match="different"):
+        store.record_feedback_follow_up(
+            run["id"], external_id, {**issue, "number": 92}
+        )
+    with pytest.raises(ValueError, match="different"):
+        store.mark_feedback_without_code(
+            run["id"],
+            external_id,
+            "RESOLVED",
+            "https://example.test/replies/replacement",
+        )
+
+    current = store.list_feedback(run["id"])[0]
+    assert current["disposition"] == "OUT_OF_SCOPE"
+    assert current["disposition_result"] == disposition_result
+    assert current["follow_up_issue"] == issue
+    assert current["status"] == "RESOLVED"
+    assert current["addressed_sha"] is None
+    assert current["response_url"] == response_url
+
+    in_scope_id = "inline:in-scope"
+    store.add_feedback(run["id"], in_scope_id, {"feedback": {"kind": "inline"}})
+    store.record_feedback_disposition(
+        run["id"], in_scope_id, "IN_SCOPE", {"explanation": "Requires code."}
+    )
+    with pytest.raises(ValueError, match="disposition"):
+        store.mark_feedback_without_code(
+            run["id"],
+            in_scope_id,
+            "RESOLVED",
+            "https://example.test/replies/not-allowed",
+        )
+    in_scope = store.list_feedback(run["id"])[1]
+    assert in_scope["status"] == "PENDING"
+    assert in_scope["addressed_sha"] is None
+    assert in_scope["response_url"] is None
+
+
 def test_store_migrates_legacy_feedback_rows_to_pending(store_path):
     with sqlite3.connect(store_path) as connection:
         connection.execute(
@@ -783,6 +1068,114 @@ def test_store_migrates_legacy_feedback_rows_to_pending(store_path):
             None,
         ),
     ]
+
+
+def test_store_migrates_existing_runs_and_addressed_feedback_without_data_loss(
+    store_path,
+):
+    with sqlite3.connect(store_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE repositories (
+                id INTEGER PRIMARY KEY,
+                github_repository TEXT NOT NULL UNIQUE,
+                target_branch TEXT NOT NULL,
+                similarity_threshold REAL NOT NULL,
+                tracked INTEGER NOT NULL DEFAULT 1 CHECK (tracked IN (0, 1))
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY,
+                repository_id INTEGER NOT NULL REFERENCES repositories(id),
+                issue_number INTEGER NOT NULL,
+                issue_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                branch TEXT,
+                pull_request TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE feedback (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL REFERENCES runs(id),
+                external_id TEXT NOT NULL,
+                package TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING'
+                    CHECK (status IN ('PENDING', 'RESOLVED', 'ACKNOWLEDGED')),
+                addressed_sha TEXT,
+                response_url TEXT,
+                UNIQUE(run_id, external_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO repositories(
+                id, github_repository, target_branch, similarity_threshold, tracked
+            ) VALUES (4, 'owner/legacy', 'main', 0.5, 1)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO runs(
+                id, repository_id, issue_number, issue_json, state, branch, pull_request
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                11,
+                4,
+                31,
+                '{"number":31,"title":"Legacy issue"}',
+                "PR_LISTENING",
+                "agent/issue-31",
+                '{"number":44,"url":"https://example.test/pulls/44"}',
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO feedback(
+                id, run_id, external_id, package,
+                status, addressed_sha, response_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                21,
+                11,
+                "review:legacy-addressed",
+                '{"feedback":{"kind":"review","body":"Handled"}}',
+                "ACKNOWLEDGED",
+                "legacy-sha",
+                "https://example.test/replies/legacy",
+            ),
+        )
+
+    migrated = Store(store_path)
+
+    run = migrated.get_run(11)
+    assert run["issue_json"] == {"number": 31, "title": "Legacy issue"}
+    assert run["state"] == "PR_LISTENING"
+    assert run["branch"] == "agent/issue-31"
+    assert run["pull_request"] == {
+        "number": 44,
+        "url": "https://example.test/pulls/44",
+    }
+    assert run["pr_listening_since"] is None
+
+    feedback = migrated.list_feedback(11)[0]
+    assert feedback["package"] == {
+        "feedback": {"kind": "review", "body": "Handled"}
+    }
+    assert feedback["status"] == "ACKNOWLEDGED"
+    assert feedback["addressed_sha"] == "legacy-sha"
+    assert feedback["response_url"] == "https://example.test/replies/legacy"
+    assert feedback["disposition"] is None
+    assert feedback["disposition_result"] is None
+    assert feedback["follow_up_issue"] is None
 
 
 def test_success_promotion_and_terminal_run_pruning_are_run_aware(store):
@@ -849,7 +1242,7 @@ def test_recovery_requeues_only_interrupted_work_and_keeps_active_run_unique(sto
     )
     store.assign_work(work_by_key["verify"]["id"], node["id"])
     store.assign_work(work_by_key["implement"]["id"], node["id"])
-    claimed = store.claim_node_work(node["id"])
+    claimed = store.claim_node_work(node["id"], run["id"])
     assert claimed["key"] == "implement"
 
     reopened = Store(store_path)
@@ -864,4 +1257,4 @@ def test_recovery_requeues_only_interrupted_work_and_keeps_active_run_unique(sto
     assert duplicate["id"] == run["id"]
     assert created is False
     assert reopened.recover_interrupted_work() == 0
-    assert reopened.claim_node_work(node["id"])["key"] == "implement"
+    assert reopened.claim_node_work(node["id"], run["id"])["key"] == "implement"

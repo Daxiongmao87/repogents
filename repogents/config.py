@@ -12,6 +12,7 @@ class ServiceConfig:
     host: str = "0.0.0.0"
     port: int = 8766
     poll_seconds: float = 60.0
+    pr_silence_seconds: float = 3600.0
     codex_api_base: str = "http://127.0.0.1:8787/v1"
     model: str = "gpt-5.6-sol"
     similarity_threshold: float = 0.75
@@ -29,6 +30,9 @@ class ServiceConfig:
             host=os.getenv("REPOGENTS_LAN_HOST", "0.0.0.0"),
             port=int(os.getenv("REPOGENTS_LAN_PORT", "8766")),
             poll_seconds=float(os.getenv("REPOGENTS_POLL_SECONDS", "60")),
+            pr_silence_seconds=float(
+                os.getenv("REPOGENTS_PR_SILENCE_SECONDS", "3600")
+            ),
             codex_api_base=os.getenv(
                 "REPOGENTS_CODEX_API_BASE", "http://127.0.0.1:8787/v1"
             ),
@@ -48,6 +52,8 @@ class ServiceConfig:
             raise ValueError("REPOGENTS_LAN_PORT must be between 0 and 65535")
         if config.poll_seconds <= 0:
             raise ValueError("REPOGENTS_POLL_SECONDS must be positive")
+        if config.pr_silence_seconds <= 0:
+            raise ValueError("REPOGENTS_PR_SILENCE_SECONDS must be positive")
         if not 0 <= config.similarity_threshold < 1:
             raise ValueError(
                 "REPOGENTS_SIMILARITY_THRESHOLD must be at least 0 and less than 1"

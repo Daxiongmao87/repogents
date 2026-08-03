@@ -25,6 +25,7 @@ WORK_STATES = frozenset(
     {"UNASSIGNED", "QUEUED", "RUNNING", "COMPLETED", "HANDED_OFF", "FAILED"}
 )
 TERMINAL_WORK_STATES = frozenset({"COMPLETED", "HANDED_OFF", "FAILED"})
+FEEDBACK_DISPOSITIONS = frozenset({"IN_SCOPE", "OUT_OF_SCOPE", "INVALID"})
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS repositories (
@@ -77,7 +78,8 @@ CREATE TABLE IF NOT EXISTS runs (
         )
     ),
     branch TEXT,
-    pull_request TEXT
+    pull_request TEXT,
+    pr_listening_since REAL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_run_per_issue
@@ -147,7 +149,20 @@ CREATE TABLE IF NOT EXISTS feedback (
         CHECK (status IN ('PENDING', 'RESOLVED', 'ACKNOWLEDGED')),
     addressed_sha TEXT,
     response_url TEXT,
+    disposition TEXT CHECK (
+        disposition IN ('IN_SCOPE', 'OUT_OF_SCOPE', 'INVALID')
+    ),
+    disposition_result TEXT,
+    follow_up_issue TEXT,
     UNIQUE(run_id, external_id)
+);
+
+CREATE TABLE IF NOT EXISTS feedback_scope_results (
+    run_id INTEGER NOT NULL,
+    pass_id INTEGER NOT NULL,
+    result TEXT NOT NULL,
+    PRIMARY KEY(run_id, pass_id),
+    FOREIGN KEY(pass_id, run_id) REFERENCES execution_passes(id, run_id)
 );
 
 CREATE TABLE IF NOT EXISTS node_run_usage (
@@ -169,6 +184,13 @@ class Store:
         try:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
+            run_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(runs)")
+            }
+            if "pr_listening_since" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN pr_listening_since REAL"
+                )
             feedback_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(feedback)")
@@ -188,6 +210,23 @@ class Store:
             if "response_url" not in feedback_columns:
                 connection.execute(
                     "ALTER TABLE feedback ADD COLUMN response_url TEXT"
+                )
+            if "disposition" not in feedback_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE feedback
+                    ADD COLUMN disposition TEXT CHECK (
+                        disposition IN ('IN_SCOPE', 'OUT_OF_SCOPE', 'INVALID')
+                    )
+                    """
+                )
+            if "disposition_result" not in feedback_columns:
+                connection.execute(
+                    "ALTER TABLE feedback ADD COLUMN disposition_result TEXT"
+                )
+            if "follow_up_issue" not in feedback_columns:
+                connection.execute(
+                    "ALTER TABLE feedback ADD COLUMN follow_up_issue TEXT"
                 )
         finally:
             connection.close()
@@ -283,7 +322,10 @@ class Store:
 
     @classmethod
     def _feedback_row(cls, row: sqlite3.Row | None) -> dict[str, Any] | None:
-        return cls._decode(row, json_fields=("package",))
+        return cls._decode(
+            row,
+            json_fields=("package", "disposition_result", "follow_up_issue"),
+        )
 
     @staticmethod
     def _fetch_one(connection: sqlite3.Connection, query: str, parameters: tuple = ()) -> sqlite3.Row | None:
@@ -457,11 +499,23 @@ class Store:
     def transition_run(self, run_id: int, state: str, **fields: Any) -> dict:
         if state not in RUN_STATES:
             raise ValueError(f"invalid run state: {state}")
-        unsupported = set(fields) - {"branch", "pull_request"}
+        unsupported = set(fields) - {
+            "branch",
+            "pull_request",
+            "pr_listening_since",
+        }
         if unsupported:
             raise ValueError(f"unsupported run fields: {', '.join(sorted(unsupported))}")
         if "branch" in fields and fields["branch"] is not None:
             self._nonempty_string(fields["branch"], "branch")
+        if "pr_listening_since" in fields:
+            listening_since = fields["pr_listening_since"]
+            if listening_since is not None:
+                if isinstance(listening_since, bool) or not isinstance(
+                    listening_since, (int, float)
+                ):
+                    raise ValueError("pr_listening_since must be a number or null")
+                fields["pr_listening_since"] = float(listening_since)
         values = dict(fields)
         if "pull_request" in values:
             if values["pull_request"] is not None and not isinstance(values["pull_request"], dict):
@@ -480,7 +534,7 @@ class Store:
                 raise ValueError("terminal runs cannot transition")
             assignments = ["state = ?"]
             parameters: list[Any] = [state]
-            for field in ("branch", "pull_request"):
+            for field in ("branch", "pull_request", "pr_listening_since"):
                 if field in values:
                     assignments.append(f"{field} = ?")
                     parameters.append(values[field])
@@ -853,7 +907,7 @@ class Store:
             )
         return self._work_row(row)
 
-    def claim_node_work(self, node_id: int) -> dict | None:
+    def claim_node_work(self, node_id: int, run_id: int) -> dict | None:
         with self._transaction() as connection:
             node = self._fetch_one(
                 connection,
@@ -876,10 +930,10 @@ class Store:
             candidates = connection.execute(
                 """
                 SELECT * FROM work_items
-                WHERE node_id = ? AND state = 'QUEUED'
+                WHERE node_id = ? AND run_id = ? AND state = 'QUEUED'
                 ORDER BY id
                 """,
-                (node_id,),
+                (node_id, run_id),
             ).fetchall()
             selected: sqlite3.Row | None = None
             terminal_states = tuple(TERMINAL_WORK_STATES)
@@ -1152,6 +1206,61 @@ class Store:
             ).fetchall()
         return [self._validation_row(row) for row in rows]
 
+    def record_feedback_scope_result(
+        self, run_id: int, pass_id: int, result: dict
+    ) -> dict:
+        if not isinstance(result, dict):
+            raise ValueError("feedback scope result must be an object")
+        if result.get("specifications"):
+            self._validated_package(
+                {"specifications": result["specifications"]}
+            )
+        payload = self._dump(result)
+        requested_result = json.loads(payload)
+        with self._transaction() as connection:
+            execution_pass = self._fetch_one(
+                connection,
+                "SELECT id FROM execution_passes WHERE id = ? AND run_id = ?",
+                (pass_id, run_id),
+            )
+            if execution_pass is None:
+                raise ValueError("pass does not belong to run")
+            existing = self._fetch_one(
+                connection,
+                """
+                SELECT result FROM feedback_scope_results
+                WHERE run_id = ? AND pass_id = ?
+                """,
+                (run_id, pass_id),
+            )
+            if existing is not None:
+                stored_result = json.loads(existing["result"])
+                if stored_result != requested_result:
+                    raise ValueError(
+                        "feedback scope result already has a different result"
+                    )
+                return stored_result
+            connection.execute(
+                """
+                INSERT INTO feedback_scope_results(run_id, pass_id, result)
+                VALUES (?, ?, ?)
+                """,
+                (run_id, pass_id, payload),
+            )
+        return requested_result
+
+    def get_feedback_scope_result(self, run_id: int, pass_id: int) -> dict | None:
+        with self._reader() as connection:
+            row = self._fetch_one(
+                connection,
+                """
+                SELECT result FROM feedback_scope_results
+                WHERE run_id = ? AND pass_id = ?
+                """,
+                (run_id, pass_id),
+            )
+        return None if row is None else json.loads(row["result"])
+
     def add_feedback(self, run_id: int, external_id: str, package: dict) -> bool:
         self._nonempty_string(external_id, "external_id")
         if not isinstance(package, dict):
@@ -1165,6 +1274,113 @@ class Store:
                 (run_id, external_id, self._dump(package)),
             )
             return cursor.rowcount == 1
+
+    def record_feedback_disposition(
+        self,
+        run_id: int,
+        external_id: str,
+        disposition: str,
+        result: dict,
+    ) -> dict:
+        self._nonempty_string(external_id, "external_id")
+        if disposition not in FEEDBACK_DISPOSITIONS:
+            raise ValueError(
+                "disposition must be IN_SCOPE, OUT_OF_SCOPE, or INVALID"
+            )
+        if not isinstance(result, dict):
+            raise ValueError("feedback disposition result must be an object")
+        payload = self._dump(result)
+        requested_result = json.loads(payload)
+
+        with self._transaction() as connection:
+            current = self._fetch_one(
+                connection,
+                """
+                SELECT * FROM feedback
+                WHERE run_id = ? AND external_id = ?
+                """,
+                (run_id, external_id),
+            )
+            if current is None:
+                raise KeyError((run_id, external_id))
+            has_completed_disposition = (
+                current["disposition"] is not None
+                or current["disposition_result"] is not None
+            )
+            if has_completed_disposition:
+                stored_result = (
+                    None
+                    if current["disposition_result"] is None
+                    else json.loads(current["disposition_result"])
+                )
+                if (
+                    current["disposition"] != disposition
+                    or stored_result != requested_result
+                ):
+                    raise ValueError(
+                        "feedback already has a different disposition result"
+                    )
+                row = current
+            else:
+                connection.execute(
+                    """
+                    UPDATE feedback
+                    SET disposition = ?, disposition_result = ?
+                    WHERE id = ?
+                    """,
+                    (disposition, payload, current["id"]),
+                )
+                row = self._fetch_one(
+                    connection,
+                    "SELECT * FROM feedback WHERE id = ?",
+                    (current["id"],),
+                )
+        decoded = self._feedback_row(row)
+        if decoded is None:
+            raise RuntimeError("feedback disappeared while recording disposition")
+        return decoded
+
+    def record_feedback_follow_up(
+        self, run_id: int, external_id: str, issue: dict
+    ) -> dict:
+        self._nonempty_string(external_id, "external_id")
+        if not isinstance(issue, dict):
+            raise ValueError("follow-up issue must be an object")
+        payload = self._dump(issue)
+        requested_issue = json.loads(payload)
+
+        with self._transaction() as connection:
+            current = self._fetch_one(
+                connection,
+                """
+                SELECT * FROM feedback
+                WHERE run_id = ? AND external_id = ?
+                """,
+                (run_id, external_id),
+            )
+            if current is None:
+                raise KeyError((run_id, external_id))
+            if current["follow_up_issue"] is not None:
+                stored_issue = json.loads(current["follow_up_issue"])
+                if stored_issue != requested_issue:
+                    raise ValueError(
+                        "feedback already has a different follow-up issue"
+                    )
+                row = current
+            else:
+                connection.execute(
+                    "UPDATE feedback SET follow_up_issue = ? WHERE id = ?",
+                    (payload, current["id"]),
+                )
+                row = self._fetch_one(
+                    connection,
+                    "SELECT * FROM feedback WHERE id = ?",
+                    (current["id"],),
+                )
+        decoded = self._feedback_row(row)
+        if decoded is None:
+            raise RuntimeError("feedback disappeared while recording follow-up")
+        return decoded
 
     def mark_feedback_addressed(
         self,
@@ -1208,6 +1424,52 @@ class Store:
                 WHERE id = ? AND status = 'PENDING'
                 """,
                 (status, addressed_sha, response_url, current["id"]),
+            )
+
+    def mark_feedback_without_code(
+        self,
+        run_id: int,
+        external_id: str,
+        status: str,
+        response_url: str,
+    ) -> None:
+        self._nonempty_string(external_id, "external_id")
+        if status not in {"RESOLVED", "ACKNOWLEDGED"}:
+            raise ValueError("status must be RESOLVED or ACKNOWLEDGED")
+        self._nonempty_string(response_url, "response_url")
+
+        with self._transaction() as connection:
+            current = self._fetch_one(
+                connection,
+                """
+                SELECT * FROM feedback
+                WHERE run_id = ? AND external_id = ?
+                """,
+                (run_id, external_id),
+            )
+            if current is None:
+                raise KeyError((run_id, external_id))
+            if current["disposition"] not in {"OUT_OF_SCOPE", "INVALID"}:
+                raise ValueError(
+                    "feedback disposition must be OUT_OF_SCOPE or INVALID"
+                )
+            completed_result = (
+                current["status"],
+                current["addressed_sha"],
+                current["response_url"],
+            )
+            requested_result = (status, None, response_url)
+            if completed_result == requested_result:
+                return
+            if current["status"] != "PENDING":
+                raise ValueError("feedback already has a different completed result")
+            connection.execute(
+                """
+                UPDATE feedback
+                SET status = ?, addressed_sha = NULL, response_url = ?
+                WHERE id = ? AND status = 'PENDING'
+                """,
+                (status, response_url, current["id"]),
             )
 
     def list_feedback(self, run_id: int) -> list[dict]:

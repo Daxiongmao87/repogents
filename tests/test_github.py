@@ -11,6 +11,7 @@ from repogents.github import (
     GitHubFeedback,
     GitHubIssue,
     PullRequest,
+    PublicationCandidate,
 )
 
 
@@ -251,6 +252,84 @@ def test_list_ready_issues_paginates_until_a_short_page():
     ]
 
 
+def test_ensure_follow_up_issue_creates_once_and_reuses_its_marker():
+    calls = []
+    external_id = "inline:101"
+    title = "Fix the unrelated cache invalidation defect"
+    body = "Observed defect and bounded acceptance criteria."
+    marker = "<!-- repogents-follow-up:inline:101 -->"
+    marked_body = f"{body}\n\n{marker}"
+    existing_issue = None
+    unrelated_issues = [
+        {
+            "number": number,
+            "title": f"Unrelated issue {number}",
+            "body": "Unrelated",
+            "html_url": f"https://example.test/issues/{number}",
+        }
+        for number in range(1, 101)
+    ]
+
+    def request(method, path, *, query=None, json_body=None):
+        nonlocal existing_issue
+        calls.append((method, path, query, json_body))
+        assert path == "/repos/acme/widgets/issues"
+        if method == "GET":
+            assert query["state"] == "all"
+            assert query["per_page"] == 100
+            if query["page"] == 1:
+                return unrelated_issues
+            assert query["page"] == 2
+            return [] if existing_issue is None else [existing_issue]
+        assert method == "POST"
+        assert existing_issue is None
+        assert json_body == {
+            "title": title,
+            "body": marked_body,
+            "labels": ["agent:ready"],
+        }
+        existing_issue = {
+            "number": 301,
+            "title": title,
+            "body": marked_body,
+            "html_url": "https://example.test/issues/301",
+            "state": "closed",
+        }
+        return existing_issue
+
+    client = GitHubClient("placeholder-token", request=request)
+
+    first = client.ensure_follow_up_issue(
+        "acme/widgets",
+        external_id,
+        title,
+        body,
+    )
+    second = client.ensure_follow_up_issue(
+        "acme/widgets",
+        external_id,
+        title,
+        body,
+    )
+
+    expected = GitHubIssue(
+        301,
+        title,
+        marked_body,
+        "https://example.test/issues/301",
+    )
+    assert first == expected
+    assert second == expected
+    assert marked_body.count(marker) == 1
+    assert [call[0] for call in calls].count("POST") == 1
+    assert [call[2]["page"] for call in calls if call[0] == "GET"] == [
+        1,
+        2,
+        1,
+        2,
+    ]
+
+
 def test_checkout_clones_the_target_branch_into_a_new_workspace(tmp_path):
     request_calls = []
     command_calls = []
@@ -393,6 +472,690 @@ def test_default_request_uses_the_github_diff_media_type(monkeypatch):
         "https://api.example.test/repos/acme/widgets/pulls/12",
     ]
     assert requests[1].get_header("Accept") == "application/vnd.github.diff"
+
+
+def test_candidate_diff_stages_the_complete_copy_against_latest_target(tmp_path):
+    remote = tmp_path / "remote.git"
+    workspace = tmp_path / "workspace"
+    upstream = tmp_path / "upstream"
+
+    def git(*args, cwd=tmp_path):
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "--bare", str(remote))
+    git("init", "-b", "main", str(workspace))
+    (workspace / ".gitignore").write_text("*.ignored\n")
+    (workspace / "base.txt").write_text("base\n")
+    (workspace / "deleted.txt").write_text("delete me\n")
+    (workspace / "staged.txt").write_text("before\n")
+    git("add", "--all", cwd=workspace)
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "Base",
+        cwd=workspace,
+    )
+    git("remote", "add", "origin", str(remote), cwd=workspace)
+    git("push", "--set-upstream", "origin", "main", cwd=workspace)
+    git("checkout", "-b", "agent/issue-7", cwd=workspace)
+    (workspace / "prior.py").write_text("prior commit\n")
+    git("add", "prior.py", cwd=workspace)
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "Prior issue work",
+        cwd=workspace,
+    )
+
+    (workspace / "staged.txt").write_text("after\n")
+    git("add", "staged.txt", cwd=workspace)
+    (workspace / "deleted.txt").unlink()
+    (workspace / "untracked.txt").write_text("untracked\n")
+    (workspace / "scratch.ignored").write_text("ignored\n")
+
+    git("clone", "--branch", "main", str(remote), str(upstream))
+    (upstream / "base.txt").write_text("base\nlatest target\n")
+    git("add", "base.txt", cwd=upstream)
+    git(
+        "-c",
+        "user.name=Upstream",
+        "-c",
+        "user.email=upstream@example.invalid",
+        "commit",
+        "-m",
+        "Advance target",
+        cwd=upstream,
+    )
+    git("push", "origin", "main", cwd=upstream)
+
+    candidate = GitHubClient("placeholder-token").candidate_diff(
+        "main",
+        workspace,
+    )
+
+    assert "-latest target" in candidate
+    assert "+prior commit" in candidate
+    assert "-before" in candidate
+    assert "+after" in candidate
+    assert "deleted file mode" in candidate
+    assert "-delete me" in candidate
+    assert "new file mode" in candidate
+    assert "+untracked" in candidate
+    assert "scratch.ignored" not in candidate
+    assert git("show", "origin/main:base.txt", cwd=workspace) == (
+        "base\nlatest target"
+    )
+
+
+def test_prepare_publication_returns_exact_frozen_candidate_and_diff_without_remote_effect(
+    tmp_path,
+):
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    request_calls = []
+    command_calls = []
+    branch = "agent/issue-7"
+    target_head_sha = "1111111111111111111111111111111111111111"
+    rebased_head_sha = "2222222222222222222222222222222222222222"
+    head_sha = "3333333333333333333333333333333333333333"
+    remote_head_sha = "4444444444444444444444444444444444444444"
+    expected_diff = "diff --git a/app.py b/app.py\n+prepared\n"
+    commit_count = 0
+
+    def request(method, path, *, query=None, json_body=None):
+        request_calls.append((method, path, query, json_body))
+        raise AssertionError("preparation must not call the GitHub API")
+
+    def command_runner(args, *, cwd=None, env=None):
+        nonlocal commit_count
+        command_calls.append((args, cwd, env))
+        if args == [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            f"refs/heads/{branch}",
+        ]:
+            return SimpleNamespace(
+                stdout=f"{remote_head_sha}\trefs/heads/{branch}\n"
+            )
+        if args == ["git", "diff", "--cached", "--name-only"]:
+            return SimpleNamespace(stdout="app.py\n")
+        if args == ["git", "commit", "-m", "Resolve issue #7"]:
+            commit_count += 1
+            return SimpleNamespace(stdout="")
+        if args == ["git", "rev-parse", "origin/main"]:
+            return SimpleNamespace(stdout=f"{target_head_sha}\n")
+        if args == ["git", "rev-parse", "HEAD"]:
+            current_head = head_sha if commit_count == 2 else rebased_head_sha
+            return SimpleNamespace(stdout=f"{current_head}\n")
+        if args == [
+            "git",
+            "diff",
+            "--no-color",
+            target_head_sha,
+            head_sha,
+            "--",
+        ]:
+            return SimpleNamespace(stdout=expected_diff)
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    candidate, candidate_diff = client.prepare_publication(7, "main", workspace)
+
+    assert candidate == PublicationCandidate(
+        branch=branch,
+        head_sha=head_sha,
+        target_head_sha=target_head_sha,
+        remote_head_sha=remote_head_sha,
+    )
+    assert candidate_diff == expected_diff
+    with pytest.raises(FrozenInstanceError):
+        candidate.head_sha = "5555555555555555555555555555555555555555"
+    commands = [call[0] for call in command_calls]
+    assert ["git", "checkout", "-B", branch] in commands
+    assert ["git", "fetch", "origin", "main"] in commands
+    assert ["git", "rebase", "origin/main"] in commands
+    assert ["git", "reset", "--soft", "origin/main"] in commands
+    assert commands.count(
+        ["git", "commit", "-m", "Resolve issue #7"]
+    ) == 2
+    assert [
+        "git",
+        "diff",
+        "--no-color",
+        target_head_sha,
+        head_sha,
+        "--",
+    ] in commands
+    assert request_calls == []
+    assert not any(args[:2] == ["git", "push"] for args in commands)
+    assert all(call[1] == workspace for call in command_calls)
+
+
+def test_publish_prepared_pushes_exact_candidate_then_creates_pull_request(
+    tmp_path,
+):
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    request_calls = []
+    command_calls = []
+    branch = "agent/issue-7"
+    target_head_sha = "1111111111111111111111111111111111111111"
+    head_sha = "3333333333333333333333333333333333333333"
+    remote_head_sha = "4444444444444444444444444444444444444444"
+    candidate = PublicationCandidate(
+        branch=branch,
+        head_sha=head_sha,
+        target_head_sha=target_head_sha,
+        remote_head_sha=remote_head_sha,
+    )
+    pull_json = {
+        "number": 12,
+        "html_url": "https://example.test/pulls/12",
+        "head": {
+            "ref": branch,
+            "sha": "5555555555555555555555555555555555555555",
+        },
+        "state": "open",
+        "merged": False,
+    }
+    pull_diff = "diff --git a/app.py b/app.py\n+published\n"
+    pushed = False
+
+    def request(method, path, *, query=None, json_body=None):
+        request_calls.append((method, path, query, json_body))
+        if method == "GET" and path == "/repos/acme/widgets/pulls":
+            return []
+        if method == "POST":
+            assert pushed
+            return {"number": 12}
+        if path.endswith(".diff"):
+            return pull_diff
+        return pull_json
+
+    def command_runner(args, *, cwd=None, env=None):
+        nonlocal pushed
+        command_calls.append((args, cwd, env))
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(stdout=f"{head_sha}\n")
+        if args == ["git", "rev-parse", "origin/main"]:
+            return SimpleNamespace(stdout=f"{target_head_sha}\n")
+        if args == [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            f"refs/heads/{branch}",
+        ]:
+            return SimpleNamespace(
+                stdout=f"{remote_head_sha}\trefs/heads/{branch}\n"
+            )
+        if args[:2] == ["git", "push"]:
+            pushed = True
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    pull = client.publish_prepared(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+        candidate,
+    )
+
+    assert pull == PullRequest(
+        number=12,
+        url="https://example.test/pulls/12",
+        branch=branch,
+        state="open",
+        merged=False,
+        diff=pull_diff,
+        head_sha=head_sha,
+    )
+    expected_push = [
+        "git",
+        "push",
+        f"--force-with-lease=refs/heads/{branch}:{remote_head_sha}",
+        "--set-upstream",
+        "origin",
+        f"{head_sha}:refs/heads/{branch}",
+    ]
+    commands = [call[0] for call in command_calls]
+    assert [args for args in commands if args[:2] == ["git", "push"]] == [
+        expected_push
+    ]
+    push_index = commands.index(expected_push)
+    assert commands.index(["git", "rev-parse", "HEAD"]) < push_index
+    assert commands.index(["git", "fetch", "origin", "main"]) < push_index
+    assert commands.index(["git", "rev-parse", "origin/main"]) < push_index
+    assert commands.index(
+        [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            f"refs/heads/{branch}",
+        ]
+    ) < push_index
+    assert request_calls == [
+        (
+            "GET",
+            "/repos/acme/widgets/pulls",
+            {"state": "open", "per_page": 100, "page": 1},
+            None,
+        ),
+        (
+            "POST",
+            "/repos/acme/widgets/pulls",
+            None,
+            {
+                "title": "Resolve issue #7",
+                "head": branch,
+                "base": "main",
+                "body": "Closes #7",
+            },
+        ),
+        ("GET", "/repos/acme/widgets/pulls/12", None, None),
+        ("GET", "/repos/acme/widgets/pulls/12.diff", None, None),
+    ]
+    assert all(call[1] == workspace for call in command_calls)
+
+
+def test_publish_prepared_retry_resumes_after_exact_candidate_was_pushed(
+    tmp_path,
+):
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    command_calls = []
+    branch = "agent/issue-7"
+    target_head_sha = "1111111111111111111111111111111111111111"
+    head_sha = "3333333333333333333333333333333333333333"
+    candidate = PublicationCandidate(
+        branch=branch,
+        head_sha=head_sha,
+        target_head_sha=target_head_sha,
+        remote_head_sha="2222222222222222222222222222222222222222",
+    )
+    pull_json = {
+        "number": 12,
+        "html_url": "https://example.test/pulls/12",
+        "head": {"ref": branch, "sha": head_sha},
+        "state": "open",
+        "merged": False,
+    }
+
+    def request(method, path, *, query=None, json_body=None):
+        if path.endswith(".diff"):
+            return "already-pushed diff"
+        return pull_json
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(stdout=f"{head_sha}\n")
+        if args == ["git", "rev-parse", "origin/main"]:
+            return SimpleNamespace(stdout=f"{target_head_sha}\n")
+        if args == [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            f"refs/heads/{branch}",
+        ]:
+            return SimpleNamespace(
+                stdout=f"{head_sha}\trefs/heads/{branch}\n"
+            )
+        if args[:2] == ["git", "push"]:
+            raise AssertionError("the exact candidate is already on the branch")
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    pull = client.publish_prepared(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+        candidate,
+        existing_pr=12,
+    )
+
+    assert pull is not None
+    assert pull.head_sha == head_sha
+    assert not any(
+        args[:2] == ["git", "push"] for args, _, _ in command_calls
+    )
+
+
+def test_publish_prepared_declines_local_head_movement_without_push(tmp_path):
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    request_calls = []
+    command_calls = []
+    candidate = PublicationCandidate(
+        branch="agent/issue-7",
+        head_sha="1111111111111111111111111111111111111111",
+        target_head_sha="2222222222222222222222222222222222222222",
+        remote_head_sha="3333333333333333333333333333333333333333",
+    )
+
+    def request(method, path, *, query=None, json_body=None):
+        request_calls.append((method, path, query, json_body))
+        return {}
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(
+                stdout="4444444444444444444444444444444444444444\n"
+            )
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    assert client.publish_prepared(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+        candidate,
+        existing_pr=12,
+    ) is None
+    commands = [call[0] for call in command_calls]
+    assert ["git", "rev-parse", "HEAD"] in commands
+    assert not any(args[:2] == ["git", "push"] for args in commands)
+    assert not any(
+        method in {"POST", "PATCH", "PUT", "DELETE"}
+        for method, _, _, _ in request_calls
+    )
+
+
+def test_publish_prepared_declines_fetched_target_movement_without_push(tmp_path):
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    request_calls = []
+    command_calls = []
+    head_sha = "1111111111111111111111111111111111111111"
+    candidate = PublicationCandidate(
+        branch="agent/issue-7",
+        head_sha=head_sha,
+        target_head_sha="2222222222222222222222222222222222222222",
+        remote_head_sha="3333333333333333333333333333333333333333",
+    )
+
+    def request(method, path, *, query=None, json_body=None):
+        request_calls.append((method, path, query, json_body))
+        return {}
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(stdout=f"{head_sha}\n")
+        if args == ["git", "rev-parse", "origin/main"]:
+            return SimpleNamespace(
+                stdout="4444444444444444444444444444444444444444\n"
+            )
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    assert client.publish_prepared(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+        candidate,
+        existing_pr=12,
+    ) is None
+    commands = [call[0] for call in command_calls]
+    assert ["git", "fetch", "origin", "main"] in commands
+    assert ["git", "rev-parse", "origin/main"] in commands
+    assert not any(args[:2] == ["git", "push"] for args in commands)
+    assert not any(
+        method in {"POST", "PATCH", "PUT", "DELETE"}
+        for method, _, _, _ in request_calls
+    )
+
+
+def test_publish_prepared_declines_remote_issue_branch_movement_without_push(
+    tmp_path,
+):
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    request_calls = []
+    command_calls = []
+    branch = "agent/issue-7"
+    head_sha = "1111111111111111111111111111111111111111"
+    target_head_sha = "2222222222222222222222222222222222222222"
+    candidate = PublicationCandidate(
+        branch=branch,
+        head_sha=head_sha,
+        target_head_sha=target_head_sha,
+        remote_head_sha="3333333333333333333333333333333333333333",
+    )
+
+    def request(method, path, *, query=None, json_body=None):
+        request_calls.append((method, path, query, json_body))
+        return {}
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(stdout=f"{head_sha}\n")
+        if args == ["git", "rev-parse", "origin/main"]:
+            return SimpleNamespace(stdout=f"{target_head_sha}\n")
+        if args == [
+            "git",
+            "ls-remote",
+            "--heads",
+            "origin",
+            f"refs/heads/{branch}",
+        ]:
+            return SimpleNamespace(
+                stdout=(
+                    "4444444444444444444444444444444444444444"
+                    f"\trefs/heads/{branch}\n"
+                )
+            )
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        request=request,
+        command_runner=command_runner,
+    )
+
+    assert client.publish_prepared(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+        candidate,
+        existing_pr=12,
+    ) is None
+    commands = [call[0] for call in command_calls]
+    assert [
+        "git",
+        "ls-remote",
+        "--heads",
+        "origin",
+        f"refs/heads/{branch}",
+    ] in commands
+    assert not any(args[:2] == ["git", "push"] for args in commands)
+    assert not any(
+        method in {"POST", "PATCH", "PUT", "DELETE"}
+        for method, _, _, _ in request_calls
+    )
+
+
+def test_publish_validated_to_target_fast_forwards_exact_head_without_force(
+    tmp_path,
+):
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    command_calls = []
+    expected_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    target_branch = "release/next"
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(stdout=f"{expected_head}\n")
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        command_runner=command_runner,
+    )
+
+    assert client.publish_validated_to_target(
+        target_branch,
+        workspace,
+        expected_head,
+    )
+    assert [call[0] for call in command_calls] == [
+        ["git", "rev-parse", "HEAD"],
+        ["git", "fetch", "origin", target_branch],
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            f"origin/{target_branch}",
+            expected_head,
+        ],
+        [
+            "git",
+            "push",
+            "origin",
+            f"{expected_head}:refs/heads/{target_branch}",
+        ],
+    ]
+    assert all(call[1] == workspace for call in command_calls)
+    assert all(call[2]["GIT_TERMINAL_PROMPT"] == "0" for call in command_calls)
+    assert not any(
+        argument.startswith("--force")
+        for args, _, _ in command_calls
+        for argument in args
+    )
+
+
+def test_publish_validated_to_target_declines_divergent_target_without_push(
+    tmp_path,
+):
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    command_calls = []
+    expected_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        if args == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(stdout=f"{expected_head}\n")
+        if args[:4] == ["git", "merge-base", "--is-ancestor", "origin/main"]:
+            raise subprocess.CalledProcessError(1, args)
+        return SimpleNamespace(stdout="")
+
+    client = GitHubClient(
+        "placeholder-token",
+        command_runner=command_runner,
+    )
+
+    assert not client.publish_validated_to_target(
+        "main",
+        workspace,
+        expected_head,
+    )
+    assert [call[0] for call in command_calls] == [
+        ["git", "rev-parse", "HEAD"],
+        ["git", "fetch", "origin", "main"],
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            "origin/main",
+            expected_head,
+        ],
+    ]
+    assert not any(args[1] == "push" for args, _, _ in command_calls)
+    assert not any(
+        argument.startswith("--force")
+        for args, _, _ in command_calls
+        for argument in args
+    )
+
+
+def test_publish_validated_to_target_rejects_expected_local_head_mismatch(
+    tmp_path,
+):
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    command_calls = []
+    expected_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local_head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_calls.append((args, cwd, env))
+        assert args == ["git", "rev-parse", "HEAD"]
+        return SimpleNamespace(stdout=f"{local_head}\n")
+
+    client = GitHubClient(
+        "placeholder-token",
+        command_runner=command_runner,
+    )
+
+    with pytest.raises(RuntimeError, match="validated head"):
+        client.publish_validated_to_target(
+            "release/next",
+            workspace,
+            expected_head,
+        )
+
+    assert [call[0] for call in command_calls] == [
+        ["git", "rev-parse", "HEAD"],
+    ]
+    assert not any(args[1] == "push" for args, _, _ in command_calls)
+    assert not any(
+        argument.startswith("--force")
+        for args, _, _ in command_calls
+        for argument in args
+    )
 
 
 def test_repeated_publication_keeps_one_issue_commit_on_the_remote_branch(tmp_path):
@@ -1758,6 +2521,154 @@ def test_address_feedback_retry_reuses_marker_and_reconciles_inline_resolution(
         }
 
 
+def test_resolve_feedback_without_code_reuses_reply_and_inline_resolution():
+    calls = []
+    comments_path = "/repos/acme/widgets/pulls/12/comments"
+    reply_path = f"{comments_path}/77/replies"
+    response_url = "https://example.test/pulls/12#discussion_r901"
+    response = (
+        "No branch change is needed. Current-head evidence shows the reported "
+        "case is already handled."
+    )
+    marker = "<!-- repogents-feedback:inline:101 -->"
+    response_body = f"{response}\n\n{marker}"
+    posted_response = None
+    resolved = False
+
+    def request(method, path, *, query=None, json_body=None):
+        nonlocal posted_response, resolved
+        calls.append((method, path, query, json_body))
+        if method == "GET" and path == comments_path:
+            return [] if posted_response is None else [posted_response]
+        if method == "POST" and path == reply_path:
+            assert posted_response is None
+            assert json_body == {"body": response_body}
+            posted_response = {
+                "id": 901,
+                "body": response_body,
+                "html_url": response_url,
+            }
+            return posted_response
+        if method == "POST" and path == "/graphql":
+            operation = json_body["query"].lstrip().split()[1].split("(")[0]
+            if operation == "ReviewThread":
+                return {
+                    "data": {
+                        "node": {
+                            "id": "PRRT_inline_101",
+                            "isResolved": resolved,
+                            "viewerCanResolve": True,
+                        }
+                    }
+                }
+            if operation == "ResolveThread":
+                resolved = True
+                return {
+                    "data": {
+                        "resolveReviewThread": {
+                            "thread": {
+                                "id": "PRRT_inline_101",
+                                "isResolved": True,
+                            }
+                        }
+                    }
+                }
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    client = GitHubClient("placeholder-token", request=request)
+    feedback = GitHubFeedback(
+        external_id="inline:101",
+        kind="inline",
+        body="Use the shared helper",
+        path="src/app.py",
+        line=14,
+        review_thread_id="PRRT_inline_101",
+        top_level_comment_id=77,
+    )
+
+    first = client.resolve_feedback_without_code(
+        "acme/widgets",
+        12,
+        feedback,
+        response,
+    )
+    second = client.resolve_feedback_without_code(
+        "acme/widgets",
+        12,
+        feedback,
+        response,
+    )
+
+    assert first == FeedbackAddress("RESOLVED", response_url)
+    assert second == first
+    assert response_body.count(marker) == 1
+    assert [call[:2] for call in calls].count(("POST", reply_path)) == 1
+    graphql_operations = [
+        call[3]["query"].lstrip().split()[1].split("(")[0]
+        for call in calls
+        if call[1] == "/graphql"
+    ]
+    assert graphql_operations == [
+        "ReviewThread",
+        "ResolveThread",
+        "ReviewThread",
+    ]
+
+
+def test_resolve_feedback_without_code_acknowledges_review_without_resolution():
+    calls = []
+    comments_path = "/repos/acme/widgets/issues/12/comments"
+    response_url = "https://example.test/pulls/12#issuecomment-902"
+    response = (
+        "The report is valid but outside this issue. Follow-up: "
+        "https://example.test/issues/301"
+    )
+    marker = "<!-- repogents-feedback:review:201 -->"
+    response_body = f"{response}\n\n{marker}"
+    posted_response = None
+
+    def request(method, path, *, query=None, json_body=None):
+        nonlocal posted_response
+        calls.append((method, path, query, json_body))
+        assert path == comments_path
+        if method == "GET":
+            return [] if posted_response is None else [posted_response]
+        assert method == "POST"
+        assert posted_response is None
+        assert json_body == {"body": response_body}
+        posted_response = {
+            "id": 902,
+            "body": response_body,
+            "html_url": response_url,
+        }
+        return posted_response
+
+    client = GitHubClient("placeholder-token", request=request)
+    feedback = GitHubFeedback(
+        external_id="review:201",
+        kind="review",
+        body="Please address the review",
+    )
+
+    first = client.resolve_feedback_without_code(
+        "acme/widgets",
+        12,
+        feedback,
+        response,
+    )
+    second = client.resolve_feedback_without_code(
+        "acme/widgets",
+        12,
+        feedback,
+        response,
+    )
+
+    assert first == FeedbackAddress("ACKNOWLEDGED", response_url)
+    assert second == first
+    assert [call[0] for call in calls].count("POST") == 1
+    assert all(call[1] != "/graphql" for call in calls)
+
+
 
 def test_address_feedback_rejects_marker_for_a_different_head_sha():
     calls = []
@@ -1950,3 +2861,4 @@ def test_publish_commit_supplies_service_local_git_identity(tmp_path):
     commit_config = _git_config(commit_call[2])
     assert commit_config["user.name"]
     assert commit_config["user.email"]
+

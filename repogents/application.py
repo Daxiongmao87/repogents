@@ -4,12 +4,13 @@ import json
 import shutil
 import tempfile
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from repogents.github import GitHubFeedback, PullRequest
+from repogents.github import GitHubFeedback, PublicationCandidate, PullRequest
 from repogents.semantic import SemanticRouter, validate_classification
 from repogents.store import TERMINAL_RUN_STATES, Store
 
@@ -21,6 +22,7 @@ class ApplicationConfig:
     promotion_threshold: int = 3
     stale_run_threshold: int = 3
     max_workers: int = 8
+    pr_silence_seconds: float = 3600
 
     def __post_init__(self) -> None:
         if not 0 <= self.default_similarity_threshold < 1:
@@ -33,6 +35,11 @@ class ApplicationConfig:
             raise ValueError("stale_run_threshold must be positive")
         if self.max_workers <= 0:
             raise ValueError("max_workers must be positive")
+        if (
+            isinstance(self.pr_silence_seconds, bool)
+            or self.pr_silence_seconds <= 0
+        ):
+            raise ValueError("pr_silence_seconds must be positive")
 
 
 _CLASSIFICATION_GUIDANCE = (
@@ -80,6 +87,27 @@ _SPECIFY_SCHEMA = {
         }
     ]
 }
+_FEEDBACK_SPECIFY_SCHEMA = {
+    "dispositions": [
+        {
+            "external_id": "string",
+            "valid": True,
+            "in_scope": True,
+            "pr_regression": False,
+            "explanation": "string",
+            "evidence": ["string"],
+            "specification_keys": ["specification key"],
+            "follow_up_issue": {
+                "title": "string",
+                "observed_defect": "string",
+                "affected_behavior": "string",
+                "affected_paths": ["string"],
+                "acceptance_criteria": ["string"],
+            },
+        }
+    ],
+    "specifications": _SPECIFY_SCHEMA["specifications"],
+}
 _ROLE_SCHEMA = {"role_prompt": "nonempty string"}
 _WORK_SCHEMA = {
     "outcome": "ready_for_validation or continue_work",
@@ -96,10 +124,20 @@ _VALIDATION_SCHEMA = {
     "passed": True,
     "failed_specifications": [],
     "failed_criteria": [],
+    "code_review_findings": [],
     "explanation": "string",
     "evidence": [],
     "repository_state": {},
     "completed_work": [],
+}
+
+
+_SOURCE_ACTIVE_RUN_STATES = {
+    "SPECIFYING",
+    "EXECUTING",
+    "WAITING_FOR_WORK_COMPLETION",
+    "VALIDATING",
+    "CREATING_PR",
 }
 
 
@@ -112,12 +150,14 @@ class Application:
         router: SemanticRouter,
         config: ApplicationConfig,
         executor=None,
+        clock=None,
     ):
         self.store = store
         self.github = github
         self.runtime = runtime
         self.router = router
         self.config = config
+        self._clock = clock or time.time
         self.data_dir = Path(config.data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.store.recover_interrupted_work()
@@ -170,7 +210,9 @@ class Application:
         self._reap_workers()
         repositories = self.store.list_repositories()
         for repository in repositories:
-            for issue in self.github.list_ready_issues(repository["github_repository"]):
+            for issue in self.github.list_ready_issues(
+                repository["github_repository"]
+            ):
                 self.store.create_run(
                     repository["id"],
                     issue.number,
@@ -184,16 +226,115 @@ class Application:
 
         repositories_by_id = {item["id"]: item for item in repositories}
         for run in self.store.list_runs():
+            repository = repositories_by_id.get(run["repository_id"])
+            if repository is None:
+                continue
             if run["state"] in TERMINAL_RUN_STATES:
                 self.store.adapt_nodes_after_run(
                     run["id"], self.config.stale_run_threshold
                 )
+            elif run["state"] == "PR_LISTENING":
+                self._poll_pull_request(repository, run)
+
+        focused_run_ids: set[int] = set()
+        for repository in repositories:
+            runs = [
+                run
+                for run in self.store.list_runs(repository["id"])
+                if run["state"] not in TERMINAL_RUN_STATES
+            ]
+            source_active = [
+                run
+                for run in runs
+                if run["state"] in _SOURCE_ACTIVE_RUN_STATES
+            ]
+            if source_active:
+                focused = source_active[0]
+                focused_run_ids.add(focused["id"])
+                self._advance_run(repository, focused)
                 continue
-            repository = repositories_by_id.get(run["repository_id"])
-            if repository is None:
+
+            pending_feedback = self._pending_feedback_selection(runs)
+            if pending_feedback is not None:
+                focused, packages = pending_feedback
+                if packages is not None:
+                    self.store.create_pass(
+                        focused["id"],
+                        "feedback",
+                        {"feedback": packages},
+                    )
+                self.store.transition_run(
+                    focused["id"],
+                    "SPECIFYING",
+                    branch=focused.get("branch"),
+                    pull_request=focused.get("pull_request"),
+                )
+                focused_run_ids.add(focused["id"])
                 continue
-            self._advance_run(repository, run)
-        self._start_workers()
+
+            now = self._clock()
+            listening_runs = [
+                run for run in runs if run["state"] == "PR_LISTENING"
+            ]
+            if any(
+                run.get("pr_listening_since") is None
+                or now - float(run["pr_listening_since"])
+                < self.config.pr_silence_seconds
+                for run in listening_runs
+            ):
+                continue
+            for listening_run in listening_runs:
+                pull_request = listening_run["pull_request"]
+                validated_head = pull_request["validated_head_sha"]
+                if pull_request["head_sha"] != validated_head:
+                    continue
+                if not self.github.publish_validated_to_target(
+                    repository["target_branch"],
+                    self._workspace(repository["id"], listening_run["id"]),
+                    validated_head,
+                ):
+                    continue
+                self.store.transition_run(listening_run["id"], "COMPLETED")
+                self.store.adapt_nodes_after_run(
+                    listening_run["id"], self.config.stale_run_threshold
+                )
+
+            queued = next(
+                (run for run in runs if run["state"] == "QUEUED"),
+                None,
+            )
+            if queued is not None:
+                focused_run_ids.add(queued["id"])
+                self._advance_run(repository, queued)
+        self._start_workers(focused_run_ids)
+
+    def _pending_feedback_selection(
+        self,
+        runs: list[dict],
+    ) -> tuple[dict, list[dict] | None] | None:
+        for run in runs:
+            if run["state"] != "PR_LISTENING":
+                continue
+            pending = [
+                item
+                for item in self.store.list_feedback(run["id"])
+                if item["status"] == "PENDING"
+            ]
+            if not pending:
+                continue
+            claimed_ids = self._claimed_feedback_ids(
+                self.store.list_passes(run["id"])
+            )
+            if any(item["external_id"] in claimed_ids for item in pending):
+                return run, None
+            packages = [
+                item["package"]
+                for item in pending
+                if item["external_id"] not in claimed_ids
+            ]
+            if packages:
+                return run, packages
+        return None
 
     def close(self) -> None:
         if self._closed:
@@ -230,8 +371,6 @@ class Application:
             self._validate(repository, run)
         elif state == "CREATING_PR":
             self._publish(repository, run)
-        elif state == "PR_LISTENING":
-            self._listen_for_pull_request(repository, run)
 
     def _begin_run(self, repository: dict, run: dict) -> None:
         workspace = self._workspace(repository["id"], run["id"])
@@ -243,13 +382,64 @@ class Application:
         self.store.transition_run(run["id"], "SPECIFYING")
 
     @staticmethod
+    def _feedback_origin_pass_id(execution_pass: dict) -> int | None:
+        if execution_pass["trigger_type"] == "feedback":
+            return execution_pass["id"]
+        if execution_pass["trigger_type"] not in {
+            "validation_failure",
+            "publication_revalidation",
+        }:
+            return None
+        origin = execution_pass["trigger_json"].get("origin_feedback_pass_id")
+        if isinstance(origin, bool) or not isinstance(origin, int):
+            return None
+        return origin
+
     def _pass_feedback_context(
+        self,
+        run_id: int,
         execution_pass: dict,
+        *,
+        in_scope_only: bool = True,
     ) -> tuple[list[dict], str | None]:
-        if execution_pass["trigger_type"] != "feedback":
+        origin_pass_id = self._feedback_origin_pass_id(execution_pass)
+        if origin_pass_id is None:
             return [], None
-        packages = execution_pass["trigger_json"].get("feedback", [])
-        pull_request_diff = packages[0].get("diff") if packages else None
+        origin_pass = next(
+            (
+                item
+                for item in self.store.list_passes(run_id)
+                if item["id"] == origin_pass_id
+                and item["trigger_type"] == "feedback"
+            ),
+            None,
+        )
+        if origin_pass is None:
+            return [], None
+        packages = origin_pass["trigger_json"].get("feedback", [])
+        if not isinstance(packages, list):
+            return [], None
+        run = self.store.get_run(run_id)
+        reference = None if run is None else run.get("pull_request")
+        pull_request_diff = (
+            reference.get("diff")
+            if isinstance(reference, dict)
+            else None
+        )
+        allowed_ids: set[str] | None = None
+        if in_scope_only:
+            scope_result = self.store.get_feedback_scope_result(
+                run_id,
+                origin_pass_id,
+            )
+            allowed_ids = {
+                item["external_id"]
+                for item in (scope_result or {}).get("dispositions", [])
+                if isinstance(item, dict)
+                and item.get("valid") is True
+                and item.get("in_scope") is True
+                and isinstance(item.get("external_id"), str)
+            }
         feedback = [
             {
                 field: package.get(field)
@@ -264,6 +454,11 @@ class Application:
                 )
             }
             for package in packages
+            if isinstance(package, dict)
+            and (
+                allowed_ids is None
+                or package.get("external_id") in allowed_ids
+            )
         ]
         return feedback, pull_request_diff
 
@@ -289,9 +484,21 @@ class Application:
         repository: dict,
         run: dict,
         execution_pass: dict,
+        *,
+        in_scope_only: bool = True,
     ) -> dict:
         validations = self.store.list_validations(run["id"])
-        feedback, pull_request_diff = self._pass_feedback_context(execution_pass)
+        feedback, pull_request_diff = self._pass_feedback_context(
+            run["id"],
+            execution_pass,
+            in_scope_only=in_scope_only,
+        )
+        reference = run.get("pull_request")
+        pull_request_head_sha = (
+            reference.get("head_sha")
+            if isinstance(reference, dict)
+            else None
+        )
         return {
             "original_issue": run["issue_json"],
             "repository": repository,
@@ -303,6 +510,7 @@ class Application:
             "validation_history": validations,
             "feedback": feedback,
             "pull_request_diff": pull_request_diff,
+            "pull_request_head_sha": pull_request_head_sha,
             "existing_specifications": self.store.list_specifications(run["id"]),
             "existing_work": self.store.list_work_items(run["id"]),
         }
@@ -317,7 +525,95 @@ class Application:
             for item in self.store.list_specifications(run["id"])
             if item["pass_id"] == execution_pass["id"]
         ]
-        if not existing:
+        if execution_pass["trigger_type"] == "feedback":
+            packages = execution_pass["trigger_json"].get("feedback", [])
+            result = self.store.get_feedback_scope_result(
+                run["id"],
+                execution_pass["id"],
+            )
+            reference = run.get("pull_request")
+            head_sha = (
+                reference.get("head_sha")
+                if isinstance(reference, dict)
+                else None
+            )
+            if not isinstance(head_sha, str) or not head_sha:
+                raise RuntimeError(
+                    "feedback Specify run has no current pull-request head"
+                )
+            if result is None:
+                result = self.runtime.run(
+                    self._task(
+                        "specify",
+                        "Disposition every claimed feedback item against the current pull-request head, original issue, accepted specifications, prior work, and validation evidence before creating correction work. A pull-request regression must be valid and in scope. Map only valid in-scope items to returned specifications. Give valid out-of-scope items a bounded follow-up issue and give invalid items no follow-up issue. "
+                        + _CLASSIFICATION_GUIDANCE,
+                        self._specify_context(
+                            repository,
+                            run,
+                            execution_pass,
+                            in_scope_only=False,
+                        ),
+                    ),
+                    self._workspace(repository["id"], run["id"]),
+                    result_schema=_FEEDBACK_SPECIFY_SCHEMA,
+                    trajectory_path=self._trajectory(
+                        run["id"], f"specify-{execution_pass['id']}"
+                    ),
+                )
+                result = self._validated_feedback_scope_result(
+                    result,
+                    packages,
+                )
+                result = dict(result)
+                result["head_sha"] = head_sha
+                result = self.store.record_feedback_scope_result(
+                    run["id"],
+                    execution_pass["id"],
+                    result,
+                )
+            else:
+                result = self._validated_feedback_scope_result(
+                    result,
+                    packages,
+                )
+                if result.get("head_sha") != head_sha:
+                    raise RuntimeError(
+                        "feedback scope result belongs to a different "
+                        "pull-request head"
+                    )
+            for disposition in result["dispositions"]:
+                self.store.record_feedback_disposition(
+                    run["id"],
+                    disposition["external_id"],
+                    self._feedback_disposition_name(disposition),
+                    disposition,
+                )
+            if result["specifications"] and not existing:
+                self.store.save_specification_package(
+                    run["id"],
+                    execution_pass["id"],
+                    {"specifications": result["specifications"]},
+                )
+            self._resolve_no_code_feedback(
+                repository,
+                run,
+                result["dispositions"],
+            )
+            if not result["specifications"]:
+                reference = run.get("pull_request")
+                if not reference:
+                    raise RuntimeError(
+                        "feedback disposition run has no pull request"
+                    )
+                self.store.transition_run(
+                    run["id"],
+                    "PR_LISTENING",
+                    branch=reference["branch"],
+                    pull_request=reference,
+                    pr_listening_since=self._clock(),
+                )
+                return
+        elif not existing:
             result = self.runtime.run(
                 self._task(
                     "specify",
@@ -337,6 +633,349 @@ class Application:
         self._route_unassigned(repository, run, execution_pass)
         self.store.transition_run(run["id"], "EXECUTING")
         self.store.transition_run(run["id"], "WAITING_FOR_WORK_COMPLETION")
+
+    @staticmethod
+    def _validated_feedback_scope_result(
+        result: dict,
+        packages: list[dict],
+    ) -> dict:
+        if (
+            not isinstance(result, dict)
+            or not {"dispositions", "specifications"}.issubset(result)
+        ):
+            raise ValueError(
+                "feedback Specify must return dispositions and specifications"
+            )
+        dispositions = result["dispositions"]
+        specifications = result["specifications"]
+        if not isinstance(dispositions, list):
+            raise ValueError("feedback dispositions must be a list")
+        if not isinstance(specifications, list):
+            raise ValueError("feedback specifications must be a list")
+        if not isinstance(packages, list) or any(
+            not isinstance(package, dict)
+            or not isinstance(package.get("external_id"), str)
+            or not package["external_id"].strip()
+            for package in packages
+        ):
+            raise ValueError("feedback pass must contain claimed feedback items")
+        claimed_ids = [package["external_id"] for package in packages]
+        if len(claimed_ids) != len(set(claimed_ids)):
+            raise ValueError("feedback pass external IDs must be unique")
+
+        required_disposition_fields = {
+            "external_id",
+            "valid",
+            "in_scope",
+            "pr_regression",
+            "explanation",
+            "evidence",
+            "specification_keys",
+            "follow_up_issue",
+        }
+        seen_ids: set[str] = set()
+        mapped_specification_keys: set[str] = set()
+        for disposition in dispositions:
+            if (
+                not isinstance(disposition, dict)
+                or not required_disposition_fields.issubset(disposition)
+            ):
+                raise ValueError(
+                    "feedback disposition must contain every required field"
+                )
+            external_id = disposition["external_id"]
+            if (
+                not isinstance(external_id, str)
+                or not external_id.strip()
+                or external_id in seen_ids
+            ):
+                raise ValueError(
+                    "feedback disposition external IDs must be nonempty and unique"
+                )
+            seen_ids.add(external_id)
+            for field in ("valid", "in_scope", "pr_regression"):
+                if not isinstance(disposition[field], bool):
+                    raise ValueError(
+                        f"feedback disposition {field} must be boolean"
+                    )
+            explanation = disposition["explanation"]
+            if not isinstance(explanation, str) or not explanation.strip():
+                raise ValueError(
+                    "feedback disposition explanation must be nonempty"
+                )
+            evidence = disposition["evidence"]
+            if (
+                not isinstance(evidence, list)
+                or not evidence
+                or any(
+                    not isinstance(item, str) or not item.strip()
+                    for item in evidence
+                )
+            ):
+                raise ValueError(
+                    "feedback disposition evidence must be nonempty strings"
+                )
+            specification_keys = disposition["specification_keys"]
+            if (
+                not isinstance(specification_keys, list)
+                or any(
+                    not isinstance(item, str) or not item.strip()
+                    for item in specification_keys
+                )
+                or len(specification_keys) != len(set(specification_keys))
+            ):
+                raise ValueError(
+                    "feedback disposition specification_keys must be unique strings"
+                )
+            if disposition["pr_regression"] and not (
+                disposition["valid"] and disposition["in_scope"]
+            ):
+                raise ValueError(
+                    "a pull-request regression must be valid and in scope"
+                )
+            if disposition["in_scope"] and not disposition["valid"]:
+                raise ValueError("in-scope feedback must be valid")
+
+            follow_up = disposition["follow_up_issue"]
+            if disposition["valid"] and disposition["in_scope"]:
+                if not specification_keys:
+                    raise ValueError(
+                        "in-scope feedback must map to a specification"
+                    )
+                if follow_up is not None:
+                    raise ValueError(
+                        "in-scope feedback cannot create a follow-up issue"
+                    )
+                mapped_specification_keys.update(specification_keys)
+            elif disposition["valid"]:
+                if specification_keys:
+                    raise ValueError(
+                        "out-of-scope feedback cannot map to specifications"
+                    )
+                if not isinstance(follow_up, dict):
+                    raise ValueError(
+                        "out-of-scope feedback requires a follow-up issue"
+                    )
+                required_follow_up_fields = {
+                    "title",
+                    "observed_defect",
+                    "affected_behavior",
+                    "affected_paths",
+                    "acceptance_criteria",
+                }
+                if not required_follow_up_fields.issubset(follow_up):
+                    raise ValueError(
+                        "follow-up issue must contain every required field"
+                    )
+                for field in (
+                    "title",
+                    "observed_defect",
+                    "affected_behavior",
+                ):
+                    if (
+                        not isinstance(follow_up[field], str)
+                        or not follow_up[field].strip()
+                    ):
+                        raise ValueError(
+                            f"follow-up issue {field} must be nonempty"
+                        )
+                for field in ("affected_paths", "acceptance_criteria"):
+                    values = follow_up[field]
+                    if (
+                        not isinstance(values, list)
+                        or any(
+                            not isinstance(item, str) or not item.strip()
+                            for item in values
+                        )
+                    ):
+                        raise ValueError(
+                            f"follow-up issue {field} must be strings"
+                        )
+                if not follow_up["acceptance_criteria"]:
+                    raise ValueError(
+                        "follow-up issue acceptance_criteria must be nonempty"
+                    )
+            else:
+                if disposition["in_scope"]:
+                    raise ValueError("invalid feedback cannot be in scope")
+                if specification_keys:
+                    raise ValueError(
+                        "invalid feedback cannot map to specifications"
+                    )
+                if follow_up is not None:
+                    raise ValueError(
+                        "invalid feedback cannot create a follow-up issue"
+                    )
+
+        if seen_ids != set(claimed_ids):
+            raise ValueError(
+                "feedback Specify must disposition every claimed item exactly once"
+            )
+        returned_specification_keys: set[str] = set()
+        for specification in specifications:
+            if (
+                not isinstance(specification, dict)
+                or not isinstance(specification.get("key"), str)
+                or not specification["key"].strip()
+                or specification["key"] in returned_specification_keys
+            ):
+                raise ValueError(
+                    "feedback specification keys must be nonempty and unique"
+                )
+            returned_specification_keys.add(specification["key"])
+        if mapped_specification_keys != returned_specification_keys:
+            raise ValueError(
+                "only in-scope feedback may map to returned specifications"
+            )
+        return dict(result)
+
+    @staticmethod
+    def _feedback_disposition_name(disposition: dict) -> str:
+        if not disposition["valid"]:
+            return "INVALID"
+        if disposition["in_scope"]:
+            return "IN_SCOPE"
+        return "OUT_OF_SCOPE"
+
+    @staticmethod
+    def _github_feedback(feedback_row: dict) -> GitHubFeedback:
+        package = feedback_row["package"]
+        return GitHubFeedback(
+            external_id=feedback_row["external_id"],
+            kind=package["kind"],
+            body=package["body"],
+            path=package.get("path"),
+            line=package.get("line"),
+            review_thread_id=package.get("review_thread_id"),
+            top_level_comment_id=package.get("top_level_comment_id"),
+        )
+
+    @staticmethod
+    def _feedback_source_url(pull_url: str, feedback_row: dict) -> str:
+        package = feedback_row["package"]
+        comment_id = package.get("top_level_comment_id")
+        if package.get("kind") == "inline" and isinstance(comment_id, int):
+            return f"{pull_url}#discussion_r{comment_id}"
+        external_id = feedback_row["external_id"]
+        if package.get("kind") == "review" and external_id.startswith("review:"):
+            return (
+                f"{pull_url}#pullrequestreview-"
+                f"{external_id.partition(':')[2]}"
+            )
+        return f"{pull_url}#feedback-{external_id}"
+
+    @classmethod
+    def _follow_up_body(
+        cls,
+        pull_url: str,
+        feedback_row: dict,
+        disposition: dict,
+    ) -> str:
+        follow_up = disposition["follow_up_issue"]
+        paths = "\n".join(
+            f"- `{path}`" for path in follow_up["affected_paths"]
+        ) or "- No repository path was identified."
+        evidence = "\n".join(
+            f"- {item}" for item in disposition["evidence"]
+        )
+        criteria = "\n".join(
+            f"- {item}" for item in follow_up["acceptance_criteria"]
+        )
+        feedback_url = cls._feedback_source_url(pull_url, feedback_row)
+        return (
+            "## Observed defect\n\n"
+            f"{follow_up['observed_defect']}\n\n"
+            "## Affected behavior\n\n"
+            f"{follow_up['affected_behavior']}\n\n"
+            "## Affected paths\n\n"
+            f"{paths}\n\n"
+            "## Supporting evidence\n\n"
+            f"{evidence}\n\n"
+            "## Acceptance criteria\n\n"
+            f"{criteria}\n\n"
+            "## Why this is outside the current issue\n\n"
+            f"{disposition['explanation']}\n\n"
+            "## Source\n\n"
+            f"- Pull request: {pull_url}\n"
+            f"- Feedback: {feedback_url}"
+        )
+
+    @staticmethod
+    def _no_code_response(
+        disposition: dict,
+        follow_up_issue: dict | None,
+    ) -> str:
+        evidence = "\n".join(
+            f"- {item}" for item in disposition["evidence"]
+        )
+        if follow_up_issue is not None:
+            return (
+                "This is valid feedback, but it is outside the current "
+                "issue's scope.\n\n"
+                f"Evidence:\n{evidence}\n\n"
+                f"Scope reason: {disposition['explanation']}\n\n"
+                f"Follow-up issue: {follow_up_issue['url']}"
+            )
+        return (
+            "No current-branch change is needed because this feedback is "
+            "invalid or no longer present.\n\n"
+            f"Evidence:\n{evidence}\n\n"
+            f"Conclusion: {disposition['explanation']}"
+        )
+
+    def _resolve_no_code_feedback(
+        self,
+        repository: dict,
+        run: dict,
+        dispositions: list[dict],
+    ) -> None:
+        reference = run.get("pull_request")
+        if not reference:
+            raise RuntimeError("feedback disposition run has no pull request")
+        rows = {
+            item["external_id"]: item
+            for item in self.store.list_feedback(run["id"])
+        }
+        for disposition in dispositions:
+            disposition_name = self._feedback_disposition_name(disposition)
+            if disposition_name == "IN_SCOPE":
+                continue
+            external_id = disposition["external_id"]
+            feedback_row = rows[external_id]
+            if feedback_row["status"] != "PENDING":
+                continue
+            follow_up_issue = feedback_row.get("follow_up_issue")
+            if disposition_name == "OUT_OF_SCOPE" and follow_up_issue is None:
+                requested = disposition["follow_up_issue"]
+                issue = self.github.ensure_follow_up_issue(
+                    repository["github_repository"],
+                    external_id,
+                    requested["title"],
+                    self._follow_up_body(
+                        reference["url"],
+                        feedback_row,
+                        disposition,
+                    ),
+                )
+                feedback_row = self.store.record_feedback_follow_up(
+                    run["id"],
+                    external_id,
+                    asdict(issue),
+                )
+                follow_up_issue = feedback_row["follow_up_issue"]
+            feedback = self._github_feedback(feedback_row)
+            address = self.github.resolve_feedback_without_code(
+                repository["github_repository"],
+                int(reference["number"]),
+                feedback,
+                self._no_code_response(disposition, follow_up_issue),
+            )
+            self.store.mark_feedback_without_code(
+                run["id"],
+                external_id,
+                address.status,
+                address.response_url,
+            )
 
     def _route_unassigned(
         self, repository: dict, run: dict, execution_pass: dict
@@ -394,13 +1033,19 @@ class Application:
         if self.store.validation_barrier_ready(run["id"], execution_pass["id"]):
             self.store.transition_run(run["id"], "VALIDATING")
 
-    def _start_workers(self) -> None:
-        for repository in self.store.list_repositories():
+    def _start_workers(self, focused_run_ids: set[int]) -> None:
+        for run_id in sorted(focused_run_ids):
+            run = self.store.get_run(run_id)
+            if run is None or run["state"] not in _SOURCE_ACTIVE_RUN_STATES:
+                continue
+            repository = self.store.get_repository(run["repository_id"])
+            if repository is None:
+                continue
             for node in self.store.list_dynamic_nodes(repository["id"]):
                 with self._worker_lock:
                     if node["id"] in self._workers:
                         continue
-                    work = self.store.claim_node_work(node["id"])
+                    work = self.store.claim_node_work(node["id"], run_id)
                     if work is None:
                         continue
                     future = self._executor.submit(self._run_work, node, work)
@@ -428,7 +1073,10 @@ class Application:
             for item in self.store.list_passes(run["id"])
             if item["id"] == work["pass_id"]
         )
-        feedback, pull_request_diff = self._pass_feedback_context(execution_pass)
+        feedback, pull_request_diff = self._pass_feedback_context(
+            run["id"],
+            execution_pass,
+        )
         specifications = {
             item["id"]: item for item in self.store.list_specifications(run["id"])
         }
@@ -499,8 +1147,12 @@ class Application:
         repository: dict,
         run: dict,
         execution_pass: dict,
+        candidate_diff: str,
     ) -> dict:
-        feedback, pull_request_diff = self._pass_feedback_context(execution_pass)
+        feedback, pull_request_diff = self._pass_feedback_context(
+            run["id"],
+            execution_pass,
+        )
         return {
             "original_issue": run["issue_json"],
             "repository": repository,
@@ -509,6 +1161,7 @@ class Application:
             "validation_history": self.store.list_validations(run["id"]),
             "feedback": feedback,
             "pull_request_diff": pull_request_diff,
+            "candidate_diff": candidate_diff,
         }
 
     @staticmethod
@@ -517,6 +1170,7 @@ class Application:
             "passed",
             "failed_specifications",
             "failed_criteria",
+            "code_review_findings",
             "explanation",
             "evidence",
             "repository_state",
@@ -526,7 +1180,11 @@ class Application:
             raise ValueError("Validate must return the complete validation result")
         if not isinstance(result["passed"], bool):
             raise ValueError("validation passed must be boolean")
-        for field in ("failed_specifications", "failed_criteria"):
+        for field in (
+            "failed_specifications",
+            "failed_criteria",
+            "code_review_findings",
+        ):
             values = result[field]
             if not isinstance(values, list) or any(
                 not isinstance(value, str) or not value.strip() for value in values
@@ -541,7 +1199,9 @@ class Application:
         if not isinstance(result["completed_work"], list):
             raise ValueError("validation completed_work must be a list")
         has_failures = bool(
-            result["failed_specifications"] or result["failed_criteria"]
+            result["failed_specifications"]
+            or result["failed_criteria"]
+            or result["code_review_findings"]
         )
         if result["passed"] == has_failures:
             raise ValueError("validation outcome and failures are inconsistent")
@@ -575,6 +1235,11 @@ class Application:
             None,
         )
         if recorded is None:
+            candidate, _ = self.github.prepare_publication(
+                run["issue_number"],
+                repository["target_branch"],
+                self._workspace(repository["id"], run["id"]),
+            )
             with tempfile.TemporaryDirectory(
                 prefix="repogents-validate-",
                 dir=self.data_dir,
@@ -585,11 +1250,20 @@ class Application:
                     validation_workspace,
                     symlinks=True,
                 )
+                candidate_diff = self.github.candidate_diff(
+                    repository["target_branch"],
+                    validation_workspace,
+                )
                 result = self.runtime.run(
                     self._task(
                         "validate",
-                        "Judge the completed result against both every atomic specification and acceptance criterion and the intent of the original issue. Do not modify repository files or implement corrections. If any requirement is unmet, return a failed validation result for Specify.",
-                        self._validation_context(repository, run, execution_pass),
+                        "Judge the completed result against every atomic specification, acceptance criterion, and the intent of the original issue. Independently review the complete staged target-to-candidate diff for branch-introduced correctness defects, regressions, and changes not mapped to the issue, specifications, necessary prerequisites, or current in-scope feedback. Do not audit unrelated pre-existing code. Do not modify repository files or implement corrections. Return a failed validation result for any failed specification, failed criterion, or code-review finding.",
+                        self._validation_context(
+                            repository,
+                            run,
+                            execution_pass,
+                            candidate_diff,
+                        ),
                     ),
                     validation_workspace,
                     result_schema=_VALIDATION_SCHEMA,
@@ -598,29 +1272,150 @@ class Application:
                     ),
                 )
             result = self._validated_validation_result(result)
+            result["publication_candidate"] = asdict(candidate)
             self.store.record_validation(run["id"], execution_pass["id"], result)
         else:
             result = self._validated_validation_result(recorded)
         if not result["passed"]:
             latest_pass = self.store.list_passes(run["id"])[-1]
             if latest_pass["id"] == execution_pass["id"]:
-                self.store.create_pass(run["id"], "validation_failure", result)
+                trigger = dict(result)
+                origin_feedback_pass_id = self._feedback_origin_pass_id(
+                    execution_pass
+                )
+                if origin_feedback_pass_id is not None:
+                    trigger["origin_feedback_pass_id"] = (
+                        origin_feedback_pass_id
+                    )
+                self.store.create_pass(
+                    run["id"],
+                    "validation_failure",
+                    trigger,
+                )
             self.store.transition_run(run["id"], "SPECIFYING")
             return
         self.store.transition_run(run["id"], "CREATING_PR")
 
+    def _publication_feedback_ids(
+        self,
+        run_id: int,
+        execution_pass: dict,
+    ) -> set[str]:
+        origin_pass_id = self._feedback_origin_pass_id(execution_pass)
+        if origin_pass_id is None:
+            return set()
+        result = self.store.get_feedback_scope_result(
+            run_id,
+            origin_pass_id,
+        )
+        return {
+            item["external_id"]
+            for item in (result or {}).get("dispositions", [])
+            if isinstance(item, dict)
+            and item.get("valid") is True
+            and item.get("in_scope") is True
+            and isinstance(item.get("external_id"), str)
+        }
+
+    @staticmethod
+    def _validated_publication_candidate(
+        validations: list[dict],
+    ) -> PublicationCandidate | None:
+        if (
+            not validations
+            or validations[-1]["result"].get("passed") is not True
+        ):
+            raise RuntimeError("publication requires a successful validation")
+        payload = validations[-1]["result"].get("publication_candidate")
+        if payload is None:
+            return None
+        if not isinstance(payload, dict):
+            raise RuntimeError("validation publication candidate is invalid")
+        branch = payload.get("branch")
+        head_sha = payload.get("head_sha")
+        target_head_sha = payload.get("target_head_sha")
+        remote_head_sha = payload.get("remote_head_sha")
+        if (
+            not isinstance(branch, str)
+            or not branch
+            or not isinstance(head_sha, str)
+            or not head_sha
+            or not isinstance(target_head_sha, str)
+            or not target_head_sha
+            or not isinstance(remote_head_sha, str)
+        ):
+            raise RuntimeError("validation publication candidate is invalid")
+        return PublicationCandidate(
+            branch=branch,
+            head_sha=head_sha,
+            target_head_sha=target_head_sha,
+            remote_head_sha=remote_head_sha,
+        )
+
+    def _start_publication_revalidation(
+        self,
+        run: dict,
+        execution_passes: list[dict],
+        candidate: PublicationCandidate | None,
+    ) -> None:
+        latest_pass = execution_passes[-1]
+        has_latest_validation = any(
+            item["pass_id"] == latest_pass["id"]
+            for item in self.store.list_validations(run["id"])
+        )
+        if (
+            latest_pass["trigger_type"] != "publication_revalidation"
+            or has_latest_validation
+        ):
+            trigger: dict[str, Any] = {}
+            if candidate is not None:
+                trigger["publication_candidate"] = asdict(candidate)
+            origin_feedback_pass_id = self._feedback_origin_pass_id(
+                latest_pass
+            )
+            if origin_feedback_pass_id is not None:
+                trigger["origin_feedback_pass_id"] = origin_feedback_pass_id
+            self.store.create_pass(
+                run["id"],
+                "publication_revalidation",
+                trigger,
+            )
+        self.store.transition_run(run["id"], "VALIDATING")
+
     def _publish(self, repository: dict, run: dict) -> None:
+        execution_passes = self.store.list_passes(run["id"])
+        if not execution_passes:
+            raise RuntimeError("publication requires an execution pass")
+        candidate = self._validated_publication_candidate(
+            self.store.list_validations(run["id"])
+        )
+        if candidate is None:
+            self._start_publication_revalidation(
+                run,
+                execution_passes,
+                None,
+            )
+            return
         existing = run.get("pull_request")
         existing_number = None if existing is None else int(existing["number"])
-        pull = self.github.publish(
+        pull = self.github.publish_prepared(
             repository["github_repository"],
             run["issue_number"],
             repository["target_branch"],
             self._workspace(repository["id"], run["id"]),
+            candidate,
             existing_pr=existing_number,
         )
-        claimed_feedback_ids = self._claimed_feedback_ids(
-            self.store.list_passes(run["id"])
+        if pull is None:
+            self._start_publication_revalidation(
+                run,
+                execution_passes,
+                candidate,
+            )
+            return
+        claimed_feedback_ids = self._publication_feedback_ids(
+            run["id"],
+            execution_passes[-1],
         )
         for feedback_row in self.store.list_feedback(run["id"]):
             if (
@@ -628,34 +1423,28 @@ class Application:
                 or feedback_row["external_id"] not in claimed_feedback_ids
             ):
                 continue
-            package = feedback_row["package"]
-            feedback = GitHubFeedback(
-                external_id=feedback_row["external_id"],
-                kind=package["kind"],
-                body=package["body"],
-                path=package.get("path"),
-                line=package.get("line"),
-                review_thread_id=package.get("review_thread_id"),
-                top_level_comment_id=package.get("top_level_comment_id"),
-            )
+            feedback = self._github_feedback(feedback_row)
             address = self.github.address_feedback(
                 repository["github_repository"],
                 pull.number,
                 feedback,
-                pull.head_sha,
+                candidate.head_sha,
             )
             self.store.mark_feedback_addressed(
                 run["id"],
                 feedback.external_id,
                 address.status,
-                pull.head_sha,
+                candidate.head_sha,
                 address.response_url,
             )
+        pull_request = asdict(pull)
+        pull_request["validated_head_sha"] = candidate.head_sha
         self.store.transition_run(
             run["id"],
             "PR_LISTENING",
             branch=pull.branch,
-            pull_request=asdict(pull),
+            pull_request=pull_request,
+            pr_listening_since=self._clock(),
         )
 
     @staticmethod
@@ -682,16 +1471,29 @@ class Application:
             "validations": validations,
         }
 
-    def _listen_for_pull_request(self, repository: dict, run: dict) -> None:
+    @staticmethod
+    def _refreshed_pull_request(pull: PullRequest, reference: dict) -> dict:
+        refreshed = asdict(pull)
+        refreshed["validated_head_sha"] = reference.get(
+            "validated_head_sha",
+            reference.get("head_sha"),
+        )
+        return refreshed
+
+    def _poll_pull_request(self, repository: dict, run: dict) -> None:
         reference = run.get("pull_request")
         if not reference:
             raise RuntimeError("PR_LISTENING run has no pull request")
         pull = self.github.pull_request(
             repository["github_repository"], int(reference["number"])
         )
+        pull_request = self._refreshed_pull_request(pull, reference)
         if pull.merged:
             self.store.transition_run(
-                run["id"], "COMPLETED", branch=pull.branch, pull_request=asdict(pull)
+                run["id"],
+                "COMPLETED",
+                branch=pull.branch,
+                pull_request=pull_request,
             )
             self.store.adapt_nodes_after_run(
                 run["id"], self.config.stale_run_threshold
@@ -699,30 +1501,27 @@ class Application:
             return
         if pull.state == "closed":
             self.store.transition_run(
-                run["id"], "CLOSED", branch=pull.branch, pull_request=asdict(pull)
+                run["id"],
+                "CLOSED",
+                branch=pull.branch,
+                pull_request=pull_request,
             )
             self.store.adapt_nodes_after_run(
                 run["id"], self.config.stale_run_threshold
             )
             return
 
-        execution_passes = self.store.list_passes(run["id"])
-        if execution_passes:
-            latest_pass = execution_passes[-1]
-            if (
-                latest_pass["trigger_type"] == "feedback"
-                and not self._pass_has_specifications(
-                    run["id"], latest_pass["id"]
-                )
-            ):
-                self.store.transition_run(
-                    run["id"],
-                    "SPECIFYING",
-                    branch=pull.branch,
-                    pull_request=asdict(pull),
-                )
-                return
-
+        transition_fields: dict[str, Any] = {
+            "branch": pull.branch,
+            "pull_request": pull_request,
+        }
+        if run.get("pr_listening_since") is None:
+            transition_fields["pr_listening_since"] = self._clock()
+        self.store.transition_run(
+            run["id"],
+            "PR_LISTENING",
+            **transition_fields,
+        )
         specifications = self.store.list_specifications(run["id"])
         work_items = self.store.list_work_items(run["id"])
         validations = self.store.list_validations(run["id"])
@@ -730,32 +1529,11 @@ class Application:
             repository["github_repository"], pull.number
         ):
             package = self._feedback_package(
-                feedback, pull, run, specifications, work_items, validations
+                feedback,
+                pull,
+                run,
+                specifications,
+                work_items,
+                validations,
             )
             self.store.add_feedback(run["id"], feedback.external_id, package)
-
-        claimed_feedback_ids = self._claimed_feedback_ids(
-            self.store.list_passes(run["id"])
-        )
-        pending_packages = [
-            item["package"]
-            for item in self.store.list_feedback(run["id"])
-            if item["external_id"] not in claimed_feedback_ids
-        ]
-        if pending_packages:
-            self.store.create_pass(
-                run["id"], "feedback", {"feedback": pending_packages}
-            )
-            self.store.transition_run(
-                run["id"],
-                "SPECIFYING",
-                branch=pull.branch,
-                pull_request=asdict(pull),
-            )
-            return
-        self.store.transition_run(
-            run["id"],
-            "PR_LISTENING",
-            branch=pull.branch,
-            pull_request=asdict(pull),
-        )
