@@ -52,7 +52,10 @@ class ServiceConfig:
             raise ValueError("REPOGENTS_LAN_PORT must be between 0 and 65535")
         if config.poll_seconds <= 0:
             raise ValueError("REPOGENTS_POLL_SECONDS must be positive")
-        if config.pr_silence_seconds <= 0:
+        if (
+            not math.isfinite(config.pr_silence_seconds)
+            or config.pr_silence_seconds <= 0
+        ):
             raise ValueError("REPOGENTS_PR_SILENCE_SECONDS must be positive")
         if not 0 <= config.similarity_threshold < 1:
             raise ValueError(

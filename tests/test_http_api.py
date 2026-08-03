@@ -179,6 +179,19 @@ def test_service_config_rejects_nonpositive_pr_silence_seconds(
         ServiceConfig.from_env()
 
 
+@pytest.mark.parametrize("silence_seconds", ["nan", "inf", "-inf"])
+def test_service_config_rejects_nonfinite_pr_silence_seconds(
+    monkeypatch, silence_seconds
+):
+    for name in _ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("REPOGENTS_GITHUB_TOKEN", "token")
+    monkeypatch.setenv("REPOGENTS_PR_SILENCE_SECONDS", silence_seconds)
+
+    with pytest.raises(ValueError, match="REPOGENTS_PR_SILENCE_SECONDS"):
+        ServiceConfig.from_env()
+
+
 def test_build_service_passes_configured_pr_silence_seconds(monkeypatch, tmp_path):
     class ComposedApplication:
         def __init__(self, *args):

@@ -86,6 +86,15 @@ mutation ResolveThread($input: ResolveReviewThreadInput!) {
 }
 """
 
+_UPDATE_REFS_MUTATION = """
+mutation UpdateRefs($input: UpdateRefsInput!) {
+  updateRefs(input: $input) {
+    clientMutationId
+  }
+}
+"""
+_ZERO_OID = "0" * 40
+
 _FEEDBACK_MARKER_PREFIX = "<!-- repogents-feedback:"
 _FOLLOW_UP_MARKER_PREFIX = "<!-- repogents-follow-up:"
 
@@ -358,14 +367,20 @@ class GitHubClient:
         self,
         target_branch: str,
         workspace: str | Path,
+        *,
+        candidate: PublicationCandidate,
     ) -> str:
         self._validate_target_branch(target_branch)
         if not isinstance(workspace, (str, Path)):
             raise TypeError("workspace must be a string or Path")
         if isinstance(workspace, str) and not workspace:
             raise ValueError("workspace must not be empty")
+        if not isinstance(candidate, PublicationCandidate):
+            raise TypeError("candidate must be a PublicationCandidate")
 
         workspace_path = Path(workspace)
+        if self._rev_parse_commit("HEAD", workspace_path) != candidate.head_sha:
+            raise RuntimeError("workspace HEAD moved after candidate preparation")
         target_ref = f"refs/remotes/origin/{target_branch}"
         self._command_runner(
             [
@@ -377,85 +392,91 @@ class GitHubClient:
             cwd=workspace_path,
             env=self._git_auth_env,
         )
-        self._command_runner(
-            ["git", "add", "--all"],
+        if (
+            self._rev_parse_commit(target_ref, workspace_path)
+            != candidate.target_head_sha
+        ):
+            raise RuntimeError("target branch moved after candidate preparation")
+        candidate_diff = self._command_runner(
+            [
+                "git",
+                "diff",
+                "--no-color",
+                candidate.target_head_sha,
+                candidate.head_sha,
+                "--",
+            ],
             cwd=workspace_path,
             env=self._git_command_env,
         )
-        candidate = self._command_runner(
-            ["git", "diff", "--cached", "--no-color", target_ref, "--"],
-            cwd=workspace_path,
-            env=self._git_command_env,
-        )
-        if not isinstance(candidate.stdout, str):
+        if not isinstance(candidate_diff.stdout, str):
             raise RuntimeError("git diff returned invalid output")
-        return candidate.stdout
+        return candidate_diff.stdout
 
     def publish_validated_to_target(
         self,
+        github_repository: str,
         target_branch: str,
         workspace: str | Path,
         expected_head: str,
+        *,
+        issue_branch: str,
     ) -> bool:
+        self._validate_github_repository(github_repository)
         self._validate_target_branch(target_branch)
+        self._validate_target_branch(issue_branch)
         if not isinstance(workspace, (str, Path)):
             raise TypeError("workspace must be a string or Path")
         if isinstance(workspace, str) and not workspace:
             raise ValueError("workspace must not be empty")
-        if (
-            not isinstance(expected_head, str)
-            or len(expected_head) != 40
-            or any(
-                character not in "0123456789abcdefABCDEF"
-                for character in expected_head
-            )
-        ):
+        if not self._is_commit_sha(expected_head):
             raise ValueError(
                 "expected_head must be a full hexadecimal commit SHA"
             )
 
         workspace_path = Path(workspace)
-        local_head = self._command_runner(
-            ["git", "rev-parse", "HEAD"],
-            cwd=workspace_path,
-            env=self._git_command_env,
-        ).stdout.strip()
+        local_head = self._rev_parse_commit("HEAD", workspace_path)
         if local_head != expected_head:
             raise RuntimeError(
                 "workspace HEAD does not match the validated head"
             )
+        if (
+            self._remote_issue_branch_head(issue_branch, workspace_path)
+            != expected_head
+        ):
+            return False
         self._command_runner(
             ["git", "fetch", "origin", target_branch],
             cwd=workspace_path,
             env=self._git_auth_env,
         )
-        try:
-            self._command_runner(
-                [
-                    "git",
-                    "merge-base",
-                    "--is-ancestor",
-                    f"origin/{target_branch}",
-                    expected_head,
-                ],
-                cwd=workspace_path,
-                env=self._git_command_env,
-            )
-        except subprocess.CalledProcessError as error:
-            if error.returncode == 1:
-                return False
-            raise
-        self._command_runner(
-            [
-                "git",
-                "push",
-                "origin",
-                f"{expected_head}:refs/heads/{target_branch}",
-            ],
-            cwd=workspace_path,
-            env=self._git_auth_env,
+        target_head = self._rev_parse_commit(
+            f"origin/{target_branch}",
+            workspace_path,
         )
-        return True
+        if target_head == expected_head:
+            return True
+        if not self._commit_is_ancestor(
+            target_head,
+            expected_head,
+            workspace_path,
+        ):
+            return self._commit_is_ancestor(
+                expected_head,
+                target_head,
+                workspace_path,
+            )
+
+        issue_ref = f"refs/heads/{issue_branch}"
+        target_ref = f"refs/heads/{target_branch}"
+        repository_id = self._repository_node_id(github_repository)
+        return self._update_refs(
+            repository_id,
+            [
+                (issue_ref, expected_head, expected_head),
+                (target_ref, target_head, expected_head),
+            ],
+        )
 
     def pull_request(self, github_repository: str, number: int) -> PullRequest:
         path = f"/repos/{github_repository}/pulls/{number}"
@@ -550,6 +571,30 @@ class GitHubClient:
             )
         return commit_sha
 
+    def _commit_is_ancestor(
+        self,
+        ancestor: str,
+        descendant: str,
+        workspace_path: Path,
+    ) -> bool:
+        try:
+            self._command_runner(
+                [
+                    "git",
+                    "merge-base",
+                    "--is-ancestor",
+                    ancestor,
+                    descendant,
+                ],
+                cwd=workspace_path,
+                env=self._git_command_env,
+            )
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 1:
+                return False
+            raise
+        return True
+
     def _remote_issue_branch_head(
         self,
         branch: str,
@@ -576,6 +621,63 @@ class GitHubClient:
             raise RuntimeError("git ls-remote returned an invalid branch ref")
         return fields[0]
 
+    def _repository_node_id(self, github_repository: str) -> str:
+        repository = self.repository(github_repository)
+        node_id = repository.get("node_id")
+        if not isinstance(node_id, str) or not node_id.strip():
+            raise RuntimeError("GitHub repository has no valid node ID")
+        return node_id
+
+    def _update_refs(
+        self,
+        repository_id: str,
+        updates: list[tuple[str, str, str]],
+    ) -> bool:
+        if not updates:
+            raise ValueError("reference transaction requires at least one update")
+        refs = [ref for ref, _old_oid, _new_oid in updates]
+        if len(refs) != len(set(refs)):
+            raise ValueError("reference transaction contains a duplicate ref")
+        ref_updates = []
+        for ref, old_oid, new_oid in updates:
+            if (
+                not ref.startswith("refs/heads/")
+                or not self._is_commit_sha(old_oid)
+                and old_oid != _ZERO_OID
+                or not self._is_commit_sha(new_oid)
+                and new_oid != _ZERO_OID
+            ):
+                raise ValueError("reference transaction contains an invalid update")
+            ref_updates.append(
+                {
+                    "name": ref,
+                    "beforeOid": old_oid,
+                    "afterOid": new_oid,
+                    "force": False,
+                }
+            )
+        payload = self._request(
+            "POST",
+            "/graphql",
+            json_body={
+                "query": _UPDATE_REFS_MUTATION,
+                "variables": {
+                    "input": {
+                        "repositoryId": repository_id,
+                        "refUpdates": ref_updates,
+                    }
+                },
+            },
+        )
+        if isinstance(payload, dict) and payload.get("errors"):
+            return False
+        data = self._graphql_data(payload, "reference transaction")
+        if not isinstance(data.get("updateRefs"), dict):
+            raise RuntimeError(
+                "GitHub reference transaction returned an invalid result"
+            )
+        return True
+
     def _prepare_issue_branch(
         self,
         issue_number: int,
@@ -594,6 +696,12 @@ class GitHubClient:
             env=self._git_auth_env,
         )
         remote_head = self._remote_issue_branch_head(branch, workspace_path)
+        if remote_head:
+            self._command_runner(
+                ["git", "fetch", "origin", f"refs/heads/{branch}"],
+                cwd=workspace_path,
+                env=self._git_auth_env,
+            )
         self._command_runner(
             ["git", "add", "--all"],
             cwd=workspace_path,
@@ -730,6 +838,54 @@ class GitHubClient:
             workspace_path,
         )
         head = self._rev_parse_commit("HEAD", workspace_path)
+        if remote_head and head != remote_head:
+            tree = self._command_runner(
+                ["git", "write-tree"],
+                cwd=workspace_path,
+                env=self._git_command_env,
+            )
+            tree_oid = (
+                tree.stdout.strip()
+                if isinstance(tree.stdout, str)
+                else ""
+            )
+            if not self._is_commit_sha(tree_oid):
+                raise RuntimeError("git write-tree returned an invalid tree")
+            commit_args = [
+                "git",
+                "commit-tree",
+                tree_oid,
+                "-p",
+                remote_head,
+            ]
+            if not self._commit_is_ancestor(
+                target_head,
+                remote_head,
+                workspace_path,
+            ):
+                commit_args.extend(["-p", target_head])
+            commit_args.extend(
+                ["-m", f"Resolve issue #{issue_number}"]
+            )
+            commit = self._command_runner(
+                commit_args,
+                cwd=workspace_path,
+                env=self._git_identity_env,
+            )
+            head = (
+                commit.stdout.strip()
+                if isinstance(commit.stdout, str)
+                else ""
+            )
+            if not self._is_commit_sha(head):
+                raise RuntimeError(
+                    "git commit-tree returned an invalid commit"
+                )
+            self._command_runner(
+                ["git", "reset", "--soft", head],
+                cwd=workspace_path,
+                env=self._git_command_env,
+            )
         candidate_diff = self._command_runner(
             ["git", "diff", "--no-color", target_head, head, "--"],
             cwd=workspace_path,
@@ -816,6 +972,29 @@ class GitHubClient:
             != candidate.head_sha
         ):
             return None
+        remote_head = self._remote_issue_branch_head(
+            candidate.branch,
+            workspace_path,
+        )
+        if remote_head == candidate.head_sha:
+            pull_number = existing_pr
+            if pull_number is None:
+                pull_number = self._find_open_pull_number(
+                    github_repository,
+                    candidate.branch,
+                    target_branch,
+                )
+            return self._finish_publication(
+                github_repository,
+                issue_number,
+                target_branch,
+                candidate.branch,
+                candidate.head_sha,
+                pull_number,
+            )
+        if remote_head != candidate.remote_head_sha:
+            return None
+
         self._command_runner(
             ["git", "fetch", "origin", target_branch],
             cwd=workspace_path,
@@ -829,30 +1008,46 @@ class GitHubClient:
             != candidate.target_head_sha
         ):
             return None
-        remote_head = self._remote_issue_branch_head(
-            candidate.branch,
+
+        remote_ref = f"refs/heads/{candidate.branch}"
+        target_ref = f"refs/heads/{target_branch}"
+        staging_branch = f"repogents/staging/issue-{issue_number}"
+        staging_ref = f"refs/heads/{staging_branch}"
+        repository_id = self._repository_node_id(github_repository)
+        staging_head = self._remote_issue_branch_head(
+            staging_branch,
             workspace_path,
         )
-        if remote_head not in {
-            candidate.remote_head_sha,
-            candidate.head_sha,
-        }:
-            return None
-
-        if remote_head != candidate.head_sha:
-            remote_ref = f"refs/heads/{candidate.branch}"
+        if staging_head != candidate.head_sha:
             self._command_runner(
                 [
                     "git",
                     "push",
-                    f"--force-with-lease={remote_ref}:{remote_head}",
-                    "--set-upstream",
+                    f"--force-with-lease={staging_ref}:{staging_head}",
                     "origin",
-                    f"{candidate.head_sha}:{remote_ref}",
+                    f"{candidate.head_sha}:{staging_ref}",
                 ],
                 cwd=workspace_path,
                 env=self._git_auth_env,
             )
+        if not self._update_refs(
+            repository_id,
+            [
+                (
+                    target_ref,
+                    candidate.target_head_sha,
+                    candidate.target_head_sha,
+                ),
+                (
+                    remote_ref,
+                    remote_head or _ZERO_OID,
+                    candidate.head_sha,
+                ),
+                (staging_ref, candidate.head_sha, _ZERO_OID),
+            ],
+        ):
+            return None
+
         pull_number = existing_pr
         if pull_number is None:
             pull_number = self._find_open_pull_number(

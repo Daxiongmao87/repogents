@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import tempfile
 import threading
@@ -37,9 +38,10 @@ class ApplicationConfig:
             raise ValueError("max_workers must be positive")
         if (
             isinstance(self.pr_silence_seconds, bool)
+            or not math.isfinite(self.pr_silence_seconds)
             or self.pr_silence_seconds <= 0
         ):
-            raise ValueError("pr_silence_seconds must be positive")
+            raise ValueError("pr_silence_seconds must be positive and finite")
 
 
 _CLASSIFICATION_GUIDANCE = (
@@ -233,7 +235,7 @@ class Application:
                 self.store.adapt_nodes_after_run(
                     run["id"], self.config.stale_run_threshold
                 )
-            elif run["state"] == "PR_LISTENING":
+            elif run.get("pull_request") is not None:
                 self._poll_pull_request(repository, run)
 
         focused_run_ids: set[int] = set()
@@ -283,22 +285,33 @@ class Application:
                 for run in listening_runs
             ):
                 continue
+            direct_publication_blocked = False
             for listening_run in listening_runs:
                 pull_request = listening_run["pull_request"]
-                validated_head = pull_request["validated_head_sha"]
-                if pull_request["head_sha"] != validated_head:
+                validated_head = pull_request.get("validated_head_sha")
+                if (
+                    not isinstance(validated_head, str)
+                    or not validated_head
+                    or pull_request["head_sha"] != validated_head
+                ):
+                    direct_publication_blocked = True
                     continue
                 if not self.github.publish_validated_to_target(
+                    repository["github_repository"],
                     repository["target_branch"],
                     self._workspace(repository["id"], listening_run["id"]),
                     validated_head,
+                    issue_branch=pull_request["branch"],
                 ):
+                    direct_publication_blocked = True
                     continue
                 self.store.transition_run(listening_run["id"], "COMPLETED")
                 self.store.adapt_nodes_after_run(
                     listening_run["id"], self.config.stale_run_threshold
                 )
 
+            if direct_publication_blocked:
+                continue
             queued = next(
                 (run for run in runs if run["state"] == "QUEUED"),
                 None,
@@ -1207,6 +1220,15 @@ class Application:
             raise ValueError("validation outcome and failures are inconsistent")
         return dict(result)
 
+    @staticmethod
+    def _is_current_persisted_validation(result: dict) -> bool:
+        return (
+            isinstance(result, dict)
+            and "code_review_findings" in result
+            and "publication_candidate" in result
+        )
+
+
     def _pass_has_specifications(self, run_id: int, pass_id: int) -> bool:
         return any(
             item["pass_id"] == pass_id
@@ -1253,6 +1275,7 @@ class Application:
                 candidate_diff = self.github.candidate_diff(
                     repository["target_branch"],
                     validation_workspace,
+                    candidate=candidate,
                 )
                 result = self.runtime.run(
                     self._task(
@@ -1275,6 +1298,13 @@ class Application:
             result["publication_candidate"] = asdict(candidate)
             self.store.record_validation(run["id"], execution_pass["id"], result)
         else:
+            if not self._is_current_persisted_validation(recorded):
+                self._start_publication_revalidation(
+                    run,
+                    execution_passes,
+                    None,
+                )
+                return
             result = self._validated_validation_result(recorded)
         if not result["passed"]:
             latest_pass = self.store.list_passes(run["id"])[-1]
@@ -1386,9 +1416,22 @@ class Application:
         execution_passes = self.store.list_passes(run["id"])
         if not execution_passes:
             raise RuntimeError("publication requires an execution pass")
-        candidate = self._validated_publication_candidate(
-            self.store.list_validations(run["id"])
-        )
+        latest_pass_id = execution_passes[-1]["id"]
+        validations = [
+            item
+            for item in self.store.list_validations(run["id"])
+            if item["pass_id"] == latest_pass_id
+        ]
+        if not validations or not self._is_current_persisted_validation(
+            validations[-1]["result"]
+        ):
+            self._start_publication_revalidation(
+                run,
+                execution_passes,
+                None,
+            )
+            return
+        candidate = self._validated_publication_candidate(validations)
         if candidate is None:
             self._start_publication_revalidation(
                 run,
@@ -1474,10 +1517,7 @@ class Application:
     @staticmethod
     def _refreshed_pull_request(pull: PullRequest, reference: dict) -> dict:
         refreshed = asdict(pull)
-        refreshed["validated_head_sha"] = reference.get(
-            "validated_head_sha",
-            reference.get("head_sha"),
-        )
+        refreshed["validated_head_sha"] = reference.get("validated_head_sha")
         return refreshed
 
     def _poll_pull_request(self, repository: dict, run: dict) -> None:
@@ -1515,11 +1555,14 @@ class Application:
             "branch": pull.branch,
             "pull_request": pull_request,
         }
-        if run.get("pr_listening_since") is None:
+        if (
+            run["state"] == "PR_LISTENING"
+            and run.get("pr_listening_since") is None
+        ):
             transition_fields["pr_listening_since"] = self._clock()
         self.store.transition_run(
             run["id"],
-            "PR_LISTENING",
+            run["state"],
             **transition_fields,
         )
         specifications = self.store.list_specifications(run["id"])

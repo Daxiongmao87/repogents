@@ -64,15 +64,24 @@ class FakeGitHub:
         ] = []
         self.publish_prepared_overrides: deque[PullRequest | None] = deque()
         self.publish_validated_to_target_result = False
-        self.publish_validated_to_target_calls: list[tuple[str, Path, str]] = []
+        self.publish_validated_to_target_calls: list[
+            tuple[str, str, Path, str]
+        ] = []
+        self.publish_validated_issue_branches: list[str | None] = []
         self.effect_calls: list[tuple] = []
         self.address_calls: list[tuple[str, int, GitHubFeedback, str]] = []
         self.no_code_calls: list[tuple[str, int, GitHubFeedback, str]] = []
         self.no_code_addresses: dict[tuple[str, int, str], FeedbackAddress] = {}
+        self.no_code_response_urls: dict[tuple[str, int, str], str] = {}
+        self.no_code_resolved_threads: set[tuple[str, int, str]] = set()
+        self.no_code_response_effects: list[tuple[str, int, str]] = []
+        self.no_code_thread_resolution_effects: list[tuple[str, int, str]] = []
+        self.no_code_interrupt_after: str | None = None
         self.checkout_calls: list[tuple[str, str, Path]] = []
         self.pull_request_calls: list[tuple[str, int]] = []
         self.feedback_calls: list[tuple[str, int]] = []
         self.candidate_diff_calls: list[tuple[str, Path]] = []
+        self.candidate_diff_candidates: list[PublicationCandidate | None] = []
         self.candidate_diff_text = "diff --git a/file.py b/file.py\n+candidate change"
         self.mutate_candidate_workspace = False
         self.follow_up_issues: dict[str, GitHubIssue] = {}
@@ -103,9 +112,11 @@ class FakeGitHub:
         self,
         target_branch: str,
         workspace: str | Path,
+        candidate: PublicationCandidate | None = None,
     ) -> str:
         path = Path(workspace)
         self.candidate_diff_calls.append((target_branch, path))
+        self.candidate_diff_candidates.append(candidate)
         if self.mutate_candidate_workspace:
             (path / "candidate-diff-staging.txt").write_text("validation copy only")
         return self.candidate_diff_text
@@ -204,13 +215,21 @@ class FakeGitHub:
         return self.pull
     def publish_validated_to_target(
         self,
+        github_repository: str,
         target_branch: str,
         workspace: str | Path,
         expected_head: str,
+        issue_branch: str | None = None,
     ) -> bool:
         self.publish_validated_to_target_calls.append(
-            (target_branch, Path(workspace), expected_head)
+            (
+                github_repository,
+                target_branch,
+                Path(workspace),
+                expected_head,
+            )
         )
+        self.publish_validated_issue_branches.append(issue_branch)
         return self.publish_validated_to_target_result
 
 
@@ -284,10 +303,23 @@ class FakeGitHub:
         self.no_code_calls.append(
             (github_repository, pull_number, feedback, response)
         )
+        response_url = self.no_code_response_urls.get(key)
+        if response_url is None:
+            response_url = f"{self.pull.url}#response-{feedback.external_id}"
+            self.no_code_response_urls[key] = response_url
+            self.no_code_response_effects.append(key)
+        if self.no_code_interrupt_after == "response":
+            self.no_code_interrupt_after = None
+            raise RuntimeError("interrupted at response")
+        if feedback.kind == "inline" and key not in self.no_code_resolved_threads:
+            self.no_code_resolved_threads.add(key)
+            self.no_code_thread_resolution_effects.append(key)
+        if self.no_code_interrupt_after == "thread":
+            self.no_code_interrupt_after = None
+            raise RuntimeError("interrupted at thread")
         address = self.no_code_addresses.get(key)
         if address is None:
             status = "RESOLVED" if feedback.kind == "inline" else "ACKNOWLEDGED"
-            response_url = f"{self.pull.url}#response-{feedback.external_id}"
             address = FeedbackAddress(status=status, response_url=response_url)
             self.no_code_addresses[key] = address
             self.effect_calls.append(
@@ -1401,7 +1433,13 @@ def test_validation_recovery_reuses_result_and_existing_followup_pass(tmp_path):
             execution_pass["id"],
             package((f"work-{issue_number}", "backend/api")),
         )
-        result = success if issue_number == 9 else failure
+        result = dict(success if issue_number == 9 else failure)
+        result["publication_candidate"] = {
+            "branch": f"agent/issue-{issue_number}",
+            "head_sha": f"{issue_number}" * 40,
+            "target_head_sha": "a" * 40,
+            "remote_head_sha": "",
+        }
         store.record_validation(run["id"], execution_pass["id"], result)
         if issue_number == 8:
             store.create_pass(run["id"], "validation_failure", result)
@@ -1462,6 +1500,96 @@ def test_legacy_creating_pr_revalidates_before_any_publication(tmp_path):
     assert [
         item["trigger_type"] for item in store.list_passes(run["id"])
     ] == ["issue", "publication_revalidation"]
+    assert github.publish_prepared_calls == []
+    assert github.effect_calls == []
+    app.close()
+
+
+def test_unvalidated_publication_revalidation_returns_to_validating_before_publication(
+    tmp_path,
+):
+    store = Store(tmp_path / "state.sqlite3")
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    run, _ = store.create_run(
+        repository["id"],
+        7,
+        {"number": 7, "title": "Validate", "body": "work"},
+    )
+    issue_pass = store.create_pass(run["id"], "issue", run["issue_json"])
+    candidate_payload = {
+        "branch": "agent/issue-7",
+        "head_sha": "validated-head",
+        "target_head_sha": "validated-target",
+        "remote_head_sha": "validated-remote",
+    }
+    older_success = validation(True, "The earlier candidate passed.")
+    older_success["publication_candidate"] = candidate_payload
+    store.record_validation(run["id"], issue_pass["id"], older_success)
+    store.create_pass(
+        run["id"],
+        "publication_revalidation",
+        {"publication_candidate": candidate_payload},
+    )
+    store.transition_run(run["id"], "CREATING_PR")
+    github = FakeGitHub()
+    app = Application(
+        store,
+        github,
+        ScriptedRuntime(),
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(data_dir=tmp_path / "runtime"),
+    )
+
+    app.poll_once()
+
+    assert store.get_run(run["id"])["state"] == "VALIDATING"
+    assert [
+        item["trigger_type"] for item in store.list_passes(run["id"])
+    ] == ["issue", "publication_revalidation"]
+    assert [
+        item["pass_id"] for item in store.list_validations(run["id"])
+    ] == [issue_pass["id"]]
+    assert github.publish_prepared_calls == []
+    assert github.effect_calls == []
+    app.close()
+
+
+def test_legacy_validation_result_starts_fresh_publication_revalidation(
+    tmp_path,
+):
+    store = Store(tmp_path / "state.sqlite3")
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    run, _ = store.create_run(
+        repository["id"],
+        7,
+        {"number": 7, "title": "Validate", "body": "work"},
+    )
+    issue_pass = store.create_pass(run["id"], "issue", run["issue_json"])
+    legacy_result = validation(True, "Legacy validation passed.")
+    del legacy_result["code_review_findings"]
+    store.record_validation(run["id"], issue_pass["id"], legacy_result)
+    store.transition_run(run["id"], "VALIDATING")
+    github = FakeGitHub()
+    runtime = ScriptedRuntime()
+    app = Application(
+        store,
+        github,
+        runtime,
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(data_dir=tmp_path / "runtime"),
+    )
+
+    app.poll_once()
+
+    assert store.get_run(run["id"])["state"] == "VALIDATING"
+    assert [
+        item["trigger_type"] for item in store.list_passes(run["id"])
+    ] == ["issue", "publication_revalidation"]
+    assert [
+        item["pass_id"] for item in store.list_validations(run["id"])
+    ] == [issue_pass["id"]]
+    assert runtime.calls == []
+    assert github.prepare_publication_calls == []
     assert github.publish_prepared_calls == []
     assert github.effect_calls == []
     app.close()
@@ -1871,7 +1999,8 @@ def test_no_code_scope_recovery_reuses_decision_and_relationship_without_duplica
     tmp_path,
 ):
     clock = ControlledClock(500.0)
-    store = Store(tmp_path / "state.sqlite3")
+    database = tmp_path / "state.sqlite3"
+    store = Store(database)
     repository = store.add_repository("acme/widget", "main", 0.75)
     github = FakeGitHub()
     run = seed_listening_run(
@@ -1947,17 +2076,17 @@ def test_no_code_scope_recovery_reuses_decision_and_relationship_without_duplica
 
     github.resolve_feedback_without_code = original_resolve
     replay_runtime = ScriptedRuntime()
-    replay_app, _, _, _ = make_app(
+    replay_app, replay_store, _, _ = make_app(
         tmp_path,
         runtime=replay_runtime,
-        store=store,
+        store=Store(database),
         github=github,
         clock=clock,
     )
     replay_app.poll_once()
 
-    completed = store.get_run(run["id"])
-    row = store.list_feedback(run["id"])[0]
+    completed = replay_store.get_run(run["id"])
+    row = replay_store.list_feedback(run["id"])[0]
     assert completed["state"] == "PR_LISTENING"
     assert completed["pr_listening_since"] == 500.0
     assert row["status"] == "RESOLVED"
@@ -1970,6 +2099,216 @@ def test_no_code_scope_recovery_reuses_decision_and_relationship_without_duplica
         for call in github.effect_calls
         if call[0] == "resolve_without_code"
     ] == [("resolve_without_code", github.pull.number, feedback.external_id)]
+    assert github.publish_existing == []
+    replay_app.close()
+
+
+@pytest.mark.parametrize(
+    ("boundary", "kind", "out_of_scope", "expected_status", "interrupt_after"),
+    [
+        pytest.param(
+            "follow-up-created-before-relationship",
+            "review",
+            True,
+            "ACKNOWLEDGED",
+            None,
+            id="follow-up-created-before-relationship",
+        ),
+        pytest.param(
+            "response-posted-before-address-recorded",
+            "inline",
+            False,
+            "RESOLVED",
+            "response",
+            id="response-posted-before-address-recorded",
+        ),
+        pytest.param(
+            "inline-thread-resolved-before-completion",
+            "inline",
+            False,
+            "RESOLVED",
+            "thread",
+            id="inline-thread-resolved-before-completion",
+        ),
+    ],
+)
+def test_no_code_scope_restart_recovers_external_effect_boundary(
+    tmp_path,
+    boundary,
+    kind,
+    out_of_scope,
+    expected_status,
+    interrupt_after,
+):
+    clock = ControlledClock(700.0)
+    database = tmp_path / "state.sqlite3"
+    store = Store(database)
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    github = FakeGitHub()
+    run = seed_listening_run(
+        store,
+        repository,
+        7,
+        github.pull,
+        pr_listening_since=600.0,
+    )
+    external_id = f"{kind}:{boundary}"
+    feedback = GitHubFeedback(
+        external_id,
+        kind,
+        "No current-branch change is needed",
+        "cache.py" if kind == "inline" else None,
+        8 if kind == "inline" else None,
+        "PRRT_restart_boundary" if kind == "inline" else None,
+        404 if kind == "inline" else None,
+    )
+    github.feedback = [feedback]
+    follow_up = (
+        {
+            "title": "Repair cache invalidation",
+            "observed_defect": "Updates leave stale cache entries.",
+            "affected_behavior": "Reads can return stale values.",
+            "affected_paths": ["cache.py"],
+            "acceptance_criteria": [
+                "Updates invalidate the corresponding cache entry."
+            ],
+        }
+        if out_of_scope
+        else None
+    )
+    first_runtime = ScriptedRuntime()
+    first_runtime.queue(
+        "specify",
+        feedback_specify(
+            [
+                feedback_disposition(
+                    external_id,
+                    valid=out_of_scope,
+                    in_scope=False,
+                    explanation=(
+                        "This defect is outside issue #7."
+                        if out_of_scope
+                        else "Current-head evidence shows no defect."
+                    ),
+                    evidence=["The current pull-request head was inspected."],
+                    follow_up_issue=follow_up,
+                )
+            ]
+        ),
+    )
+    app, _, _, _ = make_app(
+        tmp_path,
+        runtime=first_runtime,
+        store=store,
+        github=github,
+        clock=clock,
+    )
+
+    app.poll_once()
+    assert store.get_run(run["id"])["state"] == "SPECIFYING"
+    interrupted = False
+    if out_of_scope:
+        original_record_follow_up = store.record_feedback_follow_up
+
+        def interrupt_after_remote_effect(*args, **kwargs):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise RuntimeError(f"interrupted at {boundary}")
+            return original_record_follow_up(*args, **kwargs)
+
+        store.record_feedback_follow_up = interrupt_after_remote_effect
+    else:
+        github.no_code_interrupt_after = interrupt_after
+
+    with pytest.raises(RuntimeError, match=interrupt_after or boundary):
+        app.poll_once()
+
+    feedback_pass = store.list_passes(run["id"])[-1]
+    durable_scope = store.get_feedback_scope_result(
+        run["id"],
+        feedback_pass["id"],
+    )
+    interrupted_row = store.list_feedback(run["id"])[0]
+    assert durable_scope is not None
+    assert interrupted_row["disposition"] == (
+        "OUT_OF_SCOPE" if out_of_scope else "INVALID"
+    )
+    assert interrupted_row["status"] == "PENDING"
+    assert interrupted_row["response_url"] is None
+    assert len(first_runtime.calls) == 1
+    if out_of_scope:
+        assert interrupted_row["follow_up_issue"] is None
+        assert github.follow_up_issues[external_id].url.endswith("/issues/100")
+        assert github.no_code_calls == []
+    else:
+        remote_key = ("acme/widget", github.pull.number, external_id)
+        assert github.no_code_response_urls[remote_key].endswith(
+            f"#response-{external_id}"
+        )
+        assert (remote_key in github.no_code_resolved_threads) is (
+            interrupt_after == "thread"
+        )
+        assert remote_key not in github.no_code_addresses
+        assert interrupted_row["follow_up_issue"] is None
+    app.close()
+
+    replay_runtime = ScriptedRuntime()
+    replay_store = Store(database)
+    replay_app, _, _, _ = make_app(
+        tmp_path,
+        runtime=replay_runtime,
+        store=replay_store,
+        github=github,
+        clock=clock,
+    )
+    replay_app.poll_once()
+
+    completed = replay_store.get_run(run["id"])
+    row = replay_store.list_feedback(run["id"])[0]
+    assert completed["state"] == "PR_LISTENING"
+    assert completed["pr_listening_since"] == 700.0
+    assert row["status"] == expected_status
+    assert row["addressed_sha"] is None
+    assert row["response_url"] == github.no_code_addresses[
+        ("acme/widget", github.pull.number, external_id)
+    ].response_url
+    assert row["disposition"] == interrupted_row["disposition"]
+    assert row["disposition_result"] == interrupted_row["disposition_result"]
+    assert replay_store.get_feedback_scope_result(
+        run["id"],
+        feedback_pass["id"],
+    ) == durable_scope
+    assert replay_runtime.calls == []
+    follow_up_effects = [
+        call for call in github.effect_calls if call[0] == "create_follow_up"
+    ]
+    no_code_effects = [
+        call for call in github.effect_calls if call[0] == "resolve_without_code"
+    ]
+    if out_of_scope:
+        assert row["follow_up_issue"]["url"] == github.follow_up_issues[
+            external_id
+        ].url
+        assert len(github.follow_up_requests) == 2
+        assert follow_up_effects == [
+            ("create_follow_up", external_id, row["follow_up_issue"]["url"])
+        ]
+        assert len(github.no_code_calls) == 1
+    else:
+        assert row["follow_up_issue"] is None
+        assert github.follow_up_requests == []
+        assert follow_up_effects == []
+        assert len(github.no_code_calls) == 2
+        assert github.no_code_calls[0][3] == github.no_code_calls[1][3]
+    remote_key = ("acme/widget", github.pull.number, external_id)
+    assert github.no_code_response_effects == [remote_key]
+    assert github.no_code_thread_resolution_effects == (
+        [remote_key] if kind == "inline" else []
+    )
+    assert no_code_effects == [
+        ("resolve_without_code", github.pull.number, external_id)
+    ]
     assert github.publish_existing == []
     replay_app.close()
 
@@ -2326,6 +2665,10 @@ def test_publication_candidate_movement_revalidates_before_publish(tmp_path):
         (7, "main", durable_workspace),
     ]
     assert len(github.candidate_diff_calls) == 2
+    assert github.candidate_diff_candidates == [
+        first_candidate,
+        second_candidate,
+    ]
     assert all(
         path != durable_workspace
         for _, path in github.candidate_diff_calls
@@ -2551,10 +2894,17 @@ def test_active_run_does_not_preempt_and_other_listener_is_still_polled(
         active_pass["id"],
         package(("active-work", "backend/api")),
     )
+    active_validation = validation(True, "Recorded validation is clean.")
+    active_validation["publication_candidate"] = {
+        "branch": "agent/issue-8",
+        "head_sha": "8" * 40,
+        "target_head_sha": "a" * 40,
+        "remote_head_sha": "",
+    }
     store.record_validation(
         active["id"],
         active_pass["id"],
-        validation(True, "Recorded validation is clean."),
+        active_validation,
     )
     store.transition_run(active["id"], "VALIDATING")
     queued, _ = store.create_run(
@@ -2581,6 +2931,94 @@ def test_active_run_does_not_preempt_and_other_listener_is_still_polled(
     assert [
         item["trigger_type"] for item in store.list_passes(listener["id"])
     ] == ["issue"]
+    assert runtime.calls == []
+    app.close()
+
+
+def test_unfocused_source_active_run_with_open_pull_is_passively_polled(
+    tmp_path,
+):
+    store = Store(tmp_path / "state.sqlite3")
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    github = FakeGitHub()
+    focused, _ = store.create_run(
+        repository["id"],
+        7,
+        {"number": 7, "title": "Focused", "body": "Active source work"},
+    )
+    focused_pass = store.create_pass(
+        focused["id"],
+        "issue",
+        focused["issue_json"],
+    )
+    focused_validation = validation(True, "Focused validation is complete.")
+    focused_validation["publication_candidate"] = {
+        "branch": "agent/issue-7",
+        "head_sha": "focused-head",
+        "target_head_sha": "focused-target",
+        "remote_head_sha": "focused-remote",
+    }
+    store.record_validation(
+        focused["id"],
+        focused_pass["id"],
+        focused_validation,
+    )
+    store.transition_run(focused["id"], "VALIDATING")
+    unfocused, _ = store.create_run(
+        repository["id"],
+        8,
+        {"number": 8, "title": "Recovery", "body": "Persisted open PR"},
+    )
+    unfocused_pass = store.create_pass(
+        unfocused["id"],
+        "issue",
+        unfocused["issue_json"],
+    )
+    saved = store.save_specification_package(
+        unfocused["id"],
+        unfocused_pass["id"],
+        package(("unfocused-work", "backend/api")),
+    )
+    node = store.create_dynamic_node(
+        repository["id"],
+        "backend/api",
+        [1.0, 0.0],
+        "Own backend API work.",
+    )
+    work = store.assign_work(saved["work_items"][0]["id"], node["id"])
+    store.transition_run(
+        unfocused["id"],
+        "WAITING_FOR_WORK_COMPLETION",
+        branch=github.pull.branch,
+        pull_request=pull_payload(github.pull),
+    )
+    github.feedback = [
+        GitHubFeedback(
+            "review:passive-recovery",
+            "review",
+            "Observe this feedback without advancing source work.",
+        )
+    ]
+    app, _, _, runtime = make_app(
+        tmp_path,
+        store=store,
+        github=github,
+    )
+
+    app.poll_once()
+
+    assert github.pull_request_calls == [("acme/widget", github.pull.number)]
+    assert github.feedback_calls == [("acme/widget", github.pull.number)]
+    assert [
+        item["external_id"] for item in store.list_feedback(unfocused["id"])
+    ] == ["review:passive-recovery"]
+    assert store.get_run(unfocused["id"])["state"] == "WAITING_FOR_WORK_COMPLETION"
+    assert store.list_work_items(unfocused["id"])[0]["id"] == work["id"]
+    assert store.list_work_items(unfocused["id"])[0]["state"] == "QUEUED"
+    assert [
+        item["trigger_type"] for item in store.list_passes(unfocused["id"])
+    ] == ["issue"]
+    assert store.get_run(focused["id"])["state"] == "CREATING_PR"
     assert runtime.calls == []
     app.close()
 
@@ -2796,6 +3234,7 @@ def test_silence_initialization_restart_and_exact_configured_boundary(
     assert store.get_run(listener["id"])["pr_listening_since"] == 1000.0
     assert github.publish_validated_to_target_calls == [
         (
+            "acme/widget",
             "main",
             tmp_path
             / "runtime"
@@ -2809,7 +3248,7 @@ def test_silence_initialization_restart_and_exact_configured_boundary(
     restarted_app.close()
 
 
-def test_declined_direct_target_publication_leaves_run_listening(tmp_path):
+def test_declined_direct_target_publication_keeps_listener_and_next_run_queued(tmp_path):
     clock = ControlledClock(1060.0)
     store = Store(tmp_path / "state.sqlite3")
     repository = store.add_repository("acme/widget", "main", 0.75)
@@ -2821,6 +3260,11 @@ def test_declined_direct_target_publication_leaves_run_listening(tmp_path):
         7,
         github.pull,
         pr_listening_since=1000.0,
+    )
+    queued, _ = store.create_run(
+        repository["id"],
+        8,
+        {"number": 8, "title": "Queued", "body": "Queued body"},
     )
     app, _, _, _ = make_app(
         tmp_path,
@@ -2834,6 +3278,7 @@ def test_declined_direct_target_publication_leaves_run_listening(tmp_path):
 
     assert github.publish_validated_to_target_calls == [
         (
+            "acme/widget",
             "main",
             tmp_path
             / "runtime"
@@ -2843,8 +3288,12 @@ def test_declined_direct_target_publication_leaves_run_listening(tmp_path):
             github.pull.head_sha,
         )
     ]
+    assert github.publish_validated_issue_branches == [
+        listener["pull_request"]["branch"]
+    ]
     retained = store.get_run(listener["id"])
     assert retained["state"] == "PR_LISTENING"
+    assert store.get_run(queued["id"])["state"] == "QUEUED"
     assert retained["pull_request"]["validated_head_sha"] == github.pull.head_sha
     app.close()
 
@@ -2885,10 +3334,7 @@ def test_refreshed_unvalidated_pull_head_is_never_directly_published(tmp_path):
 
     refreshed = store.get_run(listener["id"])
     assert refreshed["pull_request"]["head_sha"] == "unvalidated-current-head"
-    assert (
-        refreshed["pull_request"]["validated_head_sha"]
-        == validated_pull.head_sha
-    )
+    assert refreshed["pull_request"]["validated_head_sha"] is None
     assert github.publish_validated_to_target_calls == []
 
     clock.value = 1060.0
@@ -2947,6 +3393,13 @@ def test_silent_validated_run_pushes_real_target_and_advances_next_issue(
     git("add", "README.md", cwd=workspace)
     git("commit", "-m", "Resolve issue 7", cwd=workspace)
     validated_head = git("rev-parse", "HEAD", cwd=workspace)
+    git(
+        "push",
+        "--set-upstream",
+        "origin",
+        f"{validated_head}:refs/heads/agent/issue-7",
+        cwd=workspace,
+    )
     pull = PullRequest(
         number=17,
         url="https://github.test/acme/widget/pull/17",
@@ -2973,21 +3426,68 @@ def test_silent_validated_run_pushes_real_target_and_advances_next_issue(
         def __init__(self):
             super().__init__()
             self.pull = pull
-            self.client = GitHubClient("placeholder-token")
+
+            def request(method, path, *, query=None, json_body=None):
+                if method == "GET" and path == "/repos/acme/widget":
+                    return {"node_id": "R_kgDOExample"}
+                if method == "POST" and path == "/graphql":
+                    updates = json_body["variables"]["input"]["refUpdates"]
+                    transaction = [
+                        "start",
+                        *[
+                            "update "
+                            f"{update['name']} "
+                            f"{update['afterOid']} "
+                            f"{update['beforeOid']}"
+                            for update in updates
+                        ],
+                        "prepare",
+                        "commit",
+                    ]
+                    subprocess.run(
+                        [
+                            "git",
+                            "--git-dir",
+                            str(remote),
+                            "update-ref",
+                            "--stdin",
+                        ],
+                        input="\n".join(transaction) + "\n",
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    )
+                    return {"data": {"updateRefs": {}}}
+                raise AssertionError(f"unexpected request: {method} {path}")
+
+            self.client = GitHubClient(
+                "placeholder-token",
+                request=request,
+            )
 
         def publish_validated_to_target(
             self,
+            github_repository: str,
             target_branch: str,
             workspace: str | Path,
             expected_head: str,
+            *,
+            issue_branch: str,
         ) -> bool:
             self.publish_validated_to_target_calls.append(
-                (target_branch, Path(workspace), expected_head)
+                (
+                    github_repository,
+                    target_branch,
+                    Path(workspace),
+                    expected_head,
+                )
             )
             return self.client.publish_validated_to_target(
+                github_repository,
                 target_branch,
                 workspace,
                 expected_head,
+                issue_branch=issue_branch,
             )
 
     github = RealTargetGitHub()
@@ -3133,3 +3633,16 @@ def test_application_config_defaults_and_rejects_nonpositive_pr_silence(
                 data_dir=tmp_path,
                 pr_silence_seconds=value,
             )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=["nan", "positive-infinity", "negative-infinity"],
+)
+def test_application_config_rejects_non_finite_pr_silence(tmp_path, value):
+    with pytest.raises(ValueError):
+        ApplicationConfig(
+            data_dir=tmp_path,
+            pr_silence_seconds=value,
+        )
