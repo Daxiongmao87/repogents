@@ -123,7 +123,7 @@ _WORK_SCHEMA = {
     "test_results": [],
     "repository_state": {},
     "resolved_paths": [
-        "operation_failure-only unmerged source path intentionally resolved"
+        "operation_failure-only source path intentionally ready for controller staging"
     ],
     "classification": "agent-chosen concise action/capability required only for continue_work",
     "context": {},
@@ -1135,6 +1135,36 @@ class Application:
         return value
 
     @classmethod
+    def _validated_operation_path_list(
+        cls,
+        operation_state: dict,
+        field: str,
+        *,
+        allow_missing: bool = False,
+    ) -> list[str]:
+        if field not in operation_state and allow_missing:
+            return []
+        values = operation_state.get(field)
+        label = field.replace("_", " ")
+        if (
+            not isinstance(values, list)
+            or any(
+                not isinstance(path, str) or not path
+                for path in values
+            )
+            or values != sorted(set(values))
+        ):
+            raise ValueError(
+                f"repository operation {label} must be sorted source paths"
+            )
+        for path in values:
+            cls._validated_relative_path(
+                path,
+                f"repository operation {label.removesuffix('s')}",
+            )
+        return list(values)
+
+    @classmethod
     def _validated_operation_artifact_manifest(
         cls,
         manifest: object,
@@ -1449,27 +1479,26 @@ class Application:
         if not isinstance(operation_state, dict):
             raise ValueError("repository operation state must be an object")
         rebase_in_progress = operation_state.get("rebase_in_progress")
-        unmerged_paths = operation_state.get("unmerged_paths")
         if not isinstance(rebase_in_progress, bool):
             raise ValueError(
                 "repository operation rebase state must be boolean"
             )
-        if (
-            not isinstance(unmerged_paths, list)
-            or any(
-                not isinstance(path, str) or not path
-                for path in unmerged_paths
-            )
-            or unmerged_paths != sorted(set(unmerged_paths))
-        ):
-            raise ValueError(
-                "repository operation unmerged paths must be sorted source paths"
-            )
-        for unmerged_path in unmerged_paths:
-            self._validated_relative_path(
-                unmerged_path,
-                "repository operation unmerged path",
-            )
+        unmerged_paths = self._validated_operation_path_list(
+            operation_state,
+            "unmerged_paths",
+        )
+        staged_paths = self._validated_operation_path_list(
+            operation_state,
+            "staged_paths",
+        )
+        unstaged_paths = self._validated_operation_path_list(
+            operation_state,
+            "unstaged_paths",
+        )
+        untracked_paths = self._validated_operation_path_list(
+            operation_state,
+            "untracked_paths",
+        )
         trigger = {
             "failed_stage": failed_stage,
             "command": error.cmd,
@@ -1482,7 +1511,10 @@ class Application:
                 "repository_id": repository["id"],
                 "run_id": run["id"],
                 "rebase_in_progress": rebase_in_progress,
-                "unmerged_paths": list(unmerged_paths),
+                "unmerged_paths": unmerged_paths,
+                "staged_paths": staged_paths,
+                "unstaged_paths": unstaged_paths,
+                "untracked_paths": untracked_paths,
             },
         }
         origin_feedback_pass_id = self._feedback_origin_pass_id(failed_pass)
@@ -2358,28 +2390,12 @@ class Application:
         normalized_resolved_paths = sorted(
             set(normalized_resolved_paths)
         )
-        if execution_pass["trigger_type"] == "operation_failure":
-            operation_workspace = execution_pass["trigger_json"].get(
-                "workspace"
-            )
-            unmerged_paths = (
-                operation_workspace.get("unmerged_paths")
-                if isinstance(operation_workspace, dict)
-                else None
-            )
-            if not isinstance(unmerged_paths, list):
-                raise ValueError(
-                    "operation failure has no unmerged path evidence"
-                )
-            allowed_resolved_paths = set(unmerged_paths)
-        else:
-            allowed_resolved_paths = set()
-        if any(
-            path not in allowed_resolved_paths
-            for path in normalized_resolved_paths
+        if (
+            execution_pass["trigger_type"] != "operation_failure"
+            and normalized_resolved_paths
         ):
             raise ValueError(
-                "work resolved_paths must come from this operation failure"
+                "non-operation work may not return resolved_paths"
             )
         normalized["resolved_paths"] = normalized_resolved_paths
 
@@ -2425,6 +2441,62 @@ class Application:
                     "work handoff blocking must be an object or null"
                 )
         return normalized
+
+    @classmethod
+    def _validate_resolved_path_authorization(
+        cls,
+        resolved_paths: list[str],
+        execution_pass: dict,
+        baseline: dict[str, _SourceTreeEntry],
+        desired: dict[str, _SourceTreeEntry],
+    ) -> None:
+        if execution_pass["trigger_type"] != "operation_failure":
+            return
+        trigger = execution_pass.get("trigger_json")
+        operation_workspace = (
+            trigger.get("workspace")
+            if isinstance(trigger, dict)
+            else None
+        )
+        if not isinstance(operation_workspace, dict):
+            raise ValueError(
+                "operation failure has no workspace path evidence"
+            )
+        unmerged_paths = cls._validated_operation_path_list(
+            operation_workspace,
+            "unmerged_paths",
+        )
+        cls._validated_operation_path_list(
+            operation_workspace,
+            "staged_paths",
+            allow_missing=True,
+        )
+        unstaged_paths = cls._validated_operation_path_list(
+            operation_workspace,
+            "unstaged_paths",
+            allow_missing=True,
+        )
+        untracked_paths = cls._validated_operation_path_list(
+            operation_workspace,
+            "untracked_paths",
+            allow_missing=True,
+        )
+        changed_paths = {
+            path
+            for path in baseline.keys() | desired.keys()
+            if baseline.get(path) != desired.get(path)
+        }
+        allowed_paths = (
+            changed_paths
+            | set(unmerged_paths)
+            | set(unstaged_paths)
+            | set(untracked_paths)
+        )
+        if any(path not in allowed_paths for path in resolved_paths):
+            raise ValueError(
+                "work resolved_paths must be evidenced by this operation "
+                "failure or changed by this work"
+            )
     def _run_work(self, node: dict, work: dict) -> None:
         run = self.store.get_run(work["run_id"])
         if run is None:
@@ -2513,6 +2585,12 @@ class Application:
                 desired = self._source_manifest(
                     source_workspace,
                     excluded_roots=excluded_roots,
+                )
+                self._validate_resolved_path_authorization(
+                    result["resolved_paths"],
+                    execution_pass,
+                    baseline,
+                    desired,
                 )
                 with self._durable_source_import(
                     workspace,

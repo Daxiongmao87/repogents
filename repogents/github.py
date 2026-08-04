@@ -788,16 +788,64 @@ class GitHubClient:
             stages[stage] = object_id
         return entries
 
+    def _nul_delimited_repository_paths(
+        self,
+        workspace_path: Path,
+        args: list[str],
+    ) -> list[str]:
+        result = self._repository_operation_binary_runner(
+            args,
+            cwd=workspace_path,
+            env=self._git_command_env,
+        )
+        stdout = getattr(result, "stdout", None)
+        if not isinstance(stdout, bytes):
+            raise RuntimeError(
+                f"{' '.join(args[:2])} returned invalid binary output"
+            )
+
+        paths: set[str] = set()
+        for encoded_path in stdout.split(b"\0"):
+            if not encoded_path:
+                continue
+            semantic_path = os.fsdecode(encoded_path)
+            self._repository_relative_path(semantic_path)
+            paths.add(semantic_path)
+        return sorted(paths)
+
     def repository_operation_state(
         self,
         workspace: str | Path,
     ) -> dict[str, bool | list[str]]:
         workspace_path = self._publication_workspace(workspace)
+        unmerged_paths = sorted(
+            self._unmerged_repository_entries(workspace_path)
+        )
+        unmerged_path_set = set(unmerged_paths)
+        staged_paths = self._nul_delimited_repository_paths(
+            workspace_path,
+            ["git", "diff", "--cached", "--name-only", "-z"],
+        )
+        unstaged_paths = self._nul_delimited_repository_paths(
+            workspace_path,
+            ["git", "diff", "--name-only", "-z"],
+        )
+        untracked_paths = self._nul_delimited_repository_paths(
+            workspace_path,
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        )
         return {
             "rebase_in_progress": self._rebase_in_progress(workspace_path),
-            "unmerged_paths": sorted(
-                self._unmerged_repository_entries(workspace_path)
-            ),
+            "unmerged_paths": unmerged_paths,
+            "staged_paths": [
+                path for path in staged_paths if path not in unmerged_path_set
+            ],
+            "unstaged_paths": [
+                path
+                for path in unstaged_paths
+                if path not in unmerged_path_set
+            ],
+            "untracked_paths": untracked_paths,
         }
 
     def export_repository_operation_artifacts(

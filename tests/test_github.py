@@ -772,7 +772,7 @@ def test_prepare_publication_returns_exact_frozen_candidate_and_diff_without_rem
 
 
 
-def test_prepare_publication_preserves_rebase_conflicts_and_resumes_from_artifacts(
+def test_prepare_publication_rebase_state_reports_and_stages_only_explicit_paths(
     tmp_path,
 ):
     remote = tmp_path / "remote.git"
@@ -804,23 +804,50 @@ def test_prepare_publication_preserves_rebase_conflicts_and_resumes_from_artifac
 
     git("init", "--bare", str(remote))
     git("init", "-b", "main", str(seed))
+    (seed / "src").mkdir()
+    (seed / ".gitignore").write_text("generated/\n", encoding="utf-8")
     (seed / "shared.txt").write_text("base shared\n", encoding="utf-8")
     (seed / "later.txt").write_text("base later\n", encoding="utf-8")
+    (seed / "later source.txt").write_text(
+        "base later source\n", encoding="utf-8"
+    )
+    (seed / "src" / "ready z.py").write_text("base ready z\n", encoding="utf-8")
+    (seed / "src" / "ready a.py").write_text("base ready a\n", encoding="utf-8")
+    (seed / "src" / "related z.py").write_text(
+        "base related z\n", encoding="utf-8"
+    )
+    (seed / "src" / "related a.py").write_text(
+        "base related a\n", encoding="utf-8"
+    )
     commit(seed, "Base")
     git("remote", "add", "origin", str(remote), cwd=seed)
     git("push", "--set-upstream", "origin", "main", cwd=seed)
 
     git("clone", "--branch", "main", str(remote), str(workspace))
     git("config", "core.editor", "true", cwd=workspace)
+    git("config", "user.name", "Test", cwd=workspace)
+    git("config", "user.email", "test@example.invalid", cwd=workspace)
     git("checkout", "-b", issue_branch, cwd=workspace)
     (workspace / "shared.txt").write_text("issue shared\n", encoding="utf-8")
     commit(workspace, "Change shared source")
     (workspace / "later.txt").write_text("issue later\n", encoding="utf-8")
+    (workspace / "later source.txt").write_text(
+        "issue later source\n", encoding="utf-8"
+    )
+    (workspace / "src" / "ready z.py").write_text(
+        "issue ready z\n", encoding="utf-8"
+    )
+    (workspace / "src" / "ready a.py").write_text(
+        "issue ready a\n", encoding="utf-8"
+    )
     commit(workspace, "Change later source")
     issue_head = git("rev-parse", "HEAD", cwd=workspace)
 
     (seed / "shared.txt").write_text("target shared\n", encoding="utf-8")
     (seed / "later.txt").write_text("target later\n", encoding="utf-8")
+    (seed / "later source.txt").write_text(
+        "target later source\n", encoding="utf-8"
+    )
     commit(seed, "Advance target")
     target_head = git("rev-parse", "HEAD", cwd=seed)
     git("push", "origin", "main", cwd=seed)
@@ -843,9 +870,22 @@ def test_prepare_publication_preserves_rebase_conflicts_and_resumes_from_artifac
             completed_errors.append(error)
             raise
 
+    def binary_command_runner(args, *, cwd=None, env=None):
+        command_env = os.environ.copy()
+        command_env.update(env or {})
+        return subprocess.run(
+            args,
+            cwd=cwd,
+            env=command_env,
+            check=True,
+            capture_output=True,
+            text=False,
+        )
+
     client = GitHubClient(
         "placeholder-token",
         command_runner=command_runner,
+        binary_command_runner=binary_command_runner,
     )
 
     with pytest.raises(subprocess.CalledProcessError) as captured:
@@ -867,6 +907,9 @@ def test_prepare_publication_preserves_rebase_conflicts_and_resumes_from_artifac
     assert client.repository_operation_state(workspace) == {
         "rebase_in_progress": True,
         "unmerged_paths": ["shared.txt"],
+        "staged_paths": [],
+        "unstaged_paths": [],
+        "untracked_paths": [],
     }
     unmerged_entries = git("ls-files", "--unmerged", cwd=workspace).splitlines()
     assert {entry.split(maxsplit=3)[2] for entry in unmerged_entries} == {
@@ -911,6 +954,9 @@ def test_prepare_publication_preserves_rebase_conflicts_and_resumes_from_artifac
     assert client.repository_operation_state(workspace) == {
         "rebase_in_progress": True,
         "unmerged_paths": ["shared.txt"],
+        "staged_paths": [],
+        "unstaged_paths": [],
+        "untracked_paths": [],
     }
 
     (workspace / "shared.txt").write_text("resolved shared\n", encoding="utf-8")
@@ -924,7 +970,10 @@ def test_prepare_publication_preserves_rebase_conflicts_and_resumes_from_artifac
     assert isinstance(later_conflict.value.stderr, str)
     assert client.repository_operation_state(workspace) == {
         "rebase_in_progress": True,
-        "unmerged_paths": ["later.txt"],
+        "unmerged_paths": ["later source.txt", "later.txt"],
+        "staged_paths": ["src/ready a.py", "src/ready z.py"],
+        "unstaged_paths": [],
+        "untracked_paths": [],
     }
     assert git("show", "HEAD:shared.txt", cwd=workspace) == "resolved shared"
     conflicted_later = (workspace / "later.txt").read_text(encoding="utf-8")
@@ -933,6 +982,14 @@ def test_prepare_publication_preserves_rebase_conflicts_and_resumes_from_artifac
     assert "\n>>>>>>> " in conflicted_later
     assert "target later\n" in conflicted_later
     assert "issue later\n" in conflicted_later
+    conflicted_later_source = (workspace / "later source.txt").read_text(
+        encoding="utf-8"
+    )
+    assert conflicted_later_source.startswith("<<<<<<< ")
+    assert "\n=======\n" in conflicted_later_source
+    assert "\n>>>>>>> " in conflicted_later_source
+    assert "target later source\n" in conflicted_later_source
+    assert "issue later source\n" in conflicted_later_source
 
     later_artifacts = tmp_path / "later-operation-artifacts"
     later_manifest = client.export_repository_operation_artifacts(
@@ -940,11 +997,16 @@ def test_prepare_publication_preserves_rebase_conflicts_and_resumes_from_artifac
         later_artifacts,
     )
     assert later_manifest == {
+        "later source.txt": {
+            "base": "base/later source.txt",
+            "ours": "ours/later source.txt",
+            "theirs": "theirs/later source.txt",
+        },
         "later.txt": {
             "base": "base/later.txt",
             "ours": "ours/later.txt",
             "theirs": "theirs/later.txt",
-        }
+        },
     }
     assert (later_artifacts / "base/later.txt").read_text(encoding="utf-8") == (
         "base later\n"
@@ -955,18 +1017,118 @@ def test_prepare_publication_preserves_rebase_conflicts_and_resumes_from_artifac
     assert (later_artifacts / "theirs/later.txt").read_text(encoding="utf-8") == (
         "issue later\n"
     )
+    assert (
+        later_artifacts / "base/later source.txt"
+    ).read_text(encoding="utf-8") == "base later source\n"
+    assert (
+        later_artifacts / "ours/later source.txt"
+    ).read_text(encoding="utf-8") == "target later source\n"
+    assert (
+        later_artifacts / "theirs/later source.txt"
+    ).read_text(encoding="utf-8") == "issue later source\n"
+
+    (workspace / "src" / "related z.py").write_text(
+        "resolved related z\n", encoding="utf-8"
+    )
+    (workspace / "src" / "related a.py").write_text(
+        "resolved related a\n", encoding="utf-8"
+    )
+    (workspace / "src" / "new z.py").write_text(
+        "resolved new z\n", encoding="utf-8"
+    )
+    (workspace / "src" / "new a.py").write_text(
+        "resolved new a\n", encoding="utf-8"
+    )
+    generated = workspace / "generated"
+    generated.mkdir()
+    ignored_generated = generated / "build output.log"
+    ignored_generated.write_text("ignored generated output\n", encoding="utf-8")
+
+    assert git(
+        "check-ignore",
+        "--",
+        "generated/build output.log",
+        cwd=workspace,
+    ) == "generated/build output.log"
+    assert client.repository_operation_state(workspace) == {
+        "rebase_in_progress": True,
+        "unmerged_paths": ["later source.txt", "later.txt"],
+        "staged_paths": ["src/ready a.py", "src/ready z.py"],
+        "unstaged_paths": ["src/related a.py", "src/related z.py"],
+        "untracked_paths": ["src/new a.py", "src/new z.py"],
+    }
 
     (workspace / "later.txt").write_text("resolved later\n", encoding="utf-8")
-    assert client.continue_repository_operation(workspace, ["later.txt"]) is True
+    (workspace / "later source.txt").write_text(
+        "resolved later source\n", encoding="utf-8"
+    )
+    with pytest.raises(subprocess.CalledProcessError) as dirty_failure:
+        client.continue_repository_operation(
+            workspace,
+            ["later.txt", "later source.txt"],
+        )
+
+    assert dirty_failure.value is completed_errors[-1]
+    assert dirty_failure.value.cmd == ["git", "rebase", "--continue"]
+    assert dirty_failure.value.returncode == 1
+    assert isinstance(dirty_failure.value.stdout, str)
+    assert isinstance(dirty_failure.value.stderr, str)
+    assert git("ls-files", "--unmerged", cwd=workspace) == ""
+    assert client.repository_operation_state(workspace) == {
+        "rebase_in_progress": True,
+        "unmerged_paths": [],
+        "staged_paths": [
+            "later source.txt",
+            "later.txt",
+            "src/ready a.py",
+            "src/ready z.py",
+        ],
+        "unstaged_paths": ["src/related a.py", "src/related z.py"],
+        "untracked_paths": ["src/new a.py", "src/new z.py"],
+    }
+    assert git(
+        "ls-files",
+        "--cached",
+        "--",
+        "src/new a.py",
+        "src/new z.py",
+        cwd=workspace,
+    ) == ""
+
+    assert (
+        client.continue_repository_operation(
+            workspace,
+            [
+                "src/related z.py",
+                "src/new z.py",
+                "src/related a.py",
+                "src/new a.py",
+            ],
+        )
+        is True
+    )
     assert client.repository_operation_state(workspace) == {
         "rebase_in_progress": False,
         "unmerged_paths": [],
+        "staged_paths": [],
+        "unstaged_paths": [],
+        "untracked_paths": [],
     }
     assert not any(
         (workspace / ".git" / metadata).exists()
         for metadata in ("rebase-merge", "rebase-apply")
     )
     assert git("ls-files", "--unmerged", cwd=workspace) == ""
+    assert ignored_generated.read_text(encoding="utf-8") == (
+        "ignored generated output\n"
+    )
+    assert git(
+        "ls-files",
+        "--cached",
+        "--",
+        "generated/build output.log",
+        cwd=workspace,
+    ) == ""
 
     candidate, candidate_diff = client.prepare_publication(7, "main", workspace)
 
@@ -980,10 +1142,28 @@ def test_prepare_publication_preserves_rebase_conflicts_and_resumes_from_artifac
     assert "+resolved shared" in candidate_diff
     assert "-target later" in candidate_diff
     assert "+resolved later" in candidate_diff
+    assert "-target later source" in candidate_diff
+    assert "+resolved later source" in candidate_diff
+    assert "+resolved related a" in candidate_diff
+    assert "+resolved related z" in candidate_diff
+    assert "+resolved new a" in candidate_diff
+    assert "+resolved new z" in candidate_diff
     assert git("show", "HEAD:shared.txt", cwd=workspace) == "resolved shared"
     assert git("show", "HEAD:later.txt", cwd=workspace) == "resolved later"
+    assert git("show", "HEAD:later source.txt", cwd=workspace) == (
+        "resolved later source"
+    )
+    assert git("show", "HEAD:src/related a.py", cwd=workspace) == (
+        "resolved related a"
+    )
+    assert git("show", "HEAD:src/related z.py", cwd=workspace) == (
+        "resolved related z"
+    )
+    assert git("show", "HEAD:src/new a.py", cwd=workspace) == "resolved new a"
+    assert git("show", "HEAD:src/new z.py", cwd=workspace) == "resolved new z"
     assert git("branch", "--show-current", cwd=workspace) == issue_branch
     assert git("status", "--porcelain", cwd=workspace) == ""
+    assert ignored_generated.exists()
 
 
 def test_prepare_publication_preserves_unfetched_remote_issue_head_ancestry_and_exact_diff(

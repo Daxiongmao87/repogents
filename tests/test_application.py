@@ -92,6 +92,9 @@ class FakeGitHub:
         self.repository_operation_state_result = {
             "rebase_in_progress": False,
             "unmerged_paths": [],
+            "staged_paths": [],
+            "unstaged_paths": [],
+            "untracked_paths": [],
         }
         self.repository_operation_state_calls: list[Path] = []
         self.export_repository_operation_artifacts_calls: list[
@@ -144,6 +147,15 @@ class FakeGitHub:
             ],
             "unmerged_paths": list(
                 self.repository_operation_state_result["unmerged_paths"]
+            ),
+            "staged_paths": list(
+                self.repository_operation_state_result["staged_paths"]
+            ),
+            "unstaged_paths": list(
+                self.repository_operation_state_result["unstaged_paths"]
+            ),
+            "untracked_paths": list(
+                self.repository_operation_state_result["untracked_paths"]
             ),
         }
 
@@ -207,6 +219,9 @@ class FakeGitHub:
             self.repository_operation_state_result = {
                 "rebase_in_progress": False,
                 "unmerged_paths": [],
+                "staged_paths": [],
+                "unstaged_paths": [],
+                "untracked_paths": [],
             }
         return outcome
 
@@ -3686,6 +3701,9 @@ def test_operation_failure_artifact_export_is_atomic_and_retry_persists_one_pass
     github.repository_operation_state_result = {
         "rebase_in_progress": True,
         "unmerged_paths": ["src/conflict.py"],
+        "staged_paths": [],
+        "unstaged_paths": [],
+        "untracked_paths": [],
     }
     expected_artifacts = {
         "base": b"exact base\n",
@@ -3836,6 +3854,9 @@ def test_first_operation_failure_artifact_fsyncs_ancestors_before_pass_persisten
     github.repository_operation_state_result = {
         "rebase_in_progress": True,
         "unmerged_paths": ["src/conflict.py"],
+        "staged_paths": [],
+        "unstaged_paths": [],
+        "untracked_paths": [],
     }
     github.repository_operation_artifact_contents = {
         "src/conflict.py": {
@@ -3987,6 +4008,9 @@ def test_completed_git_failure_handoff_survives_restart_and_retries_from_persist
     github.repository_operation_state_result = {
         "rebase_in_progress": True,
         "unmerged_paths": ["src/conflict.py"],
+        "staged_paths": [],
+        "unstaged_paths": [],
+        "untracked_paths": [],
     }
     github.repository_operation_artifact_contents = {
         "src/conflict.py": {
@@ -4023,6 +4047,9 @@ def test_completed_git_failure_handoff_survives_restart_and_retries_from_persist
             "run_id": run["id"],
             "rebase_in_progress": True,
             "unmerged_paths": ["src/conflict.py"],
+            "staged_paths": [],
+            "unstaged_paths": [],
+            "untracked_paths": [],
         },
         "origin_feedback_pass_id": failed_pass["id"],
     }
@@ -4241,6 +4268,319 @@ def test_completed_git_failure_handoff_survives_restart_and_retries_from_persist
     resumed_again.close()
 
 
+def test_operation_failure_dirty_evidence_allows_only_explicit_staging_paths(
+    tmp_path,
+):
+    classification = "resolve/repository-operation"
+    work_key = "select-controller-staging-paths"
+    runtime = WorkspaceScriptedRuntime()
+    runtime.queue(
+        "specify",
+        package((work_key, classification), prefix="dirty-operation"),
+    )
+    work_result = ready_result("explicit controller staging paths selected")
+    work_result["repository_state"] = {
+        "agent_observation": "dirty operation source inspected"
+    }
+    expected_resolved_paths = [
+        "src/already-unstaged.py",
+        "src/already-untracked.py",
+        "src/newly-created.py",
+    ]
+    work_result["resolved_paths"] = list(expected_resolved_paths)
+    runtime.queue("work", work_result)
+    runtime.queue(
+        "validate",
+        validation(True, "controller-staged candidate is valid"),
+    )
+
+    def change_only_new_source_and_helper(agent_workspace: Path) -> None:
+        (agent_workspace / "src" / "newly-created.py").write_text(
+            "new source from this work turn\n"
+        )
+        (agent_workspace / "src" / "helper.py").write_text(
+            "helper changed without a staging report\n"
+        )
+
+    runtime.queue_workspace_action(
+        "work",
+        change_only_new_source_and_helper,
+    )
+    github = FakeGitHub()
+    app, store, _, _ = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={classification: [1.0, 0.0]},
+        github=github,
+    )
+    target_branch = "release-dirty-operation"
+    repository = store.add_repository("acme/widget", target_branch, 0.75)
+    store.create_dynamic_node(
+        repository["id"],
+        classification,
+        [1.0, 0.0],
+        "Own bounded repository-operation source resolution.",
+    )
+    run, _ = store.create_run(
+        repository["id"],
+        7,
+        {
+            "number": 7,
+            "title": "Continue a dirty repository operation",
+            "body": "Stage only paths explicitly reported by operation work.",
+        },
+    )
+    failed_pass = store.create_pass(run["id"], "issue", run["issue_json"])
+    store.transition_run(run["id"], "VALIDATING")
+    workspace = (
+        tmp_path
+        / "runtime"
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    (workspace / "src").mkdir(parents=True)
+    source_contents = {
+        "already-staged.py": "staged before the failure\n",
+        "already-unstaged.py": "unstaged before the failure\n",
+        "already-untracked.py": "untracked before the failure\n",
+        "helper.py": "helper before operation work\n",
+    }
+    for name, contents in source_contents.items():
+        (workspace / "src" / name).write_text(contents)
+    (workspace / ".git" / "rebase-merge").mkdir(parents=True)
+
+    github.repository_operation_state_result = {
+        "rebase_in_progress": True,
+        "unmerged_paths": [],
+        "staged_paths": ["src/already-staged.py"],
+        "unstaged_paths": ["src/already-unstaged.py"],
+        "untracked_paths": ["src/already-untracked.py"],
+    }
+    github.continue_repository_operation_results.append(True)
+    command = ["git", "rebase", "--continue"]
+    command_error = subprocess.CalledProcessError(
+        1,
+        command,
+        output="",
+        stderr="related source edits remain unstaged\n",
+    )
+
+    app._record_operation_failure(
+        repository,
+        run,
+        failed_pass,
+        "continue_repository_operation",
+        command_error,
+    )
+
+    expected_trigger = {
+        "failed_stage": "continue_repository_operation",
+        "command": command,
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "related source edits remain unstaged\n",
+        "target_branch": target_branch,
+        "failed_pass_id": failed_pass["id"],
+        "workspace": {
+            "repository_id": repository["id"],
+            "run_id": run["id"],
+            "rebase_in_progress": True,
+            "unmerged_paths": [],
+            "staged_paths": ["src/already-staged.py"],
+            "unstaged_paths": ["src/already-unstaged.py"],
+            "untracked_paths": ["src/already-untracked.py"],
+        },
+    }
+    operation_pass = store.list_passes(run["id"])[-1]
+    assert operation_pass["trigger_type"] == "operation_failure"
+    assert operation_pass["trigger_json"] == expected_trigger
+
+    drive_until(
+        app,
+        lambda: any(
+            item["key"] == work_key
+            and item["state"] in {"COMPLETED", "FAILED"}
+            for item in store.list_work_items(
+                run["id"],
+                operation_pass["id"],
+            )
+        ),
+    )
+
+    completed_work = next(
+        item
+        for item in store.list_work_items(run["id"], operation_pass["id"])
+        if item["key"] == work_key
+    )
+    assert completed_work["state"] == "COMPLETED", completed_work["result"]
+    for kind in ("specify", "work"):
+        call = next(
+            item
+            for item in runtime.calls
+            if item["payload"]["kind"] == kind
+        )
+        context = call["payload"]["context"]
+        assert context["operation_failure"] == expected_trigger
+        assert "remedy" not in context
+        assert "command_sequence" not in context
+
+    controller_state = completed_work["result"]["repository_state"][
+        "_repogents"
+    ]
+    assert set(controller_state["applied_paths"]) == {
+        "src/helper.py",
+        "src/newly-created.py",
+    }
+    assert controller_state["resolved_paths"] == expected_resolved_paths
+    assert (workspace / "src" / "already-unstaged.py").read_text() == (
+        source_contents["already-unstaged.py"]
+    )
+    assert (workspace / "src" / "already-untracked.py").read_text() == (
+        source_contents["already-untracked.py"]
+    )
+    assert (workspace / "src" / "newly-created.py").read_text() == (
+        "new source from this work turn\n"
+    )
+    assert (workspace / "src" / "helper.py").read_text() == (
+        "helper changed without a staging report\n"
+    )
+    assert github.continue_repository_operation_calls == []
+
+    drive_until(
+        app,
+        lambda: any(
+            call["payload"]["kind"] == "validate"
+            for call in runtime.calls
+        ),
+    )
+
+    assert github.continue_repository_operation_calls == [
+        (workspace, expected_resolved_paths)
+    ]
+    app.close()
+
+
+def test_operation_failure_rejects_unevidenced_unchanged_resolution_before_mutation(
+    tmp_path,
+):
+    classification = "resolve/repository-operation"
+    work_key = "reject-unrelated-staging-path"
+    runtime = WorkspaceScriptedRuntime()
+    runtime.queue(
+        "specify",
+        package((work_key, classification), prefix="invalid-operation"),
+    )
+    work_result = ready_result("reported one unrelated controller path")
+    work_result["resolved_paths"] = [
+        "src/actual-turn-delta.py",
+        "src/not-evidenced-or-changed.py",
+    ]
+    runtime.queue("work", work_result)
+
+    def create_valid_delta_but_not_reported_unrelated_path(
+        agent_workspace: Path,
+    ) -> None:
+        (agent_workspace / "src" / "actual-turn-delta.py").write_text(
+            "created in this work turn\n"
+        )
+        (agent_workspace / "src" / "helper.py").write_text(
+            "disposable helper mutation\n"
+        )
+
+    runtime.queue_workspace_action(
+        "work",
+        create_valid_delta_but_not_reported_unrelated_path,
+    )
+    github = FakeGitHub()
+    app, store, _, _ = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={classification: [1.0, 0.0]},
+        github=github,
+    )
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    store.create_dynamic_node(
+        repository["id"],
+        classification,
+        [1.0, 0.0],
+        "Own bounded repository-operation source resolution.",
+    )
+    run, _ = store.create_run(
+        repository["id"],
+        7,
+        {
+            "number": 7,
+            "title": "Reject an unrelated controller staging path",
+            "body": "Do not mutate canonical source for an invalid work result.",
+        },
+    )
+    failed_pass = store.create_pass(run["id"], "issue", run["issue_json"])
+    store.transition_run(run["id"], "VALIDATING")
+    workspace = (
+        tmp_path
+        / "runtime"
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "src" / "helper.py").write_text("canonical helper\n")
+    (workspace / "src" / "evidenced-unstaged.py").write_text(
+        "canonical unstaged source\n"
+    )
+    (workspace / ".git" / "rebase-merge").mkdir(parents=True)
+    github.repository_operation_state_result = {
+        "rebase_in_progress": True,
+        "unmerged_paths": [],
+        "staged_paths": [],
+        "unstaged_paths": ["src/evidenced-unstaged.py"],
+        "untracked_paths": [],
+    }
+
+    app._record_operation_failure(
+        repository,
+        run,
+        failed_pass,
+        "continue_repository_operation",
+        subprocess.CalledProcessError(
+            1,
+            ["git", "rebase", "--continue"],
+            output="",
+            stderr="continuation requires more source staging\n",
+        ),
+    )
+    operation_pass = store.list_passes(run["id"])[-1]
+
+    drive_until(
+        app,
+        lambda: any(
+            item["key"] == work_key
+            and item["state"] in {"COMPLETED", "FAILED"}
+            for item in store.list_work_items(
+                run["id"],
+                operation_pass["id"],
+            )
+        ),
+    )
+
+    failed_work = next(
+        item
+        for item in store.list_work_items(run["id"], operation_pass["id"])
+        if item["key"] == work_key
+    )
+    assert failed_work["state"] == "FAILED"
+    assert failed_work["result"]["output"]["type"] == "ValueError"
+    assert (workspace / "src" / "helper.py").read_text() == (
+        "canonical helper\n"
+    )
+    assert not (workspace / "src" / "actual-turn-delta.py").exists()
+    assert not (workspace / "src" / "not-evidenced-or-changed.py").exists()
+    assert github.continue_repository_operation_calls == []
+    assert store.list_validations(run["id"]) == []
+    app.close()
+
+
 def test_continuation_failure_creates_one_new_operation_failure_without_validation(
     tmp_path,
 ):
@@ -4273,6 +4613,9 @@ def test_continuation_failure_creates_one_new_operation_failure_without_validati
                 "run_id": run["id"],
                 "rebase_in_progress": True,
                 "unmerged_paths": ["src/conflict.py"],
+                "staged_paths": [],
+                "unstaged_paths": [],
+                "untracked_paths": [],
             },
         },
     )
@@ -4324,6 +4667,9 @@ def test_continuation_failure_creates_one_new_operation_failure_without_validati
     github.repository_operation_state_result = {
         "rebase_in_progress": True,
         "unmerged_paths": ["src/conflict.py"],
+        "staged_paths": [],
+        "unstaged_paths": [],
+        "untracked_paths": [],
     }
     github.repository_operation_artifact_contents = {
         "src/conflict.py": {
