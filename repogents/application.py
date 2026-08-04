@@ -122,13 +122,16 @@ _WORK_SCHEMA = {
     "artifacts": [],
     "test_results": [],
     "repository_state": {},
-    "resolved_paths": [
-        "operation_failure-only source path intentionally ready for controller staging"
-    ],
     "classification": "agent-chosen concise action/capability required only for continue_work",
     "context": {},
     "dependencies": [],
     "blocking": None,
+}
+_OPERATION_WORK_SCHEMA = {
+    **_WORK_SCHEMA,
+    "resolved_paths": [
+        "operation_failure-only source path intentionally ready for controller staging"
+    ],
 }
 _VALIDATION_SCHEMA = {
     "passed": True,
@@ -2572,7 +2575,11 @@ class Application:
                     ),
                     source_workspace,
                     role_prompt=node["role_prompt"],
-                    result_schema=_WORK_SCHEMA,
+                    result_schema=(
+                        _OPERATION_WORK_SCHEMA
+                        if execution_pass["trigger_type"] == "operation_failure"
+                        else _WORK_SCHEMA
+                    ),
                     trajectory_path=self._trajectory(
                         run["id"], f"work-{work['id']}"
                     ),

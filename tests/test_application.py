@@ -4424,6 +4424,14 @@ def test_operation_failure_dirty_evidence_allows_only_explicit_staging_paths(
         assert context["operation_failure"] == expected_trigger
         assert "remedy" not in context
         assert "command_sequence" not in context
+    operation_work_call = next(
+        item
+        for item in runtime.calls
+        if item["payload"]["kind"] == "work"
+    )
+    assert operation_work_call["result_schema"]["resolved_paths"] == [
+        "operation_failure-only source path intentionally ready for controller staging"
+    ]
 
     controller_state = completed_work["result"]["repository_state"][
         "_repogents"
@@ -5874,6 +5882,15 @@ def test_complete_candidate_diff_review_finding_blocks_then_clean_review_publish
     drive_until(
         app,
         lambda: store.get_run(run["id"])["state"] == "PR_LISTENING",
+    )
+
+    work_calls = [
+        call for call in runtime.calls if call["payload"]["kind"] == "work"
+    ]
+    assert len(work_calls) == 2
+    assert all(
+        "resolved_paths" not in call["result_schema"]
+        for call in work_calls
     )
 
     validate_calls = [
