@@ -5845,6 +5845,28 @@ def test_complete_candidate_diff_review_finding_blocks_then_clean_review_publish
         ),
     )
     run = store.list_runs(repository["id"])[0]
+    first_validate_call = next(
+        call for call in runtime.calls if call["payload"]["kind"] == "validate"
+    )
+    assert first_validate_call["result_schema"]["code_review_findings"] == ["string"]
+    validations = store.list_validations(run["id"])
+    assert len(validations) == 1
+    assert validations[0]["result"]["code_review_findings"] == [
+        "Deleted fallback leaves callers without a result."
+    ]
+    assert [
+        item["trigger_type"] for item in store.list_passes(run["id"])
+    ] == ["issue", "validation_failure"]
+    prior_pass_preparation_calls = list(github.prepare_publication_calls)
+    assert len(prior_pass_preparation_calls) == 1
+
+    app.poll_once()
+
+    assert github.prepare_publication_calls == prior_pass_preparation_calls
+    assert len(store.list_validations(run["id"])) == 1
+    assert [
+        item["trigger_type"] for item in store.list_passes(run["id"])
+    ] == ["issue", "validation_failure"]
     assert github.publish_existing == []
     assert store.list_validations(run["id"])[0]["result"][
         "code_review_findings"

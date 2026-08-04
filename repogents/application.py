@@ -134,7 +134,7 @@ _VALIDATION_SCHEMA = {
     "passed": True,
     "failed_specifications": [],
     "failed_criteria": [],
-    "code_review_findings": [],
+    "code_review_findings": ["string"],
     "explanation": "string",
     "evidence": [],
     "repository_state": {},
