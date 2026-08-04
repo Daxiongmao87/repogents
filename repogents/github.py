@@ -150,12 +150,15 @@ class GitHubClient:
         api_base: str = "https://api.github.com",
         request=None,
         command_runner=None,
+        binary_command_runner=None,
     ):
         self._token = token
         self._api_base = api_base.rstrip("/")
         self._request = request or self._default_request
         self._command_runner = command_runner or self._default_command_runner
-        self._repository_operation_binary_runner = self._default_binary_command_runner
+        self._repository_operation_binary_runner = (
+            binary_command_runner or self._default_binary_command_runner
+        )
         credential = b64encode(f"x-access-token:{token}".encode()).decode()
         self._git_command_env = {"GIT_TERMINAL_PROMPT": "0"}
         self._git_auth_env = {

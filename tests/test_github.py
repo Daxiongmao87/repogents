@@ -1,6 +1,7 @@
 from base64 import b64decode
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
+import os
 import subprocess
 
 import pytest

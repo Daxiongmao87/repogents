@@ -2540,7 +2540,6 @@ def test_startup_restores_interrupted_import_before_requeue_and_preserves_metada
         SemanticRouter(MapEmbedder({})),
         ApplicationConfig(data_dir=data_dir),
     )
-    restarted.acquire_service_ownership()
     try:
         assert before_requeue == [
             {
@@ -2607,8 +2606,6 @@ def test_post_commit_completion_exception_preserves_imported_source_and_node_suc
         "Own transaction-safe source changes.",
     )
     store.assign_work(saved["work_items"][0]["id"], node["id"])
-    claimed_work = store.claim_node_work(node["id"], run["id"])
-    assert claimed_work is not None
     store.transition_run(run["id"], "WAITING_FOR_WORK_COMPLETION")
 
     workspace = (
@@ -2657,6 +2654,8 @@ def test_post_commit_completion_exception_preserves_imported_source_and_node_suc
             promotion_threshold=1,
         ),
     )
+    claimed_work = store.claim_node_work(node["id"], run["id"])
+    assert claimed_work is not None
     real_complete_work = store.complete_work
 
     def commit_work_then_raise(work_id, persisted_result, handoff=None):
@@ -2902,7 +2901,6 @@ def test_startup_preserves_post_commit_import_and_clears_journal_before_work_rec
         SemanticRouter(MapEmbedder({})),
         ApplicationConfig(data_dir=data_dir),
     )
-    restarted.acquire_service_ownership()
     try:
         assert recovery_views == [
             {
