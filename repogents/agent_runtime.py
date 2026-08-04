@@ -7,12 +7,17 @@ from pathlib import Path
 from typing import Any
 
 from minisweagent.agents.default import DefaultAgent
-from minisweagent.environments.extra.bubblewrap import BubblewrapEnvironment
+from minisweagent.environments.extra.bubblewrap import (
+    BubblewrapEnvironment,
+    BubblewrapEnvironmentConfig,
+)
 from minisweagent.models.litellm_model import LitellmModel
 
 
 _SYSTEM_TEMPLATE = """\
 You are an adaptive repository agent operating inside an isolated workspace.
+Canonical Git and controller state and credentials are unavailable in this disposable workspace.
+Git repository operations are controller-owned; source editing and tests remain available.
 Use the available shell tools flexibly and follow the task and role instructions.
 """
 
@@ -73,6 +78,7 @@ class MiniSweRuntime:
             model_kwargs=model_kwargs,
         )
         environment = BubblewrapEnvironment(
+            wrapper_args=["--clearenv", *BubblewrapEnvironmentConfig().wrapper_args],
             cwd=str(workspace_path),
             timeout=self.config.command_timeout,
         )

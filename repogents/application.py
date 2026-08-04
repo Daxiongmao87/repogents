@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
 import shutil
+import stat
+import subprocess
 import tempfile
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, cast
 
-from repogents.errors import PublicationRebaseConflictError
 from repogents.github import GitHubFeedback, PublicationCandidate, PullRequest
 from repogents.semantic import SemanticRouter, validate_classification
 from repogents.store import TERMINAL_RUN_STATES, Store
@@ -68,12 +72,6 @@ _CLASSIFICATION_GUIDANCE = (
     "semantically; no vocabulary or taxonomy is prescribed."
 )
 
-_PUBLICATION_REBASE_CONFLICT_KIND = "publication_rebase_conflict"
-_PUBLICATION_REBASE_CONFLICT_EXPLANATION = (
-    "Publication candidate preparation could not rebase the issue work onto "
-    "the current target branch."
-)
-
 
 _SPECIFY_SCHEMA = {
     "specifications": [
@@ -124,6 +122,9 @@ _WORK_SCHEMA = {
     "artifacts": [],
     "test_results": [],
     "repository_state": {},
+    "resolved_paths": [
+        "operation_failure-only unmerged source path intentionally resolved"
+    ],
     "classification": "agent-chosen concise action/capability required only for continue_work",
     "context": {},
     "dependencies": [],
@@ -140,6 +141,25 @@ _VALIDATION_SCHEMA = {
     "completed_work": [],
 }
 
+
+@dataclass(frozen=True, slots=True)
+class _SourceTreeEntry:
+    kind: str
+    mode: int
+    value: str | None
+
+
+_SOURCE_IMPORT_JOURNAL_VERSION = 1
+_SOURCE_IMPORT_SUCCESS_STATES = {"COMPLETED", "HANDED_OFF"}
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceImportJournal:
+    path: Path
+    backup: Path
+    repository_id: int
+    run_id: int
+    work_id: int
 
 _SOURCE_ACTIVE_RUN_STATES = {
     "SPECIFYING",
@@ -169,6 +189,8 @@ class Application:
         self._clock = clock or time.time
         self.data_dir = Path(config.data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._source_lock = threading.RLock()
+        self._recover_source_import_journals()
         self.store.recover_interrupted_work()
         self._executor = executor or ThreadPoolExecutor(
             max_workers=config.max_workers,
@@ -367,6 +389,1117 @@ class Application:
     def _workspace(self, repository_id: int, run_id: int) -> Path:
         return self.data_dir / "workspaces" / str(repository_id) / str(run_id)
 
+    @staticmethod
+    def _source_copy_ignore(_directory: str, names: list[str]) -> set[str]:
+        return {name for name in names if name in {".git", ".repogents"}}
+
+    @staticmethod
+    def _manifest_path(root: Path, relative_path: str) -> Path:
+        return root.joinpath(*PurePosixPath(relative_path).parts)
+
+    @staticmethod
+    def _validated_source_link_target(
+        relative_path: str,
+        target: str,
+    ) -> None:
+        target_path = PurePosixPath(target)
+        if target_path.is_absolute():
+            raise ValueError(
+                f"source symlink target must be relative: {relative_path}"
+            )
+        resolved = list(PurePosixPath(relative_path).parent.parts)
+        for part in target_path.parts:
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                if not resolved:
+                    raise ValueError(
+                        "source symlink target escapes the source tree: "
+                        f"{relative_path}"
+                    )
+                resolved.pop()
+                continue
+            if part in {".git", ".repogents"}:
+                raise ValueError(
+                    "source symlink targets controller metadata: "
+                    f"{relative_path}"
+                )
+            resolved.append(part)
+
+    @classmethod
+    def _source_manifest(
+        cls,
+        root: Path,
+        *,
+        excluded_roots: set[str] | None = None,
+    ) -> dict[str, _SourceTreeEntry]:
+        excluded_roots = excluded_roots or set()
+        manifest: dict[str, _SourceTreeEntry] = {}
+
+        def visit(directory: Path, parent: PurePosixPath | None = None) -> None:
+            with os.scandir(directory) as entries:
+                children = sorted(entries, key=lambda entry: entry.name)
+            for child in children:
+                if child.name in {".git", ".repogents"}:
+                    continue
+                if parent is None and child.name in excluded_roots:
+                    continue
+                relative = (
+                    PurePosixPath(child.name)
+                    if parent is None
+                    else parent / child.name
+                )
+                relative_path = relative.as_posix()
+                source_path = directory / child.name
+                metadata = child.stat(follow_symlinks=False)
+                mode = stat.S_IMODE(metadata.st_mode)
+                if stat.S_ISLNK(metadata.st_mode):
+                    target = os.readlink(source_path)
+                    cls._validated_source_link_target(
+                        relative_path,
+                        target,
+                    )
+                    manifest[relative_path] = _SourceTreeEntry(
+                        "symlink",
+                        mode,
+                        target,
+                    )
+                elif stat.S_ISDIR(metadata.st_mode):
+                    manifest[relative_path] = _SourceTreeEntry(
+                        "directory",
+                        mode,
+                        None,
+                    )
+                    visit(source_path, relative)
+                elif stat.S_ISREG(metadata.st_mode):
+                    digest = hashlib.sha256()
+                    with source_path.open("rb") as source_file:
+                        while chunk := source_file.read(1024 * 1024):
+                            digest.update(chunk)
+                    manifest[relative_path] = _SourceTreeEntry(
+                        "file",
+                        mode,
+                        digest.hexdigest(),
+                    )
+                else:
+                    raise ValueError(
+                        f"unsupported source path type: {relative_path}"
+                    )
+
+        visit(root)
+        return manifest
+
+
+    @contextmanager
+    def _source_snapshot(self, workspace: Path):
+        with tempfile.TemporaryDirectory(
+            prefix="repogents-source-",
+            dir=self.data_dir,
+        ) as temporary_directory:
+            snapshot = Path(temporary_directory) / "workspace"
+            with self._source_lock:
+                if workspace.exists():
+                    self._source_manifest(workspace)
+                if workspace.exists():
+                    shutil.copytree(
+                        workspace,
+                        snapshot,
+                        symlinks=True,
+                        ignore=self._source_copy_ignore,
+                    )
+                else:
+                    snapshot.mkdir()
+            yield snapshot
+
+    @staticmethod
+    def _remove_source_path(path: Path) -> None:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(
+            metadata.st_mode
+        ):
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+    @staticmethod
+    def _source_path_depth(relative_path: str) -> int:
+        return len(PurePosixPath(relative_path).parts)
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def _fsync_source_tree(
+        cls,
+        root: Path,
+        *,
+        exclude_controller_metadata: bool = False,
+    ) -> None:
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        directory_flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | no_follow
+        )
+        file_flags = os.O_RDONLY | no_follow
+
+        def sync_directory(descriptor: int) -> None:
+            with os.scandir(descriptor) as scanned:
+                entries = list(scanned)
+            for entry in entries:
+                if (
+                    exclude_controller_metadata
+                    and entry.name in {".git", ".repogents"}
+                ):
+                    continue
+                metadata = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(metadata.st_mode):
+                    continue
+                if stat.S_ISDIR(metadata.st_mode):
+                    child_descriptor = os.open(
+                        entry.name,
+                        directory_flags,
+                        dir_fd=descriptor,
+                    )
+                    try:
+                        opened = os.fstat(child_descriptor)
+                        if (
+                            not stat.S_ISDIR(opened.st_mode)
+                            or opened.st_dev != metadata.st_dev
+                            or opened.st_ino != metadata.st_ino
+                        ):
+                            raise RuntimeError(
+                                "source directory changed while being flushed"
+                            )
+                        sync_directory(child_descriptor)
+                    finally:
+                        os.close(child_descriptor)
+                    continue
+                if stat.S_ISREG(metadata.st_mode):
+                    child_descriptor = os.open(
+                        entry.name,
+                        file_flags,
+                        dir_fd=descriptor,
+                    )
+                    try:
+                        opened = os.fstat(child_descriptor)
+                        if (
+                            not stat.S_ISREG(opened.st_mode)
+                            or opened.st_dev != metadata.st_dev
+                            or opened.st_ino != metadata.st_ino
+                        ):
+                            raise RuntimeError(
+                                "source file changed while being flushed"
+                            )
+                        os.fsync(child_descriptor)
+                    finally:
+                        os.close(child_descriptor)
+                    continue
+                raise ValueError(
+                    f"unsupported source path type while flushing: {entry.name}"
+                )
+            os.fsync(descriptor)
+
+        root_descriptor = os.open(root, directory_flags)
+        try:
+            sync_directory(root_descriptor)
+        finally:
+            os.close(root_descriptor)
+
+    @classmethod
+    def _make_tree_removable(cls, root: Path) -> None:
+        try:
+            metadata = root.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(
+            metadata.st_mode
+        ):
+            return
+        os.chmod(
+            root,
+            stat.S_IMODE(metadata.st_mode)
+            | stat.S_IRUSR
+            | stat.S_IWUSR
+            | stat.S_IXUSR,
+        )
+        with os.scandir(root) as scanned:
+            children = [Path(entry.path) for entry in scanned]
+        for child in children:
+            cls._make_tree_removable(child)
+
+    def _source_import_journal_root(self) -> Path:
+        return self.data_dir / "source-import-journals"
+
+    def _create_source_import_journal(
+        self,
+        workspace: Path,
+        repository_id: int,
+        run_id: int,
+        work_id: int,
+    ) -> _SourceImportJournal:
+        root = self._source_import_journal_root()
+        root.mkdir(parents=True, exist_ok=True)
+        self._fsync_directory(self.data_dir)
+        journal_path = root / f"work-{work_id}"
+        if os.path.lexists(journal_path):
+            raise RuntimeError(
+                f"source import recovery journal already exists for work {work_id}"
+            )
+        staging = Path(
+            tempfile.mkdtemp(prefix=".pending-", dir=root)
+        )
+        try:
+            backup = staging / "source"
+            if workspace.exists():
+                shutil.copytree(
+                    workspace,
+                    backup,
+                    symlinks=True,
+                    ignore=self._source_copy_ignore,
+                    copy_function=os.link,
+                )
+            else:
+                backup.mkdir()
+            self._fsync_source_tree(backup)
+            metadata = {
+                "version": _SOURCE_IMPORT_JOURNAL_VERSION,
+                "repository_id": repository_id,
+                "run_id": run_id,
+                "work_id": work_id,
+            }
+            intent = staging / "intent.json"
+            with intent.open("x", encoding="utf-8") as intent_file:
+                json.dump(
+                    metadata,
+                    intent_file,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                intent_file.flush()
+                os.fsync(intent_file.fileno())
+            self._fsync_directory(staging)
+            os.replace(staging, journal_path)
+            self._fsync_directory(root)
+        except BaseException:
+            if os.path.lexists(staging):
+                self._make_tree_removable(staging)
+                shutil.rmtree(staging)
+            raise
+        return _SourceImportJournal(
+            path=journal_path,
+            backup=journal_path / "source",
+            repository_id=repository_id,
+            run_id=run_id,
+            work_id=work_id,
+        )
+
+    @staticmethod
+    def _strict_source_import_id(value: object, label: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                f"source import journal {label} must be a positive integer"
+            )
+        return value
+
+    def _load_source_import_journal(
+        self,
+        journal_path: Path,
+    ) -> _SourceImportJournal:
+        try:
+            metadata = json.loads(
+                (journal_path / "intent.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"invalid source import journal: {journal_path.name}"
+            ) from error
+        expected_keys = {
+            "version",
+            "repository_id",
+            "run_id",
+            "work_id",
+        }
+        if not isinstance(metadata, dict) or set(metadata) != expected_keys:
+            raise ValueError(
+                f"invalid source import journal identity: {journal_path.name}"
+            )
+        if metadata["version"] != _SOURCE_IMPORT_JOURNAL_VERSION:
+            raise ValueError(
+                f"unsupported source import journal version: {journal_path.name}"
+            )
+        repository_id = self._strict_source_import_id(
+            metadata["repository_id"],
+            "repository_id",
+        )
+        run_id = self._strict_source_import_id(metadata["run_id"], "run_id")
+        work_id = self._strict_source_import_id(
+            metadata["work_id"],
+            "work_id",
+        )
+        if journal_path.name != f"work-{work_id}":
+            raise ValueError(
+                f"source import journal path does not match work {work_id}"
+            )
+        backup = journal_path / "source"
+        try:
+            backup_metadata = backup.lstat()
+        except FileNotFoundError as error:
+            raise ValueError(
+                f"source import journal has no backup: {journal_path.name}"
+            ) from error
+        if not stat.S_ISDIR(backup_metadata.st_mode) or stat.S_ISLNK(
+            backup_metadata.st_mode
+        ):
+            raise ValueError(
+                f"source import journal backup is not a directory: {journal_path.name}"
+            )
+        return _SourceImportJournal(
+            path=journal_path,
+            backup=backup,
+            repository_id=repository_id,
+            run_id=run_id,
+            work_id=work_id,
+        )
+
+    def _source_import_work_state(
+        self,
+        journal: _SourceImportJournal,
+    ) -> str:
+        repository = self.store.get_repository(journal.repository_id)
+        run = self.store.get_run(journal.run_id)
+        if (
+            repository is None
+            or run is None
+            or run["repository_id"] != journal.repository_id
+        ):
+            raise ValueError(
+                "source import journal repository/run identity mismatch: "
+                f"work {journal.work_id}"
+            )
+        work = next(
+            (
+                item
+                for item in self.store.list_work_items(journal.run_id)
+                if item["id"] == journal.work_id
+            ),
+            None,
+        )
+        if work is None or work["run_id"] != journal.run_id:
+            raise ValueError(
+                "source import journal work identity mismatch: "
+                f"work {journal.work_id}"
+            )
+        return cast(str, work["state"])
+
+    def _restore_source_import_journal(
+        self,
+        journal: _SourceImportJournal,
+    ) -> None:
+        workspace = self._workspace(
+            journal.repository_id,
+            journal.run_id,
+        )
+        workspace.mkdir(parents=True, exist_ok=True)
+        current = self._source_manifest(workspace)
+        desired = self._source_manifest(journal.backup)
+        self._import_source_delta(
+            workspace,
+            journal.backup,
+            current,
+            desired,
+        )
+        self._fsync_source_tree(
+            workspace,
+            exclude_controller_metadata=True,
+        )
+
+    def _discard_source_import_journal(
+        self,
+        journal_path: Path,
+    ) -> None:
+        self._make_tree_removable(journal_path)
+        shutil.rmtree(journal_path)
+        self._fsync_directory(self._source_import_journal_root())
+
+    def _recover_source_import_journals(self) -> None:
+        root = self._source_import_journal_root()
+        if not root.exists():
+            return
+        with self._source_lock:
+            with os.scandir(root) as scanned:
+                paths = sorted(
+                    (Path(entry.path) for entry in scanned),
+                    key=lambda path: path.name,
+                )
+            for path in paths:
+                if path.name.startswith(".pending-"):
+                    self._make_tree_removable(path)
+                    shutil.rmtree(path)
+                    self._fsync_directory(root)
+                    continue
+                journal = self._load_source_import_journal(path)
+                state = self._source_import_work_state(journal)
+                if state not in _SOURCE_IMPORT_SUCCESS_STATES:
+                    self._restore_source_import_journal(journal)
+                self._discard_source_import_journal(path)
+
+    @staticmethod
+    def _atomic_replace_source_file(
+        source: Path,
+        destination: Path,
+        mode: int,
+    ) -> None:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".repogents-import-",
+            dir=destination.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as temporary_file:
+                descriptor = -1
+                with source.open("rb") as source_file:
+                    shutil.copyfileobj(
+                        source_file,
+                        temporary_file,
+                        length=1024 * 1024,
+                    )
+                temporary_file.flush()
+                os.fchmod(temporary_file.fileno(), mode)
+                os.fsync(temporary_file.fileno())
+            os.replace(temporary, destination)
+            Application._fsync_directory(destination.parent)
+        finally:
+            if os.path.lexists(temporary):
+                temporary.unlink()
+
+    @contextmanager
+    def _durable_source_import(
+        self,
+        workspace: Path,
+        desired_root: Path,
+        baseline: dict[str, _SourceTreeEntry],
+        desired: dict[str, _SourceTreeEntry],
+        *,
+        repository_id: int,
+        run_id: int,
+        work_id: int,
+    ):
+        changed_paths = {
+            path
+            for path in baseline.keys() | desired.keys()
+            if baseline.get(path) != desired.get(path)
+        }
+        with self._source_lock:
+            journal = None
+            if changed_paths:
+                self._source_manifest(workspace)
+                journal = self._create_source_import_journal(
+                    workspace,
+                    repository_id,
+                    run_id,
+                    work_id,
+                )
+            try:
+                applied_paths = self._import_source_delta(
+                    workspace,
+                    desired_root,
+                    baseline,
+                    desired,
+                )
+                if journal is not None:
+                    self._fsync_source_tree(
+                        workspace,
+                        exclude_controller_metadata=True,
+                    )
+                yield applied_paths
+            except BaseException:
+                if journal is None:
+                    raise
+                state = self._source_import_work_state(journal)
+                if state in _SOURCE_IMPORT_SUCCESS_STATES:
+                    self._discard_source_import_journal(journal.path)
+                    return
+                self._restore_source_import_journal(journal)
+                self._discard_source_import_journal(journal.path)
+                raise
+            else:
+                if journal is not None:
+                    self._discard_source_import_journal(journal.path)
+
+    def _import_source_delta(
+        self,
+        workspace: Path,
+        desired_root: Path,
+        baseline: dict[str, _SourceTreeEntry],
+        desired: dict[str, _SourceTreeEntry],
+    ) -> list[str]:
+        changed_paths = {
+            path
+            for path in baseline.keys() | desired.keys()
+            if baseline.get(path) != desired.get(path)
+        }
+        if not changed_paths:
+            return []
+
+        with self._source_lock:
+            current = self._source_manifest(workspace)
+            checked_paths = set(changed_paths)
+            for relative_path in changed_paths:
+                for parent in PurePosixPath(relative_path).parents:
+                    if parent != PurePosixPath("."):
+                        checked_paths.add(parent.as_posix())
+                baseline_entry = baseline.get(relative_path)
+                desired_entry = desired.get(relative_path)
+                if (
+                    baseline_entry is not None
+                    and baseline_entry.kind == "directory"
+                    and (
+                        desired_entry is None
+                        or desired_entry.kind != "directory"
+                    )
+                ):
+                    prefix = relative_path + "/"
+                    checked_paths.update(
+                        path for path in current if path.startswith(prefix)
+                    )
+
+            for relative_path in sorted(checked_paths):
+                current_entry = current.get(relative_path)
+                if current_entry not in {
+                    baseline.get(relative_path),
+                    desired.get(relative_path),
+                }:
+                    raise ValueError(
+                        "stale overlapping source path: "
+                        f"{relative_path}"
+                    )
+
+            paths_to_apply = {
+                path
+                for path in changed_paths
+                if current.get(path) != desired.get(path)
+            }
+            if not paths_to_apply:
+                return sorted(changed_paths)
+
+            permission_directories: set[str] = set()
+            for relative_path in paths_to_apply:
+                for parent in PurePosixPath(relative_path).parents:
+                    if parent == PurePosixPath("."):
+                        continue
+                    parent_path = parent.as_posix()
+                    parent_entry = current.get(parent_path)
+                    if (
+                        parent_entry is not None
+                        and parent_entry.kind == "directory"
+                    ):
+                        permission_directories.add(parent_path)
+                current_entry = current.get(relative_path)
+                if (
+                    current_entry is not None
+                    and current_entry.kind == "directory"
+                ):
+                    permission_directories.add(relative_path)
+
+            for relative_path in sorted(
+                permission_directories,
+                key=self._source_path_depth,
+            ):
+                directory = self._manifest_path(workspace, relative_path)
+                try:
+                    metadata = directory.lstat()
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISDIR(metadata.st_mode):
+                    os.chmod(
+                        directory,
+                        stat.S_IMODE(metadata.st_mode)
+                        | stat.S_IRUSR
+                        | stat.S_IWUSR
+                        | stat.S_IXUSR,
+                    )
+
+            desired_directories = [
+                path
+                for path in paths_to_apply
+                if desired.get(path) is not None
+                and cast(_SourceTreeEntry, desired[path]).kind
+                == "directory"
+            ]
+            try:
+                for relative_path in sorted(
+                    paths_to_apply,
+                    key=self._source_path_depth,
+                    reverse=True,
+                ):
+                    current_entry = current.get(relative_path)
+                    desired_entry = desired.get(relative_path)
+                    if current_entry is None:
+                        continue
+                    if (
+                        desired_entry is None
+                        or current_entry.kind != desired_entry.kind
+                        or (
+                            current_entry.kind == "symlink"
+                            and current_entry != desired_entry
+                        )
+                    ):
+                        self._remove_source_path(
+                            self._manifest_path(workspace, relative_path)
+                        )
+
+                for relative_path in sorted(
+                    desired_directories,
+                    key=self._source_path_depth,
+                ):
+                    directory = self._manifest_path(workspace, relative_path)
+                    if not os.path.lexists(directory):
+                        directory.mkdir()
+
+                for relative_path in sorted(
+                    paths_to_apply,
+                    key=self._source_path_depth,
+                ):
+                    desired_entry = desired.get(relative_path)
+                    if desired_entry is None:
+                        continue
+                    destination = self._manifest_path(
+                        workspace,
+                        relative_path,
+                    )
+                    if desired_entry.kind == "file":
+                        self._atomic_replace_source_file(
+                            self._manifest_path(
+                                desired_root,
+                                relative_path,
+                            ),
+                            destination,
+                            desired_entry.mode,
+                        )
+                    elif desired_entry.kind == "symlink":
+                        if not os.path.lexists(destination):
+                            os.symlink(
+                                cast(str, desired_entry.value),
+                                destination,
+                            )
+            finally:
+                directories_to_restore = permission_directories | set(
+                    desired_directories
+                )
+                for relative_path in sorted(
+                    directories_to_restore,
+                    key=self._source_path_depth,
+                    reverse=True,
+                ):
+                    desired_entry = desired.get(relative_path)
+                    if (
+                        desired_entry is None
+                        or desired_entry.kind != "directory"
+                    ):
+                        continue
+                    directory = self._manifest_path(
+                        workspace,
+                        relative_path,
+                    )
+                    try:
+                        metadata = directory.lstat()
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISDIR(metadata.st_mode):
+                        os.chmod(directory, desired_entry.mode)
+
+        return sorted(changed_paths)
+
+    @staticmethod
+    def _validated_relative_path(value: object, label: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{label} must be a nonempty relative path")
+        path = PurePosixPath(value)
+        if (
+            path.is_absolute()
+            or path.as_posix() != value
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or any(part in {".git", ".repogents"} for part in path.parts)
+        ):
+            raise ValueError(f"{label} must be a normalized source path")
+        return value
+
+    @classmethod
+    def _validated_operation_artifact_manifest(
+        cls,
+        manifest: object,
+        destination: Path,
+    ) -> dict[str, dict[str, str]]:
+        if not isinstance(manifest, dict):
+            raise ValueError(
+                "repository operation artifact manifest must be an object"
+            )
+        normalized: dict[str, dict[str, str]] = {}
+        for semantic_path, artifacts in manifest.items():
+            semantic_path = cls._validated_relative_path(
+                semantic_path,
+                "repository operation semantic path",
+            )
+            if not isinstance(artifacts, dict):
+                raise ValueError(
+                    "repository operation path artifacts must be an object"
+                )
+            unexpected_stages = set(artifacts) - {
+                "base",
+                "ours",
+                "theirs",
+            }
+            if unexpected_stages:
+                raise ValueError(
+                    "repository operation artifact stage is invalid"
+                )
+            normalized_artifacts: dict[str, str] = {}
+            for stage in ("base", "ours", "theirs"):
+                if stage not in artifacts:
+                    continue
+                relative_path = cls._validated_relative_path(
+                    artifacts[stage],
+                    f"repository operation {stage} artifact",
+                )
+                artifact_path = cls._manifest_path(
+                    destination,
+                    relative_path,
+                )
+                try:
+                    metadata = artifact_path.lstat()
+                except FileNotFoundError as error:
+                    raise ValueError(
+                        "repository operation artifact is missing: "
+                        f"{relative_path}"
+                    ) from error
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError(
+                        "repository operation artifact must be a regular file: "
+                        f"{relative_path}"
+                    )
+                normalized_artifacts[stage] = relative_path
+            normalized[semantic_path] = normalized_artifacts
+        return normalized
+
+    def _operation_artifacts_directory(
+        self,
+        run_id: int,
+        trigger: dict,
+    ) -> Path:
+        failed_pass_id = trigger.get("failed_pass_id")
+        failed_stage = trigger.get("failed_stage")
+        if (
+            isinstance(failed_pass_id, bool)
+            or not isinstance(failed_pass_id, int)
+            or failed_stage
+            not in {
+                "continue_repository_operation",
+                "prepare_publication",
+            }
+        ):
+            raise ValueError("operation failure artifact identity is invalid")
+        return (
+            self.data_dir
+            / "operation-artifacts"
+            / str(run_id)
+            / f"{failed_pass_id}-{failed_stage}"
+        )
+
+    def _export_operation_artifacts(
+        self,
+        run_id: int,
+        workspace: Path,
+        trigger: dict,
+    ) -> None:
+        destination = self._operation_artifacts_directory(run_id, trigger)
+        parent = destination.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        self._fsync_directory(parent)
+        self._fsync_directory(parent.parent)
+        self._fsync_directory(self.data_dir)
+
+        def validate_exact_tree(
+            root: Path,
+            manifest: dict[str, dict[str, str]],
+            *,
+            includes_manifest: bool,
+        ) -> None:
+            try:
+                root_metadata = root.lstat()
+            except FileNotFoundError as error:
+                raise ValueError(
+                    "repository operation artifact tree is unavailable"
+                ) from error
+            if not stat.S_ISDIR(root_metadata.st_mode):
+                raise ValueError(
+                    "repository operation artifact tree must be a directory"
+                )
+
+            expected_files = {
+                relative_path
+                for artifacts in manifest.values()
+                for relative_path in artifacts.values()
+            }
+            if ".manifest.json" in expected_files:
+                raise ValueError(
+                    "repository operation artifact conflicts with its manifest"
+                )
+            if includes_manifest:
+                expected_files.add(".manifest.json")
+            expected_directories: set[str] = set()
+            for relative_path in expected_files:
+                for ancestor in PurePosixPath(relative_path).parents:
+                    if ancestor != PurePosixPath("."):
+                        expected_directories.add(ancestor.as_posix())
+
+            actual_files: set[str] = set()
+            actual_directories: set[str] = set()
+
+            def visit(
+                directory: Path,
+                parent_path: PurePosixPath | None = None,
+            ) -> None:
+                with os.scandir(directory) as scanned:
+                    entries = list(scanned)
+                for entry in entries:
+                    relative = (
+                        PurePosixPath(entry.name)
+                        if parent_path is None
+                        else parent_path / entry.name
+                    )
+                    relative_path = relative.as_posix()
+                    metadata = entry.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(metadata.st_mode):
+                        actual_directories.add(relative_path)
+                        visit(Path(entry.path), relative)
+                    elif stat.S_ISREG(metadata.st_mode):
+                        actual_files.add(relative_path)
+                    else:
+                        raise ValueError(
+                            "repository operation artifact tree contains "
+                            f"an unsupported path: {relative_path}"
+                        )
+
+            visit(root)
+            if (
+                actual_files != expected_files
+                or actual_directories != expected_directories
+            ):
+                raise ValueError(
+                    "repository operation artifact manifest does not exactly "
+                    "describe its tree"
+                )
+
+        def validate_published_tree(
+            root: Path,
+        ) -> dict[str, dict[str, str]]:
+            manifest_path = root / ".manifest.json"
+            try:
+                metadata = manifest_path.lstat()
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError(
+                        "repository operation artifact manifest must be a "
+                        "regular file"
+                    )
+                manifest_bytes = manifest_path.read_bytes()
+                manifest = json.loads(manifest_bytes.decode("utf-8"))
+            except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    "repository operation artifacts are unavailable"
+                ) from error
+            normalized = self._validated_operation_artifact_manifest(
+                manifest,
+                root,
+            )
+            expected_manifest = json.dumps(
+                normalized,
+                sort_keys=True,
+            ).encode("utf-8")
+            if manifest_bytes != expected_manifest:
+                raise ValueError(
+                    "repository operation artifact manifest is not exact"
+                )
+            validate_exact_tree(
+                root,
+                normalized,
+                includes_manifest=True,
+            )
+            return normalized
+
+        if os.path.lexists(destination):
+            validate_published_tree(destination)
+            self._fsync_source_tree(destination)
+            self._fsync_directory(parent)
+            return
+
+        staging = Path(
+            tempfile.mkdtemp(
+                prefix=f".{destination.name}.pending-",
+                dir=parent,
+            )
+        )
+        try:
+            manifest = self.github.export_repository_operation_artifacts(
+                workspace,
+                staging,
+            )
+            normalized = self._validated_operation_artifact_manifest(
+                manifest,
+                staging,
+            )
+            validate_exact_tree(
+                staging,
+                normalized,
+                includes_manifest=False,
+            )
+            manifest_bytes = json.dumps(
+                normalized,
+                sort_keys=True,
+            ).encode("utf-8")
+            with (staging / ".manifest.json").open("xb") as manifest_file:
+                manifest_file.write(manifest_bytes)
+                manifest_file.flush()
+                os.fsync(manifest_file.fileno())
+            validate_published_tree(staging)
+            self._fsync_source_tree(staging)
+            os.replace(staging, destination)
+            self._fsync_directory(parent)
+        except Exception:
+            if os.path.lexists(staging):
+                self._make_tree_removable(staging)
+                shutil.rmtree(staging)
+            raise
+
+    def _operation_artifact_manifest(
+        self,
+        run_id: int,
+        trigger: dict,
+    ) -> tuple[Path, dict[str, dict[str, str]]]:
+        destination = self._operation_artifacts_directory(run_id, trigger)
+        manifest_path = destination / ".manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError) as error:
+            raise ValueError(
+                "repository operation artifacts are unavailable"
+            ) from error
+        return destination, self._validated_operation_artifact_manifest(
+            manifest,
+            destination,
+        )
+
+    def _materialize_operation_artifacts(
+        self,
+        run_id: int,
+        execution_pass: dict,
+        snapshot: Path,
+    ) -> tuple[dict[str, dict[str, str]], str]:
+        source, manifest = self._operation_artifact_manifest(
+            run_id,
+            execution_pass["trigger_json"],
+        )
+        root_name = ".repogents-operation-artifacts"
+        suffix = 0
+        while os.path.lexists(snapshot / root_name):
+            suffix += 1
+            root_name = f".repogents-operation-artifacts-{suffix}"
+        artifact_root = snapshot / root_name
+        artifact_root.mkdir()
+        materialized: dict[str, dict[str, str]] = {}
+        for semantic_path, artifacts in manifest.items():
+            materialized_artifacts: dict[str, str] = {}
+            for stage, relative_path in artifacts.items():
+                source_path = self._manifest_path(source, relative_path)
+                destination_path = self._manifest_path(
+                    artifact_root,
+                    relative_path,
+                )
+                destination_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(
+                    source_path,
+                    destination_path,
+                    follow_symlinks=False,
+                )
+                materialized_artifacts[stage] = (
+                    PurePosixPath(root_name) / relative_path
+                ).as_posix()
+            materialized[semantic_path] = materialized_artifacts
+        return materialized, root_name
+
+    def _record_operation_failure(
+        self,
+        repository: dict,
+        run: dict,
+        failed_pass: dict,
+        failed_stage: str,
+        error: subprocess.CalledProcessError,
+    ) -> None:
+        workspace = self._workspace(repository["id"], run["id"])
+        operation_state = self.github.repository_operation_state(workspace)
+        if not isinstance(operation_state, dict):
+            raise ValueError("repository operation state must be an object")
+        rebase_in_progress = operation_state.get("rebase_in_progress")
+        unmerged_paths = operation_state.get("unmerged_paths")
+        if not isinstance(rebase_in_progress, bool):
+            raise ValueError(
+                "repository operation rebase state must be boolean"
+            )
+        if (
+            not isinstance(unmerged_paths, list)
+            or any(
+                not isinstance(path, str) or not path
+                for path in unmerged_paths
+            )
+            or unmerged_paths != sorted(set(unmerged_paths))
+        ):
+            raise ValueError(
+                "repository operation unmerged paths must be sorted source paths"
+            )
+        for unmerged_path in unmerged_paths:
+            self._validated_relative_path(
+                unmerged_path,
+                "repository operation unmerged path",
+            )
+        trigger = {
+            "failed_stage": failed_stage,
+            "command": error.cmd,
+            "returncode": error.returncode,
+            "stdout": error.stdout,
+            "stderr": error.stderr,
+            "target_branch": repository["target_branch"],
+            "failed_pass_id": failed_pass["id"],
+            "workspace": {
+                "repository_id": repository["id"],
+                "run_id": run["id"],
+                "rebase_in_progress": rebase_in_progress,
+                "unmerged_paths": list(unmerged_paths),
+            },
+        }
+        origin_feedback_pass_id = self._feedback_origin_pass_id(failed_pass)
+        if origin_feedback_pass_id is not None:
+            trigger["origin_feedback_pass_id"] = origin_feedback_pass_id
+        self._export_operation_artifacts(
+            run["id"],
+            workspace,
+            trigger,
+        )
+        self.store.create_pass(
+            run["id"],
+            "operation_failure",
+            trigger,
+        )
+        self.store.transition_run(run["id"], "SPECIFYING")
+
     def _trajectory(self, run_id: int, name: str) -> Path:
         return self.data_dir / "trajectories" / str(run_id) / f"{name}.json"
 
@@ -406,8 +1539,9 @@ class Application:
         if execution_pass["trigger_type"] == "feedback":
             return execution_pass["id"]
         if execution_pass["trigger_type"] not in {
-            "validation_failure",
+            "operation_failure",
             "publication_revalidation",
+            "validation_failure",
         }:
             return None
         origin = execution_pass["trigger_json"].get("origin_feedback_pass_id")
@@ -590,7 +1724,7 @@ class Application:
             if isinstance(reference, dict)
             else None
         )
-        return {
+        context = {
             "original_issue": run["issue_json"],
             "repository": repository,
             "feedback": feedback,
@@ -610,41 +1744,16 @@ class Application:
                 else None
             ),
         }
+        if execution_pass["trigger_type"] == "operation_failure":
+            context["operation_failure"] = execution_pass["trigger_json"]
+        return context
 
     @staticmethod
-    def _is_publication_rebase_conflict(execution_pass: dict) -> bool:
-        if execution_pass.get("trigger_type") != "validation_failure":
-            return False
-        trigger = execution_pass.get("trigger_json")
-        if not isinstance(trigger, dict):
-            return False
-        if trigger.get("failure_kind") == _PUBLICATION_REBASE_CONFLICT_KIND:
-            return True
+    def _specify_instruction() -> str:
         return (
-            trigger.get("passed") is False
-            and trigger.get("publication_candidate") is None
-            and trigger.get("explanation")
-            == _PUBLICATION_REBASE_CONFLICT_EXPLANATION
-        )
-
-    def _specify_instruction(
-        self, repository: dict, execution_pass: dict
-    ) -> str:
-        if self._is_publication_rebase_conflict(execution_pass):
-            target_branch = repository["target_branch"]
-            return (
-                "The validation deficiency in context is a repository-state "
-                "integration conflict, not a request to change Repogents "
-                "publication behavior. Create only the atomic work needed to "
-                f"reconcile the current issue workspace with origin/{target_branch}, "
-                "preserving both current target behavior and issue-required "
-                "changes, and verify the integrated branch. "
-                + _CLASSIFICATION_GUIDANCE
-            )
-        return (
-            "Convert only the issue, validation deficiency, or feedback in "
-            "context into atomic specifications, acceptance criteria, "
-            "classified work items, and dependencies. "
+            "Convert only the issue, controller operation failure, validation "
+            "deficiency, or feedback in context into atomic specifications, "
+            "acceptance criteria, classified work items, and dependencies. "
             + _CLASSIFICATION_GUIDANCE
         )
 
@@ -675,24 +1784,27 @@ class Application:
                     "feedback Specify run has no current pull-request head"
                 )
             if result is None:
-                result = self.runtime.run(
-                    self._task(
-                        "specify",
-                        "Disposition every claimed feedback item against the current pull-request head, original issue, accepted specifications, prior work, and validation evidence before creating correction work. A pull-request regression must be valid and in scope. Map only valid in-scope items to returned specifications. Give valid out-of-scope items a bounded follow-up issue and give invalid items no follow-up issue. "
-                        + _CLASSIFICATION_GUIDANCE,
-                        self._specify_context(
-                            repository,
-                            run,
-                            execution_pass,
-                            in_scope_only=False,
+                with self._source_snapshot(
+                    self._workspace(repository["id"], run["id"])
+                ) as source_workspace:
+                    result = self.runtime.run(
+                        self._task(
+                            "specify",
+                            "Disposition every claimed feedback item against the current pull-request head, original issue, accepted specifications, prior work, and validation evidence before creating correction work. A pull-request regression must be valid and in scope. Map only valid in-scope items to returned specifications. Give valid out-of-scope items a bounded follow-up issue and give invalid items no follow-up issue. "
+                            + _CLASSIFICATION_GUIDANCE,
+                            self._specify_context(
+                                repository,
+                                run,
+                                execution_pass,
+                                in_scope_only=False,
+                            ),
                         ),
-                    ),
-                    self._workspace(repository["id"], run["id"]),
-                    result_schema=_FEEDBACK_SPECIFY_SCHEMA,
-                    trajectory_path=self._trajectory(
-                        run["id"], f"specify-{execution_pass['id']}"
-                    ),
-                )
+                        source_workspace,
+                        result_schema=_FEEDBACK_SPECIFY_SCHEMA,
+                        trajectory_path=self._trajectory(
+                            run["id"], f"specify-{execution_pass['id']}"
+                        ),
+                    )
                 result = self._validated_feedback_scope_result(
                     result,
                     packages,
@@ -747,18 +1859,21 @@ class Application:
                 )
                 return
         elif not existing:
-            result = self.runtime.run(
-                self._task(
-                    "specify",
-                    self._specify_instruction(repository, execution_pass),
-                    self._specify_context(repository, run, execution_pass),
-                ),
-                self._workspace(repository["id"], run["id"]),
-                result_schema=_SPECIFY_SCHEMA,
-                trajectory_path=self._trajectory(
-                    run["id"], f"specify-{execution_pass['id']}"
-                ),
-            )
+            with self._source_snapshot(
+                self._workspace(repository["id"], run["id"])
+            ) as source_workspace:
+                result = self.runtime.run(
+                    self._task(
+                        "specify",
+                        self._specify_instruction(),
+                        self._specify_context(repository, run, execution_pass),
+                    ),
+                    source_workspace,
+                    result_schema=_SPECIFY_SCHEMA,
+                    trajectory_path=self._trajectory(
+                        run["id"], f"specify-{execution_pass['id']}"
+                    ),
+                )
             self.store.save_specification_package(
                 run["id"], execution_pass["id"], result
             )
@@ -1131,20 +2246,25 @@ class Application:
                     repository["id"], classification, vector
                 )
             if node is None:
-                role_result = self.runtime.run(
-                    self._task(
-                        "node_role",
-                        "Generate a flexible role prompt for this repository-reusable agent queue. Describe responsibilities broad enough to serve this classification across repository issues without prescribing a fixed implementation workflow. Use the current work only as context; do not narrow the role to this issue or work item.",
-                        {
-                            "classification": classification,
-                            "work_item": work,
-                            "repository": repository,
-                        },
-                    ),
-                    self._workspace(repository["id"], run["id"]),
-                    result_schema=_ROLE_SCHEMA,
-                    trajectory_path=self._trajectory(run["id"], f"role-{work['id']}"),
-                )
+                with self._source_snapshot(
+                    self._workspace(repository["id"], run["id"])
+                ) as source_workspace:
+                    role_result = self.runtime.run(
+                        self._task(
+                            "node_role",
+                            "Generate a flexible role prompt for this repository-reusable agent queue. Describe responsibilities broad enough to serve this classification across repository issues without prescribing a fixed implementation workflow. Use the current work only as context; do not narrow the role to this issue or work item.",
+                            {
+                                "classification": classification,
+                                "work_item": work,
+                                "repository": repository,
+                            },
+                        ),
+                        source_workspace,
+                        result_schema=_ROLE_SCHEMA,
+                        trajectory_path=self._trajectory(
+                            run["id"], f"role-{work['id']}"
+                        ),
+                    )
                 role_prompt = role_result.get("role_prompt")
                 if not isinstance(role_prompt, str) or not role_prompt.strip():
                     raise ValueError("Node Role Agent must return a nonempty role_prompt")
@@ -1190,6 +2310,121 @@ class Application:
             except Exception:
                 pass
 
+    @classmethod
+    def _validated_work_result(
+        cls,
+        result: object,
+        execution_pass: dict,
+        work_keys: set[str],
+    ) -> dict:
+        required = {
+            "outcome",
+            "output",
+            "artifacts",
+            "test_results",
+            "repository_state",
+        }
+        if not isinstance(result, dict) or not required.issubset(result):
+            raise ValueError("work must return the complete work result")
+        try:
+            json.dumps(result)
+        except (TypeError, ValueError) as error:
+            raise ValueError("work result must be JSON-safe") from error
+        if not isinstance(result["artifacts"], list):
+            raise ValueError("work artifacts must be a list")
+        if not isinstance(result["test_results"], list):
+            raise ValueError("work test_results must be a list")
+        if not isinstance(result["repository_state"], dict):
+            raise ValueError("work repository_state must be an object")
+
+        normalized = dict(result)
+        outcome = result["outcome"]
+        if outcome not in {"ready_for_validation", "continue_work"}:
+            raise ValueError(
+                "work outcome must be ready_for_validation or continue_work"
+            )
+
+        resolved_paths = result.get("resolved_paths", [])
+        if not isinstance(resolved_paths, list):
+            raise ValueError("work resolved_paths must be a list")
+        normalized_resolved_paths: list[str] = []
+        for resolved_path in resolved_paths:
+            normalized_resolved_paths.append(
+                cls._validated_relative_path(
+                    resolved_path,
+                    "work resolved path",
+                )
+            )
+        normalized_resolved_paths = sorted(
+            set(normalized_resolved_paths)
+        )
+        if execution_pass["trigger_type"] == "operation_failure":
+            operation_workspace = execution_pass["trigger_json"].get(
+                "workspace"
+            )
+            unmerged_paths = (
+                operation_workspace.get("unmerged_paths")
+                if isinstance(operation_workspace, dict)
+                else None
+            )
+            if not isinstance(unmerged_paths, list):
+                raise ValueError(
+                    "operation failure has no unmerged path evidence"
+                )
+            allowed_resolved_paths = set(unmerged_paths)
+        else:
+            allowed_resolved_paths = set()
+        if any(
+            path not in allowed_resolved_paths
+            for path in normalized_resolved_paths
+        ):
+            raise ValueError(
+                "work resolved_paths must come from this operation failure"
+            )
+        normalized["resolved_paths"] = normalized_resolved_paths
+
+        if outcome == "continue_work":
+            continuation_fields = {
+                "classification",
+                "context",
+                "dependencies",
+                "blocking",
+            }
+            if not continuation_fields.issubset(result):
+                raise ValueError(
+                    "continue_work must return the complete handoff"
+                )
+            normalized["classification"] = validate_classification(
+                result["classification"]
+            )
+            if not isinstance(result["context"], dict):
+                raise ValueError("work handoff context must be an object")
+            dependencies = result["dependencies"]
+            if (
+                not isinstance(dependencies, list)
+                or any(
+                    not isinstance(dependency, str) or not dependency
+                    for dependency in dependencies
+                )
+                or any(
+                    dependency not in work_keys
+                    for dependency in dependencies
+                )
+            ):
+                raise ValueError(
+                    "work handoff dependencies must reference this pass"
+                )
+            normalized["dependencies"] = list(
+                dict.fromkeys(dependencies)
+            )
+            if (
+                result["blocking"] is not None
+                and not isinstance(result["blocking"], dict)
+            ):
+                raise ValueError(
+                    "work handoff blocking must be an object or null"
+                )
+        return normalized
     def _run_work(self, node: dict, work: dict) -> None:
         run = self.store.get_run(work["run_id"])
         if run is None:
@@ -1223,55 +2458,109 @@ class Application:
             item for item in all_work if item["key"] in dependency_keys
         ]
         try:
-            result = self.runtime.run(
-                self._task(
-                    "work",
-                    "Use your tools and judgment flexibly to complete this bounded work. Return ready_for_validation when no more agent work is needed, or continue_work with the next classification and handoff context. "
-                    + _CLASSIFICATION_GUIDANCE,
-                    {
-                        "original_issue": run["issue_json"],
-                        "repository": repository,
-                        "specification": self._specification_definition(
-                            specification
-                        ),
-                        "work_item": work,
-                        "dependency_results": dependencies,
-                        "specification_dependencies": specification_dependencies,
-                        "feedback": feedback,
-                        "pull_request_diff": pull_request_diff,
-                    },
-                ),
-                self._workspace(repository["id"], run["id"]),
-                role_prompt=node["role_prompt"],
-                result_schema=_WORK_SCHEMA,
-                trajectory_path=self._trajectory(run["id"], f"work-{work['id']}"),
-            )
-            outcome = result.get("outcome")
-            persisted_result = {
-                "output": result["output"],
-                "artifacts": result["artifacts"],
-                "test_results": result["test_results"],
-                "repository_state": result["repository_state"],
-            }
-            if outcome == "ready_for_validation":
-                self.store.complete_work(work["id"], persisted_result)
-            elif outcome == "continue_work":
-                handoff = {
-                    "classification": result["classification"],
-                    "context": result["context"],
-                    "artifacts": result["artifacts"],
-                    "dependencies": result["dependencies"],
-                    "blocking": result["blocking"],
+            workspace = self._workspace(repository["id"], run["id"])
+            with self._source_snapshot(workspace) as source_workspace:
+                baseline = self._source_manifest(source_workspace)
+                excluded_roots: set[str] = set()
+                work_context = {
+                    "original_issue": run["issue_json"],
+                    "repository": repository,
+                    "specification": self._specification_definition(
+                        specification
+                    ),
+                    "work_item": work,
+                    "dependency_results": dependencies,
+                    "specification_dependencies": (
+                        specification_dependencies
+                    ),
+                    "feedback": feedback,
+                    "pull_request_diff": pull_request_diff,
                 }
-                self.store.complete_work(work["id"], persisted_result, handoff)
-            else:
-                raise ValueError("work outcome must be ready_for_validation or continue_work")
+                if execution_pass["trigger_type"] == "operation_failure":
+                    operation_artifacts, artifact_root = (
+                        self._materialize_operation_artifacts(
+                            run["id"],
+                            execution_pass,
+                            source_workspace,
+                        )
+                    )
+                    excluded_roots.add(artifact_root)
+                    work_context["operation_failure"] = execution_pass[
+                        "trigger_json"
+                    ]
+                    work_context["operation_artifacts"] = (
+                        operation_artifacts
+                    )
+                result = self.runtime.run(
+                    self._task(
+                        "work",
+                        "Use your tools and judgment flexibly to complete this bounded work. Return ready_for_validation when no more agent work is needed, or continue_work with the next classification and handoff context. "
+                        + _CLASSIFICATION_GUIDANCE,
+                        work_context,
+                    ),
+                    source_workspace,
+                    role_prompt=node["role_prompt"],
+                    result_schema=_WORK_SCHEMA,
+                    trajectory_path=self._trajectory(
+                        run["id"], f"work-{work['id']}"
+                    ),
+                )
+                result = self._validated_work_result(
+                    result,
+                    execution_pass,
+                    {item["key"] for item in all_work},
+                )
+                desired = self._source_manifest(
+                    source_workspace,
+                    excluded_roots=excluded_roots,
+                )
+                with self._durable_source_import(
+                    workspace,
+                    source_workspace,
+                    baseline,
+                    desired,
+                    repository_id=repository["id"],
+                    run_id=run["id"],
+                    work_id=work["id"],
+                ) as applied_paths:
+                    repository_state = dict(result["repository_state"])
+                    repository_state["_repogents"] = {
+                        "applied_paths": applied_paths,
+                        "resolved_paths": result["resolved_paths"],
+                    }
+                    persisted_result = {
+                        "output": result["output"],
+                        "artifacts": result["artifacts"],
+                        "test_results": result["test_results"],
+                        "repository_state": repository_state,
+                    }
+                    if result["outcome"] == "ready_for_validation":
+                        self.store.complete_work(
+                            work["id"],
+                            persisted_result,
+                        )
+                    else:
+                        handoff = {
+                            "classification": result["classification"],
+                            "context": result["context"],
+                            "artifacts": result["artifacts"],
+                            "dependencies": result["dependencies"],
+                            "blocking": result["blocking"],
+                        }
+                        self.store.complete_work(
+                            work["id"],
+                            persisted_result,
+                            handoff,
+                        )
             self.store.record_node_success(
                 node["id"], run["id"], self.config.promotion_threshold
             )
         except Exception as error:
             failure = {
-                "output": {"error": str(error), "type": type(error).__name__},
+                "output": {
+                    "error": str(error),
+                    "type": type(error).__name__,
+                },
                 "artifacts": [],
                 "test_results": [],
                 "repository_state": {},
@@ -1364,12 +2653,47 @@ class Application:
             and "publication_candidate" in result
         )
 
-
     def _pass_has_specifications(self, run_id: int, pass_id: int) -> bool:
         return any(
             item["pass_id"] == pass_id
             for item in self.store.list_specifications(run_id)
         )
+
+    def _operation_failure_paths(
+        self,
+        run_id: int,
+        pass_id: int,
+    ) -> list[str]:
+        paths: set[str] = set()
+        for work in self.store.list_work_items(run_id, pass_id):
+            result = work.get("result")
+            if not isinstance(result, dict):
+                continue
+            repository_state = result.get("repository_state")
+            if not isinstance(repository_state, dict):
+                continue
+            controller_state = repository_state.get("_repogents")
+            if not isinstance(controller_state, dict):
+                continue
+            values = controller_state.get("resolved_paths")
+            if (
+                not isinstance(values, list)
+                or any(
+                    not isinstance(value, str) or not value
+                    for value in values
+                )
+            ):
+                raise ValueError(
+                    "controller work state resolved_paths is invalid"
+                )
+            paths.update(
+                self._validated_relative_path(
+                    value,
+                    "controller work state resolved_paths",
+                )
+                for value in values
+            )
+        return sorted(paths)
 
     def _validate(self, repository: dict, run: dict) -> None:
         execution_passes = self.store.list_passes(run["id"])
@@ -1377,7 +2701,8 @@ class Application:
             raise RuntimeError("validating run has no execution pass")
         execution_pass = execution_passes[-1]
         if (
-            execution_pass["trigger_type"] in {"validation_failure", "feedback"}
+            execution_pass["trigger_type"]
+            in {"feedback", "operation_failure", "validation_failure"}
             and not self._pass_has_specifications(
                 run["id"], execution_pass["id"]
             )
@@ -1393,66 +2718,81 @@ class Application:
             None,
         )
         if recorded is None:
+            workspace = self._workspace(repository["id"], run["id"])
+            if execution_pass["trigger_type"] == "operation_failure":
+                continuation_paths = self._operation_failure_paths(
+                    run["id"],
+                    execution_pass["id"],
+                )
+                try:
+                    self.github.continue_repository_operation(
+                        workspace,
+                        continuation_paths,
+                    )
+                except subprocess.CalledProcessError as error:
+                    self._record_operation_failure(
+                        repository,
+                        run,
+                        execution_pass,
+                        "continue_repository_operation",
+                        error,
+                    )
+                    return
             try:
                 candidate, _ = self.github.prepare_publication(
                     run["issue_number"],
                     repository["target_branch"],
-                    self._workspace(repository["id"], run["id"]),
+                    workspace,
                 )
-            except PublicationRebaseConflictError as error:
-                conflict_message = str(error)
-                result = {
-                    "passed": False,
-                    "failed_specifications": [],
-                    "failed_criteria": [],
-                    "code_review_findings": [conflict_message],
-                    "explanation": _PUBLICATION_REBASE_CONFLICT_EXPLANATION,
-                    "evidence": [
-                        "Publication preparation aborted after the target "
-                        "rebase entered a conflict state."
-                    ],
-                    "repository_state": {},
-                    "completed_work": [],
-                    "publication_candidate": None,
-                    "failure_kind": _PUBLICATION_REBASE_CONFLICT_KIND,
-                }
-            else:
-                with tempfile.TemporaryDirectory(
-                    prefix="repogents-validate-",
-                    dir=self.data_dir,
-                ) as temporary_directory:
-                    validation_workspace = (
-                        Path(temporary_directory) / "workspace"
-                    )
+            except subprocess.CalledProcessError as error:
+                self._record_operation_failure(
+                    repository,
+                    run,
+                    execution_pass,
+                    "prepare_publication",
+                    error,
+                )
+                return
+
+            with tempfile.TemporaryDirectory(
+                prefix="repogents-validate-controller-",
+                dir=self.data_dir,
+            ) as temporary_directory:
+                controller_workspace = (
+                    Path(temporary_directory) / "workspace"
+                )
+                with self._source_lock:
                     shutil.copytree(
-                        self._workspace(repository["id"], run["id"]),
-                        validation_workspace,
+                        workspace,
+                        controller_workspace,
                         symlinks=True,
                     )
-                    candidate_diff = self.github.candidate_diff(
-                        repository["target_branch"],
-                        validation_workspace,
-                        candidate=candidate,
-                    )
-                    result = self.runtime.run(
-                        self._task(
-                            "validate",
-                            "Judge the completed result against every atomic specification, acceptance criterion, and the intent of the original issue. Independently review the complete staged target-to-candidate diff for branch-introduced correctness defects, regressions, and changes not mapped to the issue, specifications, necessary prerequisites, or current in-scope feedback. Do not audit unrelated pre-existing code. Do not modify repository files or implement corrections. Return a failed validation result for any failed specification, failed criterion, or code-review finding.",
-                            self._validation_context(
-                                repository,
-                                run,
-                                execution_pass,
-                                candidate_diff,
-                            ),
+                candidate_diff = self.github.candidate_diff(
+                    repository["target_branch"],
+                    controller_workspace,
+                    candidate=candidate,
+                )
+
+            with self._source_snapshot(workspace) as validation_workspace:
+                result = self.runtime.run(
+                    self._task(
+                        "validate",
+                        "Judge the completed result against every atomic specification, acceptance criterion, and the intent of the original issue. Independently review the complete staged target-to-candidate diff for branch-introduced correctness defects, regressions, and changes not mapped to the issue, specifications, necessary prerequisites, or current in-scope feedback. Do not audit unrelated pre-existing code. Do not modify repository files or implement corrections. Return a failed validation result for any failed specification, failed criterion, or code-review finding.",
+                        self._validation_context(
+                            repository,
+                            run,
+                            execution_pass,
+                            candidate_diff,
                         ),
-                        validation_workspace,
-                        result_schema=_VALIDATION_SCHEMA,
-                        trajectory_path=self._trajectory(
-                            run["id"], f"validate-{execution_pass['id']}"
-                        ),
-                    )
-                result = self._validated_validation_result(result)
-                result["publication_candidate"] = asdict(candidate)
+                    ),
+                    validation_workspace,
+                    result_schema=_VALIDATION_SCHEMA,
+                    trajectory_path=self._trajectory(
+                        run["id"], f"validate-{execution_pass['id']}"
+                    ),
+                )
+            result = self._validated_validation_result(result)
+            result["publication_candidate"] = asdict(candidate)
             self.store.record_validation(
                 run["id"], execution_pass["id"], result
             )

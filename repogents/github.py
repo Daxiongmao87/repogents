@@ -9,8 +9,6 @@ import subprocess
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-from repogents.errors import PublicationRebaseConflictError
-
 
 _REVIEW_THREADS_QUERY = """
 query ReviewThreads(
@@ -157,6 +155,7 @@ class GitHubClient:
         self._api_base = api_base.rstrip("/")
         self._request = request or self._default_request
         self._command_runner = command_runner or self._default_command_runner
+        self._repository_operation_binary_runner = self._default_binary_command_runner
         credential = b64encode(f"x-access-token:{token}".encode()).decode()
         self._git_command_env = {"GIT_TERMINAL_PROMPT": "0"}
         self._git_auth_env = {
@@ -172,6 +171,14 @@ class GitHubClient:
             "GIT_CONFIG_VALUE_0": "Repogents",
             "GIT_CONFIG_KEY_1": "user.email",
             "GIT_CONFIG_VALUE_1": "repogents@localhost",
+        }
+        self._git_literal_path_env = {
+            **self._git_command_env,
+            "GIT_LITERAL_PATHSPECS": "1",
+        }
+        self._git_rebase_continue_env = {
+            **self._git_identity_env,
+            "GIT_EDITOR": "true",
         }
 
     def _default_request(self, method, path, *, query=None, json_body=None):
@@ -215,6 +222,21 @@ class GitHubClient:
             text=True,
             capture_output=True,
         )
+
+    @staticmethod
+    def _default_binary_command_runner(args, *, cwd=None, env=None):
+        command_env = os.environ.copy()
+        if env:
+            command_env.update(env)
+        return subprocess.run(
+            args,
+            cwd=cwd,
+            env=command_env,
+            check=True,
+            text=False,
+            capture_output=True,
+        )
+
 
     def repository(self, github_repository: str) -> dict:
         repository = self._request("GET", f"/repos/{github_repository}")
@@ -680,30 +702,189 @@ class GitHubClient:
             )
         return True
 
-    def _abort_rebase_if_in_progress(self, workspace_path: Path) -> bool:
-        """Abort an interrupted rebase and verify workspace restoration."""
-        rebase_states = (
-            workspace_path / ".git" / "rebase-merge",
-            workspace_path / ".git" / "rebase-apply",
-        )
-        if not any(state.exists() for state in rebase_states):
-            return False
-
-        abort_error = None
-        try:
-            self._command_runner(
-                ["git", "rebase", "--abort"],
-                cwd=workspace_path,
-                env=self._git_identity_env,
+    @staticmethod
+    def _repository_relative_path(semantic_path: str) -> Path:
+        if not isinstance(semantic_path, str):
+            raise TypeError("repository path must be a string")
+        parts = semantic_path.split("/")
+        relative_path = Path(*parts)
+        if (
+            not semantic_path
+            or "\0" in semantic_path
+            or relative_path.is_absolute()
+            or bool(relative_path.drive)
+            or any(part in {"", ".", ".."} for part in parts)
+            or any(part == ".." for part in relative_path.parts)
+            or (
+                relative_path.parts
+                and relative_path.parts[0].casefold() in {".git", ".repogents"}
             )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
-            abort_error = error
+        ):
+            raise ValueError(
+                "repository path must be a secure repository-relative "
+                "source path"
+            )
+        return relative_path
 
-        if any(state.exists() for state in rebase_states):
-            detail = "git rebase --abort did not restore the workspace"
-            if abort_error is not None:
-                detail = f"{detail}: {abort_error}"
-            raise OSError(detail) from abort_error
+    @staticmethod
+    def _rebase_in_progress(workspace_path: Path) -> bool:
+        git_dir = workspace_path / ".git"
+        return any(
+            (git_dir / metadata).exists()
+            for metadata in ("rebase-merge", "rebase-apply")
+        )
+
+    def _unmerged_repository_entries(
+        self,
+        workspace_path: Path,
+    ) -> dict[str, dict[str, str]]:
+        result = self._repository_operation_binary_runner(
+            ["git", "ls-files", "--unmerged", "-z"],
+            cwd=workspace_path,
+            env=self._git_command_env,
+        )
+        stdout = getattr(result, "stdout", None)
+        if not isinstance(stdout, bytes):
+            raise RuntimeError("git ls-files returned invalid binary output")
+
+        stage_names = {b"1": "base", b"2": "ours", b"3": "theirs"}
+        entries: dict[str, dict[str, str]] = {}
+        for encoded_entry in stdout.split(b"\0"):
+            if not encoded_entry:
+                continue
+            header, separator, encoded_path = encoded_entry.partition(b"\t")
+            fields = header.split()
+            if not separator or not encoded_path or len(fields) != 3:
+                raise RuntimeError(
+                    "git ls-files returned an invalid unmerged entry"
+                )
+            _mode, encoded_object_id, encoded_stage = fields
+            stage = stage_names.get(encoded_stage)
+            try:
+                object_id = encoded_object_id.decode("ascii")
+            except UnicodeDecodeError as error:
+                raise RuntimeError(
+                    "git ls-files returned an invalid unmerged object ID"
+                ) from error
+            if (
+                stage is None
+                or len(object_id) not in {40, 64}
+                or any(
+                    character not in "0123456789abcdefABCDEF"
+                    for character in object_id
+                )
+            ):
+                raise RuntimeError(
+                    "git ls-files returned an invalid unmerged entry"
+                )
+
+            semantic_path = os.fsdecode(encoded_path)
+            self._repository_relative_path(semantic_path)
+            stages = entries.setdefault(semantic_path, {})
+            if stage in stages:
+                raise RuntimeError(
+                    "git ls-files returned a duplicate unmerged stage"
+                )
+            stages[stage] = object_id
+        return entries
+
+    def repository_operation_state(
+        self,
+        workspace: str | Path,
+    ) -> dict[str, bool | list[str]]:
+        workspace_path = self._publication_workspace(workspace)
+        return {
+            "rebase_in_progress": self._rebase_in_progress(workspace_path),
+            "unmerged_paths": sorted(
+                self._unmerged_repository_entries(workspace_path)
+            ),
+        }
+
+    def export_repository_operation_artifacts(
+        self,
+        workspace: str | Path,
+        destination: str | Path,
+    ) -> dict[str, dict[str, str]]:
+        workspace_path = self._publication_workspace(workspace)
+        destination_path = self._publication_workspace(destination)
+        destination_path.mkdir(parents=True, exist_ok=True)
+        destination_root = destination_path.resolve()
+        entries = self._unmerged_repository_entries(workspace_path)
+        manifest: dict[str, dict[str, str]] = {}
+
+        for semantic_path in sorted(entries):
+            relative_path = self._repository_relative_path(semantic_path)
+            artifacts: dict[str, str] = {}
+            for stage in ("base", "ours", "theirs"):
+                object_id = entries[semantic_path].get(stage)
+                if object_id is None:
+                    continue
+                result = self._repository_operation_binary_runner(
+                    ["git", "cat-file", "blob", object_id],
+                    cwd=workspace_path,
+                    env=self._git_command_env,
+                )
+                contents = getattr(result, "stdout", None)
+                if not isinstance(contents, bytes):
+                    raise RuntimeError(
+                        "git cat-file returned invalid binary output"
+                    )
+
+                artifact_relative = Path(stage) / relative_path
+                artifact_path = destination_root / artifact_relative
+                artifact_parent = destination_root
+                for part in artifact_relative.parent.parts:
+                    artifact_parent /= part
+                    if artifact_parent.is_symlink():
+                        raise ValueError(
+                            "artifact destination contains a symbolic-link "
+                            "directory"
+                        )
+                    artifact_parent.mkdir(exist_ok=True)
+                    if not artifact_parent.is_dir():
+                        raise ValueError(
+                            "artifact destination contains a non-directory "
+                            "parent"
+                        )
+                if artifact_path.is_symlink():
+                    raise ValueError(
+                        "artifact destination contains a symbolic-link "
+                        "artifact"
+                    )
+                artifact_path.write_bytes(contents)
+                artifacts[stage] = artifact_relative.as_posix()
+            manifest[semantic_path] = artifacts
+        return manifest
+
+    def continue_repository_operation(
+        self,
+        workspace: str | Path,
+        paths: list[str],
+    ) -> bool:
+        workspace_path = self._publication_workspace(workspace)
+        if not self._rebase_in_progress(workspace_path):
+            return False
+        if not isinstance(paths, list):
+            raise TypeError("paths must be a list")
+
+        repository_paths = []
+        seen_paths = set()
+        for semantic_path in paths:
+            self._repository_relative_path(semantic_path)
+            if semantic_path not in seen_paths:
+                repository_paths.append(semantic_path)
+                seen_paths.add(semantic_path)
+        if repository_paths:
+            self._command_runner(
+                ["git", "add", "--", *repository_paths],
+                cwd=workspace_path,
+                env=self._git_literal_path_env,
+            )
+        self._command_runner(
+            ["git", "rebase", "--continue"],
+            cwd=workspace_path,
+            env=self._git_rebase_continue_env,
+        )
         return True
 
     def _prepare_issue_branch(
@@ -713,7 +894,6 @@ class GitHubClient:
         workspace_path: Path,
     ) -> tuple[str, str]:
         branch = f"agent/issue-{issue_number}"
-        self._abort_rebase_if_in_progress(workspace_path)
         self._command_runner(
             ["git", "checkout", "-B", branch],
             cwd=workspace_path,
@@ -747,18 +927,11 @@ class GitHubClient:
                 cwd=workspace_path,
                 env=self._git_identity_env,
             )
-        try:
-            self._command_runner(
-                ["git", "rebase", f"origin/{target_branch}"],
-                cwd=workspace_path,
-                env=self._git_identity_env,
-            )
-        except subprocess.CalledProcessError as error:
-            if not self._abort_rebase_if_in_progress(workspace_path):
-                raise
-            raise PublicationRebaseConflictError(
-                f"publication rebase onto target branch {target_branch!r} conflicted"
-            ) from error
+        self._command_runner(
+            ["git", "rebase", f"origin/{target_branch}"],
+            cwd=workspace_path,
+            env=self._git_identity_env,
+        )
         local_head = self._rev_parse_commit("HEAD", workspace_path)
         if not remote_head or local_head != remote_head:
             self._command_runner(

@@ -5,7 +5,6 @@ import subprocess
 
 import pytest
 
-from repogents.errors import PublicationRebaseConflictError
 from repogents.github import (
     FeedbackAddress,
     GitHubClient,
@@ -773,7 +772,7 @@ def test_prepare_publication_returns_exact_frozen_candidate_and_diff_without_rem
 
 
 
-def test_prepare_publication_recovers_stale_rebase_then_bounds_reproducible_conflict(
+def test_prepare_publication_preserves_rebase_conflicts_and_resumes_from_artifacts(
     tmp_path,
 ):
     remote = tmp_path / "remote.git"
@@ -790,84 +789,201 @@ def test_prepare_publication_recovers_stale_rebase_then_bounds_reproducible_conf
             text=True,
         ).stdout.strip()
 
+    def commit(cwd, message):
+        git("add", "--all", cwd=cwd)
+        git(
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            message,
+            cwd=cwd,
+        )
+
     git("init", "--bare", str(remote))
     git("init", "-b", "main", str(seed))
-    (seed / "shared.txt").write_text("base content\n")
-    git("add", "shared.txt", cwd=seed)
-    git(
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.invalid",
-        "commit",
-        "-m",
-        "Base",
-        cwd=seed,
-    )
+    (seed / "shared.txt").write_text("base shared\n", encoding="utf-8")
+    (seed / "later.txt").write_text("base later\n", encoding="utf-8")
+    commit(seed, "Base")
     git("remote", "add", "origin", str(remote), cwd=seed)
     git("push", "--set-upstream", "origin", "main", cwd=seed)
 
     git("clone", "--branch", "main", str(remote), str(workspace))
+    git("config", "core.editor", "true", cwd=workspace)
     git("checkout", "-b", issue_branch, cwd=workspace)
-    (workspace / "shared.txt").write_text("issue content\n")
-    git("add", "shared.txt", cwd=workspace)
-    git(
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.invalid",
-        "commit",
-        "-m",
-        "Issue work",
-        cwd=workspace,
-    )
+    (workspace / "shared.txt").write_text("issue shared\n", encoding="utf-8")
+    commit(workspace, "Change shared source")
+    (workspace / "later.txt").write_text("issue later\n", encoding="utf-8")
+    commit(workspace, "Change later source")
     issue_head = git("rev-parse", "HEAD", cwd=workspace)
 
-    (seed / "shared.txt").write_text("target content\n")
-    git("add", "shared.txt", cwd=seed)
-    git(
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.invalid",
-        "commit",
-        "-m",
-        "Advance target",
-        cwd=seed,
-    )
+    (seed / "shared.txt").write_text("target shared\n", encoding="utf-8")
+    (seed / "later.txt").write_text("target later\n", encoding="utf-8")
+    commit(seed, "Advance target")
+    target_head = git("rev-parse", "HEAD", cwd=seed)
     git("push", "origin", "main", cwd=seed)
-    git("fetch", "origin", "main", cwd=workspace)
 
-    stale_rebase = subprocess.run(
-        ["git", "rebase", "origin/main"],
-        cwd=workspace,
-        check=False,
-        capture_output=True,
-        text=True,
+    completed_errors = []
+
+    def command_runner(args, *, cwd=None, env=None):
+        command_env = os.environ.copy()
+        command_env.update(env or {})
+        try:
+            return subprocess.run(
+                args,
+                cwd=cwd,
+                env=command_env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as error:
+            completed_errors.append(error)
+            raise
+
+    client = GitHubClient(
+        "placeholder-token",
+        command_runner=command_runner,
     )
-    assert stale_rebase.returncode != 0
-    assert any(
-        (workspace / ".git" / metadata).exists()
-        for metadata in ("rebase-merge", "rebase-apply")
+
+    with pytest.raises(subprocess.CalledProcessError) as captured:
+        client.prepare_publication(7, "main", workspace)
+
+    assert completed_errors == [captured.value]
+    assert captured.value is completed_errors[0]
+    assert captured.value.cmd == ["git", "rebase", "origin/main"]
+    assert captured.value.returncode == 1
+    assert isinstance(captured.value.stdout, str)
+    assert isinstance(captured.value.stderr, str)
+
+    rebase_states = [
+        workspace / ".git" / name
+        for name in ("rebase-merge", "rebase-apply")
+        if (workspace / ".git" / name).exists()
+    ]
+    assert len(rebase_states) == 1
+    assert client.repository_operation_state(workspace) == {
+        "rebase_in_progress": True,
+        "unmerged_paths": ["shared.txt"],
+    }
+    unmerged_entries = git("ls-files", "--unmerged", cwd=workspace).splitlines()
+    assert {entry.split(maxsplit=3)[2] for entry in unmerged_entries} == {
+        "1",
+        "2",
+        "3",
+    }
+    assert {
+        entry.split("\t", maxsplit=1)[1] for entry in unmerged_entries
+    } == {"shared.txt"}
+    conflicted_shared = (workspace / "shared.txt").read_text(encoding="utf-8")
+    assert conflicted_shared.startswith("<<<<<<< ")
+    assert "\n=======\n" in conflicted_shared
+    assert "\n>>>>>>> " in conflicted_shared
+    assert "target shared\n" in conflicted_shared
+    assert "issue shared\n" in conflicted_shared
+    assert git("rev-parse", f"refs/heads/{issue_branch}", cwd=workspace) == issue_head
+    assert not (workspace / ".git" / "repogents-workspace-unusable").exists()
+
+    first_artifacts = tmp_path / "first-operation-artifacts"
+    first_manifest = client.export_repository_operation_artifacts(
+        workspace,
+        first_artifacts,
     )
-    assert git("ls-files", "--unmerged", cwd=workspace)
+    assert first_manifest == {
+        "shared.txt": {
+            "base": "base/shared.txt",
+            "ours": "ours/shared.txt",
+            "theirs": "theirs/shared.txt",
+        }
+    }
+    assert (first_artifacts / "base/shared.txt").read_text(encoding="utf-8") == (
+        "base shared\n"
+    )
+    assert (first_artifacts / "ours/shared.txt").read_text(encoding="utf-8") == (
+        "target shared\n"
+    )
+    assert (first_artifacts / "theirs/shared.txt").read_text(encoding="utf-8") == (
+        "issue shared\n"
+    )
+    assert (workspace / "shared.txt").read_text(encoding="utf-8") == conflicted_shared
+    assert client.repository_operation_state(workspace) == {
+        "rebase_in_progress": True,
+        "unmerged_paths": ["shared.txt"],
+    }
 
-    with pytest.raises(PublicationRebaseConflictError):
-        GitHubClient("placeholder-token").prepare_publication(
-            7,
-            "main",
-            workspace,
-        )
+    (workspace / "shared.txt").write_text("resolved shared\n", encoding="utf-8")
+    with pytest.raises(subprocess.CalledProcessError) as later_conflict:
+        client.continue_repository_operation(workspace, ["shared.txt"])
 
+    assert later_conflict.value is completed_errors[-1]
+    assert later_conflict.value.cmd == ["git", "rebase", "--continue"]
+    assert later_conflict.value.returncode == 1
+    assert isinstance(later_conflict.value.stdout, str)
+    assert isinstance(later_conflict.value.stderr, str)
+    assert client.repository_operation_state(workspace) == {
+        "rebase_in_progress": True,
+        "unmerged_paths": ["later.txt"],
+    }
+    assert git("show", "HEAD:shared.txt", cwd=workspace) == "resolved shared"
+    conflicted_later = (workspace / "later.txt").read_text(encoding="utf-8")
+    assert conflicted_later.startswith("<<<<<<< ")
+    assert "\n=======\n" in conflicted_later
+    assert "\n>>>>>>> " in conflicted_later
+    assert "target later\n" in conflicted_later
+    assert "issue later\n" in conflicted_later
+
+    later_artifacts = tmp_path / "later-operation-artifacts"
+    later_manifest = client.export_repository_operation_artifacts(
+        workspace,
+        later_artifacts,
+    )
+    assert later_manifest == {
+        "later.txt": {
+            "base": "base/later.txt",
+            "ours": "ours/later.txt",
+            "theirs": "theirs/later.txt",
+        }
+    }
+    assert (later_artifacts / "base/later.txt").read_text(encoding="utf-8") == (
+        "base later\n"
+    )
+    assert (later_artifacts / "ours/later.txt").read_text(encoding="utf-8") == (
+        "target later\n"
+    )
+    assert (later_artifacts / "theirs/later.txt").read_text(encoding="utf-8") == (
+        "issue later\n"
+    )
+
+    (workspace / "later.txt").write_text("resolved later\n", encoding="utf-8")
+    assert client.continue_repository_operation(workspace, ["later.txt"]) is True
+    assert client.repository_operation_state(workspace) == {
+        "rebase_in_progress": False,
+        "unmerged_paths": [],
+    }
     assert not any(
         (workspace / ".git" / metadata).exists()
         for metadata in ("rebase-merge", "rebase-apply")
     )
     assert git("ls-files", "--unmerged", cwd=workspace) == ""
-    assert git("status", "--porcelain", cwd=workspace) == ""
+
+    candidate, candidate_diff = client.prepare_publication(7, "main", workspace)
+
+    assert candidate == PublicationCandidate(
+        branch=issue_branch,
+        head_sha=git("rev-parse", "HEAD", cwd=workspace),
+        target_head_sha=target_head,
+        remote_head_sha="",
+    )
+    assert "-target shared" in candidate_diff
+    assert "+resolved shared" in candidate_diff
+    assert "-target later" in candidate_diff
+    assert "+resolved later" in candidate_diff
+    assert git("show", "HEAD:shared.txt", cwd=workspace) == "resolved shared"
+    assert git("show", "HEAD:later.txt", cwd=workspace) == "resolved later"
     assert git("branch", "--show-current", cwd=workspace) == issue_branch
-    assert git("rev-parse", "HEAD", cwd=workspace) == issue_head
-    assert git("show", "HEAD:shared.txt", cwd=workspace) == "issue content"
+    assert git("status", "--porcelain", cwd=workspace) == ""
 
 
 def test_prepare_publication_preserves_unfetched_remote_issue_head_ancestry_and_exact_diff(

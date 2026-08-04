@@ -1,4 +1,5 @@
 import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,42 @@ def test_runtime_config_rejects_caller_credentials(credential_field):
         RuntimeConfig(**{credential_field: "not-a-real-key"})
 
 
+def test_real_bubblewrap_environment_clears_inherited_credentials_and_returns_result(
+    monkeypatch,
+    tmp_path,
+):
+    credential_sentinel = "REPOGENTS_TEST_CREDENTIAL_SENTINEL"
+    monkeypatch.setenv(credential_sentinel, "must-not-reach-agent-shell")
+
+    class FakeAgent:
+        def __init__(self, model, environment, **kwargs):
+            self.environment = environment
+
+        def run(self, task, **kwargs):
+            result_path = shlex.quote(kwargs["result_path"])
+            execution = self.environment.execute(
+                {
+                    "command": (
+                        f'if test -n "${{{credential_sentinel}+x}}"; '
+                        "then exposed=true; else exposed=false; fi; "
+                        'printf \'{"credential_exposed":%s,"status":"returned"}\\n\' '
+                        f'"$exposed" > {result_path}'
+                    )
+                }
+            )
+            assert execution["returncode"] == 0, execution
+            return {"exit_status": "Submitted"}
+
+    monkeypatch.setattr(agent_runtime, "LitellmModel", lambda **kwargs: object())
+    monkeypatch.setattr(agent_runtime, "DefaultAgent", FakeAgent)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    result = MiniSweRuntime(RuntimeConfig()).run("inspect the shell environment", workspace)
+
+    assert result == {"credential_exposed": False, "status": "returned"}
+
+
 def test_each_run_uses_a_fresh_direct_local_bubblewrap_agent(monkeypatch, tmp_path):
     records = _install_factories(monkeypatch, lambda call: json.dumps({"call": call}))
     workspace = tmp_path / "workspace"
@@ -106,10 +143,10 @@ def test_each_run_uses_a_fresh_direct_local_bubblewrap_agent(monkeypatch, tmp_pa
             },
         },
     ]
-    assert [environment.kwargs for environment in records["environments"]] == [
-        {"cwd": str(workspace.resolve()), "timeout": 19},
-        {"cwd": str(workspace.resolve()), "timeout": 19},
-    ]
+    for environment in records["environments"]:
+        assert environment.kwargs["cwd"] == str(workspace.resolve())
+        assert environment.kwargs["timeout"] == 19
+        assert environment.kwargs["wrapper_args"][0] == "--clearenv"
     assert [agent.kwargs["step_limit"] for agent in records["agents"]] == [7, 7]
     assert [agent.kwargs["cost_limit"] for agent in records["agents"]] == [0, 0]
     result_paths = [Path(run["kwargs"]["result_path"]) for run in records["runs"]]

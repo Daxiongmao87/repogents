@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import stat
 import subprocess
 import threading
 import time
@@ -10,7 +12,6 @@ import pytest
 from pathlib import Path
 
 from repogents.application import Application, ApplicationConfig
-from repogents.errors import PublicationRebaseConflictError
 from repogents.github import (
     FeedbackAddress,
     GitHubClient,
@@ -87,6 +88,25 @@ class FakeGitHub:
         self.mutate_candidate_workspace = False
         self.follow_up_issues: dict[str, GitHubIssue] = {}
         self.follow_up_requests: list[tuple[str, str, str, str]] = []
+        self.prepare_publication_failures: deque[BaseException] = deque()
+        self.repository_operation_state_result = {
+            "rebase_in_progress": False,
+            "unmerged_paths": [],
+        }
+        self.repository_operation_state_calls: list[Path] = []
+        self.export_repository_operation_artifacts_calls: list[
+            tuple[Path, Path]
+        ] = []
+        self.repository_operation_artifact_contents: dict[
+            str, dict[str, str]
+        ] = {}
+        self.continue_repository_operation_calls: list[
+            tuple[Path, list[str]]
+        ] = []
+        self.continue_repository_operation_results: deque[
+            bool | BaseException
+        ] = deque()
+        self.repository_operation_events: list[tuple[str, Path]] = []
 
     def repository(self, github_repository: str) -> dict:
         return {
@@ -108,6 +128,87 @@ class FakeGitHub:
         path.mkdir(parents=True, exist_ok=True)
         self.checkout_calls.append((github_repository, target_branch, path))
         return path
+
+    def repository_operation_state(
+        self,
+        workspace: str | Path,
+    ) -> dict:
+        path = Path(workspace)
+        self.repository_operation_state_calls.append(path)
+        self.repository_operation_events.append(
+            ("repository_operation_state", path)
+        )
+        return {
+            "rebase_in_progress": self.repository_operation_state_result[
+                "rebase_in_progress"
+            ],
+            "unmerged_paths": list(
+                self.repository_operation_state_result["unmerged_paths"]
+            ),
+        }
+
+    def export_repository_operation_artifacts(
+        self,
+        workspace: str | Path,
+        destination: str | Path,
+    ) -> dict:
+        workspace_path = Path(workspace)
+        destination_path = Path(destination)
+        self.export_repository_operation_artifacts_calls.append(
+            (workspace_path, destination_path)
+        )
+        self.repository_operation_events.append(
+            ("export_repository_operation_artifacts", workspace_path)
+        )
+        manifest = {}
+        for semantic_path in self.repository_operation_state_result[
+            "unmerged_paths"
+        ]:
+            contents = self.repository_operation_artifact_contents.get(
+                semantic_path,
+                {
+                    stage: f"{stage} version of {semantic_path}\n"
+                    for stage in ("base", "ours", "theirs")
+                },
+            )
+            artifacts = {}
+            for stage in ("base", "ours", "theirs"):
+                relative_path = Path(stage) / semantic_path
+                artifact_path = destination_path / relative_path
+                artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                artifact_path.write_text(contents[stage])
+                artifacts[stage] = relative_path.as_posix()
+            manifest[semantic_path] = artifacts
+        return manifest
+
+    def continue_repository_operation(
+        self,
+        workspace: str | Path,
+        paths: list[str],
+    ) -> bool:
+        workspace_path = Path(workspace)
+        copied_paths = list(paths)
+        self.continue_repository_operation_calls.append(
+            (workspace_path, copied_paths)
+        )
+        self.repository_operation_events.append(
+            ("continue_repository_operation", workspace_path)
+        )
+        outcome = (
+            self.continue_repository_operation_results.popleft()
+            if self.continue_repository_operation_results
+            else bool(
+                self.repository_operation_state_result["rebase_in_progress"]
+            )
+        )
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome:
+            self.repository_operation_state_result = {
+                "rebase_in_progress": False,
+                "unmerged_paths": [],
+            }
+        return outcome
 
     def candidate_diff(
         self,
@@ -132,6 +233,11 @@ class FakeGitHub:
         self.prepare_publication_calls.append(
             (issue_number, target_branch, path)
         )
+        self.repository_operation_events.append(
+            ("prepare_publication", path)
+        )
+        if self.prepare_publication_failures:
+            raise self.prepare_publication_failures.popleft()
         if self.prepare_publication_overrides:
             return self.prepare_publication_overrides.popleft()
         head_sha = (
@@ -357,6 +463,31 @@ class ScriptedRuntime:
             }
         )
         return self.results[payload["kind"]].popleft()
+
+
+class WorkspaceScriptedRuntime(ScriptedRuntime):
+    def __init__(self):
+        super().__init__()
+        self.workspace_actions: dict[str, deque] = defaultdict(deque)
+        self.workspace_observations: list[dict] = []
+
+    def queue_workspace_action(self, kind: str, *actions) -> None:
+        self.workspace_actions[kind].extend(actions)
+
+    def run(self, task: str, workspace: str | Path, **kwargs) -> dict:
+        payload = json.loads(task)
+        path = Path(workspace)
+        self.workspace_observations.append(
+            {
+                "kind": payload["kind"],
+                "path": path,
+                "has_git": (path / ".git").exists(),
+                "has_controller_metadata": (path / ".repogents").exists(),
+            }
+        )
+        if self.workspace_actions[payload["kind"]]:
+            self.workspace_actions[payload["kind"]].popleft()(path)
+        return super().run(task, workspace, **kwargs)
 
 
 class BlockingWorkRuntime(ScriptedRuntime):
@@ -1627,6 +1758,1166 @@ def test_dynamic_nodes_run_concurrently_keep_busy_queue_and_hold_validation_barr
     app.close()
 
 
+def test_agent_turns_use_gitless_disposable_snapshots_and_import_only_work_delta(
+    tmp_path,
+):
+    classification = "change/source-area"
+    runtime = WorkspaceScriptedRuntime()
+    runtime.queue(
+        "specify",
+        package(("source-delta", classification), prefix="workspace"),
+    )
+    runtime.queue(
+        "node_role",
+        {"role_prompt": "Own agent-selected source changes."},
+    )
+    runtime.queue("work", ready_result("source delta completed"))
+    runtime.queue("validate", validation(True, "source delta is valid"))
+    work_views = []
+    validation_views = []
+
+    def write_during_specify(agent_workspace: Path) -> None:
+        (agent_workspace / "src").mkdir(parents=True, exist_ok=True)
+        (agent_workspace / "specify-only.txt").write_text("discard me\n")
+        (agent_workspace / "src" / "existing.py").write_text(
+            "specify write\n"
+        )
+
+    def write_during_node_role(agent_workspace: Path) -> None:
+        (agent_workspace / "src" / "role-only.py").write_text("discard me\n")
+
+    def write_during_work(agent_workspace: Path) -> None:
+        work_views.append(
+            {
+                "existing": (
+                    agent_workspace / "src" / "existing.py"
+                ).read_text(),
+                "role_write_exists": (
+                    agent_workspace / "src" / "role-only.py"
+                ).exists(),
+            }
+        )
+        (agent_workspace / "src" / "existing.py").write_text("edited by work\n")
+        (agent_workspace / "src" / "added.py").write_text("added by work\n")
+        (agent_workspace / "src" / "obsolete.py").unlink()
+
+    def write_during_validate(agent_workspace: Path) -> None:
+        validation_views.append(
+            {
+                "existing": (
+                    agent_workspace / "src" / "existing.py"
+                ).read_text(),
+                "added": (agent_workspace / "src" / "added.py").read_text(),
+                "obsolete_exists": (
+                    agent_workspace / "src" / "obsolete.py"
+                ).exists(),
+            }
+        )
+        (agent_workspace / "src" / "existing.py").write_text(
+            "validate write\n"
+        )
+        (agent_workspace / "validate-only.txt").write_text("discard me\n")
+
+    runtime.queue_workspace_action("specify", write_during_specify)
+    runtime.queue_workspace_action("node_role", write_during_node_role)
+    runtime.queue_workspace_action("work", write_during_work)
+    runtime.queue_workspace_action("validate", write_during_validate)
+    app, store, github, runtime = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={classification: [1.0, 0.0]},
+    )
+    repository = app.add_repository("acme/widget")
+    github.issues = [
+        GitHubIssue(
+            7,
+            "Change source",
+            "Edit, add, and delete source files.",
+            "https://issue/7",
+        )
+    ]
+
+    app.poll_once()
+    run = store.list_runs(repository["id"])[0]
+    workspace = (
+        tmp_path
+        / "runtime"
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    (workspace / "src").mkdir()
+    (workspace / "src" / "existing.py").write_text("original\n")
+    (workspace / "src" / "obsolete.py").write_text("remove me\n")
+    (workspace / ".git").mkdir()
+    (workspace / ".git" / "config").write_text("credential = controller-only\n")
+    (workspace / ".repogents").mkdir()
+    (workspace / ".repogents" / "operation.json").write_text(
+        '{"owner":"controller"}\n'
+    )
+
+    drive_until(
+        app,
+        lambda: store.get_run(run["id"])["state"] == "PR_LISTENING",
+    )
+
+    assert [
+        observation["kind"]
+        for observation in runtime.workspace_observations
+    ] == ["specify", "node_role", "work", "validate"]
+    assert all(
+        not observation["has_git"]
+        and not observation["has_controller_metadata"]
+        and observation["path"] != workspace
+        for observation in runtime.workspace_observations
+    )
+    assert all(
+        not observation["path"].exists()
+        for observation in runtime.workspace_observations
+    )
+    assert work_views == [
+        {
+            "existing": "original\n",
+            "role_write_exists": False,
+        }
+    ]
+    assert validation_views == [
+        {
+            "existing": "edited by work\n",
+            "added": "added by work\n",
+            "obsolete_exists": False,
+        }
+    ]
+    assert (workspace / "src" / "existing.py").read_text() == "edited by work\n"
+    assert (workspace / "src" / "added.py").read_text() == "added by work\n"
+    assert not (workspace / "src" / "obsolete.py").exists()
+    assert not (workspace / "specify-only.txt").exists()
+    assert not (workspace / "src" / "role-only.py").exists()
+    assert not (workspace / "validate-only.txt").exists()
+    assert (
+        workspace / ".git" / "config"
+    ).read_text() == "credential = controller-only\n"
+    assert (
+        workspace / ".repogents" / "operation.json"
+    ).read_text() == '{"owner":"controller"}\n'
+    completed_work = store.list_work_items(run["id"])[0]
+    assert completed_work["result"]["artifacts"] == []
+    app.close()
+
+
+def test_invalid_work_output_discards_disposable_source_delta(tmp_path):
+    classification = "change/invalid-output-area"
+    runtime = WorkspaceScriptedRuntime()
+    runtime.queue(
+        "specify",
+        package(("invalid-delta", classification), prefix="invalid"),
+    )
+    runtime.queue(
+        "work",
+        {
+            "outcome": "ready_for_validation",
+            "output": "must not commit this delta",
+            "artifacts": "not-a-list",
+            "test_results": [],
+            "repository_state": {},
+        },
+    )
+
+    def write_before_invalid_result(agent_workspace: Path) -> None:
+        (agent_workspace / "source.py").write_text("invalid edit\n")
+        (agent_workspace / "invalid-addition.py").write_text(
+            "must not import\n"
+        )
+
+    runtime.queue_workspace_action("work", write_before_invalid_result)
+    app, store, github, runtime = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={classification: [1.0, 0.0]},
+    )
+    repository = app.add_repository("acme/widget")
+    store.create_dynamic_node(
+        repository["id"],
+        classification,
+        [1.0, 0.0],
+        "Own source changes.",
+    )
+    github.issues = [
+        GitHubIssue(7, "Invalid output", "Change source", "https://issue/7")
+    ]
+
+    app.poll_once()
+    run = store.list_runs(repository["id"])[0]
+    workspace = (
+        tmp_path
+        / "runtime"
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    (workspace / "source.py").write_text("original\n")
+    app.poll_once()
+    drive_until(
+        app,
+        lambda: bool(store.list_work_items(run["id"]))
+        and store.list_work_items(run["id"])[0]["state"]
+        in {"COMPLETED", "FAILED"},
+    )
+
+    failed_work = store.list_work_items(run["id"])[0]
+    assert failed_work["state"] == "FAILED"
+    assert (workspace / "source.py").read_text() == "original\n"
+    assert not (workspace / "invalid-addition.py").exists()
+    work_observation = next(
+        observation
+        for observation in runtime.workspace_observations
+        if observation["kind"] == "work"
+    )
+    assert work_observation["path"] != workspace
+    assert store.list_validations(run["id"]) == []
+    app.close()
+    assert not work_observation["path"].exists()
+
+
+def test_concurrent_disposable_work_preserves_disjoint_deltas_and_rejects_stale_overlap(
+    tmp_path,
+):
+    first_key = "first-delta"
+    disjoint_key = "disjoint-delta"
+    stale_key = "stale-overlap"
+
+    class ConcurrentDeltaRuntime(ScriptedRuntime):
+        def __init__(self):
+            super().__init__()
+            self.snapshot_barrier = threading.Barrier(3)
+            self.all_started = threading.Event()
+            self.release_disjoint = threading.Event()
+            self.release_stale = threading.Event()
+            self.workspaces: dict[str, Path] = {}
+            self.initial_shared_contents: dict[str, str] = {}
+
+        def run(self, task: str, workspace: str | Path, **kwargs) -> dict:
+            payload = json.loads(task)
+            if payload["kind"] != "work":
+                return super().run(task, workspace, **kwargs)
+            key = payload["context"]["work_item"]["key"]
+            agent_workspace = Path(workspace)
+            self.workspaces[key] = agent_workspace
+            self.initial_shared_contents[key] = (
+                agent_workspace / "shared.txt"
+            ).read_text()
+            barrier_index = self.snapshot_barrier.wait(timeout=5)
+            if barrier_index == 0:
+                self.all_started.set()
+            if key == first_key:
+                (agent_workspace / "shared.txt").write_text("first wins\n")
+                (agent_workspace / "first.txt").write_text("first delta\n")
+            elif key == disjoint_key:
+                self.release_disjoint.wait(timeout=5)
+                (agent_workspace / "disjoint.txt").write_text(
+                    "disjoint delta\n"
+                )
+            elif key == stale_key:
+                self.release_stale.wait(timeout=5)
+                (agent_workspace / "shared.txt").write_text(
+                    "stale overwrite\n"
+                )
+            return ready_result(f"completed {key}")
+
+    classifications = {
+        first_key: "change/first-area",
+        disjoint_key: "change/disjoint-area",
+        stale_key: "change/stale-area",
+    }
+    vectors = {
+        classifications[first_key]: [1.0, 0.0],
+        classifications[disjoint_key]: [0.0, 1.0],
+        classifications[stale_key]: [-1.0, 0.0],
+    }
+    runtime = ConcurrentDeltaRuntime()
+    runtime.queue(
+        "specify",
+        package(
+            (first_key, classifications[first_key]),
+            (disjoint_key, classifications[disjoint_key]),
+            (stale_key, classifications[stale_key]),
+            prefix="concurrent-delta",
+        ),
+    )
+    app, store, github, runtime = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors=vectors,
+        max_workers=4,
+    )
+    repository = app.add_repository("acme/widget")
+    for key, classification in classifications.items():
+        store.create_dynamic_node(
+            repository["id"],
+            classification,
+            vectors[classification],
+            f"Own {key} work.",
+        )
+    github.issues = [
+        GitHubIssue(
+            7,
+            "Concurrent deltas",
+            "Apply disjoint work without stale overwrite.",
+            "https://issue/7",
+        )
+    ]
+
+    app.poll_once()
+    run = store.list_runs(repository["id"])[0]
+    workspace = (
+        tmp_path
+        / "runtime"
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    (workspace / "shared.txt").write_text("base\n")
+    app.poll_once()
+    assert runtime.all_started.wait(timeout=5)
+
+    def work_state(key: str) -> str | None:
+        return next(
+            (
+                item["state"]
+                for item in store.list_work_items(run["id"])
+                if item["key"] == key
+            ),
+            None,
+        )
+
+    drive_until(app, lambda: work_state(first_key) == "COMPLETED")
+    assert (workspace / "shared.txt").read_text() == "first wins\n"
+    assert (workspace / "first.txt").read_text() == "first delta\n"
+
+    runtime.release_disjoint.set()
+    drive_until(app, lambda: work_state(disjoint_key) == "COMPLETED")
+    assert (workspace / "shared.txt").read_text() == "first wins\n"
+    assert (workspace / "first.txt").read_text() == "first delta\n"
+    assert (
+        workspace / "disjoint.txt"
+    ).read_text() == "disjoint delta\n"
+
+    runtime.release_stale.set()
+    drive_until(
+        app,
+        lambda: work_state(stale_key) in {"COMPLETED", "FAILED"},
+    )
+
+    assert work_state(stale_key) == "FAILED"
+    assert (workspace / "shared.txt").read_text() == "first wins\n"
+    assert (workspace / "first.txt").read_text() == "first delta\n"
+    assert (
+        workspace / "disjoint.txt"
+    ).read_text() == "disjoint delta\n"
+    assert set(runtime.initial_shared_contents.values()) == {"base\n"}
+    assert len(set(runtime.workspaces.values())) == 3
+    assert store.list_validations(run["id"]) == []
+    app.close()
+    assert all(
+        agent_workspace != workspace and not agent_workspace.exists()
+        for agent_workspace in runtime.workspaces.values()
+    )
+
+
+def test_successful_work_replaces_read_only_file_and_preserves_read_only_modes(
+    tmp_path,
+):
+    classification = "change/read-only-source"
+    runtime = WorkspaceScriptedRuntime()
+    runtime.queue(
+        "specify",
+        package(("read-only-delta", classification), prefix="read-only"),
+    )
+    runtime.queue("work", ready_result("read-only source delta completed"))
+
+    def replace_read_only_source(agent_workspace: Path) -> None:
+        read_only_file = agent_workspace / "read-only.txt"
+        read_only_file.unlink()
+        read_only_file.write_bytes(b"replacement\n")
+        read_only_file.chmod(0o440)
+        read_only_directory = agent_workspace / "read-only-directory"
+        read_only_directory.mkdir()
+        (read_only_directory / "payload.txt").write_bytes(b"payload\n")
+        read_only_directory.chmod(0o550)
+
+    runtime.queue_workspace_action("work", replace_read_only_source)
+    app, store, github, runtime = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={classification: [1.0, 0.0]},
+    )
+    repository = app.add_repository("acme/widget")
+    store.create_dynamic_node(
+        repository["id"],
+        classification,
+        [1.0, 0.0],
+        "Own read-only source changes.",
+    )
+    github.issues = [
+        GitHubIssue(
+            7,
+            "Update read-only source",
+            "Replace a file and create a directory.",
+            "https://issue/7",
+        )
+    ]
+
+    app.poll_once()
+    run = store.list_runs(repository["id"])[0]
+    workspace = (
+        tmp_path
+        / "runtime"
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    read_only_file = workspace / "read-only.txt"
+    read_only_file.write_bytes(b"original\n")
+    read_only_file.chmod(0o400)
+
+    app.poll_once()
+    drive_until(
+        app,
+        lambda: store.list_work_items(run["id"])[0]["state"]
+        in {"COMPLETED", "FAILED"},
+    )
+
+    completed_work = store.list_work_items(run["id"])[0]
+    read_only_directory = workspace / "read-only-directory"
+    assert completed_work["state"] == "COMPLETED"
+    assert read_only_file.read_bytes() == b"replacement\n"
+    assert stat.S_IMODE(read_only_file.stat().st_mode) == 0o440
+    assert (read_only_directory / "payload.txt").read_bytes() == b"payload\n"
+    assert stat.S_IMODE(read_only_directory.stat().st_mode) == 0o550
+    app.close()
+
+
+@pytest.mark.parametrize(
+    "link_target",
+    ["../outside-source.py", ".git/config"],
+    ids=["parent-escape", "controller-metadata"],
+)
+def test_work_delta_with_unsafe_symlink_rejects_the_entire_import(
+    tmp_path,
+    link_target,
+):
+    classification = "change/link-boundary"
+    runtime = WorkspaceScriptedRuntime()
+    runtime.queue(
+        "specify",
+        package(("unsafe-link-delta", classification), prefix="link"),
+    )
+    runtime.queue("work", ready_result("source and link updated"))
+
+    def edit_source_and_create_link(agent_workspace: Path) -> None:
+        (agent_workspace / "source.py").write_bytes(b"untrusted edit\n")
+        (agent_workspace / "untrusted-link").symlink_to(link_target)
+
+    runtime.queue_workspace_action("work", edit_source_and_create_link)
+    app, store, github, runtime = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={classification: [1.0, 0.0]},
+    )
+    repository = app.add_repository("acme/widget")
+    store.create_dynamic_node(
+        repository["id"],
+        classification,
+        [1.0, 0.0],
+        "Own bounded source changes.",
+    )
+    github.issues = [
+        GitHubIssue(
+            7,
+            "Reject unsafe link",
+            "Edit source without crossing controller boundaries.",
+            "https://issue/7",
+        )
+    ]
+
+    app.poll_once()
+    run = store.list_runs(repository["id"])[0]
+    workspace = (
+        tmp_path
+        / "runtime"
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    (workspace / "source.py").write_bytes(b"original\n")
+    (workspace / ".git").mkdir()
+    (workspace / ".git" / "config").write_bytes(b"controller config\n")
+
+    app.poll_once()
+    drive_until(
+        app,
+        lambda: store.list_work_items(run["id"])[0]["state"]
+        in {"COMPLETED", "FAILED"},
+    )
+
+    failed_work = store.list_work_items(run["id"])[0]
+    assert failed_work["state"] == "FAILED"
+    assert (workspace / "source.py").read_bytes() == b"original\n"
+    with pytest.raises(FileNotFoundError):
+        (workspace / "untrusted-link").lstat()
+    assert (workspace / ".git" / "config").read_bytes() == b"controller config\n"
+    assert store.list_validations(run["id"]) == []
+    app.close()
+
+
+def test_complete_work_failure_rolls_back_the_entire_imported_source_delta(
+    tmp_path,
+    monkeypatch,
+):
+    classification = "change/persistence-boundary"
+    runtime = WorkspaceScriptedRuntime()
+    runtime.queue(
+        "specify",
+        package(("persistence-delta", classification), prefix="persistence"),
+    )
+    runtime.queue("work", ready_result("source delta ready to persist"))
+
+    def change_source(agent_workspace: Path) -> None:
+        (agent_workspace / "edited.txt").write_bytes(b"edited\n")
+        (agent_workspace / "created.txt").write_bytes(b"created\n")
+        (agent_workspace / "deleted.txt").unlink()
+
+    runtime.queue_workspace_action("work", change_source)
+    app, store, github, runtime = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={classification: [1.0, 0.0]},
+    )
+    repository = app.add_repository("acme/widget")
+    store.create_dynamic_node(
+        repository["id"],
+        classification,
+        [1.0, 0.0],
+        "Own persisted source changes.",
+    )
+    github.issues = [
+        GitHubIssue(
+            7,
+            "Persist source result",
+            "Apply the source delta atomically.",
+            "https://issue/7",
+        )
+    ]
+
+    app.poll_once()
+    run = store.list_runs(repository["id"])[0]
+    workspace = (
+        tmp_path
+        / "runtime"
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    (workspace / "edited.txt").write_bytes(b"original\n")
+    (workspace / "deleted.txt").write_bytes(b"restore me\n")
+    completion_views = []
+
+    def fail_completion(work_id, result, handoff=None):
+        completion_views.append(
+            {
+                "edited": (workspace / "edited.txt").read_bytes(),
+                "created": (workspace / "created.txt").read_bytes(),
+                "deleted_exists": (workspace / "deleted.txt").exists(),
+            }
+        )
+        raise RuntimeError("durable work result unavailable")
+
+    monkeypatch.setattr(store, "complete_work", fail_completion)
+    app.poll_once()
+    drive_until(
+        app,
+        lambda: store.list_work_items(run["id"])[0]["state"]
+        in {"COMPLETED", "FAILED"},
+    )
+
+    assert completion_views == [
+        {
+            "edited": b"edited\n",
+            "created": b"created\n",
+            "deleted_exists": False,
+        }
+    ]
+    assert store.list_work_items(run["id"])[0]["state"] == "FAILED"
+    assert (workspace / "edited.txt").read_bytes() == b"original\n"
+    assert (workspace / "deleted.txt").read_bytes() == b"restore me\n"
+    assert not (workspace / "created.txt").exists()
+    assert store.list_validations(run["id"]) == []
+    app.close()
+
+
+def test_startup_restores_interrupted_import_before_requeue_and_preserves_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    database = tmp_path / "state.sqlite3"
+    data_dir = tmp_path / "runtime"
+    store = Store(database)
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    run, _ = store.create_run(
+        repository["id"],
+        7,
+        {
+            "number": 7,
+            "title": "Interrupt imported source",
+            "body": "Recover the pre-import tree on restart.",
+        },
+    )
+    execution_pass = store.create_pass(run["id"], "activation", {})
+    saved = store.save_specification_package(
+        run["id"],
+        execution_pass["id"],
+        package(
+            ("interrupted-source-delta", "change/interrupted-source"),
+            prefix="interrupt",
+        ),
+    )
+    node = store.create_dynamic_node(
+        repository["id"],
+        "change/interrupted-source",
+        [1.0, 0.0],
+        "Own interruption-safe source changes.",
+    )
+    assigned_work = store.assign_work(saved["work_items"][0]["id"], node["id"])
+    store.transition_run(run["id"], "WAITING_FOR_WORK_COMPLETION")
+
+    workspace = (
+        data_dir
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    workspace.mkdir(parents=True)
+    edited_path = workspace / "edited.txt"
+    deleted_path = workspace / "deleted.txt"
+    created_path = workspace / "created.txt"
+    edited_path.write_bytes(b"original editable source\n")
+    edited_path.chmod(0o640)
+    deleted_path.write_bytes(b"original deleted source\n")
+    deleted_path.chmod(0o640)
+    (workspace / ".git").mkdir()
+    (workspace / ".git" / "config").write_bytes(b"canonical git metadata\n")
+    (workspace / ".repogents").mkdir()
+    (workspace / ".repogents" / "controller.json").write_bytes(
+        b'{"owner":"controller"}\n'
+    )
+
+    def source_state() -> dict:
+        def regular_file_state(path: Path):
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                return None
+            return path.read_bytes(), stat.S_IMODE(metadata.st_mode)
+
+        return {
+            "edited": regular_file_state(edited_path),
+            "deleted": regular_file_state(deleted_path),
+            "created": regular_file_state(created_path),
+        }
+
+    pre_import_source = source_state()
+    fork_context = multiprocessing.get_context("fork")
+    completion_reached = fork_context.Event()
+    keep_child_at_completion = fork_context.Event()
+
+    def run_until_work_completion() -> None:
+        child_store = Store(database)
+        child_runtime = WorkspaceScriptedRuntime()
+        child_runtime.queue(
+            "work",
+            ready_result("interrupted source delta completed"),
+        )
+
+        def import_changed_source(agent_workspace: Path) -> None:
+            child_edited = agent_workspace / "edited.txt"
+            child_edited.unlink()
+            child_edited.write_bytes(b"imported editable source\n")
+            child_edited.chmod(0o600)
+            (agent_workspace / "deleted.txt").unlink()
+            (agent_workspace / "created.txt").write_bytes(
+                b"imported created source\n"
+            )
+            (agent_workspace / "created.txt").chmod(0o640)
+
+        child_runtime.queue_workspace_action("work", import_changed_source)
+        child_app = Application(
+            child_store,
+            FakeGitHub(),
+            child_runtime,
+            SemanticRouter(MapEmbedder({})),
+            ApplicationConfig(data_dir=data_dir),
+        )
+        claimed_work = child_store.claim_node_work(node["id"], run["id"])
+        if claimed_work is None:
+            raise RuntimeError("seeded work was not claimable")
+
+        def stop_at_complete_work(work_id, result, handoff=None):
+            completion_reached.set()
+            keep_child_at_completion.wait()
+
+        child_store.complete_work = stop_at_complete_work
+        child_app._run_work(node, claimed_work)
+
+    child = fork_context.Process(target=run_until_work_completion)
+    child.start()
+    try:
+        assert completion_reached.wait(timeout=5)
+        assert source_state() == {
+            "edited": (b"imported editable source\n", 0o600),
+            "deleted": None,
+            "created": (b"imported created source\n", 0o640),
+        }
+        assert store.list_work_items(run["id"])[0]["state"] == "RUNNING"
+    finally:
+        if child.is_alive():
+            child.terminate()
+        child.join(timeout=5)
+        if child.is_alive():
+            child.kill()
+            child.join(timeout=5)
+    assert not child.is_alive()
+    assert store.list_work_items(run["id"])[0]["state"] == "RUNNING"
+
+    restarted_store = Store(database)
+    original_recover_interrupted_work = (
+        restarted_store.recover_interrupted_work
+    )
+    before_requeue = []
+
+    def observe_source_before_requeue():
+        before_requeue.append(
+            {
+                "source": source_state(),
+                "work_state": restarted_store.list_work_items(run["id"])[0][
+                    "state"
+                ],
+            }
+        )
+        return original_recover_interrupted_work()
+
+    monkeypatch.setattr(
+        restarted_store,
+        "recover_interrupted_work",
+        observe_source_before_requeue,
+    )
+    restarted = Application(
+        restarted_store,
+        FakeGitHub(),
+        ScriptedRuntime(),
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(data_dir=data_dir),
+    )
+    restarted.acquire_service_ownership()
+    try:
+        assert before_requeue == [
+            {
+                "source": pre_import_source,
+                "work_state": "RUNNING",
+            }
+        ]
+        assert source_state() == pre_import_source
+        assert restarted_store.list_work_items(run["id"])[0]["state"] == "QUEUED"
+        assert (
+            workspace / ".git" / "config"
+        ).read_bytes() == b"canonical git metadata\n"
+        assert (
+            workspace / ".repogents" / "controller.json"
+        ).read_bytes() == b'{"owner":"controller"}\n'
+        assert assigned_work["id"] == restarted_store.list_work_items(
+            run["id"]
+        )[0]["id"]
+    finally:
+        restarted.close()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_state"),
+    [
+        ("ready_for_validation", "COMPLETED"),
+        ("continue_work", "HANDED_OFF"),
+    ],
+    ids=["completed", "handed-off"],
+)
+def test_post_commit_completion_exception_preserves_imported_source_and_node_success(
+    tmp_path,
+    monkeypatch,
+    outcome,
+    expected_state,
+):
+    database = tmp_path / "state.sqlite3"
+    data_dir = tmp_path / "runtime"
+    store = Store(database)
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    run, _ = store.create_run(
+        repository["id"],
+        7,
+        {
+            "number": 7,
+            "title": "Retain committed source",
+            "body": "Treat a committed work result as durable success.",
+        },
+    )
+    execution_pass = store.create_pass(run["id"], "activation", {})
+    classification = "change/post-commit-source"
+    saved = store.save_specification_package(
+        run["id"],
+        execution_pass["id"],
+        package(
+            ("post-commit-source", classification),
+            prefix="post-commit",
+        ),
+    )
+    node = store.create_dynamic_node(
+        repository["id"],
+        classification,
+        [1.0, 0.0],
+        "Own transaction-safe source changes.",
+    )
+    store.assign_work(saved["work_items"][0]["id"], node["id"])
+    claimed_work = store.claim_node_work(node["id"], run["id"])
+    assert claimed_work is not None
+    store.transition_run(run["id"], "WAITING_FOR_WORK_COMPLETION")
+
+    workspace = (
+        data_dir
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    workspace.mkdir(parents=True)
+    edited_path = workspace / "edited.bin"
+    created_path = workspace / "created.bin"
+    edited_path.write_bytes(b"original source\n")
+    edited_path.chmod(0o640)
+
+    runtime = WorkspaceScriptedRuntime()
+    result = ready_result("durable source result")
+    result["outcome"] = outcome
+    if outcome == "continue_work":
+        result.update(
+            {
+                "classification": "verify/post-commit-source",
+                "context": {"reason": "verify imported source"},
+                "dependencies": [],
+                "blocking": None,
+            }
+        )
+    runtime.queue("work", result)
+
+    def import_source(agent_workspace: Path) -> None:
+        agent_edited = agent_workspace / "edited.bin"
+        agent_edited.unlink()
+        agent_edited.write_bytes(b"\x00imported source\n")
+        agent_edited.chmod(0o600)
+        agent_created = agent_workspace / "created.bin"
+        agent_created.write_bytes(b"\xffcreated source\n")
+        agent_created.chmod(0o440)
+
+    runtime.queue_workspace_action("work", import_source)
+    app = Application(
+        store,
+        FakeGitHub(),
+        runtime,
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(
+            data_dir=data_dir,
+            promotion_threshold=1,
+        ),
+    )
+    real_complete_work = store.complete_work
+
+    def commit_work_then_raise(work_id, persisted_result, handoff=None):
+        real_complete_work(work_id, persisted_result, handoff)
+        raise RuntimeError("completion response lost after commit")
+
+    monkeypatch.setattr(store, "complete_work", commit_work_then_raise)
+
+    app._run_work(node, claimed_work)
+
+    work_items = store.list_work_items(run["id"])
+    completed_work = next(
+        item for item in work_items if item["id"] == claimed_work["id"]
+    )
+    assert completed_work["state"] == expected_state
+    assert completed_work["result"]["output"] == "durable source result"
+    children = [
+        item
+        for item in work_items
+        if item["parent_work_id"] == claimed_work["id"]
+    ]
+    assert len(children) == (1 if outcome == "continue_work" else 0)
+    if children:
+        assert children[0]["state"] == "UNASSIGNED"
+        assert children[0]["classification"] == "verify/post-commit-source"
+    assert edited_path.read_bytes() == b"\x00imported source\n"
+    assert stat.S_IMODE(edited_path.stat().st_mode) == 0o600
+    assert created_path.read_bytes() == b"\xffcreated source\n"
+    assert stat.S_IMODE(created_path.stat().st_mode) == 0o440
+    persisted_node = next(
+        item
+        for item in store.list_dynamic_nodes(repository["id"])
+        if item["id"] == node["id"]
+    )
+    assert persisted_node["success_count"] == 1
+    assert persisted_node["persistence"] == "PERSISTENT"
+    app.close()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_state"),
+    [
+        ("ready_for_validation", "COMPLETED"),
+        ("continue_work", "HANDED_OFF"),
+    ],
+    ids=["completed", "handed-off"],
+)
+def test_startup_preserves_post_commit_import_and_clears_journal_before_work_recovery(
+    tmp_path,
+    monkeypatch,
+    outcome,
+    expected_state,
+):
+    database = tmp_path / "state.sqlite3"
+    data_dir = tmp_path / "runtime"
+    store = Store(database)
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    run, _ = store.create_run(
+        repository["id"],
+        7,
+        {
+            "number": 7,
+            "title": "Recover committed source",
+            "body": "Keep source whose successful work result is durable.",
+        },
+    )
+    execution_pass = store.create_pass(run["id"], "activation", {})
+    classification = "change/fork-committed-source"
+    saved = store.save_specification_package(
+        run["id"],
+        execution_pass["id"],
+        package(
+            ("fork-committed-source", classification),
+            prefix="fork-commit",
+        ),
+    )
+    node = store.create_dynamic_node(
+        repository["id"],
+        classification,
+        [1.0, 0.0],
+        "Own interruption-safe committed source.",
+    )
+    assigned_work = store.assign_work(
+        saved["work_items"][0]["id"],
+        node["id"],
+    )
+    store.transition_run(run["id"], "WAITING_FOR_WORK_COMPLETION")
+
+    workspace = (
+        data_dir
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    workspace.mkdir(parents=True)
+    edited_path = workspace / "edited.bin"
+    created_path = workspace / "created.bin"
+    edited_path.write_bytes(b"original source\n")
+    edited_path.chmod(0o640)
+    (workspace / ".git").mkdir()
+    (workspace / ".git" / "config").write_bytes(
+        b"canonical git metadata\n"
+    )
+    (workspace / ".repogents").mkdir()
+    (workspace / ".repogents" / "controller.json").write_bytes(
+        b'{"owner":"controller"}\n'
+    )
+    journal_path = (
+        data_dir
+        / "source-import-journals"
+        / f"work-{assigned_work['id']}"
+    )
+
+    def source_state() -> dict:
+        def regular_file_state(path: Path):
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                return None
+            return path.read_bytes(), stat.S_IMODE(metadata.st_mode)
+
+        return {
+            "edited": regular_file_state(edited_path),
+            "created": regular_file_state(created_path),
+        }
+
+    imported_source = {
+        "edited": (b"\x00committed source\n", 0o600),
+        "created": (b"\xffcommitted creation\n", 0o440),
+    }
+    fork_context = multiprocessing.get_context("fork")
+    completion_committed = fork_context.Event()
+    keep_child_after_commit = fork_context.Event()
+
+    def run_until_post_commit_cleanup() -> None:
+        child_store = Store(database)
+        child_runtime = WorkspaceScriptedRuntime()
+        result = ready_result("committed before interruption")
+        result["outcome"] = outcome
+        if outcome == "continue_work":
+            result.update(
+                {
+                    "classification": "verify/fork-committed-source",
+                    "context": {"reason": "verify committed source"},
+                    "dependencies": [],
+                    "blocking": None,
+                }
+            )
+        child_runtime.queue("work", result)
+
+        def import_source(agent_workspace: Path) -> None:
+            child_edited = agent_workspace / "edited.bin"
+            child_edited.unlink()
+            child_edited.write_bytes(b"\x00committed source\n")
+            child_edited.chmod(0o600)
+            child_created = agent_workspace / "created.bin"
+            child_created.write_bytes(b"\xffcommitted creation\n")
+            child_created.chmod(0o440)
+
+        child_runtime.queue_workspace_action("work", import_source)
+        child_app = Application(
+            child_store,
+            FakeGitHub(),
+            child_runtime,
+            SemanticRouter(MapEmbedder({})),
+            ApplicationConfig(data_dir=data_dir),
+        )
+        claimed_work = child_store.claim_node_work(
+            node["id"],
+            run["id"],
+        )
+        if claimed_work is None:
+            raise RuntimeError("seeded work was not claimable")
+        real_complete_work = child_store.complete_work
+
+        def commit_work_then_block(work_id, persisted_result, handoff=None):
+            child = real_complete_work(work_id, persisted_result, handoff)
+            completion_committed.set()
+            keep_child_after_commit.wait()
+            return child
+
+        child_store.complete_work = commit_work_then_block
+        child_app._run_work(node, claimed_work)
+
+    child = fork_context.Process(target=run_until_post_commit_cleanup)
+    child.start()
+    try:
+        assert completion_committed.wait(timeout=5)
+        assert source_state() == imported_source
+        assert journal_path.is_dir()
+        committed_work = next(
+            item
+            for item in store.list_work_items(run["id"])
+            if item["id"] == assigned_work["id"]
+        )
+        assert committed_work["state"] == expected_state
+    finally:
+        if child.is_alive():
+            child.terminate()
+        child.join(timeout=5)
+        if child.is_alive():
+            child.kill()
+            child.join(timeout=5)
+    assert not child.is_alive()
+    assert journal_path.is_dir()
+
+    restarted_store = Store(database)
+    real_recover_interrupted_work = (
+        restarted_store.recover_interrupted_work
+    )
+    recovery_views = []
+
+    def observe_recovery_order():
+        work = next(
+            item
+            for item in restarted_store.list_work_items(run["id"])
+            if item["id"] == assigned_work["id"]
+        )
+        recovery_views.append(
+            {
+                "source": source_state(),
+                "work_state": work["state"],
+                "journal_exists": journal_path.exists(),
+                "git_metadata": (
+                    workspace / ".git" / "config"
+                ).read_bytes(),
+                "controller_metadata": (
+                    workspace / ".repogents" / "controller.json"
+                ).read_bytes(),
+            }
+        )
+        return real_recover_interrupted_work()
+
+    monkeypatch.setattr(
+        restarted_store,
+        "recover_interrupted_work",
+        observe_recovery_order,
+    )
+    restarted = Application(
+        restarted_store,
+        FakeGitHub(),
+        ScriptedRuntime(),
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(data_dir=data_dir),
+    )
+    restarted.acquire_service_ownership()
+    try:
+        assert recovery_views == [
+            {
+                "source": imported_source,
+                "work_state": expected_state,
+                "journal_exists": False,
+                "git_metadata": b"canonical git metadata\n",
+                "controller_metadata": b'{"owner":"controller"}\n',
+            }
+        ]
+        assert source_state() == imported_source
+        assert not journal_path.exists()
+        recovered_work_items = restarted_store.list_work_items(run["id"])
+        recovered_work = next(
+            item
+            for item in recovered_work_items
+            if item["id"] == assigned_work["id"]
+        )
+        assert recovered_work["state"] == expected_state
+        recovered_children = [
+            item
+            for item in recovered_work_items
+            if item["parent_work_id"] == assigned_work["id"]
+        ]
+        assert len(recovered_children) == (
+            1 if outcome == "continue_work" else 0
+        )
+        if recovered_children:
+            assert recovered_children[0]["state"] == "UNASSIGNED"
+            assert (
+                recovered_children[0]["classification"]
+                == "verify/fork-committed-source"
+            )
+    finally:
+        restarted.close()
+
+
+
 def test_validation_failure_feedback_reentry_same_pr_update_and_merge_completion(tmp_path):
     runtime = MutatingValidationRuntime()
     runtime.queue(
@@ -2357,97 +3648,739 @@ def test_validation_requires_complete_typed_failure_evidence(tmp_path):
     app.close()
 
 
-def test_publication_rebase_conflict_records_failed_validation_without_validate_runtime(
+def test_operation_failure_artifact_export_is_atomic_and_retry_persists_one_pass(
+    tmp_path,
+    monkeypatch,
+):
+    store = Store(tmp_path / "state.sqlite3")
+    data_dir = tmp_path / "runtime"
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    run, _ = store.create_run(
+        repository["id"],
+        7,
+        {
+            "number": 7,
+            "title": "Export operation artifacts",
+            "body": "Publish an exact atomic operation handoff.",
+        },
+    )
+    failed_pass = store.create_pass(
+        run["id"],
+        "feedback",
+        {"feedback": []},
+    )
+    store.transition_run(run["id"], "VALIDATING")
+    workspace = (
+        data_dir
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "src" / "conflict.py").write_bytes(
+        b"canonical conflicted source\n"
+    )
+    (workspace / ".git" / "rebase-merge").mkdir(parents=True)
+
+    github = FakeGitHub()
+    github.repository_operation_state_result = {
+        "rebase_in_progress": True,
+        "unmerged_paths": ["src/conflict.py"],
+    }
+    expected_artifacts = {
+        "base": b"exact base\n",
+        "ours": b"exact ours\n",
+        "theirs": b"exact theirs\n",
+    }
+    github.repository_operation_artifact_contents = {
+        "src/conflict.py": {
+            stage: contents.decode()
+            for stage, contents in expected_artifacts.items()
+        }
+    }
+    app = Application(
+        store,
+        github,
+        ScriptedRuntime(),
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(data_dir=data_dir),
+    )
+    command_error = subprocess.CalledProcessError(
+        41,
+        ["git", "operation-export-sentinel"],
+        output="export stdout\n",
+        stderr="export stderr\n",
+    )
+    final_directory = (
+        data_dir
+        / "operation-artifacts"
+        / str(run["id"])
+        / f"{failed_pass['id']}-prepare_publication"
+    )
+
+    def write_partial_artifact_then_raise(
+        operation_workspace,
+        destination,
+    ):
+        destination_path = Path(destination)
+        partial = destination_path / "base" / "src" / "conflict.py"
+        partial.parent.mkdir(parents=True)
+        partial.write_bytes(b"partial base only\n")
+        raise RuntimeError("artifact export interrupted")
+
+    with monkeypatch.context() as export_failure:
+        export_failure.setattr(
+            github,
+            "export_repository_operation_artifacts",
+            write_partial_artifact_then_raise,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="artifact export interrupted",
+        ):
+            app._record_operation_failure(
+                repository,
+                run,
+                failed_pass,
+                "prepare_publication",
+                command_error,
+            )
+
+    assert not final_directory.exists()
+    assert [
+        item
+        for item in store.list_passes(run["id"])
+        if item["trigger_type"] == "operation_failure"
+    ] == []
+    assert store.get_run(run["id"])["state"] == "VALIDATING"
+
+    real_create_pass = store.create_pass
+    artifacts_at_pass_commit = []
+
+    def create_pass_after_artifact_publication(
+        run_id,
+        trigger_type,
+        trigger_json,
+    ):
+        if trigger_type == "operation_failure":
+            artifacts_at_pass_commit.append(
+                {
+                    stage: (
+                        final_directory
+                        / stage
+                        / "src"
+                        / "conflict.py"
+                    ).read_bytes()
+                    for stage in ("base", "ours", "theirs")
+                }
+            )
+        return real_create_pass(run_id, trigger_type, trigger_json)
+
+    monkeypatch.setattr(
+        store,
+        "create_pass",
+        create_pass_after_artifact_publication,
+    )
+    app._record_operation_failure(
+        repository,
+        run,
+        failed_pass,
+        "prepare_publication",
+        command_error,
+    )
+
+    assert artifacts_at_pass_commit == [expected_artifacts]
+    assert {
+        stage: (
+            final_directory / stage / "src" / "conflict.py"
+        ).read_bytes()
+        for stage in ("base", "ours", "theirs")
+    } == expected_artifacts
+    operation_failure_passes = [
+        item
+        for item in store.list_passes(run["id"])
+        if item["trigger_type"] == "operation_failure"
+    ]
+    assert len(operation_failure_passes) == 1
+    assert (
+        operation_failure_passes[0]["trigger_json"]["failed_pass_id"]
+        == failed_pass["id"]
+    )
+    assert store.get_run(run["id"])["state"] == "SPECIFYING"
+    app.close()
+
+
+def test_first_operation_failure_artifact_fsyncs_ancestors_before_pass_persistence(
+    tmp_path,
+    monkeypatch,
+):
+    store = Store(tmp_path / "state.sqlite3")
+    data_dir = tmp_path / "runtime"
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    run, _ = store.create_run(
+        repository["id"],
+        7,
+        {
+            "number": 7,
+            "title": "Export operation artifacts",
+            "body": "Publish an exact durable operation handoff.",
+        },
+    )
+    failed_pass = store.create_pass(
+        run["id"],
+        "feedback",
+        {"feedback": []},
+    )
+    store.transition_run(run["id"], "VALIDATING")
+    github = FakeGitHub()
+    github.repository_operation_state_result = {
+        "rebase_in_progress": True,
+        "unmerged_paths": ["src/conflict.py"],
+    }
+    github.repository_operation_artifact_contents = {
+        "src/conflict.py": {
+            "base": "exact base\n",
+            "ours": "exact ours\n",
+            "theirs": "exact theirs\n",
+        }
+    }
+    app = Application(
+        store,
+        github,
+        ScriptedRuntime(),
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(data_dir=data_dir),
+    )
+    assert not (data_dir / "operation-artifacts").exists()
+
+    fsynced_directories = []
+    real_fsync_directory = Application._fsync_directory
+
+    def record_fsync_directory(directory):
+        fsynced_directories.append(Path(directory).resolve())
+        real_fsync_directory(directory)
+
+    monkeypatch.setattr(
+        Application,
+        "_fsync_directory",
+        staticmethod(record_fsync_directory),
+    )
+    real_create_pass = store.create_pass
+    fsyncs_before_operation_failure_pass = None
+
+    def create_pass_after_durable_artifact_publication(
+        run_id,
+        trigger_type,
+        trigger_json,
+    ):
+        nonlocal fsyncs_before_operation_failure_pass
+        if trigger_type == "operation_failure":
+            fsyncs_before_operation_failure_pass = tuple(fsynced_directories)
+        return real_create_pass(run_id, trigger_type, trigger_json)
+
+    monkeypatch.setattr(
+        store,
+        "create_pass",
+        create_pass_after_durable_artifact_publication,
+    )
+    app._record_operation_failure(
+        repository,
+        run,
+        failed_pass,
+        "prepare_publication",
+        subprocess.CalledProcessError(
+            41,
+            ["git", "operation-export-sentinel"],
+            output="export stdout\n",
+            stderr="export stderr\n",
+        ),
+    )
+
+    assert fsyncs_before_operation_failure_pass is not None
+    artifact_root = data_dir / "operation-artifacts"
+    run_artifact_directory = artifact_root / str(run["id"])
+    assert {
+        data_dir.resolve(),
+        artifact_root.resolve(),
+        run_artifact_directory.resolve(),
+    } <= set(fsyncs_before_operation_failure_pass)
+    app.close()
+
+
+def test_completed_git_failure_handoff_survives_restart_and_retries_from_persisted_paths(
     tmp_path,
 ):
     store = Store(tmp_path / "state.sqlite3")
-    repository = store.add_repository("acme/widget", "main", 0.75)
+    target_branch = "release-operation-target"
+    repository = store.add_repository("acme/widget", target_branch, 0.75)
     run, _ = store.create_run(
         repository["id"],
         7,
         {"number": 7, "title": "Validate", "body": "work"},
     )
-    execution_pass = store.create_pass(run["id"], "issue", run["issue_json"])
+    feedback_item = {
+        "external_id": "review:operation-origin",
+        "kind": "review",
+        "body": "Preserve the feedback origin across controller work.",
+        "path": None,
+        "line": None,
+        "review_thread_id": None,
+        "top_level_comment_id": None,
+    }
+    failed_pass = store.create_pass(
+        run["id"],
+        "feedback",
+        {"feedback": [feedback_item]},
+    )
     saved = store.save_specification_package(
         run["id"],
-        execution_pass["id"],
-        package(("validate-work", "backend/api")),
+        failed_pass["id"],
+        package(("completed-before-controller-failure", "maintain/existing")),
     )
-    node = store.create_dynamic_node(
+    existing_node = store.create_dynamic_node(
         repository["id"],
-        "backend/api",
+        "maintain/existing",
         [1.0, 0.0],
-        "Own API work.",
+        "Own existing source work.",
     )
-    store.assign_work(saved["work_items"][0]["id"], node["id"])
-    claimed = store.claim_node_work(node["id"], run["id"])
+    store.assign_work(saved["work_items"][0]["id"], existing_node["id"])
+    claimed = store.claim_node_work(existing_node["id"], run["id"])
     store.complete_work(
         claimed["id"],
         {
-            "output": "done",
+            "output": "source work completed",
             "artifacts": [],
             "test_results": [],
             "repository_state": {},
         },
     )
     store.transition_run(run["id"], "VALIDATING")
-    (
-        tmp_path / "runtime" / "workspaces" / str(repository["id"]) / str(run["id"])
-    ).mkdir(parents=True)
+
+    workspace = (
+        tmp_path
+        / "runtime"
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "src" / "conflict.py").write_text(
+        "<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs\n"
+    )
+    (workspace / ".git").mkdir()
+    (workspace / ".git" / "rebase-merge").mkdir()
+
+    command = [
+        "git",
+        "operation-command-sentinel",
+        "--target",
+        target_branch,
+    ]
+    command_failure = subprocess.CalledProcessError(
+        23,
+        command,
+        output="operation stdout sentinel\n",
+        stderr="operation stderr sentinel\n",
+    )
     github = FakeGitHub()
-    conflict_message = "git rebase origin/main conflicted"
+    github.prepare_publication_failures.append(command_failure)
+    github.repository_operation_state_result = {
+        "rebase_in_progress": True,
+        "unmerged_paths": ["src/conflict.py"],
+    }
+    github.repository_operation_artifact_contents = {
+        "src/conflict.py": {
+            "base": "base\n",
+            "ours": "ours\n",
+            "theirs": "theirs\n",
+        }
+    }
+    github.continue_repository_operation_results.append(True)
+    first_runtime = ScriptedRuntime()
+    app = Application(
+        store,
+        github,
+        first_runtime,
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(data_dir=tmp_path / "runtime"),
+    )
+    original_dynamic_node_ids = {
+        item["id"] for item in store.list_dynamic_nodes(repository["id"])
+    }
 
-    def raise_conflict(issue_number, target_branch, workspace):
-        github.prepare_publication_calls.append(
-            (issue_number, target_branch, Path(workspace))
+    app.poll_once()
+
+    expected_trigger = {
+        "failed_stage": "prepare_publication",
+        "command": command,
+        "returncode": 23,
+        "stdout": "operation stdout sentinel\n",
+        "stderr": "operation stderr sentinel\n",
+        "target_branch": target_branch,
+        "failed_pass_id": failed_pass["id"],
+        "workspace": {
+            "repository_id": repository["id"],
+            "run_id": run["id"],
+            "rebase_in_progress": True,
+            "unmerged_paths": ["src/conflict.py"],
+        },
+        "origin_feedback_pass_id": failed_pass["id"],
+    }
+    operation_failure_passes = [
+        item
+        for item in store.list_passes(run["id"])
+        if item["trigger_type"] == "operation_failure"
+    ]
+    assert len(operation_failure_passes) == 1
+    operation_failure_pass = operation_failure_passes[0]
+    assert operation_failure_pass["trigger_json"] == expected_trigger
+    assert store.list_validations(run["id"]) == []
+    assert store.get_run(run["id"])["state"] == "SPECIFYING"
+    assert first_runtime.calls == []
+    assert {
+        item["id"] for item in store.list_dynamic_nodes(repository["id"])
+    } == original_dynamic_node_ids
+    assert github.repository_operation_state_calls
+    assert set(github.repository_operation_state_calls) == {workspace}
+    assert github.export_repository_operation_artifacts_calls
+    assert {
+        operation_workspace
+        for operation_workspace, _ in (
+            github.export_repository_operation_artifacts_calls
         )
-        raise PublicationRebaseConflictError(conflict_message)
+    } == {workspace}
+    assert (workspace / "src" / "conflict.py").read_text() == (
+        "<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs\n"
+    )
+    assert (workspace / ".git" / "rebase-merge").is_dir()
+    assert github.continue_repository_operation_calls == []
+    app.close()
 
-    github.prepare_publication = raise_conflict
+    chosen_classification = "agent-choice/repository-area"
+    chosen_role = "Apply agent-selected source changes for this repository area."
+    class ArtifactReadingRuntime(WorkspaceScriptedRuntime):
+        def __init__(self):
+            super().__init__()
+            self.operation_artifact_bytes = []
+
+        def run(self, task: str, workspace: str | Path, **kwargs) -> dict:
+            payload = json.loads(task)
+            if payload["kind"] == "work":
+                self.operation_artifact_bytes.append(
+                    {
+                        semantic_path: {
+                            stage: (
+                                Path(workspace) / relative_path
+                            ).read_bytes()
+                            for stage, relative_path in artifacts.items()
+                        }
+                        for semantic_path, artifacts in payload["context"][
+                            "operation_artifacts"
+                        ].items()
+                    }
+                )
+            return super().run(task, workspace, **kwargs)
+
+    resolution_runtime = ArtifactReadingRuntime()
+    resolution_runtime.queue(
+        "specify",
+        package(
+            ("agent-selected-resolution", chosen_classification),
+            prefix="operation",
+        ),
+    )
+    resolution_runtime.queue("node_role", {"role_prompt": chosen_role})
+    resolution_result = ready_result("controller operation source is resolved")
+    resolution_result["repository_state"] = {"agent_observation": "resolved"}
+    resolution_result["resolved_paths"] = ["src/conflict.py"]
+    resolution_runtime.queue("work", resolution_result)
+
+    def resolve_source(agent_workspace: Path) -> None:
+        (agent_workspace / "src" / "conflict.py").write_text("resolved\n")
+        (agent_workspace / "src" / "helper.py").write_text("helper\n")
+
+    resolution_runtime.queue_workspace_action("work", resolve_source)
+    restarted = Application(
+        store,
+        github,
+        resolution_runtime,
+        SemanticRouter(MapEmbedder({chosen_classification: [0.0, 1.0]})),
+        ApplicationConfig(data_dir=tmp_path / "runtime"),
+    )
+
+    restarted.poll_once()
+
+    specify_call = next(
+        call
+        for call in resolution_runtime.calls
+        if call["payload"]["kind"] == "specify"
+    )
+    assert specify_call["payload"]["context"]["operation_failure"] == expected_trigger
+    for absent_key in (
+        "operation_target",
+        "remedy",
+        "command_sequence",
+        "classification",
+        "node",
+    ):
+        assert absent_key not in specify_call["payload"]["context"]
+    role_call = next(
+        call
+        for call in resolution_runtime.calls
+        if call["payload"]["kind"] == "node_role"
+    )
+    assert role_call["payload"]["context"]["classification"] == chosen_classification
+    chosen_node = next(
+        item
+        for item in store.list_dynamic_nodes(repository["id"])
+        if item["classification"] == chosen_classification
+    )
+    assert chosen_node["role_prompt"] == chosen_role
+    assert len(store.list_dynamic_nodes(repository["id"])) == (
+        len(original_dynamic_node_ids) + 1
+    )
+
+    drive_until(
+        restarted,
+        lambda: any(
+            item["key"] == "agent-selected-resolution"
+            and item["state"] == "COMPLETED"
+            for item in store.list_work_items(run["id"])
+        ),
+    )
+    assert resolution_runtime.operation_artifact_bytes == [
+        {
+            "src/conflict.py": {
+                "base": b"base\n",
+                "ours": b"ours\n",
+                "theirs": b"theirs\n",
+            }
+        }
+    ]
+
+    completed_resolution = next(
+        item
+        for item in store.list_work_items(run["id"])
+        if item["key"] == "agent-selected-resolution"
+    )
+    controller_state = completed_resolution["result"]["repository_state"][
+        "_repogents"
+    ]
+    assert set(controller_state["applied_paths"]) == {
+        "src/conflict.py",
+        "src/helper.py",
+    }
+    assert controller_state["resolved_paths"] == ["src/conflict.py"]
+    assert (workspace / "src" / "conflict.py").read_text() == "resolved\n"
+    assert (workspace / "src" / "helper.py").read_text() == "helper\n"
+    assert github.continue_repository_operation_calls == []
+    assert len(
+        [
+            item
+            for item in store.list_passes(run["id"])
+            if item["trigger_type"] == "operation_failure"
+        ]
+    ) == 1
+    restarted.close()
+
+    validation_runtime = ScriptedRuntime()
+    validation_runtime.queue(
+        "validate",
+        validation(True, "controller-prepared candidate is valid"),
+    )
+    resumed_again = Application(
+        store,
+        github,
+        validation_runtime,
+        SemanticRouter(MapEmbedder({})),
+        ApplicationConfig(data_dir=tmp_path / "runtime"),
+    )
+
+    drive_until(
+        resumed_again,
+        lambda: any(
+            call["payload"]["kind"] == "validate"
+            for call in validation_runtime.calls
+        ),
+    )
+
+    assert len(github.continue_repository_operation_calls) == 1
+    continuation_workspace, continuation_paths = (
+        github.continue_repository_operation_calls[0]
+    )
+    assert continuation_workspace == workspace
+    assert continuation_paths == ["src/conflict.py"]
+    assert github.prepare_publication_calls == [
+        (7, target_branch, workspace),
+        (7, target_branch, workspace),
+    ]
+    operation_events = [
+        event for event, _ in github.repository_operation_events
+    ]
+    prepare_positions = [
+        index
+        for index, event in enumerate(operation_events)
+        if event == "prepare_publication"
+    ]
+    continuation_position = operation_events.index(
+        "continue_repository_operation"
+    )
+    assert len(prepare_positions) == 2
+    assert prepare_positions[0] < continuation_position < prepare_positions[1]
+    validations = store.list_validations(run["id"])
+    assert len(validations) == 1
+    assert validations[0]["pass_id"] == operation_failure_pass["id"]
+    assert validations[0]["result"]["passed"] is True
+    assert len(
+        [
+            item
+            for item in store.list_passes(run["id"])
+            if item["trigger_type"] == "operation_failure"
+        ]
+    ) == 1
+    resumed_again.close()
+
+
+def test_continuation_failure_creates_one_new_operation_failure_without_validation(
+    tmp_path,
+):
+    store = Store(tmp_path / "state.sqlite3")
+    target_branch = "release-continuation-target"
+    repository = store.add_repository("acme/widget", target_branch, 0.75)
+    run, _ = store.create_run(
+        repository["id"],
+        7,
+        {
+            "number": 7,
+            "title": "Continue repository operation",
+            "body": "Continue after completed resolution work.",
+        },
+    )
+    origin_pass = store.create_pass(run["id"], "issue", run["issue_json"])
+    operation_pass = store.create_pass(
+        run["id"],
+        "operation_failure",
+        {
+            "failed_stage": "prepare_publication",
+            "command": ["git", "rebase", target_branch],
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "initial conflict\n",
+            "target_branch": target_branch,
+            "failed_pass_id": origin_pass["id"],
+            "workspace": {
+                "repository_id": repository["id"],
+                "run_id": run["id"],
+                "rebase_in_progress": True,
+                "unmerged_paths": ["src/conflict.py"],
+            },
+        },
+    )
+    saved = store.save_specification_package(
+        run["id"],
+        operation_pass["id"],
+        package(
+            ("completed-resolution", "resolve/repository-operation"),
+            prefix="continuation",
+        ),
+    )
+    node = store.create_dynamic_node(
+        repository["id"],
+        "resolve/repository-operation",
+        [1.0, 0.0],
+        "Own semantic repository-operation resolution.",
+    )
+    store.assign_work(saved["work_items"][0]["id"], node["id"])
+    claimed = store.claim_node_work(node["id"], run["id"])
+    assert claimed is not None
+    store.complete_work(
+        claimed["id"],
+        {
+            "output": "resolution completed",
+            "artifacts": [],
+            "test_results": [],
+            "repository_state": {
+                "_repogents": {
+                    "applied_paths": ["src/conflict.py"],
+                    "resolved_paths": ["src/conflict.py"],
+                }
+            },
+        },
+    )
+    store.transition_run(run["id"], "VALIDATING")
+
+    workspace = (
+        tmp_path
+        / "runtime"
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "src" / "conflict.py").write_bytes(b"resolved\n")
+    (workspace / ".git" / "rebase-merge").mkdir(parents=True)
+    continuation_command = ["git", "rebase", "--continue"]
+    github = FakeGitHub()
+    github.repository_operation_state_result = {
+        "rebase_in_progress": True,
+        "unmerged_paths": ["src/conflict.py"],
+    }
+    github.repository_operation_artifact_contents = {
+        "src/conflict.py": {
+            "base": "base after continuation\n",
+            "ours": "ours after continuation\n",
+            "theirs": "theirs after continuation\n",
+        }
+    }
+    github.continue_repository_operation_results.append(
+        subprocess.CalledProcessError(
+            37,
+            continuation_command,
+            output="continuation stdout\n",
+            stderr="continuation failed\n",
+        )
+    )
     runtime = ScriptedRuntime()
     app = Application(
         store,
         github,
         runtime,
-        SemanticRouter(MapEmbedder({"backend/api": [1.0, 0.0]})),
+        SemanticRouter(MapEmbedder({})),
         ApplicationConfig(data_dir=tmp_path / "runtime"),
     )
+    operation_pass_ids_before = {
+        item["id"]
+        for item in store.list_passes(run["id"])
+        if item["trigger_type"] == "operation_failure"
+    }
 
     app.poll_once()
 
-    validations = store.list_validations(run["id"])
-    assert len(validations) == 1
-    assert validations[0]["pass_id"] == execution_pass["id"]
-    validation_result = validations[0]["result"]
-    assert validation_result["passed"] is False
-    assert validation_result["code_review_findings"] == [conflict_message]
-    assert validation_result["publication_candidate"] is None
-    assert validation_result["failure_kind"] == "publication_rebase_conflict"
-    assert runtime.calls == []
-    assert [
-        execution_pass["trigger_type"]
-        for execution_pass in store.list_passes(run["id"])
-    ] == ["issue", "validation_failure"]
+    operation_failure_passes = [
+        item
+        for item in store.list_passes(run["id"])
+        if item["trigger_type"] == "operation_failure"
+    ]
+    new_passes = [
+        item
+        for item in operation_failure_passes
+        if item["id"] not in operation_pass_ids_before
+    ]
+    assert len(new_passes) == 1
+    assert len(operation_failure_passes) == 2
+    new_trigger = new_passes[0]["trigger_json"]
+    assert new_trigger["failed_stage"] == "continue_repository_operation"
+    assert new_trigger["failed_pass_id"] == operation_pass["id"]
+    assert new_trigger["command"] == continuation_command
+    assert new_trigger["returncode"] == 37
+    assert new_trigger["stdout"] == "continuation stdout\n"
+    assert new_trigger["stderr"] == "continuation failed\n"
+    assert github.continue_repository_operation_calls == [
+        (workspace, ["src/conflict.py"])
+    ]
     assert store.get_run(run["id"])["state"] == "SPECIFYING"
-    legacy_pass = dict(store.list_passes(run["id"])[-1])
-    legacy_trigger = dict(legacy_pass["trigger_json"])
-    legacy_trigger.pop("failure_kind")
-    legacy_pass["trigger_json"] = legacy_trigger
-    legacy_instruction = app._specify_instruction(repository, legacy_pass)
-    assert "repository-state integration conflict" in legacy_instruction
-    assert "origin/main" in legacy_instruction
-    runtime.queue(
-        "specify",
-        package(("integrate-target", "backend/api"), prefix="integration"),
-    )
-    app.poll_once()
-    specify_call = next(
-        call for call in runtime.calls if call["payload"]["kind"] == "specify"
-    )
-    instruction = specify_call["payload"]["instruction"]
-    assert "repository-state integration conflict" in instruction
-    assert "origin/main" in instruction
-    assert "not a request to change Repogents publication behavior" in instruction
+    assert store.list_validations(run["id"]) == []
+    assert runtime.calls == []
     app.close()
 
 
