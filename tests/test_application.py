@@ -2024,6 +2024,9 @@ def test_concurrent_disposable_work_preserves_disjoint_deltas_and_rejects_stale_
             barrier_index = self.snapshot_barrier.wait(timeout=5)
             if barrier_index == 0:
                 self.all_started.set()
+            cache = agent_workspace / "repogents" / "__pycache__"
+            cache.mkdir(parents=True, exist_ok=True)
+            (cache / "module.cpython-310.pyc").write_bytes(key.encode())
             if key == first_key:
                 (agent_workspace / "shared.txt").write_text("first wins\n")
                 (agent_workspace / "first.txt").write_text("first delta\n")
@@ -2110,12 +2113,17 @@ def test_concurrent_disposable_work_preserves_disjoint_deltas_and_rejects_stale_
     assert (workspace / "first.txt").read_text() == "first delta\n"
 
     runtime.release_disjoint.set()
-    drive_until(app, lambda: work_state(disjoint_key) == "COMPLETED")
+    drive_until(
+        app,
+        lambda: work_state(disjoint_key) in {"COMPLETED", "FAILED"},
+    )
+    assert work_state(disjoint_key) == "COMPLETED"
     assert (workspace / "shared.txt").read_text() == "first wins\n"
     assert (workspace / "first.txt").read_text() == "first delta\n"
     assert (
         workspace / "disjoint.txt"
     ).read_text() == "disjoint delta\n"
+    assert not (workspace / "repogents" / "__pycache__").exists()
 
     runtime.release_stale.set()
     drive_until(

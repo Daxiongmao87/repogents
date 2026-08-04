@@ -21,6 +21,9 @@ from repogents.semantic import SemanticRouter, validate_classification
 from repogents.store import TERMINAL_RUN_STATES, Store
 
 
+_SOURCE_IGNORED_NAMES = frozenset({".git", ".repogents", "__pycache__"})
+
+
 @dataclass(frozen=True, slots=True)
 class ApplicationConfig:
     data_dir: str | Path
@@ -394,7 +397,7 @@ class Application:
 
     @staticmethod
     def _source_copy_ignore(_directory: str, names: list[str]) -> set[str]:
-        return {name for name in names if name in {".git", ".repogents"}}
+        return {name for name in names if name in _SOURCE_IGNORED_NAMES}
 
     @staticmethod
     def _manifest_path(root: Path, relative_path: str) -> Path:
@@ -443,7 +446,7 @@ class Application:
             with os.scandir(directory) as entries:
                 children = sorted(entries, key=lambda entry: entry.name)
             for child in children:
-                if child.name in {".git", ".repogents"}:
+                if child.name in _SOURCE_IGNORED_NAMES:
                     continue
                 if parent is None and child.name in excluded_roots:
                     continue
