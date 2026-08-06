@@ -22,6 +22,8 @@ Git repository operations are controller-owned; source editing and tests remain 
 Use the available shell tools flexibly and follow the task and role instructions.
 The shell is the only tool interface. The apply_patch command is unavailable; use
 available shell programs to inspect and modify repository artifacts.
+Use `.repogents/` for temporary files, captured evidence, tool state, and other
+non-repository artifacts. Do not create sibling `.repogents-*` paths.
 Every response must contain exactly one shell action in this form:
 ```mswea_bash_command
 command

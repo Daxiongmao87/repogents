@@ -2483,6 +2483,9 @@ def test_concurrent_disposable_work_preserves_disjoint_deltas_and_rejects_stale_
             cache = agent_workspace / "repogents" / "__pycache__"
             cache.mkdir(parents=True, exist_ok=True)
             (cache / "module.cpython-310.pyc").write_bytes(key.encode())
+            scratch = agent_workspace / ".repogents-browser-copy"
+            scratch.mkdir()
+            (scratch / "tool-binary").write_bytes(key.encode())
             if key == first_key:
                 (agent_workspace / "shared.txt").write_text("first wins\n")
                 (agent_workspace / "first.txt").write_text("first delta\n")
@@ -2580,6 +2583,7 @@ def test_concurrent_disposable_work_preserves_disjoint_deltas_and_rejects_stale_
         workspace / "disjoint.txt"
     ).read_text() == "disjoint delta\n"
     assert not (workspace / "repogents" / "__pycache__").exists()
+    assert not (workspace / ".repogents-browser-copy").exists()
 
     runtime.release_stale.set()
     drive_until(

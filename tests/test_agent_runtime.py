@@ -403,6 +403,7 @@ def test_run_preserves_flexible_task_role_schema_and_trajectory(monkeypatch, tmp
     system_template = records["agents"][0].kwargs["system_template"]
     assert "exactly one shell action" in system_template
     assert "apply_patch command is unavailable" in system_template
+    assert "Do not create sibling `.repogents-*` paths" in system_template
     assert "more than one action block are rejected" in system_template
     assert "standalone action" in system_template
     assert "```mswea_bash_command" in system_template

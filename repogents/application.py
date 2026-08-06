@@ -21,7 +21,7 @@ from repogents.semantic import SemanticRouter, validate_classification
 from repogents.store import TERMINAL_RUN_STATES, Store
 
 
-_SOURCE_IGNORED_NAMES = frozenset({".git", ".repogents", "__pycache__"})
+_SOURCE_IGNORED_NAMES = frozenset({".git", "__pycache__"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -794,7 +794,11 @@ class Application:
 
     @staticmethod
     def _source_copy_ignore(_directory: str, names: list[str]) -> set[str]:
-        return {name for name in names if name in _SOURCE_IGNORED_NAMES}
+        return {name for name in names if Application._source_name_ignored(name)}
+
+    @staticmethod
+    def _source_name_ignored(name: str) -> bool:
+        return name in _SOURCE_IGNORED_NAMES or name.startswith(".repogents")
 
     @staticmethod
     def _manifest_path(root: Path, relative_path: str) -> Path:
@@ -822,7 +826,7 @@ class Application:
                     )
                 resolved.pop()
                 continue
-            if part in {".git", ".repogents"}:
+            if part == ".git" or part.startswith(".repogents"):
                 raise ValueError(
                     "source symlink targets controller metadata: "
                     f"{relative_path}"
@@ -843,7 +847,7 @@ class Application:
             with os.scandir(directory) as entries:
                 children = sorted(entries, key=lambda entry: entry.name)
             for child in children:
-                if child.name in _SOURCE_IGNORED_NAMES:
+                if cls._source_name_ignored(child.name):
                     continue
                 if parent is None and child.name in excluded_roots:
                     continue

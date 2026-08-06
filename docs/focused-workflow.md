@@ -56,6 +56,11 @@ complete JSON result, artifacts, tests, repository state, limitations, context,
 and the associated command trajectory. It does not reduce a result to a small
 controller-selected subset.
 
+The `.repogents*` namespace is reserved for disposable tool state, captured
+evidence, and controller metadata. Source snapshots, continuation handoffs, and
+publication manifests exclude it consistently; repository artifacts must use a
+non-reserved path.
+
 ## Work Validator
 
 A proposed completion is validated in the same disposable source snapshot
