@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+
+
+_logger = logging.getLogger(__name__)
 
 
 _CLIENT_HTML = r"""<!doctype html>
@@ -160,6 +164,7 @@ class HttpService:
         return state
 
     def _record_poll_failure(self, error: Exception) -> None:
+        _logger.error("Background poll failed: %s", error, exc_info=error)
         failure = {
             "type": type(error).__name__,
             "message": self._sanitized_message(error),

@@ -369,3 +369,19 @@ def test_http_service_reports_sanitized_poll_failures_and_recovers():
         application.allow_recovery.set()
         service.shutdown()
         thread.join(timeout=3)
+
+
+def test_poll_failure_logs_distinct_private_diagnostics(caplog):
+    application = FakeApplication()
+    service = HttpService(application, "127.0.0.1", 0, 60)
+
+    with caplog.at_level("ERROR", logger="repogents.http_api"):
+        service._record_poll_failure(RuntimeError("GitHub response missing node ID"))
+        service._record_poll_failure(RuntimeError("GitHub response has invalid node ID"))
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [
+        "Background poll failed: GitHub response missing node ID",
+        "Background poll failed: GitHub response has invalid node ID",
+    ]
+    assert service.state()["poll_failure"]["message"] == "poll failure details withheld"
