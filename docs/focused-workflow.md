@@ -44,10 +44,13 @@ controller-selected subset.
 
 A proposed completion is validated in the same disposable source snapshot
 before its source delta is imported. The Work Validator sees only the focused
-work contract, applicable requirements and criteria, direct dependency results,
-the complete proposal, changed paths, artifacts, and execution evidence. It
-must disposition every assigned requirement and criterion with concrete
-evidence and cannot implement corrections.
+work contract, filtered definitions for its applicable requirements and
+criteria, direct dependency results, the complete proposal, changed paths,
+artifacts, and execution evidence. It does not receive the complete issue
+specification. Its result template names every exact key it must disposition,
+and it must return those keys exactly once with concrete evidence. It cannot
+disposition unrelated requirements, judge unrelated work, or implement
+corrections.
 
 An accepted result may be imported and completed. A rejected result is
 persisted with its validation findings, its source delta is discarded, and the

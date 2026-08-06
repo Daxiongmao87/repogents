@@ -7847,6 +7847,35 @@ def test_focused_workflow_persists_traceability_through_issue_validation(tmp_pat
         "work_validate",
         "validate",
     ]
+    focused_validation_call = next(
+        call
+        for call in runtime.stage_calls
+        if call["payload"]["kind"] == "work_validate"
+    )
+    assert set(focused_validation_call["payload"]["context"]) == {
+        "applicable_requirements",
+        "applicable_criteria",
+        "work_item",
+        "dependency_results",
+        "proposed_result",
+        "changed_paths",
+        "execution_trajectory",
+    }
+    assert focused_validation_call["payload"]["context"][
+        "applicable_requirements"
+    ] == focused_issue_specification()["requirements"]
+    assert focused_validation_call["payload"]["context"][
+        "applicable_criteria"
+    ] == focused_work_specification()["specification"]["acceptance_criteria"]
+    assert focused_validation_call["result_schema"]["requirement_results"][0][
+        "requirement_key"
+    ] == "requirement-1"
+    assert focused_validation_call["result_schema"]["criterion_results"][0][
+        "criterion_key"
+    ] == "criterion-1"
+    assert "do not disposition any other issue requirement" in (
+        focused_validation_call["payload"]["instruction"]
+    )
     assert store.get_issue_specification(run["id"], execution_pass["id"]) == (
         focused_issue_specification()
     )

@@ -232,17 +232,6 @@ _VALIDATION_SCHEMA = {
     ],
     "integration_findings": ["string"],
 }
-_WORK_VALIDATION_SCHEMA = {
-    "passed": True,
-    "requirement_results": [
-        {"requirement_key": "string", "passed": True, "evidence": ["string"]}
-    ],
-    "criterion_results": [
-        {"criterion_key": "string", "passed": True, "evidence": ["string"]}
-    ],
-    "findings": ["string"],
-    "explanation": "string",
-}
 _ISSUE_ORDER_SCHEMA = {
     "ordered_issues": [
         {
@@ -3607,6 +3596,30 @@ class Application:
         except (OSError, json.JSONDecodeError) as error:
             raise RuntimeError(f"invalid persisted work trajectory: {path}") from error
 
+    @staticmethod
+    def _focused_work_validation_schema(work: dict) -> dict:
+        return {
+            "passed": True,
+            "requirement_results": [
+                {
+                    "requirement_key": key,
+                    "passed": True,
+                    "evidence": ["concrete evidence for this assigned requirement"],
+                }
+                for key in work["requirement_keys"]
+            ],
+            "criterion_results": [
+                {
+                    "criterion_key": key,
+                    "passed": True,
+                    "evidence": ["concrete evidence for this assigned criterion"],
+                }
+                for key in work["acceptance_criteria"]
+            ],
+            "findings": ["focused finding; empty when none"],
+            "explanation": "nonempty focused explanation",
+        }
+
     def _run_work(self, node: dict, work: dict) -> None:
         run = self.store.get_run(work["run_id"])
         if run is None:
@@ -3717,57 +3730,74 @@ class Application:
                 )
                 work_validation = None
                 if result["outcome"] == "ready_for_validation":
-                    work_validation = self.runtime.run(
-                        self._task(
-                            "work_validate",
-                            "Independently judge only this proposed work result. "
-                            "Inspect the proposed artifacts in the workspace and "
-                            "disposition every assigned issue requirement and "
-                            "acceptance criterion using concrete evidence. Verify "
-                            "required evidence, dependency outputs, and claimed tests. "
-                            "Do not implement corrections or judge unrelated work. "
-                            "Fail the result for any unsupported, incomplete, or "
-                            "incorrect assigned outcome.",
-                            {
-                                "original_issue": run["issue_json"],
-                                "issue_specification": self.store.get_issue_specification(
-                                    run["id"], execution_pass["id"]
-                                ),
-                                "specification": self._specification_definition(
-                                    specification
-                                ),
-                                "work_item": work,
-                                "dependency_results": dependencies,
-                                "proposed_result": result,
-                                "changed_paths": changed_paths,
-                                "execution_trajectory": self._trajectory_evidence(
-                                    work_trajectory
-                                ),
-                            },
-                        ),
-                        source_workspace,
-                        result_schema=_WORK_VALIDATION_SCHEMA,
-                        trajectory_path=self._trajectory(
-                            run["id"], f"work-validate-{work['id']}"
-                        ),
+                    issue_specification = self.store.get_issue_specification(
+                        run["id"], execution_pass["id"]
                     )
-                    work_validation = self._validated_work_validation_result(
-                        work_validation, work
-                    )
-                    work_validation = self.store.record_work_validation(
-                        run["id"],
-                        execution_pass["id"],
-                        work["id"],
-                        work_validation,
-                    )["result"]
-                    if not work_validation["passed"]:
-                        failed_result = dict(result)
-                        failed_result["work_validation"] = work_validation
-                        failed_result["execution_trajectory_path"] = str(
-                            work_trajectory
+                    if issue_specification is None:
+                        if work["requirement_keys"] or work["acceptance_criteria"]:
+                            raise RuntimeError(
+                                "traced work validation has no issue specification"
+                            )
+                    else:
+                        applicable_requirements = [
+                            requirement
+                            for requirement in issue_specification["requirements"]
+                            if requirement["key"] in work["requirement_keys"]
+                        ]
+                        applicable_criteria = [
+                            criterion
+                            for criterion in specification["acceptance_traceability"]
+                            if criterion["key"] in work["acceptance_criteria"]
+                        ]
+                        work_validation = self.runtime.run(
+                            self._task(
+                                "work_validate",
+                                "Independently judge only this proposed work result. "
+                                "Inspect the proposed artifacts in the workspace and "
+                                "disposition every assigned issue requirement and "
+                                "acceptance criterion using concrete evidence. Verify "
+                                "required evidence, dependency outputs, and claimed tests. "
+                                "Return exactly the supplied requirement and criterion "
+                                "keys once each; do not disposition any other issue "
+                                "requirement or criterion. "
+                                "Do not implement corrections or judge unrelated work. "
+                                "Fail the result for any unsupported, incomplete, or "
+                                "incorrect assigned outcome.",
+                                {
+                                    "applicable_requirements": applicable_requirements,
+                                    "applicable_criteria": applicable_criteria,
+                                    "work_item": work,
+                                    "dependency_results": dependencies,
+                                    "proposed_result": result,
+                                    "changed_paths": changed_paths,
+                                    "execution_trajectory": self._trajectory_evidence(
+                                        work_trajectory
+                                    ),
+                                },
+                            ),
+                            source_workspace,
+                            result_schema=self._focused_work_validation_schema(work),
+                            trajectory_path=self._trajectory(
+                                run["id"], f"work-validate-{work['id']}"
+                            ),
                         )
-                        self.store.fail_work(work["id"], failed_result)
-                        return
+                        work_validation = self._validated_work_validation_result(
+                            work_validation, work
+                        )
+                        work_validation = self.store.record_work_validation(
+                            run["id"],
+                            execution_pass["id"],
+                            work["id"],
+                            work_validation,
+                        )["result"]
+                        if not work_validation["passed"]:
+                            failed_result = dict(result)
+                            failed_result["work_validation"] = work_validation
+                            failed_result["execution_trajectory_path"] = str(
+                                work_trajectory
+                            )
+                            self.store.fail_work(work["id"], failed_result)
+                            return
                 with self._durable_source_import(
                     workspace,
                     source_workspace,
