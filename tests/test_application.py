@@ -8407,6 +8407,9 @@ def test_focused_workflow_persists_traceability_through_issue_validation(tmp_pat
     assert "actually perform it and preserve direct execution evidence" in (
         work_call["payload"]["instruction"]
     )
+    assert "Never return a .repogents/dependencies/ transport path" in (
+        work_call["payload"]["instruction"]
+    )
     assert store.get_issue_specification(run["id"], execution_pass["id"]) == (
         focused_issue_specification()
     )

@@ -4149,6 +4149,7 @@ class Application:
                         "Use your tools and judgment flexibly to complete this bounded work. Return ready_for_validation when no more agent work is needed, or continue_work with the next classification and handoff context. For continue_work, blocking must be null or a JSON object, never a string. "
                         "Satisfy every evidence requirement in the work item. When an assigned requirement mandates a method or external interaction, actually perform it and preserve direct execution evidence; an artifact that could have been produced without that method is not evidence that it occurred. "
                         "List each private evidence file needed by causal dependents under .repogents/ in artifacts so the controller can preserve and deliver it without publishing it as repository source. "
+                        "Artifacts must identify only files this work produced or changed. Never return a .repogents/dependencies/ transport path as an artifact; the controller delivers upstream evidence to causal dependents independently. "
                         + _CLASSIFICATION_GUIDANCE,
                         work_context,
                     ),

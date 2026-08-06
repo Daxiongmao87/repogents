@@ -73,7 +73,9 @@ specification-level causal predecessors receive namespaced copies plus their
 declared paths and hashes. The controller verifies those copies after agent and
 validator execution, and fails closed if evidence is absent, altered, or does
 not match the durable result. This evidence channel never enters source import,
-handoffs, commits, or publication.
+handoffs, commits, or publication. A worker may declare only private evidence it
+produced or changed; controller-delivered `.repogents/dependencies/` paths are
+read-only inputs and must not be redeclared as the worker's artifacts.
 
 ## Work Validator
 
