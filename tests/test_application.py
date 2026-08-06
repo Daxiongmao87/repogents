@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import multiprocessing
 import stat
@@ -10,7 +11,7 @@ import time
 from collections import defaultdict, deque
 
 import pytest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from repogents.application import Application, ApplicationConfig
 from repogents.github import (
@@ -4042,6 +4043,261 @@ def test_continue_work_handoff_reclassifies_through_another_dynamic_node(tmp_pat
     app.close()
 
 
+def test_declared_private_evidence_survives_restart_and_reaches_dependent_only(
+    tmp_path,
+):
+    classification = "research/evidence-flow"
+    package_value = package(
+        ("retrieve-evidence", classification),
+        ("consume-evidence", classification),
+    )
+    consumer_work = package_value["specifications"].pop()["work_items"][0]
+    package_value["specifications"][0]["work_items"].append(consumer_work)
+    consumer_work["dependencies"] = [
+        "retrieve-evidence"
+    ]
+    consumer_work["dependency_evidence"] = dependency_evidence(
+        "retrieve-evidence"
+    )
+    runtime = WorkspaceScriptedRuntime()
+    runtime.queue("specify", package_value)
+    runtime.queue(
+        "node_role",
+        {"role_prompt": "Retrieve and preserve evidence."},
+    )
+    first_result = ready_result("retrieval complete")
+    first_result["artifacts"] = [
+        "research-summary.txt",
+        ".repogents/research/retrieval.tsv",
+    ]
+    runtime.queue("work", first_result)
+
+    def write_evidence(agent_workspace: Path) -> None:
+        private = agent_workspace / ".repogents" / "research"
+        private.mkdir(parents=True)
+        (private / "retrieval.tsv").write_text(
+            "url\tstatus\nhttps://example.test\t200\n",
+            encoding="utf-8",
+        )
+        (agent_workspace / "research-summary.txt").write_text(
+            "retrieval complete\n",
+            encoding="utf-8",
+        )
+
+    runtime.queue_workspace_action("work", write_evidence)
+    app, store, github, runtime = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={classification: [1.0, 0.0]},
+        max_workers=1,
+    )
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
+    github.issues = [
+        GitHubIssue(7, "Use evidence", "Retrieve then consume evidence", "https://issue/7")
+    ]
+    drive_until(
+        app,
+        lambda: any(
+            item["key"] == "retrieve-evidence" and item["state"] == "COMPLETED"
+            for run in store.list_runs(repository["id"])
+            for item in store.list_work_items(run["id"])
+        ),
+    )
+    run = store.list_runs(repository["id"])[0]
+    provider = next(
+        item
+        for item in store.list_work_items(run["id"])
+        if item["key"] == "retrieve-evidence"
+    )
+    app.close()
+
+    evidence_root = (
+        tmp_path / "runtime" / "work-evidence" / str(run["id"]) / str(provider["id"])
+    )
+    assert (
+        evidence_root / "files" / "research" / "retrieval.tsv"
+    ).read_text(encoding="utf-8") == (
+        "url\tstatus\nhttps://example.test\t200\n"
+    )
+    canonical_workspace = (
+        tmp_path / "runtime" / "workspaces" / str(repository["id"]) / str(run["id"])
+    )
+    assert not (canonical_workspace / ".repogents").exists()
+
+    runtime.queue("work", ready_result("evidence consumed"))
+    runtime.queue(
+        "validate",
+        validation(True, "durable dependency evidence was consumed"),
+    )
+
+    def consume_evidence(agent_workspace: Path) -> None:
+        delivered = list(
+            (agent_workspace / ".repogents" / "dependencies").glob(
+                "work-*/research/retrieval.tsv"
+            )
+        )
+        assert len(delivered) == 1
+        (agent_workspace / "consumed-evidence.txt").write_text(
+            delivered[0].read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+    runtime.queue_workspace_action("work", consume_evidence)
+    reopened_store = Store(tmp_path / "state.sqlite3")
+    reopened = Application(
+        reopened_store,
+        github,
+        runtime,
+        SemanticRouter(MapEmbedder({classification: [1.0, 0.0]})),
+        ApplicationConfig(data_dir=tmp_path / "runtime", max_workers=1),
+    )
+    drive_until(
+        reopened,
+        lambda: reopened_store.get_run(run["id"])["state"] == "PR_LISTENING",
+    )
+
+    assert (canonical_workspace / "consumed-evidence.txt").read_text(
+        encoding="utf-8"
+    ) == "url\tstatus\nhttps://example.test\t200\n"
+    assert not (canonical_workspace / ".repogents").exists()
+    dependent_call = next(
+        call
+        for call in runtime.calls
+        if call["payload"]["kind"] == "work"
+        and call["payload"]["context"]["work_item"]["key"]
+        == "consume-evidence"
+    )
+    delivered_context = dependent_call["payload"]["context"][
+        "dependency_artifacts"
+    ]
+    assert delivered_context == [
+        {
+            "work_id": provider["id"],
+            "work_key": "retrieve-evidence",
+            "files": [
+                {
+                    "declared_path": ".repogents/research/retrieval.tsv",
+                    "workspace_path": (
+                        f".repogents/dependencies/work-{provider['id']}"
+                        "/research/retrieval.tsv"
+                    ),
+                    "sha256": hashlib.sha256(
+                        b"url\tstatus\nhttps://example.test\t200\n"
+                    ).hexdigest(),
+                }
+            ],
+        }
+    ]
+    validator_call = next(
+        call
+        for call in runtime.stage_calls
+        if call["payload"]["kind"] == "work_validate"
+        and call["payload"]["context"]["work_item"]["key"]
+        == "consume-evidence"
+    )
+    assert validator_call["payload"]["context"]["dependency_artifacts"] == (
+        delivered_context
+    )
+    reopened.close()
+
+
+def test_dependent_work_fails_when_it_modifies_materialized_evidence(tmp_path):
+    app, store, _, _ = make_app(tmp_path)
+    workspace = tmp_path / "provider-workspace"
+    evidence = workspace / ".repogents" / "proof.txt"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text("original evidence\n", encoding="utf-8")
+    app._capture_work_evidence(
+        1,
+        11,
+        workspace,
+        [".repogents/proof.txt"],
+    )
+    consumer = tmp_path / "consumer-workspace"
+    consumer.mkdir()
+    delivered, integrity = app._materialize_work_evidence(
+        1,
+        [
+            {
+                "id": 11,
+                "key": "provider",
+                "result": {"artifacts": [".repogents/proof.txt"]},
+            }
+        ],
+        consumer,
+    )
+    delivered_path = consumer.joinpath(
+        *PurePosixPath(delivered[0]["files"][0]["workspace_path"]).parts
+    )
+    delivered_path.chmod(0o644)
+    delivered_path.write_text("altered evidence\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dependency evidence was modified"):
+        app._verify_materialized_work_evidence(integrity)
+    app.close()
+
+
+def test_work_fails_if_validator_modifies_its_declared_private_evidence(tmp_path):
+    classification = "research/evidence-integrity"
+    runtime = WorkspaceScriptedRuntime()
+    runtime.queue(
+        "specify",
+        package(("capture-evidence", classification)),
+    )
+    runtime.queue(
+        "node_role",
+        {"role_prompt": "Capture independently verifiable evidence."},
+    )
+    result = ready_result("evidence captured")
+    result["artifacts"] = [".repogents/proof.txt"]
+    runtime.queue("work", result)
+
+    def write_evidence(agent_workspace: Path) -> None:
+        evidence_root = agent_workspace / ".repogents"
+        evidence_root.mkdir()
+        (evidence_root / "proof.txt").write_text(
+            "worker evidence\n",
+            encoding="utf-8",
+        )
+
+    def tamper_with_evidence(validator_workspace: Path) -> None:
+        (validator_workspace / ".repogents" / "proof.txt").write_text(
+            "validator replacement\n",
+            encoding="utf-8",
+        )
+
+    runtime.queue_workspace_action("work", write_evidence)
+    runtime.queue_workspace_action("work_validate", tamper_with_evidence)
+    app, store, github, _ = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={classification: [1.0, 0.0]},
+    )
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
+    github.issues = [
+        GitHubIssue(7, "Evidence integrity", "Preserve exact evidence", "https://issue/7")
+    ]
+    drive_until(
+        app,
+        lambda: any(
+            item["state"] == "FAILED"
+            for run in store.list_runs(repository["id"])
+            for item in store.list_work_items(run["id"])
+        ),
+    )
+
+    run = store.list_runs(repository["id"])[0]
+    work = store.list_work_items(run["id"])[0]
+    assert work["result"]["output"] == {
+        "error": "declared work evidence was modified",
+        "type": "ValueError",
+    }
+    assert not (
+        tmp_path / "runtime" / "work-evidence" / str(run["id"]) / str(work["id"])
+    ).exists()
+    app.close()
+
+
 def test_startup_recovers_running_work_and_state_exposes_durable_history(tmp_path):
     store = Store(tmp_path / "state.sqlite3")
     repository = store.add_repository("acme/widget", "main", 0.75)
@@ -7955,6 +8211,7 @@ def test_focused_workflow_persists_traceability_through_issue_validation(tmp_pat
         "applicable_criteria",
         "work_item",
         "dependency_results",
+        "dependency_artifacts",
         "proposed_result",
         "changed_paths",
         "execution_trajectory",

@@ -1652,6 +1652,297 @@ class Application:
             / f"{failed_pass_id}-{failed_stage}"
         )
 
+    def _work_evidence_directory(self, run_id: int, work_id: int) -> Path:
+        return self.data_dir / "work-evidence" / str(run_id) / str(work_id)
+
+    @staticmethod
+    def _declared_work_evidence_paths(artifacts: list) -> list[str]:
+        paths: list[str] = []
+        for artifact in artifacts:
+            if not isinstance(artifact, str) or not (
+                artifact == ".repogents"
+                or artifact.startswith(".repogents/")
+            ):
+                continue
+            path = PurePosixPath(artifact)
+            if (
+                artifact == ".repogents"
+                or path.as_posix() != artifact
+                or len(path.parts) < 2
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or path.parts[:2] == (".repogents", "dependencies")
+            ):
+                raise ValueError(
+                    "declared work evidence must be a normalized file below "
+                    ".repogents and outside its dependencies transport"
+                )
+            paths.append(artifact)
+        if len(paths) != len(set(paths)):
+            raise ValueError("declared work evidence paths must be unique")
+        return sorted(paths)
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source_file:
+            while chunk := source_file.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _work_evidence_integrity(
+        self,
+        workspace: Path,
+        artifacts: list,
+    ) -> dict[Path, str]:
+        integrity: dict[Path, str] = {}
+        for declared_path in self._declared_work_evidence_paths(artifacts):
+            source = workspace.joinpath(*PurePosixPath(declared_path).parts)
+            try:
+                metadata = source.lstat()
+            except FileNotFoundError as error:
+                raise ValueError(
+                    f"declared work evidence is unavailable: {declared_path}"
+                ) from error
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(
+                    f"declared work evidence must be a regular file: {declared_path}"
+                )
+            integrity[source] = self._file_sha256(source)
+        return integrity
+
+    def _load_work_evidence(
+        self,
+        run_id: int,
+        work_id: int,
+    ) -> dict[str, str]:
+        root = self._work_evidence_directory(run_id, work_id)
+        try:
+            manifest = json.loads(
+                (root / "manifest.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"durable evidence for work {work_id} is unavailable"
+            ) from error
+        if (
+            not isinstance(manifest, dict)
+            or set(manifest) != {"version", "run_id", "work_id", "files"}
+            or manifest["version"] != 1
+            or manifest["run_id"] != run_id
+            or manifest["work_id"] != work_id
+            or not isinstance(manifest["files"], dict)
+        ):
+            raise ValueError(
+                f"durable evidence manifest for work {work_id} is invalid"
+            )
+        files: dict[str, str] = {}
+        for declared_path, expected_digest in manifest["files"].items():
+            if (
+                self._declared_work_evidence_paths([declared_path])
+                != [declared_path]
+                or not isinstance(expected_digest, str)
+                or len(expected_digest) != 64
+            ):
+                raise ValueError(
+                    f"durable evidence manifest for work {work_id} is invalid"
+                )
+            stored = root.joinpath(
+                "files", *PurePosixPath(declared_path).parts[1:]
+            )
+            try:
+                metadata = stored.lstat()
+            except FileNotFoundError as error:
+                raise ValueError(
+                    f"durable evidence for work {work_id} is incomplete"
+                ) from error
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or self._file_sha256(stored) != expected_digest
+            ):
+                raise ValueError(
+                    f"durable evidence for work {work_id} failed integrity validation"
+                )
+            files[declared_path] = expected_digest
+
+        expected_tree = {
+            "manifest.json",
+            *{
+                "files/" + "/".join(PurePosixPath(path).parts[1:])
+                for path in files
+            },
+        }
+        expected_directories = {"files"} if files else set()
+        for path in files:
+            relative = PurePosixPath("files", *PurePosixPath(path).parts[1:])
+            expected_directories.update(
+                parent.as_posix()
+                for parent in relative.parents
+                if parent != PurePosixPath(".")
+            )
+        actual_files: set[str] = set()
+        actual_directories: set[str] = set()
+        for directory, dirnames, filenames in os.walk(root):
+            directory_path = Path(directory)
+            for dirname in dirnames:
+                path = directory_path / dirname
+                if not stat.S_ISDIR(path.lstat().st_mode):
+                    raise ValueError(
+                        f"durable evidence for work {work_id} contains an unsupported path"
+                    )
+                actual_directories.add(path.relative_to(root).as_posix())
+            for filename in filenames:
+                path = directory_path / filename
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    raise ValueError(
+                        f"durable evidence for work {work_id} contains an unsupported path"
+                    )
+                actual_files.add(path.relative_to(root).as_posix())
+        if (
+            actual_files != expected_tree
+            or actual_directories != expected_directories
+        ):
+            raise ValueError(
+                f"durable evidence manifest for work {work_id} does not describe its tree"
+            )
+        return files
+
+    def _capture_work_evidence(
+        self,
+        run_id: int,
+        work_id: int,
+        workspace: Path,
+        artifacts: list,
+    ) -> dict[str, str]:
+        declared_paths = self._declared_work_evidence_paths(artifacts)
+        if not declared_paths:
+            return {}
+        integrity = self._work_evidence_integrity(workspace, artifacts)
+        files = {
+            declared_path: integrity[
+                workspace.joinpath(*PurePosixPath(declared_path).parts)
+            ]
+            for declared_path in declared_paths
+        }
+
+        destination = self._work_evidence_directory(run_id, work_id)
+        if os.path.lexists(destination):
+            if self._load_work_evidence(run_id, work_id) != files:
+                raise ValueError(
+                    f"durable evidence for work {work_id} conflicts with a prior attempt"
+                )
+            return files
+
+        parent = destination.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        self._fsync_directory(parent)
+        self._fsync_directory(parent.parent)
+        self._fsync_directory(self.data_dir)
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{work_id}.pending-", dir=parent)
+        )
+        try:
+            for declared_path in declared_paths:
+                source = workspace.joinpath(
+                    *PurePosixPath(declared_path).parts
+                )
+                stored = staging.joinpath(
+                    "files", *PurePosixPath(declared_path).parts[1:]
+                )
+                stored.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, stored)
+            manifest = {
+                "version": 1,
+                "run_id": run_id,
+                "work_id": work_id,
+                "files": files,
+            }
+            manifest_path = staging / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True),
+                encoding="utf-8",
+            )
+            self._fsync_source_tree(staging)
+            os.replace(staging, destination)
+            self._fsync_directory(parent)
+        except BaseException:
+            if os.path.lexists(staging):
+                shutil.rmtree(staging)
+            raise
+        return self._load_work_evidence(run_id, work_id)
+
+    def _materialize_work_evidence(
+        self,
+        run_id: int,
+        providers: list[dict],
+        workspace: Path,
+    ) -> tuple[list[dict], dict[Path, str]]:
+        materialized: list[dict] = []
+        integrity: dict[Path, str] = {}
+        for provider in sorted(providers, key=lambda item: item["id"]):
+            result = provider.get("result") or {}
+            declared_paths = self._declared_work_evidence_paths(
+                result.get("artifacts", [])
+            )
+            if not declared_paths:
+                continue
+            files = self._load_work_evidence(run_id, provider["id"])
+            if set(files) != set(declared_paths):
+                raise ValueError(
+                    f"durable evidence for work {provider['id']} does not match its result"
+                )
+            provider_files = []
+            for declared_path in declared_paths:
+                source = self._work_evidence_directory(
+                    run_id, provider["id"]
+                ).joinpath(
+                    "files", *PurePosixPath(declared_path).parts[1:]
+                )
+                relative = PurePosixPath(
+                    ".repogents", "dependencies", f"work-{provider['id']}",
+                    *PurePosixPath(declared_path).parts[1:],
+                ).as_posix()
+                destination = workspace.joinpath(*PurePosixPath(relative).parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                destination.chmod(0o444)
+                integrity[destination] = files[declared_path]
+                provider_files.append(
+                    {
+                        "declared_path": declared_path,
+                        "workspace_path": relative,
+                        "sha256": files[declared_path],
+                    }
+                )
+            materialized.append(
+                {
+                    "work_id": provider["id"],
+                    "work_key": provider["key"],
+                    "files": provider_files,
+                }
+            )
+        return materialized, integrity
+
+    def _verify_materialized_work_evidence(
+        self,
+        integrity: dict[Path, str],
+        *,
+        label: str = "materialized dependency evidence",
+    ) -> None:
+        for path, expected_digest in integrity.items():
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError as error:
+                raise ValueError(
+                    f"{label} was removed"
+                ) from error
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or self._file_sha256(path) != expected_digest
+            ):
+                raise ValueError(
+                    f"{label} was modified"
+                )
+
     def _export_operation_artifacts(
         self,
         run_id: int,
@@ -3764,12 +4055,32 @@ class Application:
         dependencies = [
             item for item in all_work if item["key"] in dependency_keys
         ]
+        specification_dependency_keys = {
+            item["key"] for item in specification_dependencies
+        }
+        evidence_providers_by_id = {
+            item["id"]: item
+            for item in all_work
+            if (
+                item["key"] in dependency_keys
+                or item["id"] == work["parent_work_id"]
+                or specifications[item["specification_id"]]["key"]
+                in specification_dependency_keys
+            )
+            and item["state"] in {"COMPLETED", "HANDED_OFF"}
+        }
+        evidence_providers = list(evidence_providers_by_id.values())
         proposed_result: dict | None = None
         try:
             workspace = self._workspace(repository["id"], run["id"])
             with self._source_snapshot(workspace) as source_workspace:
                 baseline = self._source_manifest(source_workspace)
                 excluded_roots: set[str] = set()
+                dependency_artifacts, dependency_artifact_integrity = (
+                    self._materialize_work_evidence(
+                        run["id"], evidence_providers, source_workspace
+                    )
+                )
                 work_context = {
                     "original_issue": run["issue_json"],
                     "issue_specification": self.store.get_issue_specification(
@@ -3781,6 +4092,7 @@ class Application:
                     ),
                     "work_item": work,
                     "dependency_results": dependencies,
+                    "dependency_artifacts": dependency_artifacts,
                     "specification_dependencies": (
                         specification_dependencies
                     ),
@@ -3808,6 +4120,7 @@ class Application:
                         "work",
                         "Use your tools and judgment flexibly to complete this bounded work. Return ready_for_validation when no more agent work is needed, or continue_work with the next classification and handoff context. For continue_work, blocking must be null or a JSON object, never a string. "
                         "Satisfy every evidence requirement in the work item. When an assigned requirement mandates a method or external interaction, actually perform it and preserve direct execution evidence; an artifact that could have been produced without that method is not evidence that it occurred. "
+                        "List each private evidence file needed by causal dependents under .repogents/ in artifacts so the controller can preserve and deliver it without publishing it as repository source. "
                         + _CLASSIFICATION_GUIDANCE,
                         work_context,
                     ),
@@ -3824,6 +4137,13 @@ class Application:
                     result,
                     execution_pass,
                     {item["key"] for item in all_work},
+                )
+                proposed_evidence_integrity = self._work_evidence_integrity(
+                    source_workspace,
+                    result["artifacts"],
+                )
+                self._verify_materialized_work_evidence(
+                    dependency_artifact_integrity
                 )
                 desired = self._source_manifest(
                     source_workspace,
@@ -3886,6 +4206,9 @@ class Application:
                                     "applicable_criteria": applicable_criteria,
                                     "work_item": work,
                                     "dependency_results": dependencies,
+                                    "dependency_artifacts": (
+                                        dependency_artifacts
+                                    ),
                                     "proposed_result": result,
                                     "changed_paths": changed_paths,
                                     "execution_trajectory": self._trajectory_evidence(
@@ -3902,6 +4225,13 @@ class Application:
                         work_validation = self._validated_work_validation_result(
                             work_validation, work
                         )
+                        self._verify_materialized_work_evidence(
+                            dependency_artifact_integrity
+                        )
+                        self._verify_materialized_work_evidence(
+                            proposed_evidence_integrity,
+                            label="declared work evidence",
+                        )
                         work_validation = self.store.record_work_validation(
                             run["id"],
                             execution_pass["id"],
@@ -3916,6 +4246,16 @@ class Application:
                             )
                             self.store.fail_work(work["id"], failed_result)
                             return
+                self._verify_materialized_work_evidence(
+                    proposed_evidence_integrity,
+                    label="declared work evidence",
+                )
+                self._capture_work_evidence(
+                    run["id"],
+                    work["id"],
+                    source_workspace,
+                    result["artifacts"],
+                )
                 with self._durable_source_import(
                     workspace,
                     source_workspace,

@@ -59,7 +59,14 @@ controller-selected subset.
 The `.repogents*` namespace is reserved for disposable tool state, captured
 evidence, and controller metadata. Source snapshots, continuation handoffs, and
 publication manifests exclude it consistently; repository artifacts must use a
-non-reserved path.
+non-reserved path. When a successful work result declares regular evidence files
+under `.repogents/`, the controller atomically stores them outside repository
+source with a hash manifest. Direct dependencies, continuation lineage, and
+specification-level causal predecessors receive namespaced copies plus their
+declared paths and hashes. The controller verifies those copies after agent and
+validator execution, and fails closed if evidence is absent, altered, or does
+not match the durable result. This evidence channel never enters source import,
+handoffs, commits, or publication.
 
 ## Work Validator
 
