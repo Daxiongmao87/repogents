@@ -1,15 +1,22 @@
 from __future__ import annotations
 
-from repogents.agent_runtime import MiniSweRuntime, RuntimeConfig
-from repogents.application import Application, ApplicationConfig
+from pathlib import Path
+
+import sys
+
+from repogents import __version__
+
 from repogents.config import ServiceConfig
-from repogents.github import GitHubClient
-from repogents.http_api import HttpService
-from repogents.semantic import SemanticRouter, SentenceTransformerEmbedder
-from repogents.store import Store
 
 
-def build_service(config: ServiceConfig) -> HttpService:
+def build_service(config: ServiceConfig) -> "HttpService":
+    from repogents.agent_runtime import MiniSweRuntime, RuntimeConfig
+    from repogents.application import Application, ApplicationConfig
+    from repogents.github import GitHubClient
+    from repogents.http_api import HttpService
+    from repogents.semantic import SemanticRouter, SentenceTransformerEmbedder
+    from repogents.store import Store
+
     config.data_dir.mkdir(parents=True, exist_ok=True)
     store = Store(config.data_dir / "repogents.sqlite3")
     github = GitHubClient(config.github_token)
@@ -34,6 +41,9 @@ def build_service(config: ServiceConfig) -> HttpService:
 
 
 def main() -> None:
+    if "--version" in sys.argv[1:]:
+        print(__version__)
+        return
     config = ServiceConfig.from_env()
     service = build_service(config)
     host, port = service.address
