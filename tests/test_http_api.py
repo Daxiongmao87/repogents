@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import threading
 import time
 import urllib.error
@@ -57,7 +59,18 @@ class FakeApplication:
                             },
                             "specifications": [{"title": "Add endpoint"}],
                             "work_items": [
-                                {"title": "Implement endpoint", "state": "COMPLETED"}
+                                {
+                                    "key": "implement",
+                                    "title": "Implement endpoint",
+                                    "state": "COMPLETED",
+                                    "dependencies": ["verify"],
+                                },
+                                {
+                                    "key": "verify",
+                                    "title": "Verify endpoint",
+                                    "state": "COMPLETED",
+                                    "dependencies": [],
+                                },
                             ],
                         }
                     ],
@@ -84,6 +97,19 @@ class FakeApplication:
 
     def close(self):
         self.closed = True
+
+
+def rendered_page(url):
+    browser = shutil.which("google-chrome") or shutil.which("chromium")
+    if browser is None:
+        pytest.skip("a headless browser is required to inspect rendered client output")
+    return subprocess.run(
+        [browser, "--headless", "--no-sandbox", "--disable-gpu", "--virtual-time-budget=1000", "--dump-dom", url],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    ).stdout
 
 
 def request_json(url, method="GET", body=None):
@@ -235,7 +261,12 @@ def test_http_service_exposes_client_state_repository_mutations_and_background_p
             html = response.read().decode("utf-8")
         assert response.status == 200
         assert "Track repository" in html
-        assert "Saved agent graph" in html
+        assert "Saved agent nodes" in html
+        assert "Nodes are not ordered by execution" in html
+        rendered_html = rendered_page(base + "/")
+        assert "Declared execution dependencies: verify → implement." in rendered_html
+        assert "Nodes are not ordered by execution" in rendered_html
+        assert 'class="arrow"' not in rendered_html
         assert "Specifications" in html
         assert "Work items" in html
         assert "Pull request" in html
