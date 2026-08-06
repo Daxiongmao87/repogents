@@ -105,6 +105,7 @@ class GitHubIssue:
     title: str
     body: str
     url: str
+    labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -248,7 +249,7 @@ class GitHubClient:
         return repository
 
 
-    def list_ready_issues(self, github_repository: str) -> list[GitHubIssue]:
+    def list_open_issues(self, github_repository: str) -> list[GitHubIssue]:
         issues = []
         page = 1
         while True:
@@ -257,7 +258,6 @@ class GitHubClient:
                 f"/repos/{github_repository}/issues",
                 query={
                     "state": "open",
-                    "labels": "agent:ready",
                     "per_page": 100,
                     "page": page,
                 },
@@ -269,11 +269,8 @@ class GitHubClient:
                 break
             page += 1
         return [
-            GitHubIssue(
-                number=issue["number"],
-                title=issue["title"],
-                body=issue.get("body") or "",
-                url=issue["html_url"],
+            self._parse_github_issue(
+                {**issue, "body": issue.get("body") or ""}
             )
             for issue in issues
             if "pull_request" not in issue
@@ -348,7 +345,6 @@ class GitHubClient:
             json_body={
                 "title": title,
                 "body": marked_body,
-                "labels": ["agent:ready"],
             },
         )
         created_issue = self._parse_github_issue(created)
@@ -1098,54 +1094,6 @@ class GitHubClient:
             workspace_path,
         )
         head = self._rev_parse_commit("HEAD", workspace_path)
-        if remote_head and head != remote_head:
-            tree = self._command_runner(
-                ["git", "write-tree"],
-                cwd=workspace_path,
-                env=self._git_command_env,
-            )
-            tree_oid = (
-                tree.stdout.strip()
-                if isinstance(tree.stdout, str)
-                else ""
-            )
-            if not self._is_commit_sha(tree_oid):
-                raise RuntimeError("git write-tree returned an invalid tree")
-            commit_args = [
-                "git",
-                "commit-tree",
-                tree_oid,
-                "-p",
-                remote_head,
-            ]
-            if not self._commit_is_ancestor(
-                target_head,
-                remote_head,
-                workspace_path,
-            ):
-                commit_args.extend(["-p", target_head])
-            commit_args.extend(
-                ["-m", f"Resolve issue #{issue_number}"]
-            )
-            commit = self._command_runner(
-                commit_args,
-                cwd=workspace_path,
-                env=self._git_identity_env,
-            )
-            head = (
-                commit.stdout.strip()
-                if isinstance(commit.stdout, str)
-                else ""
-            )
-            if not self._is_commit_sha(head):
-                raise RuntimeError(
-                    "git commit-tree returned an invalid commit"
-                )
-            self._command_runner(
-                ["git", "reset", "--soft", head],
-                cwd=workspace_path,
-                env=self._git_command_env,
-            )
         candidate_diff = self._command_runner(
             ["git", "diff", "--no-color", target_head, head, "--"],
             cwd=workspace_path,
@@ -1161,6 +1109,35 @@ class GitHubClient:
                 remote_head_sha=remote_head,
             ),
             candidate_diff.stdout,
+        )
+
+    def amend_publication(
+        self,
+        issue_number: int,
+        workspace: str | Path,
+        candidate: PublicationCandidate,
+        commit_message: str,
+    ) -> PublicationCandidate:
+        workspace_path = self._publication_workspace(workspace)
+        self._validate_issue_number(issue_number)
+        self._validate_publication_candidate(candidate, issue_number)
+        if not isinstance(commit_message, str) or not commit_message.strip():
+            raise ValueError("commit_message must be a nonempty string")
+        if "\n" in commit_message.strip():
+            raise ValueError("commit_message must be a subject line")
+        if self._rev_parse_commit("HEAD", workspace_path) != candidate.head_sha:
+            raise RuntimeError("workspace HEAD does not match publication candidate")
+        self._command_runner(
+            ["git", "commit", "--amend", "-m", commit_message.strip()],
+            cwd=workspace_path,
+            env=self._git_identity_env,
+        )
+        amended_head = self._rev_parse_commit("HEAD", workspace_path)
+        return PublicationCandidate(
+            branch=candidate.branch,
+            head_sha=amended_head,
+            target_head_sha=candidate.target_head_sha,
+            remote_head_sha=candidate.remote_head_sha,
         )
 
     def publish(
@@ -1270,43 +1247,18 @@ class GitHubClient:
             return None
 
         remote_ref = f"refs/heads/{candidate.branch}"
-        target_ref = f"refs/heads/{target_branch}"
-        staging_branch = f"repogents/staging/issue-{issue_number}"
-        staging_ref = f"refs/heads/{staging_branch}"
-        repository_id = self._repository_node_id(github_repository)
-        staging_head = self._remote_issue_branch_head(
-            staging_branch,
-            workspace_path,
-        )
-        if staging_head != candidate.head_sha:
-            self._command_runner(
-                [
-                    "git",
-                    "push",
-                    f"--force-with-lease={staging_ref}:{staging_head}",
-                    "origin",
-                    f"{candidate.head_sha}:{staging_ref}",
-                ],
-                cwd=workspace_path,
-                env=self._git_auth_env,
-            )
-        if not self._update_refs(
-            repository_id,
+        self._command_runner(
             [
-                (
-                    target_ref,
-                    candidate.target_head_sha,
-                    candidate.target_head_sha,
-                ),
-                (
-                    remote_ref,
-                    remote_head or _ZERO_OID,
-                    candidate.head_sha,
-                ),
-                (staging_ref, candidate.head_sha, _ZERO_OID),
+                "git",
+                "push",
+                f"--force-with-lease={remote_ref}:{remote_head}",
+                "--set-upstream",
+                "origin",
+                f"{candidate.head_sha}:{remote_ref}",
             ],
-        ):
-            return None
+            cwd=workspace_path,
+            env=self._git_auth_env,
+        )
 
         pull_number = existing_pr
         if pull_number is None:
@@ -1359,6 +1311,23 @@ class GitHubClient:
                 raise RuntimeError("GitHub returned an invalid reviews page")
             reviews.extend(page_reviews)
             if len(page_reviews) < 100:
+                break
+            page += 1
+
+        conversation_comments = []
+        page = 1
+        while True:
+            page_comments = self._request(
+                "GET",
+                f"{repository_path}/issues/{pull_number}/comments",
+                query={"per_page": 100, "page": page},
+            )
+            if not isinstance(page_comments, list):
+                raise RuntimeError(
+                    "GitHub returned an invalid pull request comments page"
+                )
+            conversation_comments.extend(page_comments)
+            if len(page_comments) < 100:
                 break
             page += 1
 
@@ -1441,6 +1410,28 @@ class GitHubClient:
                         body=body,
                     )
                 )
+        for comment in conversation_comments:
+            if not isinstance(comment, dict):
+                raise RuntimeError("GitHub returned an invalid pull request comment")
+            body = comment.get("body") or ""
+            if not isinstance(body, str):
+                raise RuntimeError(
+                    "GitHub returned an invalid pull request comment body"
+                )
+            if _FEEDBACK_MARKER_PREFIX in body:
+                continue
+            comment_id = comment.get("id")
+            if type(comment_id) is not int or comment_id <= 0:
+                raise RuntimeError(
+                    "GitHub pull request comment is missing a valid id"
+                )
+            feedback.append(
+                GitHubFeedback(
+                    external_id=f"comment:{comment_id}",
+                    kind="comment",
+                    body=body,
+                )
+            )
         return feedback
 
     @staticmethod
@@ -1700,7 +1691,7 @@ class GitHubClient:
             raise ValueError("feedback external_id does not match its kind")
         if (
             separator != ":"
-            or kind not in {"inline", "review"}
+            or kind not in {"inline", "review", "comment"}
             or not numeric_id
             or not numeric_id.isascii()
             or not numeric_id.isdigit()
@@ -1716,6 +1707,7 @@ class GitHubClient:
         title = issue.get("title")
         body = issue.get("body")
         url = issue.get("html_url")
+        labels = issue.get("labels", [])
         if type(number) is not int or number <= 0:
             raise RuntimeError("GitHub issue is missing a valid number")
         if not isinstance(title, str) or not title:
@@ -1724,7 +1716,21 @@ class GitHubClient:
             raise RuntimeError("GitHub issue is missing a valid body")
         if not isinstance(url, str) or not url:
             raise RuntimeError("GitHub issue is missing a valid URL")
-        return GitHubIssue(number=number, title=title, body=body, url=url)
+        if not isinstance(labels, list):
+            raise RuntimeError("GitHub issue labels are invalid")
+        label_names = []
+        for label in labels:
+            name = label.get("name") if isinstance(label, dict) else label
+            if not isinstance(name, str) or not name:
+                raise RuntimeError("GitHub issue label is invalid")
+            label_names.append(name)
+        return GitHubIssue(
+            number=number,
+            title=title,
+            body=body,
+            url=url,
+            labels=tuple(label_names),
+        )
 
     @classmethod
     def _validate_feedback_target_inputs(
@@ -1738,7 +1744,7 @@ class GitHubClient:
             raise ValueError("pull_number must be a positive integer")
         if not isinstance(feedback, GitHubFeedback):
             raise TypeError("feedback must be a GitHubFeedback")
-        if feedback.kind not in {"inline", "review"}:
+        if feedback.kind not in {"inline", "review", "comment"}:
             raise ValueError("feedback kind is not addressable")
         cls._validate_feedback_external_id(
             feedback.external_id,

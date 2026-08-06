@@ -32,6 +32,18 @@ class MapEmbedder:
         return list(self.vectors[label])
 
 
+def test_feedback_source_url_points_to_pull_request_conversation_comment():
+    pull_url = "https://github.test/acme/widget/pull/17"
+    feedback_row = {
+        "external_id": "comment:301",
+        "package": {"kind": "comment"},
+    }
+
+    assert Application._feedback_source_url(pull_url, feedback_row) == (
+        f"{pull_url}#issuecomment-301"
+    )
+
+
 class FakeGitHub:
     def __init__(self):
         self.issues: list[GitHubIssue] = []
@@ -51,6 +63,9 @@ class FakeGitHub:
         self.publish_existing: list[int | None] = []
         self.publish_head_shas: deque[str] = deque()
         self.prepare_publication_calls: list[tuple[int, str, Path]] = []
+        self.amend_publication_calls: list[
+            tuple[int, Path, PublicationCandidate, str]
+        ] = []
         self.prepare_publication_overrides: deque[
             tuple[PublicationCandidate, str]
         ] = deque()
@@ -66,6 +81,7 @@ class FakeGitHub:
         ] = []
         self.publish_prepared_overrides: deque[PullRequest | None] = deque()
         self.publish_validated_to_target_result = False
+        self.publish_validated_to_target_confirms_merge = True
         self.publish_validated_to_target_calls: list[
             tuple[str, str, Path, str]
         ] = []
@@ -118,7 +134,7 @@ class FakeGitHub:
             "clone_url": f"https://github.test/{github_repository}.git",
         }
 
-    def list_ready_issues(self, github_repository: str) -> list[GitHubIssue]:
+    def list_open_issues(self, github_repository: str) -> list[GitHubIssue]:
         return list(self.issues_by_repository.get(github_repository, self.issues))
 
     def checkout(
@@ -310,6 +326,18 @@ class FakeGitHub:
         self.effect_calls.append(("publish", existing_pr, pull.head_sha))
         return pull
 
+    def amend_publication(
+        self,
+        issue_number: int,
+        workspace: str | Path,
+        candidate: PublicationCandidate,
+        commit_message: str,
+    ) -> PublicationCandidate:
+        self.amend_publication_calls.append(
+            (issue_number, Path(workspace), candidate, commit_message)
+        )
+        return candidate
+
     def publish(
         self,
         github_repository: str,
@@ -352,6 +380,19 @@ class FakeGitHub:
             )
         )
         self.publish_validated_issue_branches.append(issue_branch)
+        if (
+            self.publish_validated_to_target_result
+            and self.publish_validated_to_target_confirms_merge
+        ):
+            self.pull = PullRequest(
+                number=self.pull.number,
+                url=self.pull.url,
+                branch=self.pull.branch,
+                state="closed",
+                merged=True,
+                diff=self.pull.diff,
+                head_sha=self.pull.head_sha,
+            )
         return self.publish_validated_to_target_result
 
 
@@ -541,6 +582,17 @@ class MutatingValidationRuntime(ScriptedRuntime):
         return super().run(task, workspace, **kwargs)
 
 
+def dependency_evidence(*dependencies):
+    return [
+        {
+            "dependency": dependency,
+            "reason": f"{dependency} must provide its outcome first.",
+            "evidence": [f"The graph declares {dependency} as a prerequisite."],
+        }
+        for dependency in dependencies
+    ]
+
+
 def package(*works: tuple[str, str], prefix: str = "spec") -> dict:
     specifications = []
     for index, (key, classification) in enumerate(works, start=1):
@@ -551,6 +603,7 @@ def package(*works: tuple[str, str], prefix: str = "spec") -> dict:
                 "description": f"Complete {key}",
                 "acceptance_criteria": [f"{key} is complete"],
                 "dependencies": [],
+                "dependency_evidence": [],
                 "executable": True,
                 "work_items": [
                     {
@@ -559,6 +612,7 @@ def package(*works: tuple[str, str], prefix: str = "spec") -> dict:
                         "description": f"Implement {key}",
                         "classification": classification,
                         "dependencies": [],
+                        "dependency_evidence": [],
                     }
                 ],
             }
@@ -597,7 +651,52 @@ def validation(
         "evidence": ["observed result"],
         "repository_state": {"workspace": "captured"},
         "completed_work": [{"key": "work", "state": "COMPLETED"}],
+        "commit_message": "Implement validated repository change",
     }
+
+
+def issue_order(
+    *issue_numbers: int,
+    dependencies: dict[int, list[int]] | None = None,
+) -> dict:
+    dependencies = dependencies or {}
+    return {
+        "ordered_issues": [
+            {
+                "issue_number": issue_number,
+                "reason": f"Issue {issue_number} belongs at this position.",
+                "evidence": [f"Issue {issue_number} supplies ordering evidence."],
+                "dependencies": [
+                    {
+                        "issue_number": dependency,
+                        "reason": f"Issue {dependency} is a causal prerequisite.",
+                        "evidence": [
+                            f"Issue {issue_number} depends on issue {dependency}."
+                        ],
+                    }
+                    for dependency in dependencies.get(issue_number, [])
+                ],
+            }
+            for issue_number in issue_numbers
+        ]
+    }
+
+
+def test_related_prior_validation_failures_follow_overlapping_criteria_without_cap():
+    validations = [
+        {"pass_id": 1, "result": validation(False, "first", failed_criteria=["a"])},
+        {"pass_id": 2, "result": validation(False, "unrelated", failed_criteria=["b"])},
+        {"pass_id": 3, "result": validation(False, "second", failed_criteria=["a"])},
+        {"pass_id": 4, "result": validation(False, "latest", failed_criteria=["a"])},
+    ]
+
+    related = Application._related_prior_validation_failures(validations)
+
+    assert [item["pass_id"] for item in related] == [1, 3]
+    assert [item["result"]["explanation"] for item in related] == [
+        "first",
+        "second",
+    ]
 
 
 def feedback_disposition(
@@ -643,6 +742,7 @@ def lean_specification_definition(specification: dict) -> dict:
             "description",
             "acceptance_criteria",
             "dependencies",
+            "dependency_evidence",
             "executable",
         )
     }
@@ -1003,12 +1103,14 @@ def test_feedback_specify_context_keeps_only_lean_current_evidence(tmp_path):
             "key": "legacy-rich-work",
             "classification": "backend/context",
             "dependencies": [],
+            "dependency_evidence": [],
             "state": "COMPLETED",
         },
         "latest-prior-work": {
             "key": "latest-prior-work",
             "classification": "backend/context",
             "dependencies": [],
+            "dependency_evidence": [],
             "state": "COMPLETED",
         },
     }
@@ -1214,6 +1316,7 @@ def test_reopened_work_context_uses_current_pass_dependency_closure(tmp_path):
                 "description": "WORK_CLOSURE_ROOT_DEFINITION",
                 "acceptance_criteria": ["Root evidence remains available."],
                 "dependencies": [],
+                "dependency_evidence": [],
                 "executable": False,
                 "work_items": [],
             },
@@ -1223,6 +1326,7 @@ def test_reopened_work_context_uses_current_pass_dependency_closure(tmp_path):
                 "description": "WORK_CLOSURE_MIDDLE_DEFINITION",
                 "acceptance_criteria": ["Middle evidence remains available."],
                 "dependencies": ["closure-root"],
+                "dependency_evidence": dependency_evidence("closure-root"),
                 "executable": False,
                 "work_items": [],
             },
@@ -1232,6 +1336,7 @@ def test_reopened_work_context_uses_current_pass_dependency_closure(tmp_path):
                 "description": "WORK_CURRENT_TARGET_DEFINITION",
                 "acceptance_criteria": ["The current handoff is completed."],
                 "dependencies": ["closure-middle"],
+                "dependency_evidence": dependency_evidence("closure-middle"),
                 "executable": True,
                 "work_items": [
                     {
@@ -1240,6 +1345,7 @@ def test_reopened_work_context_uses_current_pass_dependency_closure(tmp_path):
                         "description": "Prepare the declared dependency.",
                         "classification": "prepare/current",
                         "dependencies": [],
+                        "dependency_evidence": [],
                     },
                     {
                         "key": "current-parent",
@@ -1247,6 +1353,9 @@ def test_reopened_work_context_uses_current_pass_dependency_closure(tmp_path):
                         "description": "Produce the durable handoff.",
                         "classification": "implement/current",
                         "dependencies": ["declared-dependency"],
+                        "dependency_evidence": dependency_evidence(
+                            "declared-dependency"
+                        ),
                     },
                 ],
             },
@@ -1256,6 +1365,7 @@ def test_reopened_work_context_uses_current_pass_dependency_closure(tmp_path):
                 "description": unrelated_specification_sentinel,
                 "acceptance_criteria": ["Unrelated work is complete."],
                 "dependencies": [],
+                "dependency_evidence": [],
                 "executable": True,
                 "work_items": [
                     {
@@ -1264,6 +1374,7 @@ def test_reopened_work_context_uses_current_pass_dependency_closure(tmp_path):
                         "description": unrelated_work_sentinel,
                         "classification": "unrelated/current",
                         "dependencies": [],
+                        "dependency_evidence": [],
                     }
                 ],
             },
@@ -1310,6 +1421,7 @@ def test_reopened_work_context_uses_current_pass_dependency_closure(tmp_path):
         "context": {"request": handoff_context_sentinel},
         "artifacts": ["WORK_CURRENT_HANDOFF_ARTIFACT"],
         "dependencies": ["declared-dependency"],
+        "dependency_evidence": dependency_evidence("declared-dependency"),
         "blocking": {"reason": "WORK_CURRENT_HANDOFF_BLOCKING_EVIDENCE"},
     }
     child = store.complete_work(
@@ -1994,6 +2106,168 @@ def test_invalid_work_output_discards_disposable_source_delta(tmp_path):
     assert not work_observation["path"].exists()
 
 
+def test_failed_work_creates_adaptive_failure_pass_without_validation_or_publication(
+    tmp_path,
+):
+    classification = "change/adaptive-failure"
+    runtime = ScriptedRuntime()
+    runtime.queue(
+        "specify",
+        package(("broken-work", classification), prefix="initial"),
+        package(("replanned-work", classification), prefix="replanned"),
+    )
+    runtime.queue(
+        "work",
+        {
+            "outcome": "ready_for_validation",
+            "output": "invalid worker result",
+            "artifacts": "not-a-list",
+            "test_results": [],
+            "repository_state": {},
+        },
+        ready_result("replanned work"),
+    )
+    app, store, github, runtime = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={classification: [1.0, 0.0]},
+    )
+    repository = app.add_repository("acme/widget")
+    store.create_dynamic_node(
+        repository["id"],
+        classification,
+        [1.0, 0.0],
+        "Adapt repository work after failures.",
+    )
+    github.issues = [
+        GitHubIssue(7, "Adaptive failure", "Complete the work", "https://issue/7")
+    ]
+
+    app.poll_once()
+    run = store.list_runs(repository["id"])[0]
+    app.poll_once()
+    drive_until(
+        app,
+        lambda: any(
+            item["trigger_type"] == "work_failure"
+            for item in store.list_passes(run["id"])
+        ),
+    )
+
+    work_failure_pass = store.list_passes(run["id"])[-1]
+    assert work_failure_pass["trigger_type"] == "work_failure"
+    assert work_failure_pass["trigger_json"]["failed_pass_id"] == (
+        store.list_passes(run["id"])[0]["id"]
+    )
+    failed_work = work_failure_pass["trigger_json"]["failed_work"]
+    assert [item["key"] for item in failed_work] == ["broken-work"]
+    assert failed_work[0]["result"]["output"]["type"] == "ValueError"
+    assert not any(call["payload"]["kind"] == "validate" for call in runtime.calls)
+    assert github.prepare_publication_calls == []
+    assert github.publish_prepared_calls == []
+
+    app.poll_once()
+    specify_calls = [
+        call for call in runtime.calls if call["payload"]["kind"] == "specify"
+    ]
+    assert specify_calls[-1]["payload"]["context"]["work_failure"] == (
+        work_failure_pass["trigger_json"]
+    )
+    app.close()
+
+
+def test_failed_work_preserves_and_executes_independent_sibling_before_replanning(
+    tmp_path,
+):
+    classification = "change/adaptive-independent"
+    runtime = ScriptedRuntime()
+    runtime.queue(
+        "specify",
+        package(
+            ("broken-work", classification),
+            ("independent-work", classification),
+            prefix="initial",
+        ),
+        package(("replanned-work", classification), prefix="replanned"),
+    )
+    runtime.queue(
+        "work",
+        {
+            "outcome": "ready_for_validation",
+            "output": "invalid worker result",
+            "artifacts": "not-a-list",
+            "test_results": [],
+            "repository_state": {},
+        },
+        ready_result("independent work completed"),
+        ready_result("replanned work completed"),
+    )
+    app, store, github, runtime = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={classification: [1.0, 0.0]},
+    )
+    repository = app.add_repository("acme/widget")
+    store.create_dynamic_node(
+        repository["id"],
+        classification,
+        [1.0, 0.0],
+        "Adapt repository work while preserving independent outcomes.",
+    )
+    github.issues = [
+        GitHubIssue(7, "Adaptive siblings", "Complete both parts", "https://issue/7")
+    ]
+
+    app.poll_once()
+    run = store.list_runs(repository["id"])[0]
+    app.poll_once()
+    drive_until(
+        app,
+        lambda: any(
+            item["trigger_type"] == "work_failure"
+            for item in store.list_passes(run["id"])
+        ),
+    )
+
+    original_work = {
+        item["key"]: item
+        for item in store.list_work_items(run["id"], store.list_passes(run["id"])[0]["id"])
+    }
+    assert original_work["broken-work"]["state"] == "FAILED"
+    assert original_work["independent-work"]["state"] == "COMPLETED"
+    assert original_work["independent-work"]["result"]["output"] == (
+        "independent work completed"
+    )
+    work_failure_pass = store.list_passes(run["id"])[-1]
+    work_graph = {
+        item["key"]: item
+        for item in work_failure_pass["trigger_json"]["work_graph"]
+    }
+    assert work_graph["broken-work"]["state"] == "FAILED"
+    assert work_graph["independent-work"]["result"]["output"] == (
+        "independent work completed"
+    )
+    work_calls = [
+        call["payload"]["context"]["work_item"]["key"]
+        for call in runtime.calls
+        if call["payload"]["kind"] == "work"
+    ]
+    assert work_calls == ["broken-work", "independent-work"]
+    assert not any(call["payload"]["kind"] == "validate" for call in runtime.calls)
+    assert github.prepare_publication_calls == []
+    assert github.publish_prepared_calls == []
+    app.close()
+
+
+def test_work_failure_preserves_feedback_origin():
+    assert Application._feedback_origin_pass_id(
+        {
+            "trigger_type": "work_failure",
+            "trigger_json": {"origin_feedback_pass_id": 37},
+        }
+    ) == 37
+
+
 def test_concurrent_disposable_work_preserves_disjoint_deltas_and_rejects_stale_overlap(
     tmp_path,
 ):
@@ -2629,6 +2903,7 @@ def test_post_commit_completion_exception_preserves_imported_source_and_node_suc
                 "classification": "verify/post-commit-source",
                 "context": {"reason": "verify imported source"},
                 "dependencies": [],
+                "dependency_evidence": [],
                 "blocking": None,
             }
         )
@@ -2801,6 +3076,7 @@ def test_startup_preserves_post_commit_import_and_clears_journal_before_work_rec
                     "classification": "verify/fork-committed-source",
                     "context": {"reason": "verify committed source"},
                     "dependencies": [],
+                    "dependency_evidence": [],
                     "blocking": None,
                 }
             )
@@ -3483,6 +3759,49 @@ def test_closed_unmerged_pull_request_closes_run(tmp_path):
     app.close()
 
 
+def test_pending_merge_completes_only_after_github_reports_user_merge(tmp_path):
+    app, store, github, _ = make_app(tmp_path)
+    repository = app.add_repository("acme/widget")
+    run = seed_listening_run(
+        store, repository, 7, github.pull, pr_listening_since=0.0
+    )
+    store.transition_run(run["id"], "PENDING_MERGE")
+    github.pull = PullRequest(
+        number=github.pull.number,
+        url=github.pull.url,
+        branch=github.pull.branch,
+        state="closed",
+        merged=True,
+        diff=github.pull.diff,
+        head_sha=github.pull.head_sha,
+    )
+
+    app.poll_once()
+
+    assert store.get_run(run["id"])["state"] == "COMPLETED"
+    assert github.publish_validated_to_target_calls == []
+    app.close()
+
+
+def test_pending_merge_returns_to_work_when_new_feedback_arrives(tmp_path):
+    app, store, github, _ = make_app(tmp_path)
+    repository = app.add_repository("acme/widget")
+    run = seed_listening_run(
+        store, repository, 7, github.pull, pr_listening_since=0.0
+    )
+    store.transition_run(run["id"], "PENDING_MERGE")
+    github.feedback = [
+        GitHubFeedback("review:pending", "review", "Address this before merge")
+    ]
+
+    app.poll_once()
+
+    assert store.get_run(run["id"])["state"] == "SPECIFYING"
+    assert store.list_passes(run["id"])[-1]["trigger_type"] == "feedback"
+    assert github.publish_validated_to_target_calls == []
+    app.close()
+
+
 def test_continue_work_handoff_reclassifies_through_another_dynamic_node(tmp_path):
     runtime = ScriptedRuntime()
     runtime.queue("specify", package(("handoff-start", "backend/api")))
@@ -3502,6 +3821,7 @@ def test_continue_work_handoff_reclassifies_through_another_dynamic_node(tmp_pat
             "classification": "testing/integration",
             "context": {"need": "verify the endpoint"},
             "dependencies": ["handoff-start"],
+            "dependency_evidence": dependency_evidence("handoff-start"),
             "blocking": None,
         },
         ready_result("integration verification complete"),
@@ -5308,6 +5628,15 @@ def test_mixed_feedback_scope_outcomes_order_links_and_filter_downstream_context
         "review:invalid",
     ]
     assert "dispositions" in specify_calls[1]["result_schema"]
+    assert (
+        specify_calls[1]["result_schema"]["dispositions"][0]["in_scope"]
+        == "boolean; false whenever valid is false"
+    )
+    assert (
+        "Invalid feedback must set valid=false, in_scope=false, "
+        "pr_regression=false, specification_keys=[], and follow_up_issue=null."
+        in specify_calls[1]["payload"]["instruction"]
+    )
     work_context = [
         call["payload"]["context"]
         for call in runtime.calls
@@ -5802,6 +6131,24 @@ def test_feedback_origin_survives_consecutive_validation_failure_passes(
             assert [
                 item["external_id"] for item in context["feedback"]
             ] == ["inline:origin"]
+    specify_calls = [
+        call
+        for call in runtime.calls
+        if call["payload"]["kind"] == "specify"
+    ]
+    assert "related_prior_validation_failures" not in specify_calls[-2][
+        "payload"
+    ]["context"]
+    recurrence = specify_calls[-1]["payload"]["context"][
+        "related_prior_validation_failures"
+    ]
+    assert len(recurrence) == 1
+    assert recurrence[0]["result"]["explanation"] == (
+        "feedback attempt is incomplete"
+    )
+    assert "unresolved invariant or strategy class" in specify_calls[-1][
+        "payload"
+    ]["instruction"]
     assert [
         feedback.external_id
         for _, _, feedback, _ in github.address_calls
@@ -5863,6 +6210,7 @@ def test_complete_candidate_diff_review_finding_blocks_then_clean_review_publish
         call for call in runtime.calls if call["payload"]["kind"] == "validate"
     )
     assert first_validate_call["result_schema"]["code_review_findings"] == ["string"]
+    assert "commit_message" in first_validate_call["result_schema"]
     validations = store.list_validations(run["id"])
     assert len(validations) == 1
     assert validations[0]["result"]["code_review_findings"] == [
@@ -5889,6 +6237,9 @@ def test_complete_candidate_diff_review_finding_blocks_then_clean_review_publish
         app,
         lambda: store.get_run(run["id"])["state"] == "PR_LISTENING",
     )
+    assert [call[3] for call in github.amend_publication_calls] == [
+        "Implement validated repository change"
+    ]
 
     work_calls = [
         call for call in runtime.calls if call["payload"]["kind"] == "work"
@@ -6208,28 +6559,119 @@ class DeferredExecutor:
         return future
 
 
-def test_same_repository_ready_issues_persist_but_only_oldest_gains_focus(
+def test_out_of_graph_agent_orders_all_open_issues_by_evidenced_dependency(
     tmp_path,
 ):
-    app, store, github, _ = make_app(tmp_path)
+    runtime = ScriptedRuntime()
+    runtime.queue(
+        "issue_order",
+        issue_order(8, 7, dependencies={7: [8]}),
+    )
+    app, store, github, runtime = make_app(tmp_path, runtime=runtime)
     repository = app.add_repository("acme/widget")
     github.issues = [
-        GitHubIssue(7, "First", "First body", "https://github.test/issues/7"),
-        GitHubIssue(8, "Second", "Second body", "https://github.test/issues/8"),
+        GitHubIssue(
+            7,
+            "Dependent",
+            "Requires the foundation from #8.",
+            "https://github.test/issues/7",
+        ),
+        GitHubIssue(
+            8,
+            "Foundation",
+            "Provides the prerequisite for #7.",
+            "https://github.test/issues/8",
+            ("priority:high",),
+        ),
     ]
 
     app.poll_once()
 
     runs = store.list_runs(repository["id"])
     assert [(run["issue_number"], run["state"]) for run in runs] == [
-        (7, "SPECIFYING"),
-        (8, "QUEUED"),
+        (8, "SPECIFYING"),
+        (7, "QUEUED"),
+    ]
+    order_call = next(
+        call for call in runtime.calls if call["payload"]["kind"] == "issue_order"
+    )
+    assert [
+        issue["number"] for issue in order_call["payload"]["context"]["open_issues"]
+    ] == [7, 8]
+    assert order_call["payload"]["context"]["open_issues"][1]["labels"] == [
+        "priority:high"
+    ]
+    assert "priority or dependency taxonomy" in order_call["payload"]["instruction"]
+    plan = store.get_issue_order_plan(repository["id"])
+    assert [
+        item["issue_number"] for item in plan["result"]["ordered_issues"]
+    ] == [8, 7]
+    assert plan["result"]["ordered_issues"][1]["dependencies"][0][
+        "issue_number"
+    ] == 8
+    assert [node["classification"] for node in store.list_nodes(repository["id"])] == [
+        "Specify",
+        "Validate",
     ]
     assert [
         (repository_name, target_branch)
         for repository_name, target_branch, _ in github.checkout_calls
     ] == [("acme/widget", "main")]
     app.close()
+
+
+def test_issue_order_plan_is_reused_until_open_issue_snapshot_changes(tmp_path):
+    runtime = ScriptedRuntime()
+    runtime.queue(
+        "issue_order",
+        issue_order(8, 7, dependencies={7: [8]}),
+        issue_order(9, 8, 7, dependencies={7: [8]}),
+    )
+    app, store, _, runtime = make_app(tmp_path, runtime=runtime)
+    repository = app.add_repository("acme/widget")
+    first_snapshot = [
+        GitHubIssue(7, "Dependent", "Needs #8", "https://issue/7"),
+        GitHubIssue(8, "Foundation", "Required by #7", "https://issue/8"),
+    ]
+
+    first = app._ordered_open_issues(repository, first_snapshot)
+    reused = app._ordered_open_issues(repository, list(reversed(first_snapshot)))
+
+    assert [issue.number for issue in first] == [8, 7]
+    assert [issue.number for issue in reused] == [8, 7]
+    assert [
+        call["payload"]["kind"] for call in runtime.calls
+    ].count("issue_order") == 1
+
+    changed = app._ordered_open_issues(
+        repository,
+        [
+            *first_snapshot,
+            GitHubIssue(9, "Urgent", "Independent priority", "https://issue/9"),
+        ],
+    )
+
+    assert [issue.number for issue in changed] == [9, 8, 7]
+    assert [
+        call["payload"]["kind"] for call in runtime.calls
+    ].count("issue_order") == 2
+    assert store.get_issue_order_plan(repository["id"])["issue_snapshot"][2][
+        "number"
+    ] == 9
+    app.close()
+
+
+def test_issue_order_rejects_dependency_after_dependent():
+    issues = [
+        GitHubIssue(7, "Dependent", "Needs #8", "https://issue/7"),
+        GitHubIssue(8, "Foundation", "Required by #7", "https://issue/8"),
+    ]
+
+    with pytest.raises(ValueError, match="precede"):
+        Application._validated_issue_order_result(
+            issue_order(7, 8, dependencies={7: [8]}),
+            issues,
+        )
 
 
 def test_active_run_does_not_preempt_and_other_listener_is_still_polled(
@@ -6542,7 +6984,7 @@ def test_pending_feedback_wins_over_oldest_queued_issue_when_repository_idle(
     app.close()
 
 
-def test_silence_initialization_restart_and_exact_configured_boundary(
+def test_silence_initialization_restart_and_exact_boundary_enters_pending_merge(
     tmp_path,
 ):
     clock = ControlledClock(1000.0)
@@ -6592,21 +7034,14 @@ def test_silence_initialization_restart_and_exact_configured_boundary(
 
     clock.value = 1060.0
     restarted_app.poll_once()
-    assert store.get_run(queued["id"])["state"] == "SPECIFYING"
-    assert store.get_run(listener["id"])["state"] == "COMPLETED"
+    assert store.get_run(queued["id"])["state"] == "QUEUED"
+    assert store.get_run(listener["id"])["state"] == "PENDING_MERGE"
+    pending_pull = store.get_run(listener["id"])["pull_request"]
+    assert pending_pull["state"] == "open"
+    assert pending_pull["merged"] is False
+    assert pending_pull["validated_head_sha"] == github.pull.head_sha
     assert store.get_run(listener["id"])["pr_listening_since"] == 1000.0
-    assert github.publish_validated_to_target_calls == [
-        (
-            "acme/widget",
-            "main",
-            tmp_path
-            / "runtime"
-            / "workspaces"
-            / str(repository["id"])
-            / str(listener["id"]),
-            github.pull.head_sha,
-        )
-    ]
+    assert github.publish_validated_to_target_calls == []
     assert len(github.pull_request_calls) == 3
     restarted_app.close()
 
@@ -6635,6 +7070,7 @@ def test_declined_direct_target_publication_keeps_listener_and_next_run_queued(t
         github=github,
         clock=clock,
         pr_silence_seconds=60.0,
+        auto_merge=True,
     )
 
     app.poll_once()
@@ -6658,6 +7094,46 @@ def test_declined_direct_target_publication_keeps_listener_and_next_run_queued(t
     assert retained["state"] == "PR_LISTENING"
     assert store.get_run(queued["id"])["state"] == "QUEUED"
     assert retained["pull_request"]["validated_head_sha"] == github.pull.head_sha
+    app.close()
+
+
+def test_direct_target_publication_waits_for_remote_merge_confirmation(tmp_path):
+    clock = ControlledClock(1060.0)
+    store = Store(tmp_path / "state.sqlite3")
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    github = FakeGitHub()
+    github.publish_validated_to_target_result = True
+    github.publish_validated_to_target_confirms_merge = False
+    listener = seed_listening_run(
+        store,
+        repository,
+        7,
+        github.pull,
+        pr_listening_since=1000.0,
+    )
+    queued, _ = store.create_run(
+        repository["id"],
+        8,
+        {"number": 8, "title": "Queued", "body": "Queued body"},
+    )
+    app, _, _, _ = make_app(
+        tmp_path,
+        store=store,
+        github=github,
+        clock=clock,
+        pr_silence_seconds=60.0,
+        auto_merge=True,
+    )
+
+    app.poll_once()
+
+    retained = store.get_run(listener["id"])
+    assert retained["state"] == "PR_LISTENING"
+    assert retained["pull_request"]["merged"] is False
+    assert retained["pull_request"]["validated_head_sha"] == github.pull.head_sha
+    assert store.get_run(queued["id"])["state"] == "QUEUED"
+    assert len(github.publish_validated_to_target_calls) == 1
+    assert len(github.pull_request_calls) == 2
     app.close()
 
 
@@ -6845,13 +7321,24 @@ def test_silent_validated_run_pushes_real_target_and_advances_next_issue(
                     expected_head,
                 )
             )
-            return self.client.publish_validated_to_target(
+            published = self.client.publish_validated_to_target(
                 github_repository,
                 target_branch,
                 workspace,
                 expected_head,
                 issue_branch=issue_branch,
             )
+            if published:
+                self.pull = PullRequest(
+                    number=self.pull.number,
+                    url=self.pull.url,
+                    branch=self.pull.branch,
+                    state="closed",
+                    merged=True,
+                    diff=self.pull.diff,
+                    head_sha=self.pull.head_sha,
+                )
+            return published
 
     github = RealTargetGitHub()
     app, _, _, _ = make_app(
@@ -6860,6 +7347,7 @@ def test_silent_validated_run_pushes_real_target_and_advances_next_issue(
         github=github,
         clock=ControlledClock(1060.0),
         pr_silence_seconds=60.0,
+        auto_merge=True,
     )
 
     app.poll_once()

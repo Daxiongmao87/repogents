@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
-from repogents.github import GitHubFeedback, PublicationCandidate, PullRequest
+from repogents.github import GitHubFeedback, GitHubIssue, PublicationCandidate, PullRequest
 from repogents.semantic import SemanticRouter, validate_classification
 from repogents.store import TERMINAL_RUN_STATES, Store
 
@@ -32,6 +32,7 @@ class ApplicationConfig:
     stale_run_threshold: int = 3
     max_workers: int = 8
     pr_silence_seconds: float = 3600
+    auto_merge: bool = False
 
     def __post_init__(self) -> None:
         if not 0 <= self.default_similarity_threshold < 1:
@@ -50,6 +51,8 @@ class ApplicationConfig:
             or self.pr_silence_seconds <= 0
         ):
             raise ValueError("pr_silence_seconds must be positive and finite")
+        if not isinstance(self.auto_merge, bool):
+            raise ValueError("auto_merge must be boolean")
 
 
 _CLASSIFICATION_GUIDANCE = (
@@ -84,6 +87,13 @@ _SPECIFY_SCHEMA = {
             "description": "string",
             "acceptance_criteria": ["string"],
             "dependencies": ["specification key"],
+            "dependency_evidence": [
+                {
+                    "dependency": "specification key",
+                    "reason": "why this outcome is required",
+                    "evidence": ["concrete repository or task observation"],
+                }
+            ],
             "executable": True,
             "work_items": [
                 {
@@ -92,6 +102,13 @@ _SPECIFY_SCHEMA = {
                     "description": "string",
                     "classification": "agent-chosen concise action/capability",
                     "dependencies": ["work item key"],
+                    "dependency_evidence": [
+                        {
+                            "dependency": "work item key",
+                            "reason": "why this outcome is required",
+                            "evidence": ["concrete repository or task observation"],
+                        }
+                    ],
                 }
             ],
         }
@@ -101,9 +118,9 @@ _FEEDBACK_SPECIFY_SCHEMA = {
     "dispositions": [
         {
             "external_id": "string",
-            "valid": True,
-            "in_scope": True,
-            "pr_regression": False,
+            "valid": "boolean",
+            "in_scope": "boolean; false whenever valid is false",
+            "pr_regression": "boolean; true requires valid and in_scope",
             "explanation": "string",
             "evidence": ["string"],
             "specification_keys": ["specification key"],
@@ -128,6 +145,7 @@ _WORK_SCHEMA = {
     "classification": "agent-chosen concise action/capability required only for continue_work",
     "context": {},
     "dependencies": [],
+    "dependency_evidence": [],
     "blocking": None,
 }
 _OPERATION_WORK_SCHEMA = {
@@ -145,6 +163,23 @@ _VALIDATION_SCHEMA = {
     "evidence": [],
     "repository_state": {},
     "completed_work": [],
+    "commit_message": "concise imperative subject describing the actual completed change",
+}
+_ISSUE_ORDER_SCHEMA = {
+    "ordered_issues": [
+        {
+            "issue_number": 1,
+            "reason": "why this issue belongs at this position",
+            "evidence": ["concrete observation from the supplied issues"],
+            "dependencies": [
+                {
+                    "issue_number": 2,
+                    "reason": "why the other issue must be completed first",
+                    "evidence": ["concrete causal observation"],
+                }
+            ],
+        }
+    ]
 }
 
 
@@ -226,8 +261,14 @@ class Application:
         for repository in self.store.list_repositories():
             projected = dict(repository)
             projected["nodes"] = self.store.list_nodes(repository["id"])
+            projected["issue_order"] = self.store.get_issue_order_plan(
+                repository["id"]
+            )
             projected_runs = []
-            for run in self.store.list_runs(repository["id"]):
+            for run in self._ordered_runs(
+                repository["id"],
+                self.store.list_runs(repository["id"]),
+            ):
                 run_projection = dict(run)
                 run_projection["passes"] = self.store.list_passes(run["id"])
                 run_projection["specifications"] = self.store.list_specifications(
@@ -241,15 +282,218 @@ class Application:
             repositories.append(projected)
         return {"repositories": repositories}
 
+    @staticmethod
+    def _issue_snapshot(issues: list[GitHubIssue]) -> list[dict]:
+        return [
+            {
+                "number": issue.number,
+                "title": issue.title,
+                "body": issue.body,
+                "url": issue.url,
+                "labels": list(issue.labels),
+            }
+            for issue in sorted(issues, key=lambda item: item.number)
+        ]
+
+    @staticmethod
+    def _validated_issue_order_result(
+        result: dict,
+        issues: list[GitHubIssue],
+    ) -> dict:
+        if not isinstance(result, dict) or set(result) != {"ordered_issues"}:
+            raise ValueError("issue ordering must return ordered_issues")
+        ordered = result["ordered_issues"]
+        if not isinstance(ordered, list):
+            raise ValueError("ordered_issues must be a list")
+        expected_numbers = {issue.number for issue in issues}
+        positions: dict[int, int] = {}
+        normalized = []
+        for position, item in enumerate(ordered):
+            if not isinstance(item, dict) or set(item) != {
+                "issue_number",
+                "reason",
+                "evidence",
+                "dependencies",
+            }:
+                raise ValueError("ordered issue entry is incomplete")
+            issue_number = item["issue_number"]
+            if (
+                type(issue_number) is not int
+                or issue_number not in expected_numbers
+                or issue_number in positions
+            ):
+                raise ValueError("ordered issue number is invalid or duplicated")
+            reason = item["reason"]
+            evidence = item["evidence"]
+            dependencies = item["dependencies"]
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("ordered issue reason must be nonempty")
+            if (
+                not isinstance(evidence, list)
+                or not evidence
+                or any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in evidence
+                )
+            ):
+                raise ValueError("ordered issue evidence must be nonempty strings")
+            if not isinstance(dependencies, list):
+                raise ValueError("ordered issue dependencies must be a list")
+            normalized_dependencies = []
+            dependency_numbers: set[int] = set()
+            for dependency in dependencies:
+                if not isinstance(dependency, dict) or set(dependency) != {
+                    "issue_number",
+                    "reason",
+                    "evidence",
+                }:
+                    raise ValueError("issue dependency evidence is incomplete")
+                dependency_number = dependency["issue_number"]
+                dependency_reason = dependency["reason"]
+                dependency_evidence = dependency["evidence"]
+                if (
+                    type(dependency_number) is not int
+                    or dependency_number not in expected_numbers
+                    or dependency_number == issue_number
+                    or dependency_number in dependency_numbers
+                ):
+                    raise ValueError("issue dependency reference is invalid")
+                if (
+                    not isinstance(dependency_reason, str)
+                    or not dependency_reason.strip()
+                ):
+                    raise ValueError("issue dependency reason must be nonempty")
+                if (
+                    not isinstance(dependency_evidence, list)
+                    or not dependency_evidence
+                    or any(
+                        not isinstance(value, str) or not value.strip()
+                        for value in dependency_evidence
+                    )
+                ):
+                    raise ValueError(
+                        "issue dependency evidence must be nonempty strings"
+                    )
+                dependency_numbers.add(dependency_number)
+                normalized_dependencies.append(
+                    {
+                        "issue_number": dependency_number,
+                        "reason": dependency_reason.strip(),
+                        "evidence": list(dependency_evidence),
+                    }
+                )
+            positions[issue_number] = position
+            normalized.append(
+                {
+                    "issue_number": issue_number,
+                    "reason": reason.strip(),
+                    "evidence": list(evidence),
+                    "dependencies": normalized_dependencies,
+                }
+            )
+        if set(positions) != expected_numbers:
+            raise ValueError("issue ordering must contain every open issue exactly once")
+        for item in normalized:
+            for dependency in item["dependencies"]:
+                if positions[dependency["issue_number"]] >= positions[item["issue_number"]]:
+                    raise ValueError(
+                        "issue dependencies must precede their dependents"
+                    )
+        return {"ordered_issues": normalized}
+
+    def _ordered_open_issues(
+        self,
+        repository: dict,
+        issues: list[GitHubIssue],
+    ) -> list[GitHubIssue]:
+        snapshot = self._issue_snapshot(issues)
+        persisted = self.store.get_issue_order_plan(repository["id"])
+        if persisted is not None and persisted["issue_snapshot"] == snapshot:
+            result = self._validated_issue_order_result(
+                persisted["result"],
+                issues,
+            )
+        elif len(issues) <= 1:
+            result = {
+                "ordered_issues": [
+                    {
+                        "issue_number": issue.number,
+                        "reason": "This is the only open issue.",
+                        "evidence": [
+                            "The complete open-issue snapshot contains one issue."
+                        ],
+                        "dependencies": [],
+                    }
+                    for issue in issues
+                ]
+            }
+            result = self._validated_issue_order_result(result, issues)
+            self.store.save_issue_order_plan(repository["id"], snapshot, result)
+        else:
+            with tempfile.TemporaryDirectory(
+                prefix="repogents-issue-order-",
+                dir=self.data_dir,
+            ) as workspace:
+                result = self.runtime.run(
+                    self._task(
+                        "issue_order",
+                        "Order every supplied open GitHub issue for autonomous processing. Use issue-described urgency, causal dependencies, and repository impact. Put every causal prerequisite before its dependents. Give a reason and concrete evidence for every position and every dependency. Do not prescribe or assume a domain priority or dependency taxonomy. Return every supplied issue exactly once. Do not modify repository files.",
+                        {
+                            "repository": repository,
+                            "open_issues": snapshot,
+                            "durable_runs": [
+                                {
+                                    "issue_number": run["issue_number"],
+                                    "state": run["state"],
+                                    "branch": run.get("branch"),
+                                }
+                                for run in self.store.list_runs(repository["id"])
+                            ],
+                        },
+                    ),
+                    workspace,
+                    result_schema=_ISSUE_ORDER_SCHEMA,
+                    trajectory_path=self._trajectory(
+                        0,
+                        f"issue-order-repository-{repository['id']}",
+                    ),
+                )
+            result = self._validated_issue_order_result(result, issues)
+            self.store.save_issue_order_plan(repository["id"], snapshot, result)
+        issues_by_number = {issue.number: issue for issue in issues}
+        return [
+            issues_by_number[item["issue_number"]]
+            for item in result["ordered_issues"]
+        ]
+
+    def _ordered_runs(self, repository_id: int, runs: list[dict]) -> list[dict]:
+        plan = self.store.get_issue_order_plan(repository_id)
+        if plan is None:
+            return list(runs)
+        ordered = plan.get("result", {}).get("ordered_issues", [])
+        ranks = {
+            item.get("issue_number"): rank
+            for rank, item in enumerate(ordered)
+            if isinstance(item, dict)
+            and type(item.get("issue_number")) is int
+        }
+        fallback = len(ranks)
+        return sorted(
+            runs,
+            key=lambda run: (
+                ranks.get(run["issue_number"], fallback),
+                run["id"],
+            ),
+        )
+
     def poll_once(self) -> None:
         if self._closed:
             raise RuntimeError("application is closed")
         self._reap_workers()
         repositories = self.store.list_repositories()
         for repository in repositories:
-            for issue in self.github.list_ready_issues(
-                repository["github_repository"]
-            ):
+            issues = self.github.list_open_issues(repository["github_repository"])
+            for issue in self._ordered_open_issues(repository, issues):
                 self.store.create_run(
                     repository["id"],
                     issue.number,
@@ -258,6 +502,7 @@ class Application:
                         "title": issue.title,
                         "body": issue.body,
                         "url": issue.url,
+                        "labels": list(issue.labels),
                     },
                 )
 
@@ -275,11 +520,11 @@ class Application:
 
         focused_run_ids: set[int] = set()
         for repository in repositories:
-            runs = [
+            runs = self._ordered_runs(repository["id"], [
                 run
                 for run in self.store.list_runs(repository["id"])
                 if run["state"] not in TERMINAL_RUN_STATES
-            ]
+            ])
             source_active = [
                 run
                 for run in runs
@@ -320,6 +565,26 @@ class Application:
                 for run in listening_runs
             ):
                 continue
+            if listening_runs and not self.config.auto_merge:
+                for listening_run in listening_runs:
+                    pull_request = listening_run["pull_request"]
+                    validated_head = pull_request.get("validated_head_sha")
+                    if (
+                        not isinstance(validated_head, str)
+                        or not validated_head
+                        or pull_request["head_sha"] != validated_head
+                    ):
+                        continue
+                    self.store.transition_run(
+                        listening_run["id"],
+                        "PENDING_MERGE",
+                        branch=listening_run.get("branch"),
+                        pull_request=listening_run.get("pull_request"),
+                        pr_listening_since=listening_run.get(
+                            "pr_listening_since"
+                        ),
+                    )
+                continue
             direct_publication_blocked = False
             for listening_run in listening_runs:
                 pull_request = listening_run["pull_request"]
@@ -340,12 +605,37 @@ class Application:
                 ):
                     direct_publication_blocked = True
                     continue
-                self.store.transition_run(listening_run["id"], "COMPLETED")
+                published_pull = self.github.pull_request(
+                    repository["github_repository"],
+                    int(pull_request["number"]),
+                )
+                published_reference = asdict(published_pull)
+                published_reference["validated_head_sha"] = validated_head
+                if not published_pull.merged:
+                    direct_publication_blocked = True
+                    self.store.transition_run(
+                        listening_run["id"],
+                        "PR_LISTENING",
+                        branch=published_pull.branch,
+                        pull_request=published_reference,
+                        pr_listening_since=listening_run.get(
+                            "pr_listening_since"
+                        ),
+                    )
+                    continue
+                self.store.transition_run(
+                    listening_run["id"],
+                    "COMPLETED",
+                    branch=published_pull.branch,
+                    pull_request=published_reference,
+                )
                 self.store.adapt_nodes_after_run(
                     listening_run["id"], self.config.stale_run_threshold
                 )
 
             if direct_publication_blocked:
+                continue
+            if any(run["state"] == "PENDING_MERGE" for run in runs):
                 continue
             queued = next(
                 (run for run in runs if run["state"] == "QUEUED"),
@@ -361,7 +651,7 @@ class Application:
         runs: list[dict],
     ) -> tuple[dict, list[dict] | None] | None:
         for run in runs:
-            if run["state"] != "PR_LISTENING":
+            if run["state"] not in {"PR_LISTENING", "PENDING_MERGE"}:
                 continue
             pending = [
                 item
@@ -1580,6 +1870,7 @@ class Application:
             "operation_failure",
             "publication_revalidation",
             "validation_failure",
+            "work_failure",
         }:
             return None
         origin = execution_pass["trigger_json"].get("origin_feedback_pass_id")
@@ -1681,6 +1972,7 @@ class Application:
                 "description",
                 "acceptance_criteria",
                 "dependencies",
+                "dependency_evidence",
                 "executable",
             )
         }
@@ -1693,7 +1985,25 @@ class Application:
                 "key",
                 "classification",
                 "dependencies",
+                "dependency_evidence",
                 "state",
+            )
+        }
+
+    @staticmethod
+    def _work_failure_evidence(work: dict) -> dict:
+        return {
+            field: work.get(field)
+            for field in (
+                "key",
+                "title",
+                "description",
+                "classification",
+                "dependencies",
+                "dependency_evidence",
+                "state",
+                "result",
+                "handoff",
             )
         }
 
@@ -1716,6 +2026,39 @@ class Application:
                 )
             },
         }
+
+    @classmethod
+    def _related_prior_validation_failures(
+        cls,
+        validations: list[dict],
+    ) -> list[dict]:
+        if not validations:
+            return []
+        latest_result = validations[-1].get("result")
+        if not isinstance(latest_result, dict):
+            return []
+        latest_criteria = {
+            criterion
+            for criterion in latest_result.get("failed_criteria", [])
+            if isinstance(criterion, str) and criterion
+        }
+        if not latest_criteria:
+            return []
+        related = []
+        for validation in validations[:-1]:
+            result = validation.get("result")
+            if not isinstance(result, dict) or result.get("passed") is not False:
+                continue
+            failed_criteria = result.get("failed_criteria", [])
+            if not isinstance(failed_criteria, list):
+                continue
+            if latest_criteria.intersection(
+                criterion
+                for criterion in failed_criteria
+                if isinstance(criterion, str)
+            ):
+                related.append(cls._validation_evidence(validation))
+        return related
 
     @classmethod
     def _specification_dependency_closure(
@@ -1784,14 +2127,26 @@ class Application:
         }
         if execution_pass["trigger_type"] == "operation_failure":
             context["operation_failure"] = execution_pass["trigger_json"]
+        if execution_pass["trigger_type"] == "work_failure":
+            context["work_failure"] = execution_pass["trigger_json"]
+        if execution_pass["trigger_type"] == "validation_failure":
+            related = self._related_prior_validation_failures(validations)
+            if related:
+                context["related_prior_validation_failures"] = related
         return context
 
     @staticmethod
     def _specify_instruction() -> str:
         return (
             "Convert only the issue, controller operation failure, validation "
-            "deficiency, or feedback in context into atomic specifications, "
-            "acceptance criteria, classified work items, and dependencies. "
+            "deficiency, worker failure, or feedback in context into atomic specifications, "
+            "acceptance criteria, classified work items, and evidence-backed dependencies. "
+            "Give every dependency exactly one reason and a nonempty evidence list; "
+            "use empty dependency_evidence when there are no dependencies. "
+            "When related prior validation failures are present, use their recurring "
+            "evidence to identify the unresolved invariant or strategy class. Do not "
+            "merely enumerate the latest example when the evidence shows that bounded "
+            "variants leave the same criterion unsatisfied. "
             + _CLASSIFICATION_GUIDANCE
         )
 
@@ -1828,7 +2183,7 @@ class Application:
                     result = self.runtime.run(
                         self._task(
                             "specify",
-                            "Disposition every claimed feedback item against the current pull-request head, original issue, accepted specifications, prior work, and validation evidence before creating correction work. A pull-request regression must be valid and in scope. Map only valid in-scope items to returned specifications. Give valid out-of-scope items a bounded follow-up issue and give invalid items no follow-up issue. "
+                            "Disposition every claimed feedback item against the current pull-request head, original issue, accepted specifications, prior work, and validation evidence before creating correction work. Invalid feedback must set valid=false, in_scope=false, pr_regression=false, specification_keys=[], and follow_up_issue=null. A pull-request regression must be valid and in scope. Map only valid in-scope items to returned specifications. Give valid out-of-scope items a bounded follow-up issue and give invalid items no follow-up issue. "
                             + _CLASSIFICATION_GUIDANCE,
                             self._specify_context(
                                 repository,
@@ -2147,6 +2502,8 @@ class Application:
                 f"{pull_url}#pullrequestreview-"
                 f"{external_id.partition(':')[2]}"
             )
+        if package.get("kind") == "comment" and external_id.startswith("comment:"):
+            return f"{pull_url}#issuecomment-{external_id.partition(':')[2]}"
         return f"{pull_url}#feedback-{external_id}"
 
     @classmethod
@@ -2316,6 +2673,50 @@ class Application:
         if not execution_passes:
             raise RuntimeError("waiting run has no execution pass")
         execution_pass = execution_passes[-1]
+        work_items = self.store.list_work_items(run["id"], execution_pass["id"])
+        if any(item["state"] == "FAILED" for item in work_items):
+            settled = self.store.settle_failed_pass_work(
+                run["id"],
+                execution_pass["id"],
+                {
+                    "output": {
+                        "error": "Work could not run because one of its dependencies failed",
+                        "type": "BlockedByWorkFailure",
+                    },
+                    "artifacts": [],
+                    "test_results": [],
+                    "repository_state": {},
+                },
+            )
+            if not settled:
+                self._route_unassigned(repository, run, execution_pass)
+                return
+            settled_work = self.store.list_work_items(
+                run["id"], execution_pass["id"]
+            )
+            trigger = {
+                "failed_pass_id": execution_pass["id"],
+                "failed_work": [
+                    self._work_failure_evidence(item)
+                    for item in settled_work
+                    if item["state"] == "FAILED"
+                ],
+                "work_graph": [
+                    self._work_failure_evidence(item)
+                    for item in settled_work
+                ],
+            }
+            origin_feedback_pass_id = self._feedback_origin_pass_id(execution_pass)
+            if origin_feedback_pass_id is not None:
+                trigger["origin_feedback_pass_id"] = origin_feedback_pass_id
+            self.store.create_pass_and_transition(
+                run["id"],
+                execution_pass["id"],
+                "work_failure",
+                trigger,
+                "SPECIFYING",
+            )
+            return
         self._route_unassigned(repository, run, execution_pass)
         if self.store.validation_barrier_ready(run["id"], execution_pass["id"]):
             self.store.transition_run(run["id"], "VALIDATING")
@@ -2347,6 +2748,71 @@ class Application:
                 future.result()
             except Exception:
                 pass
+
+    @classmethod
+    def _validated_dependency_contract(
+        cls,
+        dependencies: object,
+        dependency_evidence: object,
+        name: str,
+    ) -> tuple[list[str], list[dict]]:
+        if (
+            not isinstance(dependencies, list)
+            or any(
+                not isinstance(dependency, str) or not dependency.strip()
+                for dependency in dependencies
+            )
+            or len(set(dependencies)) != len(dependencies)
+        ):
+            raise ValueError(f"{name} dependencies must be unique nonempty strings")
+        if not isinstance(dependency_evidence, list):
+            raise ValueError(f"{name} dependency_evidence must be a list")
+        normalized: list[dict] = []
+        evidence_dependencies: list[str] = []
+        for item in dependency_evidence:
+            if not isinstance(item, dict) or not {
+                "dependency",
+                "reason",
+                "evidence",
+            }.issubset(item):
+                raise ValueError(f"{name} dependency evidence is incomplete")
+            dependency = item["dependency"]
+            reason = item["reason"]
+            evidence = item["evidence"]
+            if not isinstance(dependency, str) or not dependency.strip():
+                raise ValueError(f"{name} dependency evidence key is invalid")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError(f"{name} dependency evidence reason is invalid")
+            if (
+                not isinstance(evidence, list)
+                or not evidence
+                or any(
+                    not isinstance(observation, str) or not observation.strip()
+                    for observation in evidence
+                )
+            ):
+                raise ValueError(f"{name} dependency evidence must be nonempty")
+            evidence_dependencies.append(dependency)
+            normalized.append(
+                {
+                    "dependency": dependency,
+                    "reason": reason,
+                    "evidence": list(evidence),
+                }
+            )
+        if (
+            len(set(evidence_dependencies)) != len(evidence_dependencies)
+            or set(evidence_dependencies) != set(dependencies)
+        ):
+            raise ValueError(
+                f"{name} dependency_evidence must correspond exactly to dependencies"
+            )
+        evidence_by_dependency = {
+            item["dependency"]: item for item in normalized
+        }
+        return list(dependencies), [
+            evidence_by_dependency[dependency] for dependency in dependencies
+        ]
 
     @classmethod
     def _validated_work_result(
@@ -2410,6 +2876,7 @@ class Application:
                 "classification",
                 "context",
                 "dependencies",
+                "dependency_evidence",
                 "blocking",
             }
             if not continuation_fields.issubset(result):
@@ -2421,24 +2888,17 @@ class Application:
             )
             if not isinstance(result["context"], dict):
                 raise ValueError("work handoff context must be an object")
-            dependencies = result["dependencies"]
-            if (
-                not isinstance(dependencies, list)
-                or any(
-                    not isinstance(dependency, str) or not dependency
-                    for dependency in dependencies
-                )
-                or any(
-                    dependency not in work_keys
-                    for dependency in dependencies
-                )
-            ):
+            dependencies, dependency_evidence = cls._validated_dependency_contract(
+                result["dependencies"],
+                result["dependency_evidence"],
+                "work handoff",
+            )
+            if any(dependency not in work_keys for dependency in dependencies):
                 raise ValueError(
                     "work handoff dependencies must reference this pass"
                 )
-            normalized["dependencies"] = list(
-                dict.fromkeys(dependencies)
-            )
+            normalized["dependencies"] = dependencies
+            normalized["dependency_evidence"] = dependency_evidence
             if (
                 result["blocking"] is not None
                 and not isinstance(result["blocking"], dict)
@@ -2572,7 +3032,7 @@ class Application:
                 result = self.runtime.run(
                     self._task(
                         "work",
-                        "Use your tools and judgment flexibly to complete this bounded work. Return ready_for_validation when no more agent work is needed, or continue_work with the next classification and handoff context. "
+                        "Use your tools and judgment flexibly to complete this bounded work. Return ready_for_validation when no more agent work is needed, or continue_work with the next classification and handoff context. For continue_work, blocking must be null or a JSON object, never a string. "
                         + _CLASSIFICATION_GUIDANCE,
                         work_context,
                     ),
@@ -2633,6 +3093,9 @@ class Application:
                             "context": result["context"],
                             "artifacts": result["artifacts"],
                             "dependencies": result["dependencies"],
+                            "dependency_evidence": result[
+                                "dependency_evidence"
+                            ],
                             "blocking": result["blocking"],
                         }
                         self.store.complete_work(
@@ -2701,6 +3164,7 @@ class Application:
             "evidence",
             "repository_state",
             "completed_work",
+            "commit_message",
         }
         if not isinstance(result, dict) or not required.issubset(result):
             raise ValueError("Validate must return the complete validation result")
@@ -2724,6 +3188,12 @@ class Application:
             raise ValueError("validation repository_state must be an object")
         if not isinstance(result["completed_work"], list):
             raise ValueError("validation completed_work must be a list")
+        if (
+            not isinstance(result["commit_message"], str)
+            or not result["commit_message"].strip()
+            or "\n" in result["commit_message"].strip()
+        ):
+            raise ValueError("validation commit_message must be a nonempty subject line")
         has_failures = bool(
             result["failed_specifications"]
             or result["failed_criteria"]
@@ -2790,7 +3260,7 @@ class Application:
         execution_pass = execution_passes[-1]
         if (
             execution_pass["trigger_type"]
-            in {"feedback", "operation_failure", "validation_failure"}
+            in {"feedback", "operation_failure", "validation_failure", "work_failure"}
             and not self._pass_has_specifications(
                 run["id"], execution_pass["id"]
             )
@@ -2865,7 +3335,7 @@ class Application:
                 result = self.runtime.run(
                     self._task(
                         "validate",
-                        "Judge the completed result against every atomic specification, acceptance criterion, and the intent of the original issue. Independently review the complete staged target-to-candidate diff for branch-introduced correctness defects, regressions, and changes not mapped to the issue, specifications, necessary prerequisites, or current in-scope feedback. Do not audit unrelated pre-existing code. Do not modify repository files or implement corrections. Return a failed validation result for any failed specification, failed criterion, or code-review finding.",
+                        "Judge the completed result against every atomic specification, acceptance criterion, and the intent of the original issue. Independently review the complete staged target-to-candidate diff for branch-introduced correctness defects, regressions, and changes not mapped to the issue, specifications, necessary prerequisites, or current in-scope feedback. Do not audit unrelated pre-existing code. Do not modify repository files or implement corrections. Return a failed validation result for any failed specification, failed criterion, or code-review finding. Return a concise imperative commit_message subject that describes the actual completed repository change.",
                         self._validation_context(
                             repository,
                             run,
@@ -2880,6 +3350,23 @@ class Application:
                     ),
                 )
             result = self._validated_validation_result(result)
+            if result["passed"]:
+                try:
+                    candidate = self.github.amend_publication(
+                        run["issue_number"],
+                        workspace,
+                        candidate,
+                        result["commit_message"].strip(),
+                    )
+                except subprocess.CalledProcessError as error:
+                    self._record_operation_failure(
+                        repository,
+                        run,
+                        execution_pass,
+                        "amend_publication",
+                        error,
+                    )
+                    return
             result["publication_candidate"] = asdict(candidate)
             self.store.record_validation(
                 run["id"], execution_pass["id"], result

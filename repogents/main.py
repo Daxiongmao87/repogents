@@ -14,8 +14,13 @@ def build_service(config: ServiceConfig) -> HttpService:
     store = Store(config.data_dir / "repogents.sqlite3")
     github = GitHubClient(config.github_token)
     runtime = MiniSweRuntime(
-        RuntimeConfig(api_base=config.codex_api_base, model=config.model)
+        RuntimeConfig(
+            api_base=config.codex_api_base,
+            model=config.model,
+            model_request_timeout=config.model_request_timeout,
+        )
     )
+    runtime.preflight(config.data_dir)
     router = SemanticRouter(SentenceTransformerEmbedder())
     application = Application(
         store,
@@ -28,6 +33,7 @@ def build_service(config: ServiceConfig) -> HttpService:
             promotion_threshold=config.promotion_threshold,
             stale_run_threshold=config.stale_run_threshold,
             pr_silence_seconds=config.pr_silence_seconds,
+            auto_merge=config.auto_merge,
         ),
     )
     return HttpService(application, config.host, config.port, config.poll_seconds)

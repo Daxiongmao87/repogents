@@ -22,7 +22,10 @@ _ENV_NAMES = (
     "REPOGENTS_LAN_PORT",
     "REPOGENTS_POLL_SECONDS",
     "REPOGENTS_PR_SILENCE_SECONDS",
+    "REPOGENTS_AUTO_MERGE",
     "REPOGENTS_CODEX_API_BASE",
+    "REPOGENTS_MODEL",
+    "REPOGENTS_MODEL_REQUEST_TIMEOUT",
     "REPOGENTS_SIMILARITY_THRESHOLD",
     "REPOGENTS_NODE_PROMOTION_THRESHOLD",
     "REPOGENTS_NODE_STALE_RUN_THRESHOLD",
@@ -129,6 +132,7 @@ def test_service_config_uses_subscription_bridge_and_required_mvp_defaults(monke
     for name in _ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("REPOGENTS_GITHUB_TOKEN", "github-token")
+    monkeypatch.setenv("REPOGENTS_MODEL", "gpt-5.6-terra")
     monkeypatch.setenv("REPOGENTS_DATA_DIR", str(tmp_path))
 
     config = ServiceConfig.from_env()
@@ -139,8 +143,10 @@ def test_service_config_uses_subscription_bridge_and_required_mvp_defaults(monke
     assert config.port == 8766
     assert config.poll_seconds == 60.0
     assert config.pr_silence_seconds == 3600.0
+    assert config.auto_merge is False
     assert config.codex_api_base == "http://127.0.0.1:8787/v1"
-    assert config.model == "gpt-5.6-sol"
+    assert config.model == "gpt-5.6-terra"
+    assert config.model_request_timeout == 120.0
     assert config.similarity_threshold == 0.75
     assert config.promotion_threshold == 3
     assert config.stale_run_threshold == 3
@@ -155,12 +161,18 @@ def test_service_config_requires_github_token_and_parses_configurable_thresholds
         ServiceConfig.from_env()
 
     monkeypatch.setenv("REPOGENTS_GITHUB_TOKEN", "token")
+    with pytest.raises(ValueError, match="REPOGENTS_MODEL"):
+        ServiceConfig.from_env()
+
+    monkeypatch.setenv("REPOGENTS_MODEL", "gpt-5.6-terra")
     monkeypatch.setenv("REPOGENTS_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("REPOGENTS_LAN_HOST", "192.168.0.206")
     monkeypatch.setenv("REPOGENTS_LAN_PORT", "9000")
     monkeypatch.setenv("REPOGENTS_POLL_SECONDS", "2.5")
     monkeypatch.setenv("REPOGENTS_PR_SILENCE_SECONDS", "1800.5")
+    monkeypatch.setenv("REPOGENTS_AUTO_MERGE", "true")
     monkeypatch.setenv("REPOGENTS_CODEX_API_BASE", "http://127.0.0.1:8787/v1")
+    monkeypatch.setenv("REPOGENTS_MODEL_REQUEST_TIMEOUT", "45.5")
     monkeypatch.setenv("REPOGENTS_SIMILARITY_THRESHOLD", "0.61")
     monkeypatch.setenv("REPOGENTS_NODE_PROMOTION_THRESHOLD", "4")
     monkeypatch.setenv("REPOGENTS_NODE_STALE_RUN_THRESHOLD", "5")
@@ -177,6 +189,8 @@ def test_service_config_requires_github_token_and_parses_configurable_thresholds
         config.promotion_threshold,
         config.stale_run_threshold,
     ) == (0.61, 4, 5)
+    assert config.model_request_timeout == 45.5
+    assert config.auto_merge is True
 
 
 @pytest.mark.parametrize("threshold", ["-0.01", "1", "1.01"])
@@ -186,6 +200,7 @@ def test_service_config_rejects_similarity_threshold_outside_routing_domain(
     for name in _ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("REPOGENTS_GITHUB_TOKEN", "token")
+    monkeypatch.setenv("REPOGENTS_MODEL", "gpt-5.6-terra")
     monkeypatch.setenv("REPOGENTS_SIMILARITY_THRESHOLD", threshold)
 
     with pytest.raises(ValueError, match="REPOGENTS_SIMILARITY_THRESHOLD"):
@@ -199,6 +214,7 @@ def test_service_config_rejects_nonpositive_pr_silence_seconds(
     for name in _ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("REPOGENTS_GITHUB_TOKEN", "token")
+    monkeypatch.setenv("REPOGENTS_MODEL", "gpt-5.6-terra")
     monkeypatch.setenv("REPOGENTS_PR_SILENCE_SECONDS", silence_seconds)
 
     with pytest.raises(ValueError, match="REPOGENTS_PR_SILENCE_SECONDS"):
@@ -212,9 +228,35 @@ def test_service_config_rejects_nonfinite_pr_silence_seconds(
     for name in _ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("REPOGENTS_GITHUB_TOKEN", "token")
+    monkeypatch.setenv("REPOGENTS_MODEL", "gpt-5.6-terra")
     monkeypatch.setenv("REPOGENTS_PR_SILENCE_SECONDS", silence_seconds)
 
     with pytest.raises(ValueError, match="REPOGENTS_PR_SILENCE_SECONDS"):
+        ServiceConfig.from_env()
+
+
+def test_service_config_rejects_invalid_auto_merge(monkeypatch):
+    for name in _ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("REPOGENTS_GITHUB_TOKEN", "token")
+    monkeypatch.setenv("REPOGENTS_MODEL", "gpt-5.6-terra")
+    monkeypatch.setenv("REPOGENTS_AUTO_MERGE", "sometimes")
+
+    with pytest.raises(ValueError, match="REPOGENTS_AUTO_MERGE"):
+        ServiceConfig.from_env()
+
+
+@pytest.mark.parametrize("timeout", ["0", "-1", "nan", "inf", "-inf"])
+def test_service_config_rejects_invalid_model_request_timeout(
+    monkeypatch, timeout
+):
+    for name in _ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("REPOGENTS_GITHUB_TOKEN", "token")
+    monkeypatch.setenv("REPOGENTS_MODEL", "gpt-5.6-terra")
+    monkeypatch.setenv("REPOGENTS_MODEL_REQUEST_TIMEOUT", timeout)
+
+    with pytest.raises(ValueError, match="REPOGENTS_MODEL_REQUEST_TIMEOUT"):
         ServiceConfig.from_env()
 
 
@@ -229,7 +271,22 @@ def test_build_service_passes_configured_pr_silence_seconds(monkeypatch, tmp_pat
         "GitHubClient",
         lambda token, **kwargs: object(),
     )
-    monkeypatch.setattr(main_module, "MiniSweRuntime", lambda config: object())
+    class FakeRuntime:
+        def __init__(self, config):
+            self.config = config
+            self.preflight_paths = []
+
+        def preflight(self, path):
+            self.preflight_paths.append(path)
+
+    runtimes = []
+
+    def runtime_factory(config):
+        runtime = FakeRuntime(config)
+        runtimes.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(main_module, "MiniSweRuntime", runtime_factory)
     monkeypatch.setattr(main_module, "SentenceTransformerEmbedder", lambda: object())
     monkeypatch.setattr(main_module, "SemanticRouter", lambda embedder: object())
     monkeypatch.setattr(main_module, "Application", ComposedApplication)
@@ -241,12 +298,16 @@ def test_build_service_passes_configured_pr_silence_seconds(monkeypatch, tmp_pat
     config = ServiceConfig(
         data_dir=tmp_path,
         github_token="token",
+        model="gpt-5.6-terra",
         pr_silence_seconds=45.0,
     )
 
     service = main_module.build_service(config)
 
     assert service.config.pr_silence_seconds == 45.0
+    assert service.config.auto_merge is False
+    assert runtimes[0].preflight_paths == [tmp_path]
+    assert runtimes[0].config.model == "gpt-5.6-terra"
 
 
 def test_http_service_exposes_client_state_repository_mutations_and_background_polling():

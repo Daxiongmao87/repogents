@@ -1,15 +1,25 @@
 import json
+import os
 import shlex
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import repogents.agent_runtime as agent_runtime
-from repogents.agent_runtime import MiniSweRuntime, RuntimeConfig
+from repogents.agent_runtime import BridgeAgent, BridgeTextModel, MiniSweRuntime, RuntimeConfig
 
 
 def _install_factories(monkeypatch, result_content):
-    records = {"models": [], "environments": [], "agents": [], "runs": [], "saves": []}
+    records = {
+        "models": [],
+        "environments": [],
+        "environment_checks": [],
+        "agents": [],
+        "runs": [],
+        "saves": [],
+    }
 
     class FakeModel:
         def __init__(self, kwargs):
@@ -18,6 +28,13 @@ def _install_factories(monkeypatch, result_content):
     class FakeEnvironment:
         def __init__(self, kwargs):
             self.kwargs = kwargs
+
+        def execute(self, action):
+            records["environment_checks"].append(action)
+            return {"output": "", "returncode": 0, "exception_info": ""}
+
+        def cleanup(self):
+            pass
 
     class FakeAgent:
         def __init__(self, model, environment, kwargs):
@@ -60,19 +77,19 @@ def _install_factories(monkeypatch, result_content):
         records["agents"].append(agent)
         return agent
 
-    monkeypatch.setattr(agent_runtime, "LitellmModel", model_factory)
-    monkeypatch.setattr(agent_runtime, "BubblewrapEnvironment", environment_factory)
-    monkeypatch.setattr(agent_runtime, "DefaultAgent", agent_factory)
+    monkeypatch.setattr(agent_runtime, "BridgeTextModel", model_factory)
+    monkeypatch.setattr(agent_runtime, "LandlockEnvironment", environment_factory)
+    monkeypatch.setattr(agent_runtime, "BridgeAgent", agent_factory)
     return records
 
 
 @pytest.mark.parametrize("credential_field", ["api_key", "proxy_access_token"])
 def test_runtime_config_rejects_caller_credentials(credential_field):
     with pytest.raises(TypeError):
-        RuntimeConfig(**{credential_field: "not-a-real-key"})
+        RuntimeConfig(model="gpt-5.6-terra", **{credential_field: "not-a-real-key"})
 
 
-def test_real_bubblewrap_environment_clears_inherited_credentials_and_returns_result(
+def test_real_landlock_environment_clears_inherited_credentials_and_returns_result(
     monkeypatch,
     tmp_path,
 ):
@@ -98,21 +115,29 @@ def test_real_bubblewrap_environment_clears_inherited_credentials_and_returns_re
             assert execution["returncode"] == 0, execution
             return {"exit_status": "Submitted"}
 
-    monkeypatch.setattr(agent_runtime, "LitellmModel", lambda **kwargs: object())
-    monkeypatch.setattr(agent_runtime, "DefaultAgent", FakeAgent)
+    monkeypatch.setattr(agent_runtime, "BridgeTextModel", lambda **kwargs: object())
+    monkeypatch.setattr(agent_runtime, "BridgeAgent", FakeAgent)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    result = MiniSweRuntime(RuntimeConfig()).run("inspect the shell environment", workspace)
+    result = MiniSweRuntime(RuntimeConfig(model="gpt-5.6-terra")).run(
+        "inspect the shell environment", workspace
+    )
 
     assert result == {"credential_exposed": False, "status": "returned"}
 
 
-def test_each_run_uses_a_fresh_direct_local_bubblewrap_agent(monkeypatch, tmp_path):
+def test_each_run_uses_a_fresh_direct_local_landlock_agent(monkeypatch, tmp_path):
     records = _install_factories(monkeypatch, lambda call: json.dumps({"call": call}))
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    runtime = MiniSweRuntime(RuntimeConfig(step_limit=7, command_timeout=19))
+    runtime = MiniSweRuntime(
+        RuntimeConfig(
+            model="gpt-5.6-terra",
+            step_limit=7,
+            command_timeout=19,
+        )
+    )
 
     first = runtime.run("first task", workspace)
     second = runtime.run("second task", workspace)
@@ -127,26 +152,31 @@ def test_each_run_uses_a_fresh_direct_local_bubblewrap_agent(monkeypatch, tmp_pa
     assert records["agents"][1].environment is records["environments"][1]
     assert [model.kwargs for model in records["models"]] == [
         {
-            "model_name": "openai/gpt-5.6-sol",
+            "model_name": "openai/gpt-5.6-terra",
             "cost_tracking": "ignore_errors",
             "model_kwargs": {
                 "api_base": "http://127.0.0.1:8787/v1",
                 "api_key": "local-bridge",
+                "timeout": 120.0,
             },
         },
         {
-            "model_name": "openai/gpt-5.6-sol",
+            "model_name": "openai/gpt-5.6-terra",
             "cost_tracking": "ignore_errors",
             "model_kwargs": {
                 "api_base": "http://127.0.0.1:8787/v1",
                 "api_key": "local-bridge",
+                "timeout": 120.0,
             },
         },
     ]
     for environment in records["environments"]:
         assert environment.kwargs["cwd"] == str(workspace.resolve())
         assert environment.kwargs["timeout"] == 19
-        assert environment.kwargs["wrapper_args"][0] == "--clearenv"
+    assert records["environment_checks"] == [
+        {"command": "true"},
+        {"command": "true"},
+    ]
     assert [agent.kwargs["step_limit"] for agent in records["agents"]] == [7, 7]
     assert [agent.kwargs["cost_limit"] for agent in records["agents"]] == [0, 0]
     result_paths = [Path(run["kwargs"]["result_path"]) for run in records["runs"]]
@@ -154,6 +184,100 @@ def test_each_run_uses_a_fresh_direct_local_bubblewrap_agent(monkeypatch, tmp_pa
     assert all(path.parent == workspace.resolve() / ".repogents" / "results" for path in result_paths)
     assert all(not path.exists() for path in result_paths)
     assert records["saves"] == []
+
+
+def test_runtime_preflight_fails_closed_with_landlock_error(
+    monkeypatch,
+    tmp_path,
+):
+    class FailingEnvironment:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def execute(self, action):
+            return {
+                "output": "Landlock unavailable\n",
+                "returncode": 1,
+                "exception_info": "",
+            }
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_runtime, "LandlockEnvironment", FailingEnvironment)
+    runtime = MiniSweRuntime(RuntimeConfig(model="gpt-5.6-terra"))
+
+    with pytest.raises(
+        RuntimeError,
+        match="Landlock sandbox preflight failed: Landlock unavailable",
+    ):
+        runtime.preflight(tmp_path / "workspace")
+
+
+def test_real_landlock_denies_files_outside_workspace(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret = tmp_path / "controller-secret"
+    secret.write_text("must-not-be-readable")
+    environment = agent_runtime.LandlockEnvironment(cwd=str(workspace), timeout=5)
+    try:
+        execution = environment.execute(
+            {"command": f"cat {shlex.quote(str(secret))}"}
+        )
+        assert execution["returncode"] != 0
+        assert "Permission denied" in execution["output"]
+
+        execution = environment.execute(
+            {"command": "printf writable > artifact && cat artifact"}
+        )
+        assert execution == {
+            "output": "writable",
+            "returncode": 0,
+            "exception_info": "",
+        }
+        assert (workspace / "artifact").read_text() == "writable"
+    finally:
+        environment.cleanup()
+
+
+def test_real_landlock_timeout_kills_command_process_group(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = agent_runtime.LandlockEnvironment(cwd=str(workspace), timeout=0.1)
+    try:
+        execution = environment.execute({"command": "sleep 30 & echo $!; wait"})
+        assert execution["returncode"] == -1
+        child_pid = int(execution["output"].strip())
+        for _ in range(100):
+            if not Path(f"/proc/{child_pid}").exists():
+                break
+            time.sleep(0.01)
+        assert not Path(f"/proc/{child_pid}").exists()
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        environment.cleanup()
+
+
+def test_landlock_requires_standalone_submission_action(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = agent_runtime.LandlockEnvironment(cwd=str(workspace), timeout=5)
+    try:
+        combined = environment.execute(
+            {"command": "false; echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}
+        )
+        assert combined == {
+            "output": "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n",
+            "returncode": 0,
+            "exception_info": "",
+        }
+        with pytest.raises(agent_runtime.Submitted):
+            environment.execute(
+                {"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}
+            )
+    finally:
+        environment.cleanup()
 
 
 def test_run_preserves_flexible_task_role_schema_and_trajectory(monkeypatch, tmp_path):
@@ -165,7 +289,10 @@ def test_run_preserves_flexible_task_role_schema_and_trajectory(monkeypatch, tmp
     role_prompt = "Use your repository judgment; preserve valid work and explain any handoff."
     result_schema = {"status": "string", "handoff": {"classification": "string"}}
 
-    config = RuntimeConfig(api_base="http://bridge.invalid")
+    config = RuntimeConfig(
+        model="gpt-5.6-terra",
+        api_base="http://bridge.invalid",
+    )
     result = MiniSweRuntime(config).run(
         task,
         workspace,
@@ -176,11 +303,12 @@ def test_run_preserves_flexible_task_role_schema_and_trajectory(monkeypatch, tmp
 
     assert result == {"status": "handed-off"}
     assert records["models"][0].kwargs == {
-        "model_name": "openai/gpt-5.6-sol",
+        "model_name": "openai/gpt-5.6-terra",
         "cost_tracking": "ignore_errors",
         "model_kwargs": {
             "api_base": "http://bridge.invalid/v1",
             "api_key": "local-bridge",
+            "timeout": 120.0,
         },
     }
     assert records["runs"][0]["task"] == task
@@ -197,10 +325,17 @@ def test_run_preserves_flexible_task_role_schema_and_trajectory(monkeypatch, tmp
     assert "create artifacts" in instance_template
     assert "hand off" in instance_template
     assert "Choose the actions relevant to this task" in instance_template
+    system_template = records["agents"][0].kwargs["system_template"]
+    assert "exactly one shell action" in system_template
+    assert "apply_patch command is unavailable" in system_template
+    assert "Only the first action block is executed" in system_template
+    assert "standalone action" in system_template
+    assert "```mswea_bash_command" in system_template
     assert records["saves"] == [{"agent": records["agents"][0], "path": None}]
     trajectory_data = json.loads(trajectory.read_text())
     assert trajectory_data["info"]["config"]["model"]["model_kwargs"] == {
-        "api_base": "http://bridge.invalid/v1"
+        "api_base": "http://bridge.invalid/v1",
+        "timeout": 120.0,
     }
     assert "local-bridge" not in trajectory.read_text()
 
@@ -211,7 +346,120 @@ def test_run_fails_when_agent_does_not_write_result(monkeypatch, tmp_path):
     workspace.mkdir()
 
     with pytest.raises(RuntimeError, match="agent result JSON was not written"):
-        MiniSweRuntime(RuntimeConfig()).run("task", workspace)
+        MiniSweRuntime(RuntimeConfig(model="gpt-5.6-terra")).run(
+            "task", workspace
+        )
+
+
+def test_bridge_text_model_executes_only_first_shell_action_before_observation():
+    model = BridgeTextModel(
+        model_name="openai/test",
+        cost_tracking="ignore_errors",
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=(
+                        "Inspect first.\n```mswea_bash_command\npwd\n```\n"
+                        "Then test.\n```mswea_bash_command\npytest -q\n```"
+                    )
+                )
+            )
+        ]
+    )
+
+    assert model._parse_actions(response) == [{"command": "pwd"}]
+
+
+def test_bridge_text_model_rejects_response_without_shell_actions():
+    model = BridgeTextModel(
+        model_name="openai/test",
+        cost_tracking="ignore_errors",
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="No action."))]
+    )
+
+    with pytest.raises(agent_runtime.FormatError):
+        model._parse_actions(response)
+
+
+def test_bridge_agent_returns_prior_action_failure_instead_of_submitting():
+    class FakeEnvironment:
+        def execute(self, action):
+            if action["command"] == "submit":
+                raise agent_runtime.Submitted(
+                    {"role": "exit", "content": "submitted", "extra": {}}
+                )
+            return {"output": "not found", "returncode": 127, "exception_info": ""}
+
+        def get_template_vars(self):
+            return {}
+
+    class FakeModel:
+        def format_observation_messages(self, message, outputs, template_vars):
+            return [{"role": "user", "content": "observed", "extra": {"outputs": outputs}}]
+
+        def get_template_vars(self):
+            return {}
+
+    agent = BridgeAgent(
+        FakeModel(),
+        FakeEnvironment(),
+        system_template="system",
+        instance_template="instance",
+        step_limit=0,
+        cost_limit=0,
+    )
+    message = {
+        "role": "assistant",
+        "extra": {"actions": [{"command": "missing"}, {"command": "submit"}]},
+    }
+
+    observations = agent.execute_actions(message)
+
+    assert observations[0]["extra"]["outputs"] == [
+        {"output": "not found", "returncode": 127, "exception_info": ""},
+        {
+            "output": "",
+            "returncode": -1,
+            "exception_info": "submission rejected because an earlier action in this response failed",
+        },
+    ]
+
+
+def test_bridge_agent_submits_after_successful_prior_actions():
+    class FakeEnvironment:
+        def execute(self, action):
+            if action["command"] == "submit":
+                raise agent_runtime.Submitted(
+                    {"role": "exit", "content": "submitted", "extra": {}}
+                )
+            return {"output": "ok", "returncode": 0, "exception_info": ""}
+
+        def get_template_vars(self):
+            return {}
+
+    class FakeModel:
+        def get_template_vars(self):
+            return {}
+
+    agent = BridgeAgent(
+        FakeModel(),
+        FakeEnvironment(),
+        system_template="system",
+        instance_template="instance",
+        step_limit=0,
+        cost_limit=0,
+    )
+    message = {
+        "role": "assistant",
+        "extra": {"actions": [{"command": "success"}, {"command": "submit"}]},
+    }
+
+    with pytest.raises(agent_runtime.Submitted):
+        agent.execute_actions(message)
 
 
 @pytest.mark.parametrize("result_content", ["not JSON", "[]"])
@@ -221,4 +469,6 @@ def test_run_fails_when_agent_output_is_not_a_json_object(monkeypatch, tmp_path,
     workspace.mkdir()
 
     with pytest.raises(RuntimeError, match="agent result must be a valid JSON object"):
-        MiniSweRuntime(RuntimeConfig()).run("task", workspace)
+        MiniSweRuntime(RuntimeConfig(model="gpt-5.6-terra")).run(
+            "task", workspace
+        )

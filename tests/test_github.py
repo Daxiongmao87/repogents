@@ -140,7 +140,7 @@ def test_default_request_authenticates_and_decodes_repository_json(monkeypatch):
     assert request.get_header("Authorization") == "Bearer placeholder-token"
 
 
-def test_list_ready_issues_requests_the_ready_open_issue_set():
+def test_list_open_issues_requests_every_open_issue_without_label_filter():
     calls = []
     response = [
         {
@@ -148,6 +148,7 @@ def test_list_ready_issues_requests_the_ready_open_issue_set():
             "title": "First",
             "body": "First body",
             "html_url": "https://example.test/issues/7",
+            "labels": [{"name": "urgent"}, {"name": "documentation"}],
         },
         {
             "number": 8,
@@ -170,21 +171,27 @@ def test_list_ready_issues_requests_the_ready_open_issue_set():
 
     client = GitHubClient("placeholder-token", request=request)
 
-    assert client.list_ready_issues("acme/widgets") == [
-        GitHubIssue(7, "First", "First body", "https://example.test/issues/7"),
+    assert client.list_open_issues("acme/widgets") == [
+        GitHubIssue(
+            7,
+            "First",
+            "First body",
+            "https://example.test/issues/7",
+            ("urgent", "documentation"),
+        ),
         GitHubIssue(8, "No body", "", "https://example.test/issues/8"),
     ]
     assert calls == [
         (
             "GET",
             "/repos/acme/widgets/issues",
-            {"state": "open", "labels": "agent:ready", "per_page": 100, "page": 1},
+            {"state": "open", "per_page": 100, "page": 1},
             None,
         )
     ]
 
 
-def test_list_ready_issues_paginates_until_a_short_page():
+def test_list_open_issues_paginates_until_a_short_page():
     calls = []
     pages = {
         1: [
@@ -212,7 +219,7 @@ def test_list_ready_issues_paginates_until_a_short_page():
 
     client = GitHubClient("placeholder-token", request=request)
 
-    issues = client.list_ready_issues("acme/widgets")
+    issues = client.list_open_issues("acme/widgets")
 
     assert [issue.number for issue in issues] == list(range(1, 102))
     assert issues[0] == GitHubIssue(
@@ -233,7 +240,6 @@ def test_list_ready_issues_paginates_until_a_short_page():
             "/repos/acme/widgets/issues",
             {
                 "state": "open",
-                "labels": "agent:ready",
                 "per_page": 100,
                 "page": 1,
             },
@@ -244,7 +250,6 @@ def test_list_ready_issues_paginates_until_a_short_page():
             "/repos/acme/widgets/issues",
             {
                 "state": "open",
-                "labels": "agent:ready",
                 "per_page": 100,
                 "page": 2,
             },
@@ -287,7 +292,6 @@ def test_ensure_follow_up_issue_creates_once_and_reuses_its_marker():
         assert json_body == {
             "title": title,
             "body": marked_body,
-            "labels": ["agent:ready"],
         }
         existing_issue = {
             "number": 301,
@@ -679,8 +683,6 @@ def test_prepare_publication_returns_exact_frozen_candidate_and_diff_without_rem
     rebased_head_sha = "2222222222222222222222222222222222222222"
     head_sha = "3333333333333333333333333333333333333333"
     remote_head_sha = "4444444444444444444444444444444444444444"
-    tree_oid = "5555555555555555555555555555555555555555"
-    published_head_sha = "6666666666666666666666666666666666666666"
     expected_diff = "diff --git a/app.py b/app.py\n+prepared\n"
     commit_count = 0
 
@@ -711,24 +713,12 @@ def test_prepare_publication_returns_exact_frozen_candidate_and_diff_without_rem
         if args == ["git", "rev-parse", "HEAD"]:
             current_head = head_sha if commit_count == 2 else rebased_head_sha
             return SimpleNamespace(stdout=f"{current_head}\n")
-        if args == ["git", "write-tree"]:
-            return SimpleNamespace(stdout=f"{tree_oid}\n")
-        if args == [
-            "git",
-            "commit-tree",
-            tree_oid,
-            "-p",
-            remote_head_sha,
-            "-m",
-            "Resolve issue #7",
-        ]:
-            return SimpleNamespace(stdout=f"{published_head_sha}\n")
         if args == [
             "git",
             "diff",
             "--no-color",
             target_head_sha,
-            published_head_sha,
+            head_sha,
             "--",
         ]:
             return SimpleNamespace(stdout=expected_diff)
@@ -744,7 +734,7 @@ def test_prepare_publication_returns_exact_frozen_candidate_and_diff_without_rem
 
     assert candidate == PublicationCandidate(
         branch=branch,
-        head_sha=published_head_sha,
+        head_sha=head_sha,
         target_head_sha=target_head_sha,
         remote_head_sha=remote_head_sha,
     )
@@ -764,12 +754,60 @@ def test_prepare_publication_returns_exact_frozen_candidate_and_diff_without_rem
         "diff",
         "--no-color",
         target_head_sha,
-        published_head_sha,
+        head_sha,
         "--",
     ] in commands
     assert request_calls == []
     assert not any(args[:2] == ["git", "push"] for args in commands)
     assert all(call[1] == workspace for call in command_calls)
+
+
+def test_amend_publication_uses_agent_message_and_returns_new_frozen_head(tmp_path):
+    workspace = tmp_path / "widgets"
+    workspace.mkdir()
+    original_head = "1" * 40
+    amended_head = "2" * 40
+    candidate = PublicationCandidate(
+        branch="agent/issue-7",
+        head_sha=original_head,
+        target_head_sha="3" * 40,
+        remote_head_sha="4" * 40,
+    )
+    calls = []
+    rev_parse_count = 0
+
+    def command_runner(args, *, cwd=None, env=None):
+        nonlocal rev_parse_count
+        calls.append(args)
+        if args == ["git", "rev-parse", "HEAD"]:
+            rev_parse_count += 1
+            return SimpleNamespace(
+                stdout=f"{original_head if rev_parse_count == 1 else amended_head}\n"
+            )
+        return SimpleNamespace(stdout="")
+
+    amended = GitHubClient(
+        "placeholder-token", command_runner=command_runner
+    ).amend_publication(
+        7,
+        workspace,
+        candidate,
+        "Describe the validated change",
+    )
+
+    assert amended == PublicationCandidate(
+        branch=candidate.branch,
+        head_sha=amended_head,
+        target_head_sha=candidate.target_head_sha,
+        remote_head_sha=candidate.remote_head_sha,
+    )
+    assert [
+        "git",
+        "commit",
+        "--amend",
+        "-m",
+        "Describe the validated change",
+    ] in calls
 
 
 
@@ -1167,7 +1205,7 @@ def test_prepare_publication_rebase_state_reports_and_stages_only_explicit_paths
     assert ignored_generated.exists()
 
 
-def test_prepare_publication_preserves_unfetched_remote_issue_head_ancestry_and_exact_diff(
+def test_prepare_publication_replaces_remote_history_with_one_target_based_commit(
     tmp_path,
 ):
     remote = tmp_path / "remote.git"
@@ -1251,9 +1289,23 @@ def test_prepare_publication_preserves_unfetched_remote_issue_head_ancestry_and_
         text=True,
     ).stdout
 
-    candidate, candidate_diff = GitHubClient(
-        "placeholder-token"
-    ).prepare_publication(7, "main", workspace)
+    published_head = ""
+
+    def request(method, path, *, query=None, json_body=None):
+        if method == "GET" and path == "/repos/acme/widgets/pulls/12":
+            return {
+                "number": 12,
+                "html_url": "https://example.test/pulls/12",
+                "head": {"ref": issue_branch, "sha": published_head},
+                "state": "open",
+                "merged": False,
+            }
+        if method == "GET" and path.endswith(".diff"):
+            return expected_diff
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    client = GitHubClient("placeholder-token", request=request)
+    candidate, candidate_diff = client.prepare_publication(7, "main", workspace)
 
     assert candidate.target_head_sha == target_head
     assert candidate.remote_head_sha == remote_issue_head
@@ -1289,7 +1341,9 @@ def test_prepare_publication_preserves_unfetched_remote_issue_head_ancestry_and_
         capture_output=True,
         text=True,
     )
-    assert ancestry.returncode == 0
+    assert ancestry.returncode == 1
+    assert git("rev-parse", f"{candidate.head_sha}^", cwd=workspace) == target_head
+    assert git("rev-list", "--count", f"{target_head}..{candidate.head_sha}", cwd=workspace) == "1"
     assert (
         git("rev-parse", f"refs/heads/{issue_branch}", cwd=remote)
         == remote_issue_head
@@ -1303,42 +1357,40 @@ def test_prepare_publication_preserves_unfetched_remote_issue_head_ancestry_and_
     )
     assert unpublished_candidate.returncode != 0
 
+    amended = client.amend_publication(
+        7,
+        workspace,
+        candidate,
+        "Apply reviewed feedback",
+    )
+    published_head = amended.head_sha
+    client.publish_prepared(
+        "acme/widgets",
+        7,
+        "main",
+        workspace,
+        amended,
+        existing_pr=12,
+    )
+
+    assert git("rev-parse", f"refs/heads/{issue_branch}", cwd=remote) == amended.head_sha
+    assert git("rev-list", "--count", f"{target_head}..{amended.head_sha}", cwd=workspace) == "1"
+    assert git("show", "-s", "--format=%s", amended.head_sha, cwd=workspace) == "Apply reviewed feedback"
+
 @pytest.mark.parametrize(
-    (
-        "remote_head_sha",
-        "staging_head_sha",
-        "expected_issue_before_oid",
-    ),
-    [
-        (
-            "4444444444444444444444444444444444444444",
-            "5555555555555555555555555555555555555555",
-            "4444444444444444444444444444444444444444",
-        ),
-        (
-            "4444444444444444444444444444444444444444",
-            "3333333333333333333333333333333333333333",
-            "4444444444444444444444444444444444444444",
-        ),
-        ("", "", "0000000000000000000000000000000000000000"),
-    ],
+    "remote_head_sha",
+    ["4444444444444444444444444444444444444444", ""],
 )
-def test_publish_prepared_stages_exact_candidate_then_atomically_updates_refs_and_creates_pull_request(
+def test_publish_prepared_force_pushes_exact_candidate_with_lease_and_creates_pull_request(
     tmp_path,
     remote_head_sha,
-    staging_head_sha,
-    expected_issue_before_oid,
 ):
     workspace = tmp_path / "widgets"
     workspace.mkdir()
     request_calls = []
     command_calls = []
-    repository_id = "R_kgDOExample"
     branch = "agent/issue-7"
     issue_ref = f"refs/heads/{branch}"
-    target_ref = "refs/heads/main"
-    staging_ref = "refs/heads/repogents/staging/issue-7"
-    zero_oid = "0000000000000000000000000000000000000000"
     target_head_sha = "1111111111111111111111111111111111111111"
     head_sha = "3333333333333333333333333333333333333333"
     candidate = PublicationCandidate(
@@ -1358,30 +1410,23 @@ def test_publish_prepared_stages_exact_candidate_then_atomically_updates_refs_an
         "merged": False,
     }
     pull_diff = "diff --git a/app.py b/app.py\n+published\n"
-    staging_push = [
+    issue_push = [
         "git",
         "push",
-        f"--force-with-lease={staging_ref}:{staging_head_sha}",
+        f"--force-with-lease={issue_ref}:{remote_head_sha}",
+        "--set-upstream",
         "origin",
-        f"{head_sha}:{staging_ref}",
+        f"{head_sha}:{issue_ref}",
     ]
-    staged = staging_head_sha == head_sha
-    updated = False
+    pushed = False
 
     def request(method, path, *, query=None, json_body=None):
-        nonlocal updated
         request_calls.append((method, path, query, json_body))
-        if method == "GET" and path == "/repos/acme/widgets":
-            return {"node_id": repository_id}
-        if method == "POST" and path == "/graphql":
-            assert staged
-            updated = True
-            return {"data": {"updateRefs": {}}}
         if method == "GET" and path == "/repos/acme/widgets/pulls":
-            assert updated
+            assert pushed
             return []
         if method == "POST" and path == "/repos/acme/widgets/pulls":
-            assert updated
+            assert pushed
             return {"number": 12}
         if method == "GET" and path.endswith(".diff"):
             return pull_diff
@@ -1390,7 +1435,7 @@ def test_publish_prepared_stages_exact_candidate_then_atomically_updates_refs_an
         raise AssertionError(f"unexpected request: {method} {path}")
 
     def command_runner(args, *, cwd=None, env=None):
-        nonlocal staged
+        nonlocal pushed
         command_calls.append((args, cwd, env))
         if args == ["git", "rev-parse", "HEAD"]:
             return SimpleNamespace(stdout=f"{head_sha}\n")
@@ -1409,21 +1454,8 @@ def test_publish_prepared_stages_exact_candidate_then_atomically_updates_refs_an
                 else ""
             )
             return SimpleNamespace(stdout=stdout)
-        if args == [
-            "git",
-            "ls-remote",
-            "--heads",
-            "origin",
-            staging_ref,
-        ]:
-            stdout = (
-                f"{staging_head_sha}\t{staging_ref}\n"
-                if staging_head_sha
-                else ""
-            )
-            return SimpleNamespace(stdout=stdout)
-        if args == staging_push:
-            staged = True
+        if args == issue_push:
+            pushed = True
         return SimpleNamespace(stdout="")
 
     client = GitHubClient(
@@ -1461,56 +1493,11 @@ def test_publish_prepared_stages_exact_candidate_then_atomically_updates_refs_an
         issue_ref,
     ] in commands
     assert [
-        "git",
-        "ls-remote",
-        "--heads",
-        "origin",
-        staging_ref,
-    ] in commands
-    assert [
         args
         for args in commands
         if args[:2] == ["git", "push"]
-    ] == ([] if staging_head_sha == head_sha else [staging_push])
-    assert request_calls[0] == (
-        "GET",
-        "/repos/acme/widgets",
-        None,
-        None,
-    )
-    assert request_calls[1][:3] == ("POST", "/graphql", None)
-    graphql_body = request_calls[1][3]
-    document = "".join(graphql_body["query"].split()).replace(",", "")
-    assert document.count("mutation") == 1
-    assert document.count("updateRefs(input:$input)") == 1
-    expected_updates = [
-        {
-            "name": target_ref,
-            "beforeOid": target_head_sha,
-            "afterOid": target_head_sha,
-            "force": False,
-        },
-        {
-            "name": issue_ref,
-            "beforeOid": expected_issue_before_oid,
-            "afterOid": head_sha,
-            "force": False,
-        },
-        {
-            "name": staging_ref,
-            "beforeOid": head_sha,
-            "afterOid": zero_oid,
-            "force": False,
-        },
-    ]
-    assert graphql_body["variables"] == {
-        "input": {
-            "repositoryId": repository_id,
-            "refUpdates": expected_updates,
-        }
-    }
-    assert all(update["force"] is False for update in expected_updates)
-    assert [call[:3] for call in request_calls[2:]] == [
+    ] == [issue_push]
+    assert [call[:3] for call in request_calls] == [
         (
             "GET",
             "/repos/acme/widgets/pulls",
@@ -1520,7 +1507,7 @@ def test_publish_prepared_stages_exact_candidate_then_atomically_updates_refs_an
         ("GET", "/repos/acme/widgets/pulls/12", None),
         ("GET", "/repos/acme/widgets/pulls/12.diff", None),
     ]
-    assert request_calls[3][3] == {
+    assert request_calls[1][3] == {
         "title": "Resolve issue #7",
         "head": branch,
         "base": "main",
@@ -1782,14 +1769,13 @@ def test_publish_prepared_declines_remote_issue_branch_movement_without_push(
 
 
 
-def test_publish_prepared_raises_for_malformed_update_refs_response(tmp_path):
+def test_publish_prepared_propagates_force_with_lease_failure(tmp_path):
     workspace = tmp_path / "widgets"
     workspace.mkdir()
     request_calls = []
     command_calls = []
     branch = "agent/issue-7"
     issue_ref = f"refs/heads/{branch}"
-    staging_ref = "refs/heads/repogents/staging/issue-7"
     target_head = "1111111111111111111111111111111111111111"
     remote_head = "2222222222222222222222222222222222222222"
     candidate_head = "3333333333333333333333333333333333333333"
@@ -1799,22 +1785,18 @@ def test_publish_prepared_raises_for_malformed_update_refs_response(tmp_path):
         target_head_sha=target_head,
         remote_head_sha=remote_head,
     )
-    staging_push = [
+    issue_push = [
         "git",
         "push",
-        f"--force-with-lease={staging_ref}:",
+        f"--force-with-lease={issue_ref}:{remote_head}",
+        "--set-upstream",
         "origin",
-        f"{candidate_head}:{staging_ref}",
+        f"{candidate_head}:{issue_ref}",
     ]
 
     def request(method, path, *, query=None, json_body=None):
         request_calls.append((method, path, query, json_body))
-        if method == "GET" and path == "/repos/acme/widgets":
-            return {"node_id": "R_kgDOExample"}
-        if method == "POST" and path == "/graphql":
-            assert staging_push in [call[0] for call in command_calls]
-            return {"data": {"updateRefs": []}}
-        raise AssertionError("malformed publication must not continue")
+        raise AssertionError("failed push must not continue to GitHub publication")
 
     def command_runner(args, *, cwd=None, env=None):
         command_calls.append((args, cwd, env))
@@ -1830,14 +1812,8 @@ def test_publish_prepared_raises_for_malformed_update_refs_response(tmp_path):
             issue_ref,
         ]:
             return SimpleNamespace(stdout=f"{remote_head}\t{issue_ref}\n")
-        if args == [
-            "git",
-            "ls-remote",
-            "--heads",
-            "origin",
-            staging_ref,
-        ]:
-            return SimpleNamespace(stdout="")
+        if args == issue_push:
+            raise subprocess.CalledProcessError(1, args)
         return SimpleNamespace(stdout="")
 
     client = GitHubClient(
@@ -1846,7 +1822,7 @@ def test_publish_prepared_raises_for_malformed_update_refs_response(tmp_path):
         command_runner=command_runner,
     )
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(subprocess.CalledProcessError):
         client.publish_prepared(
             "acme/widgets",
             7,
@@ -1856,58 +1832,52 @@ def test_publish_prepared_raises_for_malformed_update_refs_response(tmp_path):
             existing_pr=12,
         )
 
-    assert [call[:3] for call in request_calls] == [
-        ("GET", "/repos/acme/widgets", None),
-        ("POST", "/graphql", None),
-    ]
+    assert request_calls == []
     assert [
         args
         for args, _, _ in command_calls
         if args[:2] == ["git", "push"]
-    ] == [staging_push]
+    ] == [issue_push]
 
 
-def test_publish_prepared_returns_none_when_update_refs_is_rejected(tmp_path):
+def test_publish_prepared_existing_pull_uses_force_with_lease(tmp_path):
     workspace = tmp_path / "widgets"
     workspace.mkdir()
     request_calls = []
     command_calls = []
     branch = "agent/issue-7"
     issue_ref = f"refs/heads/{branch}"
-    staging_ref = "refs/heads/repogents/staging/issue-7"
     target_head = "1111111111111111111111111111111111111111"
     remote_head = "2222222222222222222222222222222222222222"
     candidate_head = "3333333333333333333333333333333333333333"
-    staging_head = "4444444444444444444444444444444444444444"
     candidate = PublicationCandidate(
         branch=branch,
         head_sha=candidate_head,
         target_head_sha=target_head,
         remote_head_sha=remote_head,
     )
-    staging_push = [
+    issue_push = [
         "git",
         "push",
-        f"--force-with-lease={staging_ref}:{staging_head}",
+        f"--force-with-lease={issue_ref}:{remote_head}",
+        "--set-upstream",
         "origin",
-        f"{candidate_head}:{staging_ref}",
+        f"{candidate_head}:{issue_ref}",
     ]
 
     def request(method, path, *, query=None, json_body=None):
         request_calls.append((method, path, query, json_body))
-        if method == "GET" and path == "/repos/acme/widgets":
-            return {"node_id": "R_kgDOExample"}
-        if method == "POST" and path == "/graphql":
-            assert staging_push in [call[0] for call in command_calls]
+        if method == "GET" and path == "/repos/acme/widgets/pulls/12":
             return {
-                "errors": [
-                    {
-                        "type": "UNPROCESSABLE",
-                        "message": "one or more refs did not match beforeOid",
-                    }
-                ]
+                "number": 12,
+                "html_url": "https://example.test/pulls/12",
+                "head": {"ref": branch, "sha": candidate_head},
+                "state": "open",
+                "merged": False,
             }
-        raise AssertionError("rejected publication must not continue")
+        if method == "GET" and path.endswith(".diff"):
+            return "updated diff"
+        raise AssertionError(f"unexpected request: {method} {path}")
 
     def command_runner(args, *, cwd=None, env=None):
         command_calls.append((args, cwd, env))
@@ -1923,14 +1893,6 @@ def test_publish_prepared_returns_none_when_update_refs_is_rejected(tmp_path):
             issue_ref,
         ]:
             return SimpleNamespace(stdout=f"{remote_head}\t{issue_ref}\n")
-        if args == [
-            "git",
-            "ls-remote",
-            "--heads",
-            "origin",
-            staging_ref,
-        ]:
-            return SimpleNamespace(stdout=f"{staging_head}\t{staging_ref}\n")
         return SimpleNamespace(stdout="")
 
     client = GitHubClient(
@@ -1939,23 +1901,24 @@ def test_publish_prepared_returns_none_when_update_refs_is_rejected(tmp_path):
         command_runner=command_runner,
     )
 
-    assert client.publish_prepared(
+    pull = client.publish_prepared(
         "acme/widgets",
         7,
         "main",
         workspace,
         candidate,
         existing_pr=12,
-    ) is None
+    )
+    assert pull.head_sha == candidate_head
     assert [call[:3] for call in request_calls] == [
-        ("GET", "/repos/acme/widgets", None),
-        ("POST", "/graphql", None),
+        ("GET", "/repos/acme/widgets/pulls/12", None),
+        ("GET", "/repos/acme/widgets/pulls/12.diff", None),
     ]
     assert [
         args
         for args, _, _ in command_calls
         if args[:2] == ["git", "push"]
-    ] == [staging_push]
+    ] == [issue_push]
 
 
 
@@ -3282,8 +3245,18 @@ def test_list_feedback_uses_inline_comments_and_request_changes_state_only():
             "review",
             "Please address the review",
         ),
+        GitHubFeedback(
+            "comment:301",
+            "comment",
+            "This NEEDS WORK before release.",
+        ),
+        GitHubFeedback(
+            "comment:302",
+            "comment",
+            "Looks good to me.",
+        ),
     ]
-    assert calls[:2] == [
+    assert calls[:3] == [
         (
             "GET",
             "/repos/acme/widgets/pulls/12/comments",
@@ -3296,9 +3269,15 @@ def test_list_feedback_uses_inline_comments_and_request_changes_state_only():
             {"per_page": 100, "page": 1},
             None,
         ),
+        (
+            "GET",
+            "/repos/acme/widgets/issues/12/comments",
+            {"per_page": 100, "page": 1},
+            None,
+        ),
     ]
-    assert len(calls) == 3
-    graphql_call = calls[2]
+    assert len(calls) == 4
+    graphql_call = calls[3]
     assert graphql_call[:3] == ("POST", "/graphql", None)
     assert graphql_call[3]["variables"] == {
         "owner": "acme",
@@ -3322,7 +3301,7 @@ def test_list_feedback_uses_inline_comments_and_request_changes_state_only():
         assert field in document
 
 
-def test_list_feedback_paginates_inline_comments_and_reviews():
+def test_list_feedback_paginates_all_pull_request_feedback():
     calls = []
     inline_path = "/repos/acme/widgets/pulls/12/comments"
     review_path = "/repos/acme/widgets/pulls/12/reviews"
@@ -3475,6 +3454,10 @@ def test_list_feedback_paginates_inline_comments_and_reviews():
         *(f"inline:{number}" for number in range(1, 102)),
         "review:200",
         "review:201",
+        *(f"comment:{number}" for number in range(1, 100)),
+        "comment:300",
+        "comment:301",
+        "comment:302",
     ]
     assert feedback[99] == GitHubFeedback(
         "inline:100",
@@ -3494,15 +3477,17 @@ def test_list_feedback_paginates_inline_comments_and_reviews():
         "PRRT_thread_b",
         101,
     )
-    rest_calls = calls[:4]
+    rest_calls = calls[:6]
     assert [(call[1], call[2]["page"]) for call in rest_calls] == [
         (inline_path, 1),
         (inline_path, 2),
         (review_path, 1),
         (review_path, 2),
+        (conversation_path, 1),
+        (conversation_path, 2),
     ]
     assert all(call[2]["per_page"] == 100 for call in rest_calls)
-    graphql_calls = calls[4:]
+    graphql_calls = calls[6:]
     assert [
         call[3]["query"].lstrip().split()[1].split("(")[0]
         for call in graphql_calls
@@ -3643,6 +3628,7 @@ def test_address_feedback_replies_to_inline_top_level_before_resolving_thread():
     ("kind", "external_id"),
     [
         ("review", "review:201"),
+        ("comment", "comment:301"),
     ],
 )
 def test_address_feedback_acknowledges_non_thread_feedback_without_resolution(
@@ -3697,7 +3683,7 @@ def test_address_feedback_acknowledges_non_thread_feedback_without_resolution(
     ]
 
 
-def test_address_feedback_rejects_general_pull_request_comments():
+def test_address_feedback_rejects_mismatched_comment_external_id():
     calls = []
 
     def request(method, path, *, query=None, json_body=None):
@@ -3706,7 +3692,7 @@ def test_address_feedback_rejects_general_pull_request_comments():
 
     client = GitHubClient("placeholder-token", request=request)
     feedback = GitHubFeedback(
-        external_id="comment:301",
+        external_id="review:301",
         kind="comment",
         body="This NEEDS WORK before release.",
     )
@@ -4174,4 +4160,3 @@ def test_publish_commit_supplies_service_local_git_identity(tmp_path):
     commit_config = _git_config(commit_call[2])
     assert commit_config["user.name"]
     assert commit_config["user.email"]
-

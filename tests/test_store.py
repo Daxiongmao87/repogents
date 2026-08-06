@@ -14,6 +14,7 @@ RUN_STATES = [
     "VALIDATING",
     "CREATING_PR",
     "PR_LISTENING",
+    "PENDING_MERGE",
     "COMPLETED",
     "CLOSED",
 ]
@@ -52,6 +53,17 @@ def result_payload(label="done"):
     }
 
 
+def dependency_evidence(*dependencies):
+    return [
+        {
+            "dependency": dependency,
+            "reason": f"{dependency} must provide its outcome first.",
+            "evidence": [f"The graph declares {dependency} as a prerequisite."],
+        }
+        for dependency in dependencies
+    ]
+
+
 def specification_package():
     return {
         "specifications": [
@@ -61,6 +73,7 @@ def specification_package():
                 "description": "The existing context remains valid.",
                 "acceptance_criteria": ["The context is retained."],
                 "dependencies": [],
+                "dependency_evidence": [],
                 "executable": False,
                 "work_items": [],
             },
@@ -70,6 +83,7 @@ def specification_package():
                 "description": "Implement and verify the requested repair.",
                 "acceptance_criteria": ["The repair works.", "The regression is covered."],
                 "dependencies": ["context"],
+                "dependency_evidence": dependency_evidence("context"),
                 "executable": True,
                 "work_items": [
                     {
@@ -78,6 +92,7 @@ def specification_package():
                         "description": "Exercise the repaired behavior.",
                         "classification": "quality/testing",
                         "dependencies": ["implement"],
+                        "dependency_evidence": dependency_evidence("implement"),
                     },
                     {
                         "key": "implement",
@@ -85,6 +100,7 @@ def specification_package():
                         "description": "Change the repository behavior.",
                         "classification": "backend/python",
                         "dependencies": [],
+                        "dependency_evidence": [],
                     },
                 ],
             },
@@ -101,6 +117,7 @@ def single_work_package(key="root", classification="backend/python"):
                 "description": "Complete one independently understandable change.",
                 "acceptance_criteria": ["The change is complete."],
                 "dependencies": [],
+                "dependency_evidence": [],
                 "executable": True,
                 "work_items": [
                     {
@@ -109,6 +126,7 @@ def single_work_package(key="root", classification="backend/python"):
                         "description": "Implement the atomic change.",
                         "classification": classification,
                         "dependencies": [],
+                        "dependency_evidence": [],
                     }
                 ],
             }
@@ -127,13 +145,21 @@ def invalid_package_cases():
         "description",
         "acceptance_criteria",
         "dependencies",
+        "dependency_evidence",
         "executable",
         "work_items",
     ):
         package = specification_package()
         package["specifications"][1].pop(field)
         cases.append((f"missing specification {field}", package))
-    for field in ("key", "title", "description", "classification", "dependencies"):
+    for field in (
+        "key",
+        "title",
+        "description",
+        "classification",
+        "dependencies",
+        "dependency_evidence",
+    ):
         package = specification_package()
         package["specifications"][1]["work_items"][0].pop(field)
         cases.append((f"missing work {field}", package))
@@ -174,18 +200,30 @@ def dependency_cycle_cases():
 
     package = specification_package()
     package["specifications"][0]["dependencies"] = ["context"]
+    package["specifications"][0]["dependency_evidence"] = dependency_evidence(
+        "context"
+    )
     cases.append(("self-dependent specification", package))
 
     package = specification_package()
     package["specifications"][0]["dependencies"] = ["repair"]
+    package["specifications"][0]["dependency_evidence"] = dependency_evidence(
+        "repair"
+    )
     cases.append(("cyclic specifications", package))
 
     package = specification_package()
     package["specifications"][1]["work_items"][0]["dependencies"] = ["verify"]
+    package["specifications"][1]["work_items"][0][
+        "dependency_evidence"
+    ] = dependency_evidence("verify")
     cases.append(("self-dependent work", package))
 
     package = specification_package()
     package["specifications"][1]["work_items"][1]["dependencies"] = ["verify"]
+    package["specifications"][1]["work_items"][1][
+        "dependency_evidence"
+    ] = dependency_evidence("verify")
     cases.append(("cyclic work", package))
 
     return cases
@@ -200,6 +238,7 @@ def dependency_scheduling_package():
                 "description": "Prepare both inputs required by the repair.",
                 "acceptance_criteria": ["Both inputs are prepared."],
                 "dependencies": [],
+                "dependency_evidence": [],
                 "executable": True,
                 "work_items": [
                     {
@@ -208,6 +247,7 @@ def dependency_scheduling_package():
                         "description": "Prepare the first repair input.",
                         "classification": "backend",
                         "dependencies": [],
+                        "dependency_evidence": [],
                     },
                     {
                         "key": "prepare-two",
@@ -215,6 +255,7 @@ def dependency_scheduling_package():
                         "description": "Prepare the second repair input.",
                         "classification": "backend",
                         "dependencies": [],
+                        "dependency_evidence": [],
                     },
                 ],
             },
@@ -224,6 +265,7 @@ def dependency_scheduling_package():
                 "description": "Use the prepared inputs to complete the repair.",
                 "acceptance_criteria": ["The repair is complete."],
                 "dependencies": ["prepare"],
+                "dependency_evidence": dependency_evidence("prepare"),
                 "executable": True,
                 "work_items": [
                     {
@@ -232,6 +274,7 @@ def dependency_scheduling_package():
                         "description": "Build the downstream foundation.",
                         "classification": "quality",
                         "dependencies": [],
+                        "dependency_evidence": [],
                     },
                     {
                         "key": "dependent",
@@ -239,6 +282,7 @@ def dependency_scheduling_package():
                         "description": "Finish work after the foundation.",
                         "classification": "quality",
                         "dependencies": ["foundation"],
+                        "dependency_evidence": dependency_evidence("foundation"),
                     },
                 ],
             },
@@ -384,6 +428,63 @@ def test_pr_listening_since_is_nullable_and_durable(store, store_path):
         )
 
 
+def test_issue_order_plan_is_durable_and_replaced_atomically(store, store_path):
+    repository = add_repository(store)
+    first_snapshot = [{"number": 7, "title": "First"}]
+    first_result = {"ordered_issues": [{"issue_number": 7}]}
+
+    saved = store.save_issue_order_plan(
+        repository["id"], first_snapshot, first_result
+    )
+
+    assert saved == {
+        "repository_id": repository["id"],
+        "issue_snapshot": first_snapshot,
+        "result": first_result,
+    }
+    reopened = Store(store_path)
+    assert reopened.get_issue_order_plan(repository["id"]) == saved
+
+    second_snapshot = [
+        {"number": 7, "title": "First"},
+        {"number": 8, "title": "Second"},
+    ]
+    second_result = {
+        "ordered_issues": [{"issue_number": 8}, {"issue_number": 7}]
+    }
+    replaced = reopened.save_issue_order_plan(
+        repository["id"], second_snapshot, second_result
+    )
+    assert replaced["issue_snapshot"] == second_snapshot
+    assert replaced["result"] == second_result
+
+
+def test_pass_creation_and_run_transition_are_atomic_and_guard_latest_pass(store):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+    first_pass = store.create_pass(run["id"], "issue", {})
+
+    adaptive_pass = store.create_pass_and_transition(
+        run["id"],
+        first_pass["id"],
+        "work_failure",
+        {"failed_pass_id": first_pass["id"]},
+        "SPECIFYING",
+    )
+
+    assert adaptive_pass["trigger_type"] == "work_failure"
+    assert store.get_run(run["id"])["state"] == "SPECIFYING"
+    with pytest.raises(ValueError, match="latest execution pass changed"):
+        store.create_pass_and_transition(
+            run["id"],
+            first_pass["id"],
+            "work_failure",
+            {"failed_pass_id": first_pass["id"]},
+            "SPECIFYING",
+        )
+    assert store.list_passes(run["id"]) == [first_pass, adaptive_pass]
+
+
 @pytest.mark.parametrize(
     ("case_name", "package"),
     invalid_package_cases(),
@@ -422,6 +523,75 @@ def test_specification_gate_rejects_self_and_cyclic_dependencies_atomically(
 
     assert store.list_specifications(run["id"]) == [], case_name
     assert store.list_work_items(run["id"]) == [], case_name
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda package: package["specifications"][1].update(
+            dependency_evidence=[]
+        ),
+        lambda package: package["specifications"][1]["work_items"][0].update(
+            dependency_evidence=[]
+        ),
+        lambda package: package["specifications"][1].update(
+            dependency_evidence=[
+                {
+                    "dependency": "context",
+                    "reason": "",
+                    "evidence": ["Observed prerequisite."],
+                }
+            ]
+        ),
+        lambda package: package["specifications"][1].update(
+            dependency_evidence=[
+                {
+                    "dependency": "context",
+                    "reason": "Context is required.",
+                    "evidence": [],
+                }
+            ]
+        ),
+    ],
+)
+def test_dependency_evidence_fails_closed_and_atomically(store, mutate):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+    execution_pass = store.create_pass(run["id"], "ISSUE", {})
+    package = specification_package()
+    mutate(package)
+
+    with pytest.raises(ValueError, match="dependency"):
+        store.save_specification_package(
+            run["id"], execution_pass["id"], package
+        )
+
+    assert store.list_specifications(run["id"]) == []
+    assert store.list_work_items(run["id"]) == []
+
+
+def test_dependency_evidence_order_is_normalized_to_dependency_order(store):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+    execution_pass = store.create_pass(run["id"], "ISSUE", {})
+    package = dependency_scheduling_package()
+    dependent = package["specifications"][1]["work_items"][1]
+    dependent["dependencies"] = ["prepare-one", "foundation"]
+    dependent["dependency_evidence"] = dependency_evidence(
+        "foundation", "prepare-one"
+    )
+
+    saved = store.save_specification_package(
+        run["id"], execution_pass["id"], package
+    )
+
+    saved_dependent = next(
+        item for item in saved["work_items"] if item["key"] == "dependent"
+    )
+    assert [
+        item["dependency"]
+        for item in saved_dependent["dependency_evidence"]
+    ] == ["prepare-one", "foundation"]
 
 
 def test_pass_and_complete_package_persistence_returns_decoded_rows(store, store_path):
@@ -463,6 +633,9 @@ def test_pass_and_complete_package_persistence_returns_decoded_rows(store, store
         "The context is retained."
     ]
     assert reopened.list_work_items(run["id"])[0]["dependencies"] == ["implement"]
+    assert reopened.list_work_items(run["id"])[0]["dependency_evidence"] == (
+        dependency_evidence("implement")
+    )
 
 
 def test_node_queues_claim_dependency_ready_work_and_retain_busy_queue(store):
@@ -549,7 +722,7 @@ def test_claim_node_work_requires_and_filters_the_exact_run(store):
     assert claimed_first["run_id"] == first_run["id"]
 
 
-def test_claim_waits_for_all_specification_work_and_accepts_terminal_failures(store):
+def test_failure_blocks_dependents_but_preserves_independent_work(store):
     repository = add_repository(store)
     run = add_run(store, repository["id"])
     execution_pass = store.create_pass(run["id"], "ISSUE", {})
@@ -570,15 +743,32 @@ def test_claim_waits_for_all_specification_work_and_accepts_terminal_failures(st
     assert first["key"] == "prepare-one"
     store.fail_work(first["id"], result_payload("prepare-one-failed"))
     assert store.claim_node_work(quality["id"], run["id"]) is None
-
     second = store.claim_node_work(backend["id"], run["id"])
     assert second["key"] == "prepare-two"
-    store.fail_work(second["id"], result_payload("prepare-two-failed"))
-    foundation = store.claim_node_work(quality["id"], run["id"])
-    assert foundation["key"] == "foundation"
+    assert store.validation_barrier_ready(run["id"], execution_pass["id"]) is False
 
-    store.fail_work(foundation["id"], result_payload("foundation-failed"))
-    assert store.claim_node_work(quality["id"], run["id"])["key"] == "dependent"
+    assert store.settle_failed_pass_work(
+        run["id"],
+        execution_pass["id"],
+        result_payload("blocked-by-work-failure"),
+    ) is False
+    store.complete_work(second["id"], result_payload("prepare-two-completed"))
+    assert store.settle_failed_pass_work(
+        run["id"],
+        execution_pass["id"],
+        result_payload("blocked-by-work-failure"),
+    ) is True
+    current = {
+        work["key"]: work
+        for work in store.list_work_items(run["id"], execution_pass["id"])
+    }
+    assert current["prepare-one"]["state"] == "FAILED"
+    assert current["prepare-two"]["state"] == "COMPLETED"
+    assert current["foundation"]["state"] == "FAILED"
+    assert current["dependent"]["state"] == "FAILED"
+    assert current["foundation"]["result"]["output"] == {
+        "summary": "blocked-by-work-failure"
+    }
 
 
 def test_claim_satisfies_nonexecutable_specification_dependency_without_work(store):
@@ -615,7 +805,13 @@ def test_handoff_is_atomic_and_keeps_barrier_closed_until_child_finishes(store):
         store.complete_work(
             root["id"],
             result_payload("partial"),
-            {"classification": "quality/testing", "context": {}, "artifacts": [], "dependencies": []},
+            {
+                "classification": "quality/testing",
+                "context": {},
+                "artifacts": [],
+                "dependencies": [],
+                "dependency_evidence": [],
+            },
         )
     assert store.list_work_items(run["id"])[0]["state"] == "RUNNING"
 
@@ -624,6 +820,7 @@ def test_handoff_is_atomic_and_keeps_barrier_closed_until_child_finishes(store):
         "context": {"summary": "Implementation is ready for targeted verification."},
         "artifacts": [{"path": "artifact.txt"}],
         "dependencies": ["root"],
+        "dependency_evidence": dependency_evidence("root"),
         "blocking": {"until": "root output is available"},
     }
     child = store.complete_work(root["id"], result_payload("partial"), handoff)
@@ -644,6 +841,220 @@ def test_handoff_is_atomic_and_keeps_barrier_closed_until_child_finishes(store):
     assert claimed_child["id"] == child["id"]
     assert store.complete_work(child["id"], result_payload("handoff-complete")) is None
     assert store.validation_barrier_ready(run["id"], execution_pass["id"]) is True
+
+
+def test_handoff_lineage_holds_ordinary_dependents_until_continuation_completes(store):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+    execution_pass = store.create_pass(run["id"], "ISSUE", {})
+    package = single_work_package("root", "implementation")
+    package["specifications"][0]["work_items"].append(
+        {
+            "key": "dependent",
+            "title": "Consume the completed outcome",
+            "description": "Run only after the full root continuation completes.",
+            "classification": "consumer",
+            "dependencies": ["root"],
+            "dependency_evidence": dependency_evidence("root"),
+        }
+    )
+    saved = store.save_specification_package(
+        run["id"], execution_pass["id"], package
+    )
+    work = {item["key"]: item for item in saved["work_items"]}
+    implementation = store.create_dynamic_node(
+        repository["id"], "implementation", [1], "Produce the outcome."
+    )
+    continuation = store.create_dynamic_node(
+        repository["id"], "continuation", [1], "Continue incomplete work."
+    )
+    consumer = store.create_dynamic_node(
+        repository["id"], "consumer", [1], "Consume completed outcomes."
+    )
+    store.assign_work(work["root"]["id"], implementation["id"])
+    store.assign_work(work["dependent"]["id"], consumer["id"])
+    root = store.claim_node_work(implementation["id"], run["id"])
+    child = store.complete_work(
+        root["id"],
+        result_payload("partial-root"),
+        {
+            "classification": "continuation",
+            "context": {"remaining": "finish the outcome"},
+            "artifacts": [],
+            "dependencies": ["root"],
+            "dependency_evidence": dependency_evidence("root"),
+            "blocking": None,
+        },
+    )
+    store.assign_work(child["id"], continuation["id"])
+
+    assert store.claim_node_work(consumer["id"], run["id"]) is None
+    claimed_child = store.claim_node_work(continuation["id"], run["id"])
+    assert claimed_child["id"] == child["id"]
+    assert store.claim_node_work(consumer["id"], run["id"]) is None
+
+    store.complete_work(claimed_child["id"], result_payload("continued-root"))
+    assert store.claim_node_work(consumer["id"], run["id"])["key"] == "dependent"
+
+
+def test_handoff_rejects_runtime_dependency_cycle_atomically(store):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+    execution_pass = store.create_pass(run["id"], "ISSUE", {})
+    package = single_work_package("root", "implementation")
+    package["specifications"][0]["work_items"].append(
+        {
+            "key": "dependent",
+            "title": "Consume root",
+            "description": "Depends on the root outcome.",
+            "classification": "consumer",
+            "dependencies": ["root"],
+            "dependency_evidence": dependency_evidence("root"),
+        }
+    )
+    saved = store.save_specification_package(
+        run["id"], execution_pass["id"], package
+    )
+    root = saved["work_items"][0]
+    node = store.create_dynamic_node(
+        repository["id"], "implementation", [1], "Produce the outcome."
+    )
+    store.assign_work(root["id"], node["id"])
+    store.claim_node_work(node["id"], run["id"])
+    child = store.complete_work(
+        root["id"],
+        result_payload("partial-root"),
+        {
+            "classification": "implementation",
+            "context": {},
+            "artifacts": [],
+            "dependencies": ["root"],
+            "dependency_evidence": dependency_evidence("root"),
+            "blocking": None,
+        },
+    )
+    store.assign_work(child["id"], node["id"])
+    store.claim_node_work(node["id"], run["id"])
+
+    with pytest.raises(ValueError, match="handoff dependency graph must be acyclic"):
+        store.complete_work(
+            child["id"],
+            result_payload("partial-continuation"),
+            {
+                "classification": "continuation",
+                "context": {},
+                "artifacts": [],
+                "dependencies": ["dependent"],
+                "dependency_evidence": dependency_evidence("dependent"),
+                "blocking": None,
+            },
+        )
+
+    current = store.list_work_items(run["id"])
+    assert len(current) == 3
+    assert next(item for item in current if item["key"] == "root")["state"] == "HANDED_OFF"
+    assert next(item for item in current if item["id"] == child["id"])["state"] == "RUNNING"
+
+
+def test_failed_continuation_propagates_only_to_causal_descendants(store):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+    execution_pass = store.create_pass(run["id"], "ISSUE", {})
+    package = single_work_package("root", "implementation")
+    package["specifications"][0]["work_items"].extend(
+        [
+            {
+                "key": "dependent",
+                "title": "Consume root",
+                "description": "Requires the completed root lineage.",
+                "classification": "consumer",
+                "dependencies": ["root"],
+                "dependency_evidence": dependency_evidence("root"),
+            },
+            {
+                "key": "independent",
+                "title": "Independent work",
+                "description": "Does not require the root lineage.",
+                "classification": "consumer",
+                "dependencies": [],
+                "dependency_evidence": [],
+            },
+        ]
+    )
+    saved = store.save_specification_package(
+        run["id"], execution_pass["id"], package
+    )
+    work = {item["key"]: item for item in saved["work_items"]}
+    implementation = store.create_dynamic_node(
+        repository["id"], "implementation", [1], "Produce the outcome."
+    )
+    continuation = store.create_dynamic_node(
+        repository["id"], "continuation", [1], "Continue incomplete work."
+    )
+    for key in ("dependent", "independent"):
+        store.assign_work(work[key]["id"], continuation["id"])
+    store.assign_work(work["root"]["id"], implementation["id"])
+    root = store.claim_node_work(implementation["id"], run["id"])
+    child = store.complete_work(
+        root["id"],
+        result_payload("partial-root"),
+        {
+            "classification": "continuation",
+            "context": {},
+            "artifacts": [],
+            "dependencies": ["root"],
+            "dependency_evidence": dependency_evidence("root"),
+            "blocking": None,
+        },
+    )
+    store.assign_work(child["id"], continuation["id"])
+    independent = store.claim_node_work(continuation["id"], run["id"])
+    assert independent["key"] == "independent"
+    store.complete_work(independent["id"], result_payload("independent-complete"))
+    claimed_child = store.claim_node_work(continuation["id"], run["id"])
+    assert claimed_child["id"] == child["id"]
+    store.fail_work(claimed_child["id"], result_payload("continuation-failed"))
+
+    assert store.settle_failed_pass_work(
+        run["id"],
+        execution_pass["id"],
+        result_payload("blocked-by-continuation"),
+    ) is True
+    current = {
+        item["key"]: item for item in store.list_work_items(run["id"])
+    }
+    assert current["dependent"]["state"] == "FAILED"
+    assert current["independent"]["state"] == "COMPLETED"
+    assert store.validation_barrier_ready(run["id"], execution_pass["id"]) is False
+
+
+def test_persisted_unevidenced_dependency_fails_closed_at_every_gate(store, store_path):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+    execution_pass = store.create_pass(run["id"], "ISSUE", {})
+    saved = store.save_specification_package(
+        run["id"], execution_pass["id"], specification_package()
+    )
+    implement = next(
+        item for item in saved["work_items"] if item["key"] == "implement"
+    )
+    node = store.create_dynamic_node(
+        repository["id"], "backend/python", [1], "Complete the work."
+    )
+    store.assign_work(implement["id"], node["id"])
+    with sqlite3.connect(store_path) as connection:
+        connection.execute(
+            """
+            UPDATE specifications SET dependency_evidence = '[]'
+            WHERE pass_id = ? AND key = 'repair'
+            """,
+            (execution_pass["id"],),
+        )
+
+    with pytest.raises(ValueError, match="persisted specification dependency_evidence"):
+        store.claim_node_work(node["id"], run["id"])
+    with pytest.raises(ValueError, match="persisted specification dependency_evidence"):
+        store.validation_barrier_ready(run["id"], execution_pass["id"])
 
 
 def test_validation_barrier_rejects_outstanding_node_work_from_same_run(store):
