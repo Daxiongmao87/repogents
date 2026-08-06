@@ -23,6 +23,11 @@ The controller validates unique identities, complete requirement coverage,
 dependency evidence, and acyclicity, then persists the result before another
 stage runs. Restart recovery reuses that exact result.
 
+Agent transport must reject ambiguous multi-action responses before executing
+them and reject submission without a valid result object inside the same agent
+turn. A protocol violation must become corrective agent context, not a silent
+discard followed by an identical poll-level retry.
+
 ## Work Specifier
 
 The Work Specifier processes one strategic work area per turn. It returns

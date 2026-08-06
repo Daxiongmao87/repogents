@@ -370,7 +370,7 @@ def test_run_preserves_flexible_task_role_schema_and_trajectory(monkeypatch, tmp
     system_template = records["agents"][0].kwargs["system_template"]
     assert "exactly one shell action" in system_template
     assert "apply_patch command is unavailable" in system_template
-    assert "Only the first action block is executed" in system_template
+    assert "more than one action block are rejected" in system_template
     assert "standalone action" in system_template
     assert "```mswea_bash_command" in system_template
     assert records["saves"] == [{"agent": records["agents"][0], "path": None}]
@@ -393,7 +393,7 @@ def test_run_fails_when_agent_does_not_write_result(monkeypatch, tmp_path):
         )
 
 
-def test_bridge_text_model_executes_only_first_shell_action_before_observation():
+def test_bridge_text_model_rejects_multiple_shell_actions_before_execution():
     model = BridgeTextModel(
         model_name="openai/test",
         cost_tracking="ignore_errors",
@@ -411,7 +411,10 @@ def test_bridge_text_model_executes_only_first_shell_action_before_observation()
         ]
     )
 
-    assert model._parse_actions(response) == [{"command": "pwd"}]
+    with pytest.raises(agent_runtime.FormatError) as caught:
+        model._parse_actions(response)
+
+    assert caught.value.messages[0]["extra"]["n_actions"] == 2
 
 
 def test_bridge_text_model_rejects_response_without_shell_actions():
@@ -471,7 +474,7 @@ def test_bridge_agent_returns_prior_action_failure_instead_of_submitting():
     ]
 
 
-def test_bridge_agent_submits_after_successful_prior_actions():
+def test_bridge_agent_submits_after_successful_prior_actions(tmp_path):
     class FakeEnvironment:
         def execute(self, action):
             if action["command"] == "submit":
@@ -499,9 +502,66 @@ def test_bridge_agent_submits_after_successful_prior_actions():
         "role": "assistant",
         "extra": {"actions": [{"command": "success"}, {"command": "submit"}]},
     }
+    result_path = tmp_path / "result.json"
+    agent.extra_template_vars["result_path"] = str(result_path)
+    result_path.write_text("{}")
 
-    with pytest.raises(agent_runtime.Submitted):
-        agent.execute_actions(message)
+    try:
+        with pytest.raises(agent_runtime.Submitted):
+            agent.execute_actions(message)
+    finally:
+        result_path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize(
+    ("result_content", "expected_error"),
+    [
+        (None, "required result JSON was not written"),
+        ("not JSON", "result file is not valid JSON"),
+        ("[]", "result JSON is not an object"),
+    ],
+)
+def test_bridge_agent_rejects_submission_without_valid_result_object(
+    tmp_path, result_content, expected_error
+):
+    class FakeEnvironment:
+        def execute(self, action):
+            raise agent_runtime.Submitted(
+                {"role": "exit", "content": "submitted", "extra": {}}
+            )
+
+        def get_template_vars(self):
+            return {}
+
+    class FakeModel:
+        def format_observation_messages(self, message, outputs, template_vars):
+            return [
+                {"role": "user", "content": "observed", "extra": {"outputs": outputs}}
+            ]
+
+        def get_template_vars(self):
+            return {}
+
+    result_path = tmp_path / "result.json"
+    if result_content is not None:
+        result_path.write_text(result_content)
+    agent = BridgeAgent(
+        FakeModel(),
+        FakeEnvironment(),
+        system_template="system",
+        instance_template="instance",
+        step_limit=0,
+        cost_limit=0,
+    )
+    agent.extra_template_vars["result_path"] = str(result_path)
+
+    observations = agent.execute_actions(
+        {"role": "assistant", "extra": {"actions": [{"command": "submit"}]}}
+    )
+
+    assert observations[0]["extra"]["outputs"] == [
+        {"output": "", "returncode": -1, "exception_info": f"submission rejected because the {expected_error}"}
+    ]
 
 
 @pytest.mark.parametrize("result_content", ["not JSON", "[]"])

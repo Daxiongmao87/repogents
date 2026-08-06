@@ -26,9 +26,10 @@ Every response must contain exactly one shell action in this form:
 ```mswea_bash_command
 command
 ```
-Only the first action block is executed. Wait for its observation before deciding
-the next action. Submit only in a later, standalone action after observing that all
-required artifact changes and checks succeeded.
+Responses containing more than one action block are rejected without executing
+any action. Wait for each observation before deciding the next action. Submit only
+in a later, standalone action after observing that all required artifact changes
+and checks succeeded.
 """
 
 _INSTANCE_TEMPLATE = """\
@@ -96,11 +97,42 @@ class BridgeTextModel(LitellmTextbasedModel):
                     },
                 }
             )
+        if len(commands) != 1:
+            raise FormatError(
+                {
+                    "role": "user",
+                    "content": (
+                        "Multiple shell actions found in one response. No action "
+                        "was executed. Return exactly one mswea_bash_command block, "
+                        "then wait for its observation."
+                    ),
+                    "extra": {
+                        "interrupt_type": "FormatError",
+                        "n_actions": len(commands),
+                        "model_response": content,
+                    },
+                }
+            )
         return [{"command": commands[0]}]
 
 
 class BridgeAgent(DefaultAgent):
     """Agent control flow that rejects submission after a failed batched action."""
+
+    def _result_submission_error(self) -> str | None:
+        result_path = self.get_template_vars().get("result_path")
+        if not isinstance(result_path, str) or not result_path:
+            return "submission rejected because the result path is unavailable"
+        path = Path(result_path)
+        if not path.is_file():
+            return "submission rejected because the required result JSON was not written"
+        try:
+            result = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return "submission rejected because the result file is not valid JSON"
+        if not isinstance(result, dict):
+            return "submission rejected because the result JSON is not an object"
+        return None
 
     def execute_actions(self, message: dict) -> list[dict]:
         outputs = []
@@ -117,6 +149,16 @@ class BridgeAgent(DefaultAgent):
                                 "submission rejected because an earlier action "
                                 "in this response failed"
                             ),
+                        }
+                    )
+                    break
+                result_error = self._result_submission_error()
+                if result_error is not None:
+                    outputs.append(
+                        {
+                            "output": "",
+                            "returncode": -1,
+                            "exception_info": result_error,
                         }
                     )
                     break
