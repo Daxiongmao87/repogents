@@ -2628,7 +2628,7 @@ class Application:
         source_workspace: Path,
         *,
         feedback_dispositions: dict | None = None,
-    ) -> None:
+    ) -> bool:
         issue_specification = self.store.get_issue_specification(
             run["id"], execution_pass["id"]
         )
@@ -2686,6 +2686,22 @@ class Application:
         for work_area in issue_specification["work_areas"]:
             focused = persisted.get(work_area["key"])
             if focused is None:
+                rejection_path = self._trajectory(
+                    run["id"],
+                    f"work-specify-{execution_pass['id']}-{work_area['key']}-rejections",
+                )
+                prior_rejections = self._stage_rejections(rejection_path)
+                work_context = {
+                    "original_issue": run["issue_json"],
+                    "repository": repository,
+                    "issue_specification": issue_specification,
+                    "work_area": work_area,
+                    "pass_evidence": self._specify_context(
+                        repository, run, execution_pass
+                    ),
+                }
+                if prior_rejections:
+                    work_context["prior_specification_rejections"] = prior_rejections
                 focused = self.runtime.run(
                     self._task(
                         "work_specify",
@@ -2703,27 +2719,26 @@ class Application:
                         "validation failures are present, identify the unresolved "
                         "invariant or strategy class demonstrated by their recurring "
                         "evidence instead of enumerating only the latest example. "
+                        "Correct every supplied prior specification rejection without "
+                        "dropping any requirement from the current work area. "
                         + _CLASSIFICATION_GUIDANCE,
-                        {
-                            "original_issue": run["issue_json"],
-                            "repository": repository,
-                            "issue_specification": issue_specification,
-                            "work_area": work_area,
-                            "pass_evidence": self._specify_context(
-                                repository, run, execution_pass
-                            ),
-                        },
+                        work_context,
                     ),
                     source_workspace,
                     result_schema=_WORK_SPECIFY_SCHEMA,
                     trajectory_path=self._trajectory(
                         run["id"],
-                        f"work-specify-{execution_pass['id']}-{work_area['key']}",
+                        f"work-specify-{execution_pass['id']}-{work_area['key']}"
+                        f"-attempt-{len(prior_rejections) + 1}",
                     ),
                 )
-                focused = self._validated_work_specification(
-                    focused, issue_specification, work_area
-                )
+                try:
+                    focused = self._validated_work_specification(
+                        focused, issue_specification, work_area
+                    )
+                except (TypeError, ValueError) as error:
+                    self._record_stage_rejection(rejection_path, focused, error)
+                    return False
                 focused = self.store.record_work_specification_result(
                     run["id"],
                     execution_pass["id"],
@@ -2740,6 +2755,43 @@ class Application:
             execution_pass["id"],
             {"specifications": specifications},
         )
+        return True
+
+    @staticmethod
+    def _stage_rejections(path: Path) -> list[dict]:
+        if not path.is_file():
+            return []
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"invalid persisted stage rejections: {path}") from error
+        if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+            raise RuntimeError(f"invalid persisted stage rejections: {path}")
+        return value
+
+    @classmethod
+    def _record_stage_rejection(
+        cls,
+        path: Path,
+        rejected_result: object,
+        error: Exception,
+    ) -> None:
+        rejections = cls._stage_rejections(path)
+        rejections.append(
+            {
+                "attempt": len(rejections) + 1,
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "rejected_result": rejected_result,
+            }
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        staging = path.with_suffix(path.suffix + ".pending")
+        with staging.open("w", encoding="utf-8") as output:
+            json.dump(rejections, output, indent=2, sort_keys=True)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(staging, path)
 
     def _specify(self, repository: dict, run: dict) -> None:
         execution_passes = self.store.list_passes(run["id"])
@@ -2840,23 +2892,25 @@ class Application:
                 with self._source_snapshot(
                     self._workspace(repository["id"], run["id"])
                 ) as source_workspace:
-                    self._run_focused_specification(
+                    if not self._run_focused_specification(
                         repository,
                         run,
                         execution_pass,
                         source_workspace,
                         feedback_dispositions=result,
-                    )
+                    ):
+                        return
         elif not existing:
             with self._source_snapshot(
                 self._workspace(repository["id"], run["id"])
             ) as source_workspace:
-                self._run_focused_specification(
+                if not self._run_focused_specification(
                     repository,
                     run,
                     execution_pass,
                     source_workspace,
-                )
+                ):
+                    return
         self._route_unassigned(repository, run, execution_pass)
         self.store.transition_run(run["id"], "EXECUTING")
         self.store.transition_run(run["id"], "WAITING_FOR_WORK_COMPLETION")

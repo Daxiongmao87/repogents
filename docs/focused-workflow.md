@@ -38,6 +38,10 @@ to work. The controller validates and persists each area independently, so a
 restart does not discard completed specification work or rerun it.
 Persisted normalized specifications are reconstructed through the same semantic
 validator and must reproduce the exact durable normalized result before reuse.
+Rejected Work Specification payloads and their validator errors are persisted as
+attempt evidence. The run remains in specification, and the next unbounded
+attempt receives those rejections as corrective context; execution stays closed
+until every strategic area has a valid persisted specification.
 
 When an issue mandates a method or interaction with an external system, source,
 tool, or environment, the specification must require direct execution evidence

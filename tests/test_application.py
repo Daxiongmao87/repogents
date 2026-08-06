@@ -7843,6 +7843,71 @@ def test_normalized_work_specification_is_revalidated_after_restart():
         )
 
 
+def test_rejected_work_specification_is_durable_corrective_context(tmp_path):
+    runtime = ScriptedRuntime()
+    rejected = copy.deepcopy(focused_work_specification())
+    rejected["specification"]["requirement_keys"] = []
+    runtime.queue("issue_specify", focused_issue_specification())
+    runtime.queue("work_specify", rejected)
+    runtime.queue("work_specify", focused_work_specification())
+    runtime.queue("node_role", {"role_prompt": "Own repository changes."})
+    runtime.queue("work", ready_result("bounded result"))
+    runtime.queue("work_validate", focused_work_validation(True))
+    runtime.queue("validate", focused_issue_validation())
+    app, store, github, runtime = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={"change/repository": [1.0, 0.0]},
+    )
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
+    github.issues = [
+        GitHubIssue(28, "Focused workflow", "Produce the outcome", "https://issue/28")
+    ]
+
+    drive_until(
+        app,
+        lambda: len(
+            [
+                call
+                for call in runtime.stage_calls
+                if call["payload"]["kind"] == "work_specify"
+            ]
+        )
+        == 1,
+    )
+    run = store.list_runs(repository["id"])[0]
+    pass_id = store.list_passes(run["id"])[0]["id"]
+    assert store.get_run(run["id"])["state"] == "SPECIFYING"
+    rejection_path = (
+        tmp_path
+        / "runtime"
+        / "trajectories"
+        / str(run["id"])
+        / f"work-specify-{pass_id}-area-1-rejections.json"
+    )
+    rejections = json.loads(rejection_path.read_text())
+    assert len(rejections) == 1
+    assert rejections[0]["rejected_result"] == rejected
+    assert "retain every work area requirement" in rejections[0]["error"]
+
+    drive_until(
+        app,
+        lambda: store.list_runs(repository["id"])[0]["state"] == "PR_LISTENING",
+    )
+
+    work_specification_calls = [
+        call
+        for call in runtime.stage_calls
+        if call["payload"]["kind"] == "work_specify"
+    ]
+    assert len(work_specification_calls) == 2
+    assert work_specification_calls[1]["payload"]["context"][
+        "prior_specification_rejections"
+    ] == rejections
+    assert store.list_work_specification_results(run["id"], pass_id)
+    app.close()
+
+
 def test_focused_workflow_persists_traceability_through_issue_validation(tmp_path):
     runtime = ScriptedRuntime()
     runtime.queue("issue_specify", focused_issue_specification())
