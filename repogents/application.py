@@ -2573,6 +2573,53 @@ class Application:
         }
         return normalized_result
 
+    @classmethod
+    def _validated_persisted_work_specification(
+        cls,
+        result: object,
+        issue_specification: dict,
+        work_area: dict,
+    ) -> dict:
+        if not isinstance(result, dict) or set(result) != {
+            "work_area_key",
+            "specification",
+        }:
+            raise ValueError("persisted focused specification is incomplete")
+        specification = result["specification"]
+        normalized_fields = {
+            "key",
+            "title",
+            "description",
+            "requirement_keys",
+            "acceptance_criteria",
+            "acceptance_traceability",
+            "dependencies",
+            "dependency_evidence",
+            "executable",
+            "work_items",
+        }
+        if not isinstance(specification, dict) or set(specification) != normalized_fields:
+            raise ValueError("persisted focused specification has an invalid shape")
+        raw_result = {
+            "work_area_key": result["work_area_key"],
+            "specification": {
+                "key": specification["key"],
+                "title": specification["title"],
+                "description": specification["description"],
+                "requirement_keys": specification["requirement_keys"],
+                "acceptance_criteria": specification["acceptance_traceability"],
+                "work_items": specification["work_items"],
+            },
+        }
+        normalized = cls._validated_work_specification(
+            raw_result,
+            issue_specification,
+            work_area,
+        )
+        if normalized != result:
+            raise ValueError("persisted focused specification is inconsistent")
+        return normalized
+
     def _run_focused_specification(
         self,
         repository: dict,
@@ -2684,7 +2731,7 @@ class Application:
                     focused,
                 )
             else:
-                focused = self._validated_work_specification(
+                focused = self._validated_persisted_work_specification(
                     focused, issue_specification, work_area
                 )
             specifications.append(focused["specification"])

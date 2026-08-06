@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import multiprocessing
 import stat
@@ -7812,6 +7813,34 @@ def focused_issue_validation() -> dict:
         }
     )
     return result
+
+
+def test_normalized_work_specification_is_revalidated_after_restart():
+    issue_specification = focused_issue_specification()
+    work_area = issue_specification["work_areas"][0]
+    normalized = Application._validated_work_specification(
+        focused_work_specification(),
+        issue_specification,
+        work_area,
+    )
+
+    assert Application._validated_persisted_work_specification(
+        normalized,
+        issue_specification,
+        work_area,
+    ) == normalized
+
+    inconsistent = copy.deepcopy(normalized)
+    inconsistent["specification"]["acceptance_criteria"] = ["changed after validation"]
+    with pytest.raises(
+        ValueError,
+        match="persisted focused specification is inconsistent",
+    ):
+        Application._validated_persisted_work_specification(
+            inconsistent,
+            issue_specification,
+            work_area,
+        )
 
 
 def test_focused_workflow_persists_traceability_through_issue_validation(tmp_path):

@@ -36,6 +36,8 @@ agent-owned classifications, requirement mappings, and evidence-backed
 within-area dependencies. Every applicable requirement and criterion must map
 to work. The controller validates and persists each area independently, so a
 restart does not discard completed specification work or rerun it.
+Persisted normalized specifications are reconstructed through the same semantic
+validator and must reproduce the exact durable normalized result before reuse.
 
 When an issue mandates a method or interaction with an external system, source,
 tool, or environment, the specification must require direct execution evidence
