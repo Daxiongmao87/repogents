@@ -294,17 +294,21 @@ def test_http_service_rejects_malformed_repository_requests():
 
 
 @pytest.mark.parametrize(
-    ("message", "expected"),
+    ("message", "secret"),
     [
-        ("token=delimiter-secret", "token=[redacted]"),
-        ("api_key whitespace-secret", "api_key=[redacted]"),
-        ('{"token":"json-secret"}', '{"token":"[redacted]"}'),
-        ('{"access_token":"access-token-secret","client_secret":"client-secret-value"}', '{"access_token":"[redacted]","client_secret":"[redacted]"}'),
+        ("session_credential=delimiter-secret", "delimiter-secret"),
+        ("session_credential whitespace-secret", "whitespace-secret"),
+        ('{"session_credential":"json-secret"}', "json-secret"),
     ],
 )
-def test_poll_failure_sanitizer_redacts_delimited_and_whitespace_credentials(message, expected):
-    sanitized = HttpService._sanitized_message(RuntimeError(message))
-    assert sanitized == expected
+def test_poll_failure_sanitizer_fails_closed_for_unrecognized_credential_labels(message, secret):
+    application = FakeApplication()
+    service = HttpService(application, "127.0.0.1", 0, 60)
+    service._record_poll_failure(RuntimeError(message))
+
+    projected_state = service.state()
+    assert projected_state["poll_failure"]["message"] == "poll failure details withheld"
+    assert secret not in json.dumps(projected_state)
 
 
 def test_http_service_reports_sanitized_poll_failures_and_recovers():
@@ -318,7 +322,7 @@ def test_http_service_reports_sanitized_poll_failures_and_recovers():
             if self.poll_calls == 1:
                 self.failed.set()
                 raise RuntimeError(
-                    'upstream response {"access_token":"browser-must-not-see-this-access-token","client_secret":"browser-must-not-see-this-client-secret"}\ntraceback details'
+                    'upstream session_credential=browser-must-not-see-session-secret\ntraceback details'
                 )
 
     application = FailingThenHealthyApplication()
@@ -331,10 +335,10 @@ def test_http_service_reports_sanitized_poll_failures_and_recovers():
         _, failed_state = request_json(f"http://{host}:{port}/api/state")
         failure = failed_state["poll_failure"]
         assert failure["type"] == "RuntimeError"
-        assert failure["message"] == 'upstream response {"access_token":"[redacted]","client_secret":"[redacted]"}'
+        assert failure["message"] == "poll failure details withheld"
         assert "traceback" not in failure["message"]
-        assert "browser-must-not-see-this-access-token" not in json.dumps(failed_state)
-        assert "browser-must-not-see-this-client-secret" not in json.dumps(failed_state)
+        assert "browser-must-not-see-session-secret" not in json.dumps(failed_state)
+        assert "browser-must-not-see-session-secret" not in json.dumps(failed_state)
         assert failure["occurred_at"].endswith("+00:00")
 
         for _ in range(100):

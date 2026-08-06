@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import threading
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -149,19 +148,8 @@ class HttpService:
 
     @staticmethod
     def _sanitized_message(error: Exception) -> str:
-        message = str(error).splitlines()[0] if str(error) else "no message"
-        message = re.sub(
-            r'(?i)("(?:authorization|bearer|access[_-]?token|client[_-]?secret|token|api[_-]?key|password|secret)"\s*:\s*)"(?:(?:\\.)|[^"])*"',
-            r'\1"[redacted]"',
-            message,
-        )
-        message = re.sub(
-            r"(?i)(authorization|bearer|access[_-]?token|client[_-]?secret|token|api[_-]?key|password|secret)(?:\s*[=:]\s*|\s+).*",
-            r"\1=[redacted]",
-            message,
-        )
-        message = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1[redacted]@", message)
-        return message[:500]
+        """Return a public-safe poll failure message without exception details."""
+        return "poll failure details withheld"
 
     def state(self):
         state = dict(self.application.state())
