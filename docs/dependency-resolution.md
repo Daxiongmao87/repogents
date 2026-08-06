@@ -94,9 +94,10 @@ creates a `work_failure` pass containing the failed items, their dependency
 evidence, results, handoffs, and originating feedback relationship when one
 exists.
 
-The next Specify agent may preserve successful output, replace work, add or
-remove dependencies, consolidate a cycle, or produce another domain-appropriate
-plan. The controller does not prescribe which adaptation is correct.
+The next Issue Specifier and focused Work Specifier turns may preserve
+successful output, replace work, add or remove dependencies, consolidate a
+cycle, or produce another domain-appropriate plan. The controller does not
+prescribe which adaptation is correct.
 
 ## Recovery And Idempotency
 

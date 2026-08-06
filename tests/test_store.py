@@ -308,8 +308,10 @@ def test_repository_crud_creates_permanent_graph_and_preserves_history(store, st
 
     nodes = store.list_nodes(repository["id"])
     assert [(node["classification"], node["persistence"]) for node in nodes] == [
-        ("Specify", "PERMANENT"),
-        ("Validate", "PERMANENT"),
+        ("Issue Specifier", "PERMANENT"),
+        ("Work Specifier", "PERMANENT"),
+        ("Work Validator", "PERMANENT"),
+        ("Issue Validator", "PERMANENT"),
     ]
     assert all(node["vector"] is None and node["active"] is True for node in nodes)
     assert store.list_dynamic_nodes(repository["id"]) == []
@@ -320,7 +322,7 @@ def test_repository_crud_creates_permanent_graph_and_preserves_history(store, st
     assert store.list_repositories() == []
     assert store.get_repository(repository["id"])["tracked"] is False
     assert store.get_run(run["id"])["issue_json"]["title"] == "Repair the service"
-    assert len(store.list_nodes(repository["id"])) == 2
+    assert len(store.list_nodes(repository["id"])) == 4
     with pytest.raises(KeyError):
         store.set_autonomous_issue_intake(repository["id"], True)
 
@@ -1656,9 +1658,11 @@ def test_success_promotion_and_terminal_run_pruning_are_run_aware(store):
     store.transition_run(third_run["id"], "COMPLETED")
     assert store.adapt_nodes_after_run(third_run["id"], stale_run_threshold=2) == [stale["id"]]
     assert [node["id"] for node in store.list_dynamic_nodes(repository["id"])] == [used["id"]]
-    assert [(node["classification"], node["persistence"]) for node in store.list_nodes(repository["id"])[:2]] == [
-        ("Specify", "PERMANENT"),
-        ("Validate", "PERMANENT"),
+    assert [(node["classification"], node["persistence"]) for node in store.list_nodes(repository["id"])[:4]] == [
+        ("Issue Specifier", "PERMANENT"),
+        ("Work Specifier", "PERMANENT"),
+        ("Work Validator", "PERMANENT"),
+        ("Issue Validator", "PERMANENT"),
     ]
 
 
@@ -1704,3 +1708,33 @@ def test_recovery_requeues_only_interrupted_work_and_keeps_active_run_unique(sto
     assert created is False
     assert reopened.recover_interrupted_work() == 0
     assert reopened.claim_node_work(node["id"], run["id"])["key"] == "implement"
+
+
+def test_work_validation_preserves_sequential_attempts_for_restarted_work(store):
+    repository = add_repository(store)
+    run = add_run(store, repository["id"])
+    execution_pass = store.create_pass(run["id"], "issue", {})
+    saved = store.save_specification_package(
+        run["id"], execution_pass["id"], specification_package()
+    )
+    work = next(item for item in saved["work_items"] if item["key"] == "implement")
+    node = store.create_dynamic_node(
+        repository["id"], "backend/python", [1, 0], "Handle backend work."
+    )
+    store.assign_work(work["id"], node["id"])
+    claimed = store.claim_node_work(node["id"], run["id"])
+    assert claimed["id"] == work["id"]
+
+    first = store.record_work_validation(
+        run["id"], execution_pass["id"], work["id"], {"passed": False}
+    )
+    second = store.record_work_validation(
+        run["id"], execution_pass["id"], work["id"], {"passed": True}
+    )
+
+    assert (first["attempt"], first["result"]) == (1, {"passed": False})
+    assert (second["attempt"], second["result"]) == (2, {"passed": True})
+    assert [
+        (item["attempt"], item["result"])
+        for item in store.list_work_validations(run["id"], execution_pass["id"])
+    ] == [(1, {"passed": False}), (2, {"passed": True})]

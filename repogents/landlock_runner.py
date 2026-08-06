@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import os
+import socket
 import sys
 from pathlib import Path
 
@@ -53,6 +55,15 @@ class _PathBeneathAttr(ctypes.Structure):
     _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int32)]
 
 
+class _ScmpArgCmp(ctypes.Structure):
+    _fields_ = [
+        ("arg", ctypes.c_uint),
+        ("op", ctypes.c_uint),
+        ("datum_a", ctypes.c_uint64),
+        ("datum_b", ctypes.c_uint64),
+    ]
+
+
 def _checked_syscall(libc, number: int, *args) -> int:
     result = libc.syscall(number, *args)
     if result < 0:
@@ -93,7 +104,12 @@ def _restrict_filesystem(read_paths: tuple[Path, ...], write_paths: tuple[Path, 
     try:
         for path, access in (
             *((path, _READ_ACCESS) for path in read_paths),
-            *((path, handled) for path in write_paths),
+            *((
+                path,
+                handled
+                if path.is_dir()
+                else (_READ_FILE | _WRITE_FILE | _TRUNCATE),
+            ) for path in write_paths),
         ):
             if not path.exists():
                 continue
@@ -118,6 +134,51 @@ def _restrict_filesystem(read_paths: tuple[Path, ...], write_paths: tuple[Path, 
         os.close(ruleset_fd)
 
 
+def _deny_internet_sockets() -> None:
+    try:
+        seccomp = ctypes.CDLL("libseccomp.so.2", use_errno=True)
+    except OSError as error:
+        raise RuntimeError("libseccomp is required when internet access is disabled") from error
+    seccomp.seccomp_init.argtypes = [ctypes.c_uint32]
+    seccomp.seccomp_init.restype = ctypes.c_void_p
+    seccomp.seccomp_release.argtypes = [ctypes.c_void_p]
+    seccomp.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+    seccomp.seccomp_syscall_resolve_name.restype = ctypes.c_int
+    seccomp.seccomp_rule_add_array.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.POINTER(_ScmpArgCmp),
+    ]
+    seccomp.seccomp_rule_add_array.restype = ctypes.c_int
+    seccomp.seccomp_load.argtypes = [ctypes.c_void_p]
+    seccomp.seccomp_load.restype = ctypes.c_int
+
+    allow = 0x7FFF0000
+    deny = 0x00050000 | errno.EPERM
+    compare_equal = 4
+    context = seccomp.seccomp_init(allow)
+    if not context:
+        raise OSError(ctypes.get_errno(), "seccomp_init failed")
+    try:
+        socket_syscall = seccomp.seccomp_syscall_resolve_name(b"socket")
+        if socket_syscall < 0:
+            raise RuntimeError("seccomp could not resolve the socket syscall")
+        for family in (socket.AF_INET, socket.AF_INET6):
+            comparison = _ScmpArgCmp(0, compare_equal, family, 0)
+            result = seccomp.seccomp_rule_add_array(
+                context, deny, socket_syscall, 1, ctypes.byref(comparison)
+            )
+            if result != 0:
+                raise OSError(-result, os.strerror(-result))
+        result = seccomp.seccomp_load(context)
+        if result != 0:
+            raise OSError(-result, os.strerror(-result))
+    finally:
+        seccomp.seccomp_release(context)
+
+
 def main(argv: list[str]) -> None:
     try:
         separator = argv.index("--")
@@ -127,19 +188,37 @@ def main(argv: list[str]) -> None:
         workspace = Path(values["--workspace"]).resolve()
         temp = Path(values["--temp"]).resolve()
         command_cwd = Path(values["--cwd"]).resolve()
+        internet = values["--internet"]
     except (ValueError, KeyError) as exc:
         raise SystemExit(f"invalid Landlock sandbox invocation: {exc}") from exc
     if not command:
         raise SystemExit("invalid Landlock sandbox invocation: command is required")
+    if internet not in {"enabled", "disabled"}:
+        raise SystemExit("invalid Landlock sandbox invocation: internet mode is invalid")
     if command_cwd != workspace and workspace not in command_cwd.parents:
         raise SystemExit("invalid Landlock sandbox invocation: cwd escapes workspace")
 
     read_paths = tuple(
         path.resolve()
-        for path in map(Path, ("/usr", "/bin", "/lib", "/lib64", "/etc", "/dev", "/proc"))
+        for path in map(
+            Path,
+            (
+                "/usr",
+                "/bin",
+                "/lib",
+                "/lib64",
+                "/etc",
+                "/dev",
+                "/proc",
+                "/run/systemd/resolve",
+            ),
+        )
         if path.exists()
     )
-    _restrict_filesystem(read_paths, (workspace, temp))
+    writable_devices = tuple(path for path in (Path("/dev/null"),) if path.exists())
+    _restrict_filesystem(read_paths, (workspace, temp, *writable_devices))
+    if internet == "disabled":
+        _deny_internet_sockets()
     os.chdir(command_cwd)
     os.execv(command[0], command)
 

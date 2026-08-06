@@ -18,6 +18,7 @@ def build_service(config: ServiceConfig) -> HttpService:
             api_base=config.codex_api_base,
             model=config.model,
             model_request_timeout=config.model_request_timeout,
+            internet_access=config.agent_internet_access,
         )
     )
     runtime.preflight(config.data_dir)

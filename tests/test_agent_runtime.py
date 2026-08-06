@@ -173,6 +173,7 @@ def test_each_run_uses_a_fresh_direct_local_landlock_agent(monkeypatch, tmp_path
     for environment in records["environments"]:
         assert environment.kwargs["cwd"] == str(workspace.resolve())
         assert environment.kwargs["timeout"] == 19
+        assert environment.kwargs["internet_access"] is False
     assert records["environment_checks"] == [
         {"command": "true"},
         {"command": "true"},
@@ -236,6 +237,47 @@ def test_real_landlock_denies_files_outside_workspace(tmp_path):
             "exception_info": "",
         }
         assert (workspace / "artifact").read_text() == "writable"
+    finally:
+        environment.cleanup()
+
+
+def test_real_landlock_disabled_mode_denies_internet_sockets(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = agent_runtime.LandlockEnvironment(
+        cwd=str(workspace), timeout=5, internet_access=False
+    )
+    try:
+        execution = environment.execute(
+            {
+                "command": (
+                    "python3 -c 'import socket; "
+                    "socket.socket(socket.AF_INET, socket.SOCK_STREAM)'"
+                )
+            }
+        )
+        assert execution["returncode"] != 0
+        assert "PermissionError" in execution["output"]
+    finally:
+        environment.cleanup()
+
+
+def test_real_landlock_enabled_mode_permits_outbound_sockets(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = agent_runtime.LandlockEnvironment(
+        cwd=str(workspace), timeout=5, internet_access=True
+    )
+    try:
+        execution = environment.execute(
+            {
+                "command": (
+                    "python3 -c 'import socket; "
+                    "s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.close()'"
+                )
+            }
+        )
+        assert execution == {"output": "", "returncode": 0, "exception_info": ""}
     finally:
         environment.cleanup()
 

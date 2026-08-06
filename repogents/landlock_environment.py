@@ -18,9 +18,12 @@ from minisweagent.utils.serialize import recursive_merge
 class LandlockEnvironment:
     """mini-swe-agent environment with unprivileged filesystem isolation."""
 
-    def __init__(self, *, cwd: str, timeout: int = 30):
+    def __init__(
+        self, *, cwd: str, timeout: int = 30, internet_access: bool = False
+    ):
         self.cwd = Path(cwd).resolve()
         self.timeout = timeout
+        self.internet_access = internet_access
         self.working_dir = Path(tempfile.gettempdir()) / f"repogents-{uuid.uuid4().hex[:8]}"
         self.working_dir.mkdir(parents=True, exist_ok=True)
 
@@ -49,6 +52,8 @@ class LandlockEnvironment:
                     str(self.working_dir),
                     "--cwd",
                     str(command_cwd),
+                    "--internet",
+                    "enabled" if self.internet_access else "disabled",
                     "--",
                     "/bin/bash",
                     "-c",
@@ -113,7 +118,11 @@ class LandlockEnvironment:
         return {
             "info": {
                 "config": {
-                    "environment": {"cwd": str(self.cwd), "timeout": self.timeout},
+                    "environment": {
+                        "cwd": str(self.cwd),
+                        "timeout": self.timeout,
+                        "internet_access": self.internet_access,
+                    },
                     "environment_type": f"{self.__class__.__module__}.{self.__class__.__name__}",
                 }
             }

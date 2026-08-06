@@ -114,6 +114,66 @@ _SPECIFY_SCHEMA = {
         }
     ]
 }
+_ISSUE_SPECIFY_SCHEMA = {
+    "requirements": [
+        {
+            "key": "stable requirement key",
+            "statement": "explicit required outcome, constraint, or method",
+            "evidence": ["concrete issue, feedback, failure, or repository observation"],
+        }
+    ],
+    "work_areas": [
+        {
+            "key": "stable strategic work area key",
+            "title": "string",
+            "description": "strategic outcome without a prescribed procedure",
+            "requirement_keys": ["requirement key"],
+            "dependencies": ["work area key"],
+            "dependency_evidence": [
+                {
+                    "dependency": "work area key",
+                    "reason": "why this outcome is required first",
+                    "evidence": ["concrete causal observation"],
+                }
+            ],
+        }
+    ],
+}
+_WORK_SPECIFY_SCHEMA = {
+    "work_area_key": "strategic work area key",
+    "specification": {
+        "key": "same strategic work area key",
+        "title": "string",
+        "description": "bounded outcome",
+        "requirement_keys": ["requirement key"],
+        "acceptance_criteria": [
+            {
+                "key": "stable criterion key",
+                "description": "observable criterion",
+                "requirement_keys": ["requirement key"],
+            }
+        ],
+        "work_items": [
+            {
+                "key": "string",
+                "title": "string",
+                "description": "focused actionable outcome",
+                "classification": "agent-chosen concise action/capability",
+                "requirement_keys": ["requirement key"],
+                "acceptance_criteria": ["criterion key"],
+                "evidence_requirements": ["evidence needed to judge completion"],
+                "dependencies": ["work item key in this work area"],
+                "dependency_evidence": [
+                    {
+                        "dependency": "work item key",
+                        "reason": "why this outcome is required first",
+                        "evidence": ["concrete causal observation"],
+                    }
+                ],
+            }
+        ],
+    },
+}
 _FEEDBACK_SPECIFY_SCHEMA = {
     "dispositions": [
         {
@@ -164,6 +224,24 @@ _VALIDATION_SCHEMA = {
     "repository_state": {},
     "completed_work": [],
     "commit_message": "concise imperative subject describing the actual completed change",
+    "requirement_results": [
+        {"requirement_key": "string", "passed": True, "evidence": ["string"]}
+    ],
+    "criterion_results": [
+        {"criterion_key": "string", "passed": True, "evidence": ["string"]}
+    ],
+    "integration_findings": ["string"],
+}
+_WORK_VALIDATION_SCHEMA = {
+    "passed": True,
+    "requirement_results": [
+        {"requirement_key": "string", "passed": True, "evidence": ["string"]}
+    ],
+    "criterion_results": [
+        {"criterion_key": "string", "passed": True, "evidence": ["string"]}
+    ],
+    "findings": ["string"],
+    "explanation": "string",
 }
 _ISSUE_ORDER_SCHEMA = {
     "ordered_issues": [
@@ -285,7 +363,30 @@ class Application:
                 run_projection["specifications"] = self.store.list_specifications(
                     run["id"]
                 )
+                run_projection["issue_specifications"] = [
+                    {
+                        "pass_id": execution_pass["id"],
+                        "result": issue_specification,
+                    }
+                    for execution_pass in run_projection["passes"]
+                    if (
+                        issue_specification := self.store.get_issue_specification(
+                            run["id"], execution_pass["id"]
+                        )
+                    )
+                    is not None
+                ]
+                run_projection["work_specification_results"] = [
+                    result
+                    for execution_pass in run_projection["passes"]
+                    for result in self.store.list_work_specification_results(
+                        run["id"], execution_pass["id"]
+                    )
+                ]
                 run_projection["work_items"] = self.store.list_work_items(run["id"])
+                run_projection["work_validations"] = self.store.list_work_validations(
+                    run["id"]
+                )
                 run_projection["validations"] = self.store.list_validations(run["id"])
                 run_projection["feedback"] = self.store.list_feedback(run["id"])
                 projected_runs.append(run_projection)
@@ -1982,12 +2083,16 @@ class Application:
     @staticmethod
     def _specification_definition(specification: dict) -> dict:
         return {
-            field: specification[field]
+            field: specification.get(field, [] if field in {
+                "requirement_keys", "acceptance_traceability"
+            } else None)
             for field in (
                 "key",
                 "title",
                 "description",
                 "acceptance_criteria",
+                "requirement_keys",
+                "acceptance_traceability",
                 "dependencies",
                 "dependency_evidence",
                 "executable",
@@ -2003,6 +2108,9 @@ class Application:
                 "classification",
                 "dependencies",
                 "dependency_evidence",
+                "requirement_keys",
+                "acceptance_criteria",
+                "evidence_requirements",
                 "state",
             )
         }
@@ -2018,6 +2126,9 @@ class Application:
                 "classification",
                 "dependencies",
                 "dependency_evidence",
+                "requirement_keys",
+                "acceptance_criteria",
+                "evidence_requirements",
                 "state",
                 "result",
                 "handoff",
@@ -2032,15 +2143,19 @@ class Application:
         return {
             "pass_id": validation["pass_id"],
             "result": {
-                field: result.get(field)
+                field: result[field]
                 for field in (
                     "passed",
                     "failed_specifications",
                     "failed_criteria",
                     "code_review_findings",
+                    "requirement_results",
+                    "criterion_results",
+                    "integration_findings",
                     "explanation",
                     "evidence",
                 )
+                if field in result
             },
         }
 
@@ -2167,6 +2282,422 @@ class Application:
             + _CLASSIFICATION_GUIDANCE
         )
 
+    @staticmethod
+    def _nonempty_unique_strings(value: object, name: str) -> list[str]:
+        if (
+            not isinstance(value, list)
+            or any(not isinstance(item, str) or not item.strip() for item in value)
+            or len(value) != len(set(value))
+        ):
+            raise ValueError(f"{name} must be unique nonempty strings")
+        return list(value)
+
+    @staticmethod
+    def _require_acyclic_keys(graph: dict[str, list[str]], name: str) -> None:
+        visited: set[str] = set()
+        active: set[str] = set()
+
+        def visit(key: str) -> None:
+            if key in active:
+                raise ValueError(f"{name} must be acyclic")
+            if key in visited:
+                return
+            active.add(key)
+            for dependency in graph[key]:
+                visit(dependency)
+            active.remove(key)
+            visited.add(key)
+
+        for key in graph:
+            visit(key)
+
+    @classmethod
+    def _validated_issue_specification(cls, result: object) -> dict:
+        if not isinstance(result, dict) or set(result) != {
+            "requirements",
+            "work_areas",
+        }:
+            raise ValueError(
+                "Issue Specifier must return requirements and work_areas"
+            )
+        requirements = result["requirements"]
+        work_areas = result["work_areas"]
+        if not isinstance(requirements, list) or not requirements:
+            raise ValueError("Issue Specifier requirements must be nonempty")
+        if not isinstance(work_areas, list) or not work_areas:
+            raise ValueError("Issue Specifier work_areas must be nonempty")
+
+        normalized_requirements = []
+        requirement_keys: set[str] = set()
+        for requirement in requirements:
+            if not isinstance(requirement, dict) or set(requirement) != {
+                "key",
+                "statement",
+                "evidence",
+            }:
+                raise ValueError("issue requirement is incomplete")
+            key = requirement["key"]
+            statement = requirement["statement"]
+            evidence = requirement["evidence"]
+            if not isinstance(key, str) or not key.strip() or key in requirement_keys:
+                raise ValueError("issue requirement keys must be unique and nonempty")
+            if not isinstance(statement, str) or not statement.strip():
+                raise ValueError("issue requirement statement must be nonempty")
+            evidence = cls._nonempty_unique_strings(
+                evidence, "issue requirement evidence"
+            )
+            requirement_keys.add(key)
+            normalized_requirements.append(
+                {"key": key, "statement": statement, "evidence": evidence}
+            )
+
+        normalized_areas = []
+        area_keys: set[str] = set()
+        covered_requirements: set[str] = set()
+        for area in work_areas:
+            required = {
+                "key",
+                "title",
+                "description",
+                "requirement_keys",
+                "dependencies",
+                "dependency_evidence",
+            }
+            if not isinstance(area, dict) or set(area) != required:
+                raise ValueError("strategic work area is incomplete")
+            key = area["key"]
+            if not isinstance(key, str) or not key.strip() or key in area_keys:
+                raise ValueError("work area keys must be unique and nonempty")
+            for field in ("title", "description"):
+                if not isinstance(area[field], str) or not area[field].strip():
+                    raise ValueError(f"work area {field} must be nonempty")
+            mapped = cls._nonempty_unique_strings(
+                area["requirement_keys"], "work area requirement_keys"
+            )
+            if any(item not in requirement_keys for item in mapped):
+                raise ValueError("work area references an unknown requirement")
+            dependencies, dependency_evidence = cls._validated_dependency_contract(
+                area["dependencies"],
+                area["dependency_evidence"],
+                "work area",
+            )
+            area_keys.add(key)
+            covered_requirements.update(mapped)
+            normalized_areas.append(
+                {
+                    "key": key,
+                    "title": area["title"],
+                    "description": area["description"],
+                    "requirement_keys": mapped,
+                    "dependencies": dependencies,
+                    "dependency_evidence": dependency_evidence,
+                }
+            )
+        if covered_requirements != requirement_keys:
+            raise ValueError("every issue requirement must map to a work area")
+        if any(
+            dependency not in area_keys
+            for area in normalized_areas
+            for dependency in area["dependencies"]
+        ):
+            raise ValueError("work area dependency references an unknown work area")
+        cls._require_acyclic_keys(
+            {area["key"]: area["dependencies"] for area in normalized_areas},
+            "work area dependency graph",
+        )
+        return {
+            "requirements": normalized_requirements,
+            "work_areas": normalized_areas,
+        }
+
+    @classmethod
+    def _validated_work_specification(
+        cls,
+        result: object,
+        issue_specification: dict,
+        work_area: dict,
+    ) -> dict:
+        if not isinstance(result, dict) or set(result) != {
+            "work_area_key",
+            "specification",
+        }:
+            raise ValueError(
+                "Work Specifier must return work_area_key and specification"
+            )
+        if result["work_area_key"] != work_area["key"]:
+            raise ValueError("Work Specifier returned a different work area")
+        specification = result["specification"]
+        required_specification_fields = {
+            "key",
+            "title",
+            "description",
+            "requirement_keys",
+            "acceptance_criteria",
+            "work_items",
+        }
+        if (
+            not isinstance(specification, dict)
+            or set(specification) != required_specification_fields
+            or specification["key"] != work_area["key"]
+        ):
+            raise ValueError("focused specification is incomplete or misidentified")
+        for field in ("title", "description"):
+            if (
+                not isinstance(specification[field], str)
+                or not specification[field].strip()
+            ):
+                raise ValueError(f"focused specification {field} must be nonempty")
+        requirement_keys = cls._nonempty_unique_strings(
+            specification["requirement_keys"],
+            "focused specification requirement_keys",
+        )
+        if set(requirement_keys) != set(work_area["requirement_keys"]):
+            raise ValueError(
+                "focused specification must retain every work area requirement"
+            )
+
+        criteria = specification["acceptance_criteria"]
+        if not isinstance(criteria, list) or not criteria:
+            raise ValueError("focused specification requires acceptance criteria")
+        normalized_criteria = []
+        criterion_keys: set[str] = set()
+        criterion_requirement_coverage: set[str] = set()
+        for criterion in criteria:
+            if not isinstance(criterion, dict) or set(criterion) != {
+                "key",
+                "description",
+                "requirement_keys",
+            }:
+                raise ValueError("focused acceptance criterion is incomplete")
+            key = criterion["key"]
+            description = criterion["description"]
+            mapped = cls._nonempty_unique_strings(
+                criterion["requirement_keys"], "criterion requirement_keys"
+            )
+            if (
+                not isinstance(key, str)
+                or not key.strip()
+                or key in criterion_keys
+                or not isinstance(description, str)
+                or not description.strip()
+            ):
+                raise ValueError("criterion key and description must be valid")
+            if any(item not in requirement_keys for item in mapped):
+                raise ValueError("criterion references an unknown requirement")
+            criterion_keys.add(key)
+            criterion_requirement_coverage.update(mapped)
+            normalized_criteria.append(
+                {"key": key, "description": description, "requirement_keys": mapped}
+            )
+        if criterion_requirement_coverage != set(requirement_keys):
+            raise ValueError("criteria must cover every focused requirement")
+
+        work_items = specification["work_items"]
+        if not isinstance(work_items, list) or not work_items:
+            raise ValueError("focused specification requires work items")
+        normalized_work = []
+        work_keys: set[str] = set()
+        covered_criteria: set[str] = set()
+        covered_requirements: set[str] = set()
+        for work in work_items:
+            required_work_fields = {
+                "key",
+                "title",
+                "description",
+                "classification",
+                "requirement_keys",
+                "acceptance_criteria",
+                "evidence_requirements",
+                "dependencies",
+                "dependency_evidence",
+            }
+            if not isinstance(work, dict) or set(work) != required_work_fields:
+                raise ValueError("focused work item is incomplete")
+            key = work["key"]
+            if not isinstance(key, str) or not key.strip() or key in work_keys:
+                raise ValueError("focused work keys must be unique and nonempty")
+            for field in ("title", "description"):
+                if not isinstance(work[field], str) or not work[field].strip():
+                    raise ValueError(f"focused work {field} must be nonempty")
+            mapped_requirements = cls._nonempty_unique_strings(
+                work["requirement_keys"], "focused work requirement_keys"
+            )
+            mapped_criteria = cls._nonempty_unique_strings(
+                work["acceptance_criteria"], "focused work acceptance_criteria"
+            )
+            evidence_requirements = cls._nonempty_unique_strings(
+                work["evidence_requirements"], "focused work evidence_requirements"
+            )
+            if any(item not in requirement_keys for item in mapped_requirements):
+                raise ValueError("work item references an unknown requirement")
+            if any(item not in criterion_keys for item in mapped_criteria):
+                raise ValueError("work item references an unknown criterion")
+            dependencies, dependency_evidence = cls._validated_dependency_contract(
+                work["dependencies"], work["dependency_evidence"], "focused work"
+            )
+            work_keys.add(key)
+            covered_requirements.update(mapped_requirements)
+            covered_criteria.update(mapped_criteria)
+            normalized_work.append(
+                {
+                    "key": key,
+                    "title": work["title"],
+                    "description": work["description"],
+                    "classification": validate_classification(work["classification"]),
+                    "requirement_keys": mapped_requirements,
+                    "acceptance_criteria": mapped_criteria,
+                    "evidence_requirements": evidence_requirements,
+                    "dependencies": dependencies,
+                    "dependency_evidence": dependency_evidence,
+                }
+            )
+        if covered_requirements != set(requirement_keys):
+            raise ValueError("work items must cover every focused requirement")
+        if covered_criteria != criterion_keys:
+            raise ValueError("work items must cover every focused criterion")
+        if any(
+            dependency not in work_keys
+            for work in normalized_work
+            for dependency in work["dependencies"]
+        ):
+            raise ValueError("focused work dependency references another work area")
+        cls._require_acyclic_keys(
+            {work["key"]: work["dependencies"] for work in normalized_work},
+            "focused work dependency graph",
+        )
+        normalized_result = {
+            "work_area_key": work_area["key"],
+            "specification": {
+                "key": work_area["key"],
+                "title": specification["title"],
+                "description": specification["description"],
+                "requirement_keys": requirement_keys,
+                "acceptance_criteria": [
+                    criterion["description"] for criterion in normalized_criteria
+                ],
+                "acceptance_traceability": normalized_criteria,
+                "dependencies": work_area["dependencies"],
+                "dependency_evidence": work_area["dependency_evidence"],
+                "executable": True,
+                "work_items": normalized_work,
+            },
+        }
+        return normalized_result
+
+    def _run_focused_specification(
+        self,
+        repository: dict,
+        run: dict,
+        execution_pass: dict,
+        source_workspace: Path,
+        *,
+        feedback_dispositions: dict | None = None,
+    ) -> None:
+        issue_specification = self.store.get_issue_specification(
+            run["id"], execution_pass["id"]
+        )
+        if issue_specification is None:
+            context = self._specify_context(repository, run, execution_pass)
+            if feedback_dispositions is not None:
+                context["feedback_dispositions"] = feedback_dispositions[
+                    "dispositions"
+                ]
+                context["feedback_proposed_specifications"] = feedback_dispositions[
+                    "specifications"
+                ]
+            issue_specification = self.runtime.run(
+                self._task(
+                    "issue_specify",
+                    "Interpret the complete current issue objective and this pass's "
+                    "durable evidence. Produce explicit, independently identifiable "
+                    "requirements covering every required outcome, constraint, and "
+                    "required method. Cite concrete evidence for every requirement. "
+                    "Organize all requirements into strategic work areas that describe "
+                    "what must be achieved without prescribing implementation steps. "
+                    "Include only causally necessary dependencies, each with a reason "
+                    "and concrete evidence. Do not omit requirements merely because "
+                    "existing work appears to address them.",
+                    context,
+                ),
+                source_workspace,
+                result_schema=_ISSUE_SPECIFY_SCHEMA,
+                trajectory_path=self._trajectory(
+                    run["id"], f"issue-specify-{execution_pass['id']}"
+                ),
+            )
+            issue_specification = self._validated_issue_specification(
+                issue_specification
+            )
+            issue_specification = self.store.record_issue_specification(
+                run["id"], execution_pass["id"], issue_specification
+            )
+        else:
+            issue_specification = self._validated_issue_specification(
+                issue_specification
+            )
+
+        persisted = {
+            item["work_area_key"]: item["result"]
+            for item in self.store.list_work_specification_results(
+                run["id"], execution_pass["id"]
+            )
+        }
+        specifications = []
+        for work_area in issue_specification["work_areas"]:
+            focused = persisted.get(work_area["key"])
+            if focused is None:
+                focused = self.runtime.run(
+                    self._task(
+                        "work_specify",
+                        "Specify only the supplied strategic work area. Derive "
+                        "observable acceptance criteria and focused work items that "
+                        "retain traceability to every applicable issue requirement. "
+                        "State the evidence each work item must produce. Assign an "
+                        "agent classification using repository evidence. Add only "
+                        "causally necessary within-area dependencies, each supported "
+                        "by a reason and concrete evidence. Define required outcomes "
+                        "without prescribing a fixed procedure. When related prior "
+                        "validation failures are present, identify the unresolved "
+                        "invariant or strategy class demonstrated by their recurring "
+                        "evidence instead of enumerating only the latest example. "
+                        + _CLASSIFICATION_GUIDANCE,
+                        {
+                            "original_issue": run["issue_json"],
+                            "repository": repository,
+                            "issue_specification": issue_specification,
+                            "work_area": work_area,
+                            "pass_evidence": self._specify_context(
+                                repository, run, execution_pass
+                            ),
+                        },
+                    ),
+                    source_workspace,
+                    result_schema=_WORK_SPECIFY_SCHEMA,
+                    trajectory_path=self._trajectory(
+                        run["id"],
+                        f"work-specify-{execution_pass['id']}-{work_area['key']}",
+                    ),
+                )
+                focused = self._validated_work_specification(
+                    focused, issue_specification, work_area
+                )
+                focused = self.store.record_work_specification_result(
+                    run["id"],
+                    execution_pass["id"],
+                    work_area["key"],
+                    focused,
+                )
+            else:
+                focused = self._validated_work_specification(
+                    focused, issue_specification, work_area
+                )
+            specifications.append(focused["specification"])
+        self.store.save_specification_package(
+            run["id"],
+            execution_pass["id"],
+            {"specifications": specifications},
+        )
+
     def _specify(self, repository: dict, run: dict) -> None:
         execution_passes = self.store.list_passes(run["id"])
         if not execution_passes:
@@ -2243,12 +2774,6 @@ class Application:
                     self._feedback_disposition_name(disposition),
                     disposition,
                 )
-            if result["specifications"] and not existing:
-                self.store.save_specification_package(
-                    run["id"],
-                    execution_pass["id"],
-                    {"specifications": result["specifications"]},
-                )
             self._resolve_no_code_feedback(
                 repository,
                 run,
@@ -2268,25 +2793,27 @@ class Application:
                     pr_listening_since=self._clock(),
                 )
                 return
+            if not existing:
+                with self._source_snapshot(
+                    self._workspace(repository["id"], run["id"])
+                ) as source_workspace:
+                    self._run_focused_specification(
+                        repository,
+                        run,
+                        execution_pass,
+                        source_workspace,
+                        feedback_dispositions=result,
+                    )
         elif not existing:
             with self._source_snapshot(
                 self._workspace(repository["id"], run["id"])
             ) as source_workspace:
-                result = self.runtime.run(
-                    self._task(
-                        "specify",
-                        self._specify_instruction(),
-                        self._specify_context(repository, run, execution_pass),
-                    ),
+                self._run_focused_specification(
+                    repository,
+                    run,
+                    execution_pass,
                     source_workspace,
-                    result_schema=_SPECIFY_SCHEMA,
-                    trajectory_path=self._trajectory(
-                        run["id"], f"specify-{execution_pass['id']}"
-                    ),
                 )
-            self.store.save_specification_package(
-                run["id"], execution_pass["id"], result
-            )
         self._route_unassigned(repository, run, execution_pass)
         self.store.transition_run(run["id"], "EXECUTING")
         self.store.transition_run(run["id"], "WAITING_FOR_WORK_COMPLETION")
@@ -2980,6 +3507,106 @@ class Application:
                 "work resolved_paths must be evidenced by this operation "
                 "failure or changed by this work"
             )
+
+    @classmethod
+    def _validated_work_validation_result(
+        cls,
+        result: object,
+        work: dict,
+    ) -> dict:
+        required = {
+            "passed",
+            "requirement_results",
+            "criterion_results",
+            "findings",
+            "explanation",
+        }
+        if not isinstance(result, dict) or set(result) != required:
+            raise ValueError("Work Validator must return the complete focused result")
+        if not isinstance(result["passed"], bool):
+            raise ValueError("work validation passed must be boolean")
+        if not isinstance(result["explanation"], str) or not result[
+            "explanation"
+        ].strip():
+            raise ValueError("work validation explanation must be nonempty")
+        findings = cls._nonempty_unique_strings(
+            result["findings"], "work validation findings"
+        )
+
+        def dispositions(
+            values: object,
+            key_field: str,
+            expected_keys: list[str],
+            label: str,
+        ) -> list[dict]:
+            if not isinstance(values, list):
+                raise ValueError(f"{label} must be a list")
+            normalized = []
+            seen: set[str] = set()
+            for value in values:
+                if not isinstance(value, dict) or set(value) != {
+                    key_field,
+                    "passed",
+                    "evidence",
+                }:
+                    raise ValueError(f"{label} entry is incomplete")
+                key = value[key_field]
+                if (
+                    not isinstance(key, str)
+                    or key not in expected_keys
+                    or key in seen
+                    or not isinstance(value["passed"], bool)
+                ):
+                    raise ValueError(f"{label} entry is invalid or duplicated")
+                evidence = cls._nonempty_unique_strings(
+                    value["evidence"], f"{label} evidence"
+                )
+                if not evidence:
+                    raise ValueError(f"{label} evidence must be nonempty")
+                seen.add(key)
+                normalized.append(
+                    {key_field: key, "passed": value["passed"], "evidence": evidence}
+                )
+            if seen != set(expected_keys):
+                raise ValueError(f"{label} must disposition every applicable key")
+            return normalized
+
+        requirement_results = dispositions(
+            result["requirement_results"],
+            "requirement_key",
+            work["requirement_keys"],
+            "work validation requirement_results",
+        )
+        criterion_results = dispositions(
+            result["criterion_results"],
+            "criterion_key",
+            work["acceptance_criteria"],
+            "work validation criterion_results",
+        )
+        has_failure = bool(
+            findings
+            or any(not item["passed"] for item in requirement_results)
+            or any(not item["passed"] for item in criterion_results)
+        )
+        if result["passed"] == has_failure:
+            raise ValueError("work validation outcome and dispositions are inconsistent")
+        return {
+            "passed": result["passed"],
+            "requirement_results": requirement_results,
+            "criterion_results": criterion_results,
+            "findings": findings,
+            "explanation": result["explanation"].strip(),
+        }
+
+    @staticmethod
+    def _trajectory_evidence(path: Path) -> object:
+        if not path.is_file():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"invalid persisted work trajectory: {path}") from error
+
     def _run_work(self, node: dict, work: dict) -> None:
         run = self.store.get_run(work["run_id"])
         if run is None:
@@ -3012,6 +3639,7 @@ class Application:
         dependencies = [
             item for item in all_work if item["key"] in dependency_keys
         ]
+        proposed_result: dict | None = None
         try:
             workspace = self._workspace(repository["id"], run["id"])
             with self._source_snapshot(workspace) as source_workspace:
@@ -3019,6 +3647,9 @@ class Application:
                 excluded_roots: set[str] = set()
                 work_context = {
                     "original_issue": run["issue_json"],
+                    "issue_specification": self.store.get_issue_specification(
+                        run["id"], execution_pass["id"]
+                    ),
                     "repository": repository,
                     "specification": self._specification_definition(
                         specification
@@ -3046,6 +3677,7 @@ class Application:
                     work_context["operation_artifacts"] = (
                         operation_artifacts
                     )
+                work_trajectory = self._trajectory(run["id"], f"work-{work['id']}")
                 result = self.runtime.run(
                     self._task(
                         "work",
@@ -3060,9 +3692,7 @@ class Application:
                         if execution_pass["trigger_type"] == "operation_failure"
                         else _WORK_SCHEMA
                     ),
-                    trajectory_path=self._trajectory(
-                        run["id"], f"work-{work['id']}"
-                    ),
+                    trajectory_path=work_trajectory,
                 )
                 result = self._validated_work_result(
                     result,
@@ -3079,6 +3709,65 @@ class Application:
                     baseline,
                     desired,
                 )
+                proposed_result = dict(result)
+                changed_paths = sorted(
+                    path
+                    for path in baseline.keys() | desired.keys()
+                    if baseline.get(path) != desired.get(path)
+                )
+                work_validation = None
+                if result["outcome"] == "ready_for_validation":
+                    work_validation = self.runtime.run(
+                        self._task(
+                            "work_validate",
+                            "Independently judge only this proposed work result. "
+                            "Inspect the proposed artifacts in the workspace and "
+                            "disposition every assigned issue requirement and "
+                            "acceptance criterion using concrete evidence. Verify "
+                            "required evidence, dependency outputs, and claimed tests. "
+                            "Do not implement corrections or judge unrelated work. "
+                            "Fail the result for any unsupported, incomplete, or "
+                            "incorrect assigned outcome.",
+                            {
+                                "original_issue": run["issue_json"],
+                                "issue_specification": self.store.get_issue_specification(
+                                    run["id"], execution_pass["id"]
+                                ),
+                                "specification": self._specification_definition(
+                                    specification
+                                ),
+                                "work_item": work,
+                                "dependency_results": dependencies,
+                                "proposed_result": result,
+                                "changed_paths": changed_paths,
+                                "execution_trajectory": self._trajectory_evidence(
+                                    work_trajectory
+                                ),
+                            },
+                        ),
+                        source_workspace,
+                        result_schema=_WORK_VALIDATION_SCHEMA,
+                        trajectory_path=self._trajectory(
+                            run["id"], f"work-validate-{work['id']}"
+                        ),
+                    )
+                    work_validation = self._validated_work_validation_result(
+                        work_validation, work
+                    )
+                    work_validation = self.store.record_work_validation(
+                        run["id"],
+                        execution_pass["id"],
+                        work["id"],
+                        work_validation,
+                    )["result"]
+                    if not work_validation["passed"]:
+                        failed_result = dict(result)
+                        failed_result["work_validation"] = work_validation
+                        failed_result["execution_trajectory_path"] = str(
+                            work_trajectory
+                        )
+                        self.store.fail_work(work["id"], failed_result)
+                        return
                 with self._durable_source_import(
                     workspace,
                     source_workspace,
@@ -3093,12 +3782,13 @@ class Application:
                         "applied_paths": applied_paths,
                         "resolved_paths": result["resolved_paths"],
                     }
-                    persisted_result = {
-                        "output": result["output"],
-                        "artifacts": result["artifacts"],
-                        "test_results": result["test_results"],
-                        "repository_state": repository_state,
-                    }
+                    persisted_result = dict(result)
+                    persisted_result["repository_state"] = repository_state
+                    persisted_result["execution_trajectory_path"] = str(
+                        work_trajectory
+                    )
+                    if work_validation is not None:
+                        persisted_result["work_validation"] = work_validation
                     if result["outcome"] == "ready_for_validation":
                         self.store.complete_work(
                             work["id"],
@@ -3133,6 +3823,8 @@ class Application:
                 "test_results": [],
                 "repository_state": {},
             }
+            if proposed_result is not None:
+                failure["proposed_result"] = proposed_result
             try:
                 self.store.fail_work(work["id"], failure)
             except (KeyError, ValueError):
@@ -3150,16 +3842,28 @@ class Application:
             execution_pass,
         )
         validations = self.store.list_validations(run["id"])
+        all_specifications = self.store.list_specifications(run["id"])
         return {
             "original_issue": run["issue_json"],
             "repository": repository,
+            "issue_specification": self.store.get_issue_specification(
+                run["id"], execution_pass["id"]
+            ),
             "specifications": [
                 self._specification_definition(item)
-                for item in self.store.list_specifications(run["id"])
+                for item in all_specifications
+            ],
+            "current_specifications": [
+                self._specification_definition(item)
+                for item in all_specifications
+                if item["pass_id"] == execution_pass["id"]
             ],
             "work_items": self.store.list_work_items(
                 run["id"],
                 execution_pass["id"],
+            ),
+            "work_validations": self.store.list_work_validations(
+                run["id"], execution_pass["id"]
             ),
             "latest_prior_validation": (
                 self._validation_evidence(validations[-1])
@@ -3170,8 +3874,13 @@ class Application:
             "candidate_diff": candidate_diff,
         }
 
-    @staticmethod
-    def _validated_validation_result(result: dict) -> dict:
+    @classmethod
+    def _validated_validation_result(
+        cls,
+        result: dict,
+        issue_specification: dict | None = None,
+        specifications: list[dict] | None = None,
+    ) -> dict:
         required = {
             "passed",
             "failed_specifications",
@@ -3216,9 +3925,93 @@ class Application:
             or result["failed_criteria"]
             or result["code_review_findings"]
         )
-        if result["passed"] == has_failures:
+        if issue_specification is None and result["passed"] == has_failures:
             raise ValueError("validation outcome and failures are inconsistent")
-        return dict(result)
+        normalized = dict(result)
+        if issue_specification is None:
+            return normalized
+
+        requirements = issue_specification.get("requirements")
+        if not isinstance(requirements, list):
+            raise ValueError("Issue Validator has no valid issue requirements")
+        requirement_keys = [item.get("key") for item in requirements]
+        criterion_keys = [
+            criterion.get("key")
+            for specification in specifications or []
+            for criterion in specification.get("acceptance_traceability", [])
+            if isinstance(criterion, dict)
+        ]
+
+        def dispositions(
+            field: str,
+            key_field: str,
+            expected: list[object],
+        ) -> list[dict]:
+            values = result.get(field)
+            if not isinstance(values, list):
+                raise ValueError(f"Issue Validator must return {field}")
+            expected_keys = {
+                key for key in expected if isinstance(key, str) and key
+            }
+            if len(expected_keys) != len(expected):
+                raise ValueError(f"Issue Validator expected {field} keys are invalid")
+            seen: set[str] = set()
+            normalized_values = []
+            for value in values:
+                if not isinstance(value, dict) or set(value) != {
+                    key_field,
+                    "passed",
+                    "evidence",
+                }:
+                    raise ValueError(f"Issue Validator {field} entry is incomplete")
+                key = value[key_field]
+                if (
+                    not isinstance(key, str)
+                    or key not in expected_keys
+                    or key in seen
+                    or not isinstance(value["passed"], bool)
+                ):
+                    raise ValueError(f"Issue Validator {field} entry is invalid")
+                evidence = cls._nonempty_unique_strings(
+                    value["evidence"], f"Issue Validator {field} evidence"
+                )
+                if not evidence:
+                    raise ValueError(
+                        f"Issue Validator {field} evidence must be nonempty"
+                    )
+                seen.add(key)
+                normalized_values.append(
+                    {key_field: key, "passed": value["passed"], "evidence": evidence}
+                )
+            if seen != expected_keys:
+                raise ValueError(
+                    f"Issue Validator must disposition every key in {field}"
+                )
+            return normalized_values
+
+        requirement_results = dispositions(
+            "requirement_results", "requirement_key", requirement_keys
+        )
+        criterion_results = dispositions(
+            "criterion_results", "criterion_key", criterion_keys
+        )
+        integration_findings = cls._nonempty_unique_strings(
+            result.get("integration_findings"),
+            "Issue Validator integration_findings",
+        )
+        traced_failure = bool(
+            integration_findings
+            or any(not item["passed"] for item in requirement_results)
+            or any(not item["passed"] for item in criterion_results)
+        )
+        if result["passed"] == (has_failures or traced_failure):
+            raise ValueError(
+                "Issue Validator outcome and traceability dispositions are inconsistent"
+            )
+        normalized["requirement_results"] = requirement_results
+        normalized["criterion_results"] = criterion_results
+        normalized["integration_findings"] = integration_findings
+        return normalized
 
     @staticmethod
     def _is_current_persisted_validation(result: dict) -> bool:
@@ -3352,7 +4145,21 @@ class Application:
                 result = self.runtime.run(
                     self._task(
                         "validate",
-                        "Judge the completed result against every atomic specification, acceptance criterion, and the intent of the original issue. Independently review the complete staged target-to-candidate diff for branch-introduced correctness defects, regressions, and changes not mapped to the issue, specifications, necessary prerequisites, or current in-scope feedback. Do not audit unrelated pre-existing code. Do not modify repository files or implement corrections. Return a failed validation result for any failed specification, failed criterion, or code-review finding. Return a concise imperative commit_message subject that describes the actual completed repository change.",
+                        "Act as the Issue Validator. Review all individually accepted "
+                        "work as one integrated result. Disposition every original "
+                        "issue requirement and every focused acceptance criterion "
+                        "with concrete evidence. Check interoperability, required "
+                        "methods, cross-work assumptions, regressions, and alignment "
+                        "with the complete original issue. Independently review the "
+                        "complete staged target-to-candidate diff for branch-introduced "
+                        "correctness defects, regressions, and changes not mapped to "
+                        "the issue, specifications, necessary prerequisites, or current "
+                        "in-scope feedback. Do not audit unrelated pre-existing code. "
+                        "Do not modify repository "
+                        "files or implement corrections. Fail for any unsupported requirement, "
+                        "criterion, integration finding, regression, or review finding. "
+                        "Return a concise imperative commit_message subject describing "
+                        "the actual completed repository change.",
                         self._validation_context(
                             repository,
                             run,
@@ -3366,7 +4173,19 @@ class Application:
                         run["id"], f"validate-{execution_pass['id']}"
                     ),
                 )
-            result = self._validated_validation_result(result)
+            issue_specification = self.store.get_issue_specification(
+                run["id"], execution_pass["id"]
+            )
+            pass_specifications = [
+                item
+                for item in self.store.list_specifications(run["id"])
+                if item["pass_id"] == execution_pass["id"]
+            ]
+            result = self._validated_validation_result(
+                result,
+                issue_specification,
+                pass_specifications,
+            )
             if result["passed"]:
                 try:
                     candidate = self.github.amend_publication(
@@ -3396,7 +4215,19 @@ class Application:
                     None,
                 )
                 return
-            result = self._validated_validation_result(recorded)
+            issue_specification = self.store.get_issue_specification(
+                run["id"], execution_pass["id"]
+            )
+            pass_specifications = [
+                item
+                for item in self.store.list_specifications(run["id"])
+                if item["pass_id"] == execution_pass["id"]
+            ]
+            result = self._validated_validation_result(
+                recorded,
+                issue_specification,
+                pass_specifications,
+            )
         if not result["passed"]:
             latest_pass = self.store.list_passes(run["id"])[-1]
             if latest_pass["id"] == execution_pass["id"]:

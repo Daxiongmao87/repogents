@@ -22,20 +22,27 @@ The environment must:
 - permit private runtime temporary storage;
 - permit reads and execution from required operating-system runtime paths;
 - deny filesystem access outside those roots; and
+- deny IPv4 and IPv6 socket creation when agent internet access is disabled;
+- preserve DNS, TLS, and outbound sockets when agent internet access is enabled; and
 - terminate the complete command process group on timeout.
 
-The local sandbox does not isolate networking. Work requiring a stronger
-operating-system, process, dependency, or network boundary belongs in a
-separately implemented container runtime rather than an implicit local
-fallback.
+Agent internet access is an explicit opt-in controlled by
+`REPOGENTS_AGENT_INTERNET_ACCESS` and defaults to disabled. Disabled mode uses
+a seccomp rule layered with Landlock to reject `AF_INET` and `AF_INET6` socket
+creation with `EPERM`; it does not simulate denial through broken DNS. Enabled
+mode retains resolver paths and outbound sockets. Service startup probes the
+configured behavior through the complete sandbox: disabled mode must observe
+socket denial, while enabled mode must complete DNS resolution, TLS, and an
+HTTP exchange. A failed probe stops startup.
 
 ## Implementation Plan
 
 1. Provide a mini-swe-agent-compatible Landlock environment in Repogents.
 2. Verify Landlock at service startup and before direct runtime use.
-3. Keep application configuration free of host privilege and sandbox-selector
-   settings.
+3. Keep internet access opt-in, disabled by default, and independent of graph
+   semantics or agent procedure.
 4. Test fail-closed preflight, environment clearing, workspace writes,
-   outside-workspace denial, timeout cleanup, and service wiring.
+   outside-workspace denial, both network modes, timeout cleanup, and service
+   wiring.
 5. Run focused tests, a real host production-path isolation probe, and the
    complete test suite.

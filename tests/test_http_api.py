@@ -23,6 +23,7 @@ _ENV_NAMES = (
     "REPOGENTS_POLL_SECONDS",
     "REPOGENTS_PR_SILENCE_SECONDS",
     "REPOGENTS_AUTO_MERGE",
+    "REPOGENTS_AGENT_INTERNET_ACCESS",
     "REPOGENTS_CODEX_API_BASE",
     "REPOGENTS_MODEL",
     "REPOGENTS_MODEL_REQUEST_TIMEOUT",
@@ -159,6 +160,7 @@ def test_service_config_uses_subscription_bridge_and_required_mvp_defaults(monke
     assert config.poll_seconds == 60.0
     assert config.pr_silence_seconds == 3600.0
     assert config.auto_merge is False
+    assert config.agent_internet_access is False
     assert config.codex_api_base == "http://127.0.0.1:8787/v1"
     assert config.model == "gpt-5.6-terra"
     assert config.model_request_timeout == 120.0
@@ -186,6 +188,7 @@ def test_service_config_requires_github_token_and_parses_configurable_thresholds
     monkeypatch.setenv("REPOGENTS_POLL_SECONDS", "2.5")
     monkeypatch.setenv("REPOGENTS_PR_SILENCE_SECONDS", "1800.5")
     monkeypatch.setenv("REPOGENTS_AUTO_MERGE", "true")
+    monkeypatch.setenv("REPOGENTS_AGENT_INTERNET_ACCESS", "true")
     monkeypatch.setenv("REPOGENTS_CODEX_API_BASE", "http://127.0.0.1:8787/v1")
     monkeypatch.setenv("REPOGENTS_MODEL_REQUEST_TIMEOUT", "45.5")
     monkeypatch.setenv("REPOGENTS_SIMILARITY_THRESHOLD", "0.61")
@@ -206,6 +209,7 @@ def test_service_config_requires_github_token_and_parses_configurable_thresholds
     ) == (0.61, 4, 5)
     assert config.model_request_timeout == 45.5
     assert config.auto_merge is True
+    assert config.agent_internet_access is True
 
 
 @pytest.mark.parametrize("threshold", ["-0.01", "1", "1.01"])
@@ -258,6 +262,15 @@ def test_service_config_rejects_invalid_auto_merge(monkeypatch):
     monkeypatch.setenv("REPOGENTS_AUTO_MERGE", "sometimes")
 
     with pytest.raises(ValueError, match="REPOGENTS_AUTO_MERGE"):
+        ServiceConfig.from_env()
+
+
+def test_service_config_rejects_invalid_agent_internet_access(monkeypatch):
+    monkeypatch.setenv("REPOGENTS_GITHUB_TOKEN", "token")
+    monkeypatch.setenv("REPOGENTS_MODEL", "gpt-5.6-terra")
+    monkeypatch.setenv("REPOGENTS_AGENT_INTERNET_ACCESS", "sometimes")
+
+    with pytest.raises(ValueError, match="REPOGENTS_AGENT_INTERNET_ACCESS"):
         ServiceConfig.from_env()
 
 
@@ -315,6 +328,7 @@ def test_build_service_passes_configured_pr_silence_seconds(monkeypatch, tmp_pat
         github_token="token",
         model="gpt-5.6-terra",
         pr_silence_seconds=45.0,
+        agent_internet_access=True,
     )
 
     service = main_module.build_service(config)
@@ -323,6 +337,7 @@ def test_build_service_passes_configured_pr_silence_seconds(monkeypatch, tmp_pat
     assert service.config.auto_merge is False
     assert runtimes[0].preflight_paths == [tmp_path]
     assert runtimes[0].config.model == "gpt-5.6-terra"
+    assert runtimes[0].config.internet_access is True
 
 
 def test_http_service_exposes_client_state_repository_mutations_and_background_polling():

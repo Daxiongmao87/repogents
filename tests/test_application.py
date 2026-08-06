@@ -495,6 +495,9 @@ class ScriptedRuntime:
     def __init__(self):
         self.results: dict[str, deque[dict]] = defaultdict(deque)
         self.calls: list[dict] = []
+        self.stage_calls: list[dict] = []
+        self._legacy_specifications: dict[str, dict] = {}
+        self._feedback_work_area_keys: set[str] = set()
 
     def queue(self, kind: str, *results: dict) -> None:
         self.results[kind].extend(results)
@@ -509,16 +512,172 @@ class ScriptedRuntime:
         trajectory_path: str | Path | None = None,
     ) -> dict:
         payload = json.loads(task)
-        self.calls.append(
-            {
-                "payload": payload,
-                "workspace": str(workspace),
-                "role_prompt": role_prompt,
-                "result_schema": result_schema,
-                "trajectory_path": None if trajectory_path is None else str(trajectory_path),
+        call = {
+            "payload": payload,
+            "workspace": str(workspace),
+            "role_prompt": role_prompt,
+            "result_schema": result_schema,
+            "trajectory_path": None if trajectory_path is None else str(trajectory_path),
+        }
+        self.stage_calls.append(call)
+        kind = payload["kind"]
+        if kind == "issue_specify":
+            if self.results[kind]:
+                return self.results[kind].popleft()
+            legacy = payload["context"].get("feedback_proposed_specifications")
+            if legacy is None:
+                legacy = self.results["specify"].popleft()["specifications"]
+            else:
+                self._feedback_work_area_keys = {
+                    specification["key"] for specification in legacy
+                }
+            self._legacy_specifications = {
+                specification["key"]: specification for specification in legacy
             }
-        )
-        return self.results[payload["kind"]].popleft()
+            requirements = []
+            work_areas = []
+            for specification in legacy:
+                requirement_keys = []
+                for index, criterion in enumerate(
+                    specification["acceptance_criteria"], start=1
+                ):
+                    key = f"{specification['key']}-requirement-{index}"
+                    requirement_keys.append(key)
+                    requirements.append(
+                        {
+                            "key": key,
+                            "statement": criterion,
+                            "evidence": [specification["description"]],
+                        }
+                    )
+                work_areas.append(
+                    {
+                        "key": specification["key"],
+                        "title": specification["title"],
+                        "description": specification["description"],
+                        "requirement_keys": requirement_keys,
+                        "dependencies": specification["dependencies"],
+                        "dependency_evidence": specification["dependency_evidence"],
+                    }
+                )
+            return {"requirements": requirements, "work_areas": work_areas}
+        if kind == "work_specify":
+            if self.results[kind]:
+                return self.results[kind].popleft()
+            area = payload["context"]["work_area"]
+            specification = self._legacy_specifications[area["key"]]
+            if area["key"] not in self._feedback_work_area_keys:
+                legacy_call = dict(call)
+                legacy_call["payload"] = {
+                    **payload,
+                    "kind": "specify",
+                    "context": payload["context"]["pass_evidence"],
+                }
+                legacy_call["result_schema"] = {
+                    "specifications": [
+                        {
+                            "work_items": [
+                                {
+                                    "classification": result_schema["specification"][
+                                        "work_items"
+                                    ][0]["classification"]
+                                }
+                            ]
+                        }
+                    ]
+                }
+                self.calls.append(legacy_call)
+            else:
+                self._feedback_work_area_keys.remove(area["key"])
+            criteria = [
+                {
+                    "key": f"{area['key']}-criterion-{index}",
+                    "description": description,
+                    "requirement_keys": [area["requirement_keys"][index - 1]],
+                }
+                for index, description in enumerate(
+                    specification["acceptance_criteria"], start=1
+                )
+            ]
+            criterion_keys = [item["key"] for item in criteria]
+            work_items = []
+            for work in specification["work_items"]:
+                work_items.append(
+                    {
+                        **work,
+                        "requirement_keys": list(area["requirement_keys"]),
+                        "acceptance_criteria": criterion_keys,
+                        "evidence_requirements": [
+                            "Evidence that the focused acceptance criteria are satisfied."
+                        ],
+                    }
+                )
+            return {
+                "work_area_key": area["key"],
+                "specification": {
+                    "key": area["key"],
+                    "title": specification["title"],
+                    "description": specification["description"],
+                    "requirement_keys": list(area["requirement_keys"]),
+                    "acceptance_criteria": criteria,
+                    "work_items": work_items,
+                },
+            }
+        if kind == "work_validate":
+            if self.results[kind]:
+                return self.results[kind].popleft()
+            work = payload["context"]["work_item"]
+            return {
+                "passed": True,
+                "requirement_results": [
+                    {
+                        "requirement_key": key,
+                        "passed": True,
+                        "evidence": ["The proposed focused result satisfies this requirement."],
+                    }
+                    for key in work["requirement_keys"]
+                ],
+                "criterion_results": [
+                    {
+                        "criterion_key": key,
+                        "passed": True,
+                        "evidence": ["The proposed artifacts satisfy this criterion."],
+                    }
+                    for key in work["acceptance_criteria"]
+                ],
+                "findings": [],
+                "explanation": "The focused work is supported by its evidence.",
+            }
+        self.calls.append(call)
+        result = self.results[kind].popleft()
+        if kind == "validate" and payload["context"].get("issue_specification"):
+            result = dict(result)
+            passed = result["passed"]
+            result.setdefault(
+                "requirement_results",
+                [
+                    {
+                        "requirement_key": item["key"],
+                        "passed": passed,
+                        "evidence": ["The integrated result was inspected."],
+                    }
+                    for item in payload["context"]["issue_specification"]["requirements"]
+                ],
+            )
+            result.setdefault(
+                "criterion_results",
+                [
+                    {
+                        "criterion_key": criterion["key"],
+                        "passed": passed,
+                        "evidence": ["The integrated criterion was inspected."],
+                    }
+                    for specification in payload["context"]["current_specifications"]
+                    for criterion in specification["acceptance_traceability"]
+                ],
+            )
+            result.setdefault("integration_findings", [] if passed else ["Validation failed."])
+        return result
 
 
 class WorkspaceScriptedRuntime(ScriptedRuntime):
@@ -541,8 +700,9 @@ class WorkspaceScriptedRuntime(ScriptedRuntime):
                 "has_controller_metadata": (path / ".repogents").exists(),
             }
         )
-        if self.workspace_actions[payload["kind"]]:
-            self.workspace_actions[payload["kind"]].popleft()(path)
+        action_kind = "specify" if payload["kind"] == "issue_specify" else payload["kind"]
+        if self.workspace_actions[action_kind]:
+            self.workspace_actions[action_kind].popleft()(path)
         return super().run(task, workspace, **kwargs)
 
 
@@ -741,6 +901,8 @@ def lean_specification_definition(specification: dict) -> dict:
             "title",
             "description",
             "acceptance_criteria",
+            "requirement_keys",
+            "acceptance_traceability",
             "dependencies",
             "dependency_evidence",
             "executable",
@@ -796,8 +958,10 @@ def test_repository_tracking_state_and_history_preserving_removal(tmp_path):
     state = app.state()
     assert [item["github_repository"] for item in state["repositories"]] == ["acme/widget"]
     assert [node["classification"] for node in state["repositories"][0]["nodes"]] == [
-        "Specify",
-        "Validate",
+        "Issue Specifier",
+        "Work Specifier",
+        "Work Validator",
+        "Issue Validator",
     ]
     app.remove_repository(repository["id"])
     assert app.state()["repositories"] == []
@@ -1104,6 +1268,9 @@ def test_feedback_specify_context_keeps_only_lean_current_evidence(tmp_path):
             "classification": "backend/context",
             "dependencies": [],
             "dependency_evidence": [],
+            "requirement_keys": [],
+            "acceptance_criteria": [],
+            "evidence_requirements": [],
             "state": "COMPLETED",
         },
         "latest-prior-work": {
@@ -1111,21 +1278,28 @@ def test_feedback_specify_context_keeps_only_lean_current_evidence(tmp_path):
             "classification": "backend/context",
             "dependencies": [],
             "dependency_evidence": [],
+            "requirement_keys": [],
+            "acceptance_criteria": [],
+            "evidence_requirements": [],
             "state": "COMPLETED",
         },
     }
     relevant_validation = context["relevant_validation"]
     assert relevant_validation["pass_id"] == latest_validation["pass_id"]
     assert relevant_validation["result"] == {
-        field: latest_validation_result[field]
+        field: latest_validation_result.get(field)
         for field in (
             "passed",
             "failed_specifications",
             "failed_criteria",
             "code_review_findings",
+            "requirement_results",
+            "criterion_results",
+            "integration_findings",
             "explanation",
             "evidence",
         )
+        if field in latest_validation_result
     }
     assert context["feedback"] == [
         {
@@ -1991,7 +2165,14 @@ def test_agent_turns_use_gitless_disposable_snapshots_and_import_only_work_delta
     assert [
         observation["kind"]
         for observation in runtime.workspace_observations
-    ] == ["specify", "node_role", "work", "validate"]
+    ] == [
+        "issue_specify",
+        "work_specify",
+        "node_role",
+        "work",
+        "work_validate",
+        "validate",
+    ]
     assert all(
         not observation["has_git"]
         and not observation["has_controller_metadata"]
@@ -6636,8 +6817,10 @@ def test_out_of_graph_agent_orders_all_open_issues_by_evidenced_dependency(
         "issue_number"
     ] == 8
     assert [node["classification"] for node in store.list_nodes(repository["id"])] == [
-        "Specify",
-        "Validate",
+        "Issue Specifier",
+        "Work Specifier",
+        "Work Validator",
+        "Issue Validator",
     ]
     assert [
         (repository_name, target_branch)
@@ -7523,3 +7706,226 @@ def test_application_config_rejects_non_finite_pr_silence(tmp_path, value):
             data_dir=tmp_path,
             pr_silence_seconds=value,
         )
+
+
+def focused_issue_specification() -> dict:
+    return {
+        "requirements": [
+            {
+                "key": "requirement-1",
+                "statement": "Produce the requested repository outcome.",
+                "evidence": ["The issue explicitly requests the outcome."],
+            }
+        ],
+        "work_areas": [
+            {
+                "key": "area-1",
+                "title": "Requested outcome",
+                "description": "Establish the requested repository behavior.",
+                "requirement_keys": ["requirement-1"],
+                "dependencies": [],
+                "dependency_evidence": [],
+            }
+        ],
+    }
+
+
+def focused_work_specification() -> dict:
+    return {
+        "work_area_key": "area-1",
+        "specification": {
+            "key": "area-1",
+            "title": "Requested outcome",
+            "description": "Produce an independently verifiable result.",
+            "requirement_keys": ["requirement-1"],
+            "acceptance_criteria": [
+                {
+                    "key": "criterion-1",
+                    "description": "The requested outcome is observable.",
+                    "requirement_keys": ["requirement-1"],
+                }
+            ],
+            "work_items": [
+                {
+                    "key": "work-1",
+                    "title": "Produce requested outcome",
+                    "description": "Create the bounded repository result.",
+                    "classification": "change/repository",
+                    "requirement_keys": ["requirement-1"],
+                    "acceptance_criteria": ["criterion-1"],
+                    "evidence_requirements": ["Artifact and focused check evidence."],
+                    "dependencies": [],
+                    "dependency_evidence": [],
+                }
+            ],
+        },
+    }
+
+
+def focused_work_validation(passed: bool) -> dict:
+    return {
+        "passed": passed,
+        "requirement_results": [
+            {
+                "requirement_key": "requirement-1",
+                "passed": True,
+                "evidence": ["The proposed result addresses the assigned requirement."],
+            }
+        ],
+        "criterion_results": [
+            {
+                "criterion_key": "criterion-1",
+                "passed": passed,
+                "evidence": [
+                    "The proposed artifact was independently inspected."
+                ],
+            }
+        ],
+        "findings": [] if passed else ["The observable artifact is incomplete."],
+        "explanation": (
+            "The focused result is supported."
+            if passed
+            else "The focused result does not satisfy its criterion."
+        ),
+    }
+
+
+def focused_issue_validation() -> dict:
+    result = validation(True, "The integrated result satisfies the issue.")
+    result.update(
+        {
+            "requirement_results": [
+                {
+                    "requirement_key": "requirement-1",
+                    "passed": True,
+                    "evidence": ["The complete candidate satisfies the requirement."],
+                }
+            ],
+            "criterion_results": [
+                {
+                    "criterion_key": "criterion-1",
+                    "passed": True,
+                    "evidence": ["The complete candidate satisfies the criterion."],
+                }
+            ],
+            "integration_findings": [],
+        }
+    )
+    return result
+
+
+def test_focused_workflow_persists_traceability_through_issue_validation(tmp_path):
+    runtime = ScriptedRuntime()
+    runtime.queue("issue_specify", focused_issue_specification())
+    runtime.queue("work_specify", focused_work_specification())
+    runtime.queue("node_role", {"role_prompt": "Own repository changes."})
+    runtime.queue("work", ready_result("bounded result"))
+    runtime.queue("work_validate", focused_work_validation(True))
+    runtime.queue("validate", focused_issue_validation())
+    app, store, github, runtime = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={"change/repository": [1.0, 0.0]},
+    )
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
+    github.issues = [
+        GitHubIssue(28, "Focused workflow", "Produce the outcome", "https://issue/28")
+    ]
+
+    drive_until(
+        app,
+        lambda: store.list_runs(repository["id"])[0]["state"] == "PR_LISTENING",
+    )
+
+    run = store.list_runs(repository["id"])[0]
+    execution_pass = store.list_passes(run["id"])[0]
+    assert [call["payload"]["kind"] for call in runtime.stage_calls] == [
+        "issue_specify",
+        "work_specify",
+        "node_role",
+        "work",
+        "work_validate",
+        "validate",
+    ]
+    assert store.get_issue_specification(run["id"], execution_pass["id"]) == (
+        focused_issue_specification()
+    )
+    work = store.list_work_items(run["id"], execution_pass["id"])[0]
+    assert work["requirement_keys"] == ["requirement-1"]
+    assert work["acceptance_criteria"] == ["criterion-1"]
+    assert work["evidence_requirements"] == [
+        "Artifact and focused check evidence."
+    ]
+    assert work["result"]["outcome"] == "ready_for_validation"
+    assert work["result"]["work_validation"]["passed"] is True
+    assert store.list_work_validations(run["id"], execution_pass["id"])[0][
+        "result"
+    ] == focused_work_validation(True)
+    final_validation = store.list_validations(run["id"])[0]["result"]
+    assert final_validation["requirement_results"][0]["requirement_key"] == (
+        "requirement-1"
+    )
+    assert final_validation["criterion_results"][0]["criterion_key"] == (
+        "criterion-1"
+    )
+    projected_run = app.state()["repositories"][0]["runs"][0]
+    assert projected_run["issue_specifications"]
+    assert projected_run["work_specification_results"]
+    assert projected_run["work_validations"]
+    app.close()
+
+
+def test_failed_work_validation_blocks_source_import_and_drives_adaptive_recovery(
+    tmp_path,
+):
+    runtime = WorkspaceScriptedRuntime()
+    runtime.queue("issue_specify", focused_issue_specification())
+    runtime.queue("work_specify", focused_work_specification())
+    runtime.queue("node_role", {"role_prompt": "Own repository changes."})
+    runtime.queue("work", ready_result("unsupported result"))
+    runtime.queue("work_validate", focused_work_validation(False))
+
+    def incomplete_change(workspace: Path) -> None:
+        (workspace / "artifact.txt").write_text("incomplete\n")
+
+    runtime.queue_workspace_action("work", incomplete_change)
+    app, store, github, _ = make_app(
+        tmp_path,
+        runtime=runtime,
+        vectors={"change/repository": [1.0, 0.0]},
+    )
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
+    github.issues = [
+        GitHubIssue(28, "Focused recovery", "Produce the outcome", "https://issue/28")
+    ]
+    app.poll_once()
+    run = store.list_runs(repository["id"])[0]
+    durable_workspace = (
+        tmp_path
+        / "runtime"
+        / "workspaces"
+        / str(repository["id"])
+        / str(run["id"])
+    )
+
+    drive_until(
+        app,
+        lambda: (
+            len(store.list_passes(run["id"])) == 2
+            and store.get_run(run["id"])["state"] == "SPECIFYING"
+        ),
+    )
+
+    first_pass, recovery_pass = store.list_passes(run["id"])
+    failed_work = store.list_work_items(run["id"], first_pass["id"])[0]
+    assert failed_work["state"] == "FAILED"
+    assert failed_work["result"]["work_validation"] == focused_work_validation(False)
+    assert failed_work["result"]["outcome"] == "ready_for_validation"
+    assert not (durable_workspace / "artifact.txt").exists()
+    assert recovery_pass["trigger_type"] == "work_failure"
+    assert recovery_pass["trigger_json"]["failed_work"][0]["result"][
+        "work_validation"
+    ]["findings"] == ["The observable artifact is incomplete."]
+    assert store.list_validations(run["id"]) == []
+    assert github.prepare_publication_calls == []
+    app.close()

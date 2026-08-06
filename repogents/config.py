@@ -16,6 +16,7 @@ class ServiceConfig:
     poll_seconds: float = 60.0
     pr_silence_seconds: float = 3600.0
     auto_merge: bool = False
+    agent_internet_access: bool = False
     codex_api_base: str = "http://127.0.0.1:8787/v1"
     model_request_timeout: float = 120.0
     similarity_threshold: float = 0.75
@@ -41,6 +42,9 @@ class ServiceConfig:
                 os.getenv("REPOGENTS_PR_SILENCE_SECONDS", "3600")
             ),
             auto_merge=cls._boolean_env("REPOGENTS_AUTO_MERGE", False),
+            agent_internet_access=cls._boolean_env(
+                "REPOGENTS_AGENT_INTERNET_ACCESS", False
+            ),
             codex_api_base=os.getenv(
                 "REPOGENTS_CODEX_API_BASE", "http://127.0.0.1:8787/v1"
             ),

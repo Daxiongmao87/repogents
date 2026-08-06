@@ -59,6 +59,7 @@ class RuntimeConfig:
     step_limit: int = 50
     command_timeout: int = 120
     model_request_timeout: float = 120.0
+    internet_access: bool = False
 
 
 class BridgeTextModel(LitellmTextbasedModel):
@@ -186,12 +187,51 @@ class MiniSweRuntime:
         workspace_path = Path(workspace).resolve()
         workspace_path.mkdir(parents=True, exist_ok=True)
         environment = self._verified_environment(workspace_path)
-        environment.cleanup()
+        try:
+            if self.config.internet_access:
+                probe = environment.execute(
+                    {
+                        "command": (
+                            "python3 -c 'import ssl,socket; "
+                            "s=socket.create_connection((\"example.com\",443),10); "
+                            "c=ssl.create_default_context().wrap_socket(s,server_hostname=\"example.com\"); "
+                            "c.sendall(b\"HEAD / HTTP/1.0\\r\\nHost: example.com\\r\\n\\r\\n\"); "
+                            "assert c.recv(16).startswith(b\"HTTP/\")'"
+                        )
+                    },
+                    timeout=15,
+                )
+                expectation = "enabled"
+                valid = probe.get("returncode") == 0
+            else:
+                probe = environment.execute(
+                    {
+                        "command": (
+                            "python3 -c 'import socket,sys; "
+                            "\ntry: socket.socket(socket.AF_INET,socket.SOCK_STREAM)"
+                            "\nexcept PermissionError: sys.exit(0)"
+                            "\nelse: sys.exit(1)'"
+                        )
+                    }
+                )
+                expectation = "disabled"
+                valid = probe.get("returncode") == 0
+            if not valid:
+                detail = str(probe.get("output", "")).strip() or str(
+                    probe.get("exception_info", "")
+                ).strip()
+                raise RuntimeError(
+                    "Landlock sandbox internet preflight failed for "
+                    f"{expectation} mode: {detail or 'unexpected probe result'}"
+                )
+        finally:
+            environment.cleanup()
 
     def _verified_environment(self, workspace: Path):
         environment = LandlockEnvironment(
             cwd=str(workspace),
             timeout=self.config.command_timeout,
+            internet_access=self.config.internet_access,
         )
         execution = environment.execute({"command": "true"})
         if execution.get("returncode") == 0:

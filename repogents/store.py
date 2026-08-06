@@ -98,6 +98,23 @@ CREATE TABLE IF NOT EXISTS execution_passes (
     UNIQUE(id, run_id)
 );
 
+CREATE TABLE IF NOT EXISTS issue_specifications (
+    run_id INTEGER NOT NULL,
+    pass_id INTEGER NOT NULL,
+    result TEXT NOT NULL,
+    PRIMARY KEY(run_id, pass_id),
+    FOREIGN KEY(pass_id, run_id) REFERENCES execution_passes(id, run_id)
+);
+
+CREATE TABLE IF NOT EXISTS work_specification_results (
+    run_id INTEGER NOT NULL,
+    pass_id INTEGER NOT NULL,
+    work_area_key TEXT NOT NULL,
+    result TEXT NOT NULL,
+    PRIMARY KEY(pass_id, work_area_key),
+    FOREIGN KEY(pass_id, run_id) REFERENCES execution_passes(id, run_id)
+);
+
 CREATE TABLE IF NOT EXISTS specifications (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL,
@@ -108,6 +125,8 @@ CREATE TABLE IF NOT EXISTS specifications (
     acceptance_criteria TEXT NOT NULL,
     dependencies TEXT NOT NULL,
     dependency_evidence TEXT NOT NULL DEFAULT '[]',
+    requirement_keys TEXT NOT NULL DEFAULT '[]',
+    acceptance_traceability TEXT NOT NULL DEFAULT '[]',
     executable INTEGER NOT NULL CHECK (executable IN (0, 1)),
     UNIQUE(pass_id, key),
     UNIQUE(id, pass_id, run_id),
@@ -126,6 +145,9 @@ CREATE TABLE IF NOT EXISTS work_items (
     classification TEXT NOT NULL,
     dependencies TEXT NOT NULL,
     dependency_evidence TEXT NOT NULL DEFAULT '[]',
+    requirement_keys TEXT NOT NULL DEFAULT '[]',
+    acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+    evidence_requirements TEXT NOT NULL DEFAULT '[]',
     state TEXT NOT NULL CHECK (
         state IN ('UNASSIGNED', 'QUEUED', 'RUNNING', 'COMPLETED', 'HANDED_OFF', 'FAILED')
     ),
@@ -143,6 +165,17 @@ CREATE TABLE IF NOT EXISTS validations (
     pass_id INTEGER NOT NULL,
     result TEXT NOT NULL,
     UNIQUE(run_id, pass_id),
+    FOREIGN KEY(pass_id, run_id) REFERENCES execution_passes(id, run_id)
+);
+
+CREATE TABLE IF NOT EXISTS work_validations (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL,
+    pass_id INTEGER NOT NULL,
+    work_id INTEGER NOT NULL REFERENCES work_items(id),
+    attempt INTEGER NOT NULL,
+    result TEXT NOT NULL,
+    UNIQUE(work_id, attempt),
     FOREIGN KEY(pass_id, run_id) REFERENCES execution_passes(id, run_id)
 );
 
@@ -196,6 +229,8 @@ class Store:
         try:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
+            self._migrate_work_validation_attempts(connection)
+            self._migrate_permanent_workflow_nodes(connection)
             repository_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(repositories)")
@@ -264,6 +299,12 @@ class Store:
                     ADD COLUMN dependency_evidence TEXT NOT NULL DEFAULT '[]'
                     """
                 )
+            for column in ("requirement_keys", "acceptance_traceability"):
+                if column not in specification_columns:
+                    connection.execute(
+                        f"ALTER TABLE specifications ADD COLUMN {column} "
+                        "TEXT NOT NULL DEFAULT '[]'"
+                    )
             work_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(work_items)")
@@ -275,8 +316,97 @@ class Store:
                     ADD COLUMN dependency_evidence TEXT NOT NULL DEFAULT '[]'
                     """
                 )
+            for column in (
+                "requirement_keys",
+                "acceptance_criteria",
+                "evidence_requirements",
+            ):
+                if column not in work_columns:
+                    connection.execute(
+                        f"ALTER TABLE work_items ADD COLUMN {column} "
+                        "TEXT NOT NULL DEFAULT '[]'"
+                    )
         finally:
             connection.close()
+
+    @staticmethod
+    def _migrate_work_validation_attempts(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(work_validations)")
+        }
+        if "attempt" in columns:
+            return
+        connection.execute("PRAGMA foreign_keys=OFF")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("ALTER TABLE work_validations RENAME TO old_work_validations")
+            connection.execute(
+                """
+                CREATE TABLE work_validations (
+                    id INTEGER PRIMARY KEY,
+                    run_id INTEGER NOT NULL,
+                    pass_id INTEGER NOT NULL,
+                    work_id INTEGER NOT NULL REFERENCES work_items(id),
+                    attempt INTEGER NOT NULL,
+                    result TEXT NOT NULL,
+                    UNIQUE(work_id, attempt),
+                    FOREIGN KEY(pass_id, run_id)
+                        REFERENCES execution_passes(id, run_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO work_validations(
+                    id, run_id, pass_id, work_id, attempt, result
+                )
+                SELECT id, run_id, pass_id, work_id, 1, result
+                FROM old_work_validations
+                """
+            )
+            connection.execute("DROP TABLE old_work_validations")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys=ON")
+
+    @staticmethod
+    def _migrate_permanent_workflow_nodes(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "UPDATE nodes SET classification = 'Issue Specifier' "
+            "WHERE classification = 'Specify' AND persistence = 'PERMANENT'"
+        )
+        connection.execute(
+            "UPDATE nodes SET classification = 'Issue Validator' "
+            "WHERE classification = 'Validate' AND persistence = 'PERMANENT'"
+        )
+        repository_ids = [
+            row["id"] for row in connection.execute("SELECT id FROM repositories")
+        ]
+        for repository_id in repository_ids:
+            existing = {
+                row["classification"]
+                for row in connection.execute(
+                    "SELECT classification FROM nodes "
+                    "WHERE repository_id = ? AND persistence = 'PERMANENT'",
+                    (repository_id,),
+                )
+            }
+            for classification in (
+                "Issue Specifier",
+                "Work Specifier",
+                "Work Validator",
+                "Issue Validator",
+            ):
+                if classification not in existing:
+                    connection.execute(
+                        "INSERT INTO nodes(repository_id, classification, vector, "
+                        "role_prompt, persistence) VALUES (?, ?, NULL, '', 'PERMANENT')",
+                        (repository_id, classification),
+                    )
 
     @staticmethod
     def _migrate_runs_pending_merge(connection: sqlite3.Connection) -> None:
@@ -434,6 +564,8 @@ class Store:
                 "acceptance_criteria",
                 "dependencies",
                 "dependency_evidence",
+                "requirement_keys",
+                "acceptance_traceability",
             ),
             bool_fields=("executable",),
         )
@@ -445,6 +577,9 @@ class Store:
             json_fields=(
                 "dependencies",
                 "dependency_evidence",
+                "requirement_keys",
+                "acceptance_criteria",
+                "evidence_requirements",
                 "result",
                 "handoff",
             ),
@@ -643,7 +778,12 @@ class Store:
                     repository_id, classification, vector, role_prompt, persistence
                 ) VALUES (?, ?, NULL, '', 'PERMANENT')
                 """,
-                ((repository_id, "Specify"), (repository_id, "Validate")),
+                (
+                    (repository_id, "Issue Specifier"),
+                    (repository_id, "Work Specifier"),
+                    (repository_id, "Work Validator"),
+                    (repository_id, "Issue Validator"),
+                ),
             )
             row = self._fetch_one(
                 connection, "SELECT * FROM repositories WHERE id = ?", (repository_id,)
@@ -760,7 +900,13 @@ class Store:
                 """
                 SELECT * FROM nodes
                 WHERE repository_id = ? AND active = 1
-                ORDER BY id
+                ORDER BY CASE classification
+                    WHEN 'Issue Specifier' THEN 0
+                    WHEN 'Work Specifier' THEN 1
+                    WHEN 'Work Validator' THEN 2
+                    WHEN 'Issue Validator' THEN 3
+                    ELSE 4
+                END, id
                 """,
                 (repository_id,),
             ).fetchall()
@@ -950,6 +1096,105 @@ class Store:
             ).fetchall()
         return [self._pass_row(row) for row in rows]
 
+    def record_issue_specification(
+        self, run_id: int, pass_id: int, result: dict
+    ) -> dict:
+        return self._record_pass_result(
+            "issue_specifications", run_id, pass_id, result
+        )
+
+    def get_issue_specification(self, run_id: int, pass_id: int) -> dict | None:
+        with self._reader() as connection:
+            row = self._fetch_one(
+                connection,
+                "SELECT result FROM issue_specifications WHERE run_id = ? AND pass_id = ?",
+                (run_id, pass_id),
+            )
+        return None if row is None else json.loads(row["result"])
+
+    def record_work_specification_result(
+        self,
+        run_id: int,
+        pass_id: int,
+        work_area_key: str,
+        result: dict,
+    ) -> dict:
+        key = self._nonempty_string(work_area_key, "work area key")
+        payload = self._dump(result)
+        requested = json.loads(payload)
+        with self._transaction() as connection:
+            execution_pass = self._fetch_one(
+                connection,
+                "SELECT id FROM execution_passes WHERE id = ? AND run_id = ?",
+                (pass_id, run_id),
+            )
+            if execution_pass is None:
+                raise ValueError("pass does not belong to run")
+            existing = self._fetch_one(
+                connection,
+                "SELECT result FROM work_specification_results "
+                "WHERE pass_id = ? AND work_area_key = ?",
+                (pass_id, key),
+            )
+            if existing is not None:
+                stored = json.loads(existing["result"])
+                if stored != requested:
+                    raise ValueError(
+                        "work area already has a different specification result"
+                    )
+                return stored
+            connection.execute(
+                "INSERT INTO work_specification_results"
+                "(run_id, pass_id, work_area_key, result) VALUES (?, ?, ?, ?)",
+                (run_id, pass_id, key, payload),
+            )
+        return requested
+
+    def list_work_specification_results(
+        self, run_id: int, pass_id: int
+    ) -> list[dict]:
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT work_area_key, result FROM work_specification_results "
+                "WHERE run_id = ? AND pass_id = ? ORDER BY work_area_key",
+                (run_id, pass_id),
+            ).fetchall()
+        return [
+            {"work_area_key": row["work_area_key"], "result": json.loads(row["result"])}
+            for row in rows
+        ]
+
+    def _record_pass_result(
+        self, table: str, run_id: int, pass_id: int, result: dict
+    ) -> dict:
+        if table not in {"issue_specifications"}:
+            raise ValueError("unsupported pass result table")
+        payload = self._dump(result)
+        requested = json.loads(payload)
+        with self._transaction() as connection:
+            execution_pass = self._fetch_one(
+                connection,
+                "SELECT id FROM execution_passes WHERE id = ? AND run_id = ?",
+                (pass_id, run_id),
+            )
+            if execution_pass is None:
+                raise ValueError("pass does not belong to run")
+            existing = self._fetch_one(
+                connection,
+                f'SELECT result FROM "{table}" WHERE run_id = ? AND pass_id = ?',
+                (run_id, pass_id),
+            )
+            if existing is not None:
+                stored = json.loads(existing["result"])
+                if stored != requested:
+                    raise ValueError(f"{table} already has a different result")
+                return stored
+            connection.execute(
+                f'INSERT INTO "{table}"(run_id, pass_id, result) VALUES (?, ?, ?)',
+                (run_id, pass_id, payload),
+            )
+        return requested
+
     def _validated_package(self, package: dict) -> list[dict]:
         package = self._require_fields(package, ("specifications",), "package")
         specifications = package["specifications"]
@@ -995,6 +1240,15 @@ class Store:
                 "acceptance criteria",
                 nonempty=True,
             )
+            requirement_keys = self._string_list(
+                specification.get("requirement_keys", []),
+                "specification requirement_keys",
+            )
+            acceptance_traceability = specification.get(
+                "acceptance_traceability", []
+            )
+            if not isinstance(acceptance_traceability, list):
+                raise ValueError("specification acceptance_traceability must be a list")
             dependencies, dependency_evidence = self._dependency_contract(
                 specification["dependencies"],
                 specification["dependency_evidence"],
@@ -1031,6 +1285,18 @@ class Store:
                         "classification": self._classification(work["classification"]),
                         "dependencies": work_dependencies,
                         "dependency_evidence": work_dependency_evidence,
+                        "requirement_keys": self._string_list(
+                            work.get("requirement_keys", []),
+                            "work requirement_keys",
+                        ),
+                        "acceptance_criteria": self._string_list(
+                            work.get("acceptance_criteria", []),
+                            "work acceptance_criteria",
+                        ),
+                        "evidence_requirements": self._string_list(
+                            work.get("evidence_requirements", []),
+                            "work evidence_requirements",
+                        ),
                     }
                 )
             normalized.append(
@@ -1041,6 +1307,8 @@ class Store:
                     "acceptance_criteria": acceptance_criteria,
                     "dependencies": dependencies,
                     "dependency_evidence": dependency_evidence,
+                    "requirement_keys": requirement_keys,
+                    "acceptance_traceability": acceptance_traceability,
                     "executable": executable,
                     "work_items": work_items,
                 }
@@ -1093,7 +1361,8 @@ class Store:
                         run_id, pass_id, key, title, description,
                         acceptance_criteria, dependencies, executable,
                         dependency_evidence
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        , requirement_keys, acceptance_traceability
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -1105,6 +1374,8 @@ class Store:
                         self._dump(specification["dependencies"]),
                         int(specification["executable"]),
                         self._dump(specification["dependency_evidence"]),
+                        self._dump(specification["requirement_keys"]),
+                        self._dump(specification["acceptance_traceability"]),
                     ),
                 )
                 specification_id = cursor.lastrowid
@@ -1116,7 +1387,9 @@ class Store:
                             run_id, pass_id, specification_id, key, title, description,
                             classification, dependencies, state,
                             dependency_evidence
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'UNASSIGNED', ?)
+                            , requirement_keys, acceptance_criteria,
+                            evidence_requirements
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'UNASSIGNED', ?, ?, ?, ?)
                         """,
                         (
                             run_id,
@@ -1128,6 +1401,9 @@ class Store:
                             work["classification"],
                             self._dump(work["dependencies"]),
                             self._dump(work["dependency_evidence"]),
+                            self._dump(work["requirement_keys"]),
+                            self._dump(work["acceptance_criteria"]),
+                            self._dump(work["evidence_requirements"]),
                         ),
                     )
                     work_ids.append(work_cursor.lastrowid)
@@ -1563,8 +1839,9 @@ class Store:
                 INSERT INTO work_items(
                     run_id, pass_id, specification_id, parent_work_id,
                     key, title, description, classification, dependencies,
-                    dependency_evidence, state, handoff
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNASSIGNED', ?)
+                    dependency_evidence, requirement_keys,
+                    acceptance_criteria, evidence_requirements, state, handoff
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNASSIGNED', ?)
                 """,
                 (
                     work["run_id"],
@@ -1577,6 +1854,9 @@ class Store:
                     normalized_handoff["classification"],
                     self._dump(normalized_handoff["dependencies"]),
                     self._dump(normalized_handoff["dependency_evidence"]),
+                    work["requirement_keys"],
+                    work["acceptance_criteria"],
+                    work["evidence_requirements"],
                     self._dump(normalized_handoff),
                 ),
             )
@@ -1779,6 +2059,67 @@ class Store:
                 (run_id,),
             ).fetchall()
         return [self._validation_row(row) for row in rows]
+
+    def record_work_validation(
+        self,
+        run_id: int,
+        pass_id: int,
+        work_id: int,
+        result: dict,
+    ) -> dict:
+        payload = self._dump(result)
+        with self._transaction() as connection:
+            work = self._fetch_one(
+                connection,
+                "SELECT id, state FROM work_items "
+                "WHERE id = ? AND run_id = ? AND pass_id = ?",
+                (work_id, run_id, pass_id),
+            )
+            if work is None:
+                raise ValueError("work validation target does not belong to pass")
+            if work["state"] != "RUNNING":
+                raise ValueError("work validation target must be running")
+            attempt = connection.execute(
+                "SELECT COALESCE(MAX(attempt), 0) + 1 FROM work_validations "
+                "WHERE work_id = ?",
+                (work_id,),
+            ).fetchone()[0]
+            cursor = connection.execute(
+                "INSERT INTO work_validations"
+                "(run_id, pass_id, work_id, attempt, result) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (run_id, pass_id, work_id, attempt, payload),
+            )
+            row = self._fetch_one(
+                connection,
+                "SELECT * FROM work_validations WHERE id = ?",
+                (cursor.lastrowid,),
+            )
+        decoded = dict(row)
+        decoded["result"] = json.loads(decoded["result"])
+        return decoded
+
+    def list_work_validations(
+        self, run_id: int, pass_id: int | None = None
+    ) -> list[dict]:
+        with self._reader() as connection:
+            if pass_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM work_validations WHERE run_id = ? ORDER BY id",
+                    (run_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM work_validations "
+                    "WHERE run_id = ? AND pass_id = ? ORDER BY id",
+                    (run_id, pass_id),
+                ).fetchall()
+        decoded = []
+        for row in rows:
+            value = dict(row)
+            value["result"] = json.loads(value["result"])
+            decoded.append(value)
+        return decoded
 
     def record_feedback_scope_result(
         self, run_id: int, pass_id: int, result: dict
