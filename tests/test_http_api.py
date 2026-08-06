@@ -242,7 +242,7 @@ def test_http_service_exposes_client_state_repository_mutations_and_background_p
 
         status, state = request_json(base + "/api/state")
         assert status == 200
-        assert state == application.payload
+        assert state == {**application.payload, "poll_failure": None}
 
         status, added = request_json(
             base + "/api/repositories",
@@ -288,6 +288,70 @@ def test_http_service_rejects_malformed_repository_requests():
         assert captured.value.code == 400
         error = json.loads(captured.value.read())
         assert "github_repository" in error["error"]
+    finally:
+        service.shutdown()
+        thread.join(timeout=3)
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("token=delimiter-secret", "token=[redacted]"),
+        ("api_key whitespace-secret", "api_key=[redacted]"),
+        ('{"token":"json-secret"}', '{"token":"[redacted]"}'),
+        ('{"access_token":"access-token-secret","client_secret":"client-secret-value"}', '{"access_token":"[redacted]","client_secret":"[redacted]"}'),
+    ],
+)
+def test_poll_failure_sanitizer_redacts_delimited_and_whitespace_credentials(message, expected):
+    sanitized = HttpService._sanitized_message(RuntimeError(message))
+    assert sanitized == expected
+
+
+def test_http_service_reports_sanitized_poll_failures_and_recovers():
+    class FailingThenHealthyApplication(FakeApplication):
+        def __init__(self):
+            super().__init__()
+            self.failed = threading.Event()
+
+        def poll_once(self):
+            self.poll_calls += 1
+            if self.poll_calls == 1:
+                self.failed.set()
+                raise RuntimeError(
+                    'upstream response {"access_token":"browser-must-not-see-this-access-token","client_secret":"browser-must-not-see-this-client-secret"}\ntraceback details'
+                )
+
+    application = FailingThenHealthyApplication()
+    service = HttpService(application, "127.0.0.1", 0, 0.05)
+    thread = threading.Thread(target=service.serve_forever, daemon=True)
+    thread.start()
+    host, port = service.address
+    try:
+        assert application.failed.wait(timeout=3)
+        _, failed_state = request_json(f"http://{host}:{port}/api/state")
+        failure = failed_state["poll_failure"]
+        assert failure["type"] == "RuntimeError"
+        assert failure["message"] == 'upstream response {"access_token":"[redacted]","client_secret":"[redacted]"}'
+        assert "traceback" not in failure["message"]
+        assert "browser-must-not-see-this-access-token" not in json.dumps(failed_state)
+        assert "browser-must-not-see-this-client-secret" not in json.dumps(failed_state)
+        assert failure["occurred_at"].endswith("+00:00")
+
+        for _ in range(100):
+            if application.poll_calls >= 2:
+                break
+            time.sleep(0.01)
+        assert application.poll_calls >= 2
+        _, recovered_state = request_json(f"http://{host}:{port}/api/state")
+        assert recovered_state["poll_failure"] is None
+
+        with urllib.request.urlopen(f"http://{host}:{port}/", timeout=3) as response:
+            html = response.read().decode("utf-8")
+        assert "Background polling failed" in html
+        assert "renderPollFailure(state.poll_failure)" in html
+        assert 'id="poll-failure" role="alert" aria-live="polite"' in html
+        assert '${esc(failure.type)}: ${esc(failure.message)}' in html
+        assert 'Last failure: ${esc(failure.occurred_at)}' in html
     finally:
         service.shutdown()
         thread.join(timeout=3)

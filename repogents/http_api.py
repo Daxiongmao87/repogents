@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -33,7 +35,7 @@ button.danger { background: transparent; border-color: #8b4351; color: #ffb7c2; 
 ul { margin: .35rem 0 0; padding-left: 1.2rem; color: #c8d2e4; }
 a { color: #7fa9ff; }
 .empty, #error { color: #aebbd1; }
-#error { min-height: 1.4em; margin-top: .5rem; color: #ff9eaa; }
+#error, #poll-failure { min-height: 1.4em; margin-top: .5rem; color: #ff9eaa; }
 @media (max-width: 720px) { form, .columns { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -41,14 +43,15 @@ a { color: #7fa9ff; }
 <header><h1>Repogents</h1><p class="lead">Adaptive issue-to-pull-request agents. Track repositories, inspect the Saved agent graph, and follow every issue lifecycle.</p></header>
 <section class="panel"><h2>Track repository</h2>
 <form id="add-form"><input id="repository" required placeholder="owner/repository" aria-label="GitHub repository"><input id="branch" placeholder="target branch (default from GitHub)" aria-label="Target branch"><button type="submit">Add repository</button></form><div id="error" role="alert"></div></section>
-<section id="repositories" aria-live="polite"><p class="empty">Loading tracked repositories…</p></section>
+<section id="poll-failure" role="alert" aria-live="polite"></section><section id="repositories" aria-live="polite"><p class="empty">Loading tracked repositories…</p></section>
 </main>
 <script>
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 async function api(path, options = {}) { const response = await fetch(path, {headers:{'Content-Type':'application/json'}, ...options}); if (!response.ok) { const body = await response.json().catch(() => ({error: response.statusText})); throw new Error(body.error || response.statusText); } return response.status === 204 ? null : response.json(); }
 function renderRun(run) { const specs = (run.specifications || []).map(x => `<li>${esc(x.title)}</li>`).join('') || '<li>None yet</li>'; const work = (run.work_items || []).map(x => `<li>${esc(x.title)} — ${esc(x.state)}</li>`).join('') || '<li>None yet</li>'; const pr = run.pull_request ? `<a href="${esc(run.pull_request.url)}" target="_blank" rel="noreferrer">#${esc(run.pull_request.number)}</a>` : 'Not created'; return `<div class="run"><div class="run-head"><strong>Issue #${esc(run.issue_number)}</strong><span class="state">${esc(run.state)}</span></div><p>Branch: ${esc(run.branch || 'Not created')} · Pull request: ${pr}</p><div class="columns"><div><strong>Specifications</strong><ul>${specs}</ul></div><div><strong>Work items</strong><ul>${work}</ul></div></div></div>`; }
+function renderPollFailure(failure) { return failure ? `<div class="panel"><strong>Background polling failed</strong><p>${esc(failure.type)}: ${esc(failure.message)}</p><small>Last failure: ${esc(failure.occurred_at)}</small></div>` : ''; }
 function renderRepository(repo) { const nodes = (repo.nodes || []).map((node, index) => `${index ? '<span class="arrow">→</span>' : ''}<span class="node">${esc(node.classification)} · ${esc(node.persistence)}</span>`).join(''); const runs = (repo.runs || []).map(renderRun).join('') || '<p class="empty">No queued issues.</p>'; return `<article class="repo"><div class="repo-head"><div><h2>${esc(repo.github_repository)}</h2><span>Target: ${esc(repo.target_branch)}</span></div><button class="danger" data-remove="${esc(repo.id)}">Remove</button></div><strong>Saved agent graph</strong><div class="graph">${nodes}</div>${runs}</article>`; }
-async function load() { try { const state = await api('/api/state'); document.querySelector('#repositories').innerHTML = state.repositories.length ? state.repositories.map(renderRepository).join('') : '<p class="panel empty">No tracked repositories.</p>'; document.querySelectorAll('[data-remove]').forEach(button => button.onclick = async () => { await api(`/api/repositories/${button.dataset.remove}`, {method:'DELETE'}); await load(); }); } catch (error) { document.querySelector('#error').textContent = error.message; } }
+async function load() { try { const state = await api('/api/state'); document.querySelector('#poll-failure').innerHTML = renderPollFailure(state.poll_failure); document.querySelector('#repositories').innerHTML = state.repositories.length ? state.repositories.map(renderRepository).join('') : '<p class="panel empty">No tracked repositories.</p>'; document.querySelectorAll('[data-remove]').forEach(button => button.onclick = async () => { await api(`/api/repositories/${button.dataset.remove}`, {method:'DELETE'}); await load(); }); } catch (error) { document.querySelector('#error').textContent = error.message; } }
 document.querySelector('#add-form').addEventListener('submit', async event => { event.preventDefault(); const repository = document.querySelector('#repository').value.trim(); const branch = document.querySelector('#branch').value.trim(); try { await api('/api/repositories', {method:'POST', body:JSON.stringify({github_repository:repository, target_branch:branch || null})}); event.target.reset(); document.querySelector('#error').textContent=''; await load(); } catch (error) { document.querySelector('#error').textContent=error.message; } });
 load(); setInterval(load, 3000);
 </script></body></html>"""
@@ -59,6 +62,8 @@ class HttpService:
         self.application = application
         self.poll_seconds = poll_seconds
         self._stop = threading.Event()
+        self._poll_failure: dict[str, str] | None = None
+        self._poll_failure_lock = threading.Lock()
         self._poll_thread: threading.Thread | None = None
         service = self
 
@@ -88,7 +93,7 @@ class HttpService:
                     self.wfile.write(body)
                     return
                 if path == "/api/state":
-                    self._send_json(HTTPStatus.OK, service.application.state())
+                    self._send_json(HTTPStatus.OK, service.state())
                     return
                 self._error(HTTPStatus.NOT_FOUND, "not found")
 
@@ -142,12 +147,51 @@ class HttpService:
         host, port = self._server.server_address[:2]
         return str(host), int(port)
 
+    @staticmethod
+    def _sanitized_message(error: Exception) -> str:
+        message = str(error).splitlines()[0] if str(error) else "no message"
+        message = re.sub(
+            r'(?i)("(?:authorization|bearer|access[_-]?token|client[_-]?secret|token|api[_-]?key|password|secret)"\s*:\s*)"(?:(?:\\.)|[^"])*"',
+            r'\1"[redacted]"',
+            message,
+        )
+        message = re.sub(
+            r"(?i)(authorization|bearer|access[_-]?token|client[_-]?secret|token|api[_-]?key|password|secret)(?:\s*[=:]\s*|\s+).*",
+            r"\1=[redacted]",
+            message,
+        )
+        message = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1[redacted]@", message)
+        return message[:500]
+
+    def state(self):
+        state = dict(self.application.state())
+        with self._poll_failure_lock:
+            state["poll_failure"] = (
+                None if self._poll_failure is None else dict(self._poll_failure)
+            )
+        return state
+
+    def _record_poll_failure(self, error: Exception) -> None:
+        failure = {
+            "type": type(error).__name__,
+            "message": self._sanitized_message(error),
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with self._poll_failure_lock:
+            self._poll_failure = failure
+
+    def _clear_poll_failure(self) -> None:
+        with self._poll_failure_lock:
+            self._poll_failure = None
+
     def _poll(self) -> None:
         while not self._stop.is_set():
             try:
                 self.application.poll_once()
-            except Exception:
-                pass
+            except Exception as error:
+                self._record_poll_failure(error)
+            else:
+                self._clear_poll_failure()
             self._stop.wait(self.poll_seconds)
 
     def serve_forever(self) -> None:
