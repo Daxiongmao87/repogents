@@ -1,8 +1,10 @@
 # Issue Intake And Ordering
 
-Repogents discovers every open GitHub issue in each tracked repository. Intake
-does not require an opt-in label. Pull requests returned by GitHub's issues API
-are excluded from issue intake.
+Repogents discovers every open GitHub issue in each tracked repository. By
+default, only issues explicitly labeled `agent:ready` are authorized for a run.
+Repository-wide autonomous issue intake is an explicit per-repository opt-in;
+when enabled, every open issue is authorized without that label. Pull requests
+returned by GitHub's issues API are excluded from issue intake.
 
 Follow-up issues created from valid out-of-scope pull-request feedback are
 created without `agent:ready` or any other execution label. Their provenance
@@ -10,11 +12,11 @@ marker remains the idempotency key for creation and acknowledgement.
 
 ## Ordering Agent
 
-When a repository has more than one open issue, the controller invokes an
+When a repository has more than one authorized open issue, the controller invokes an
 out-of-graph issue-ordering agent. Like the out-of-graph Node Role Agent, this
 agent is controller-scoped and never becomes a saved graph node.
 
-The ordering agent receives the complete current open-issue snapshot,
+The ordering agent receives the complete current authorized-issue snapshot,
 repository identity, and durable run states. It returns every issue exactly
 once in processing order. For each issue it must provide:
 

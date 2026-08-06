@@ -296,9 +296,15 @@ def test_repository_crud_creates_permanent_graph_and_preserves_history(store, st
     assert repository["github_repository"] == "owner/project"
     assert repository["target_branch"] == "main"
     assert repository["similarity_threshold"] == pytest.approx(0.72)
+    assert repository["autonomous_issue_intake"] is False
     assert repository["tracked"] is True
     assert store.list_repositories() == [repository]
     assert store.get_repository(repository["id"]) == repository
+
+    enabled = store.set_autonomous_issue_intake(repository["id"], True)
+    assert enabled["autonomous_issue_intake"] is True
+    disabled = store.set_autonomous_issue_intake(repository["id"], False)
+    assert disabled["autonomous_issue_intake"] is False
 
     nodes = store.list_nodes(repository["id"])
     assert [(node["classification"], node["persistence"]) for node in nodes] == [
@@ -315,12 +321,41 @@ def test_repository_crud_creates_permanent_graph_and_preserves_history(store, st
     assert store.get_repository(repository["id"])["tracked"] is False
     assert store.get_run(run["id"])["issue_json"]["title"] == "Repair the service"
     assert len(store.list_nodes(repository["id"])) == 2
+    with pytest.raises(KeyError):
+        store.set_autonomous_issue_intake(repository["id"], True)
 
     with sqlite3.connect(store_path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
 
     with pytest.raises(sqlite3.IntegrityError):
         store.create_run(999_999, 1, {"number": 1})
+
+
+def test_existing_repository_migrates_to_non_autonomous_issue_intake(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE repositories (
+                id INTEGER PRIMARY KEY,
+                github_repository TEXT NOT NULL UNIQUE,
+                target_branch TEXT NOT NULL,
+                similarity_threshold REAL NOT NULL,
+                tracked INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO repositories(
+                github_repository, target_branch, similarity_threshold
+            ) VALUES ('owner/legacy', 'main', 0.75)
+            """
+        )
+
+    migrated = Store(path).get_repository(1)
+
+    assert migrated["autonomous_issue_intake"] is False
 
 
 def test_classification_vectors_normalize_update_and_initialize_existing_database(

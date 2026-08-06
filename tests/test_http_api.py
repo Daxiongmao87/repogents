@@ -87,16 +87,31 @@ class FakeApplication:
     def state(self):
         return self.payload
 
-    def add_repository(self, github_repository, target_branch=None):
-        self.added.append((github_repository, target_branch))
+    def add_repository(
+        self,
+        github_repository,
+        target_branch=None,
+        autonomous_issue_intake=False,
+    ):
+        self.added.append(
+            (github_repository, target_branch, autonomous_issue_intake)
+        )
         return {
             "id": 2,
             "github_repository": github_repository,
             "target_branch": target_branch or "main",
+            "autonomous_issue_intake": autonomous_issue_intake,
         }
 
     def remove_repository(self, repository_id):
         self.removed.append(repository_id)
+
+    def set_autonomous_issue_intake(self, repository_id, enabled):
+        for repository in self.payload["repositories"]:
+            if repository["id"] == repository_id:
+                repository["autonomous_issue_intake"] = enabled
+                return repository
+        raise KeyError(repository_id)
 
     def close(self):
         self.closed = True
@@ -339,11 +354,24 @@ def test_http_service_exposes_client_state_repository_mutations_and_background_p
         status, added = request_json(
             base + "/api/repositories",
             method="POST",
-            body={"github_repository": "acme/new", "target_branch": "develop"},
+            body={
+                "github_repository": "acme/new",
+                "target_branch": "develop",
+                "autonomous_issue_intake": True,
+            },
         )
         assert status == 201
         assert added["github_repository"] == "acme/new"
-        assert application.added == [("acme/new", "develop")]
+        assert added["autonomous_issue_intake"] is True
+        assert application.added == [("acme/new", "develop", True)]
+
+        status, updated = request_json(
+            base + "/api/repositories/1",
+            method="PATCH",
+            body={"autonomous_issue_intake": True},
+        )
+        assert status == 200
+        assert updated["autonomous_issue_intake"] is True
 
         status, body = request_json(base + "/api/repositories/2", method="DELETE")
         assert status == 204

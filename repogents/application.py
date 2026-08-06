@@ -243,7 +243,10 @@ class Application:
         self._closed = False
 
     def add_repository(
-        self, github_repository: str, target_branch: str | None = None
+        self,
+        github_repository: str,
+        target_branch: str | None = None,
+        autonomous_issue_intake: bool = False,
     ) -> dict:
         metadata = self.github.repository(github_repository)
         branch = target_branch or metadata["default_branch"]
@@ -251,10 +254,18 @@ class Application:
             github_repository,
             branch,
             self.config.default_similarity_threshold,
+            autonomous_issue_intake,
         )
 
     def remove_repository(self, repository_id: int) -> None:
         self.store.remove_repository(repository_id)
+
+    def set_autonomous_issue_intake(
+        self,
+        repository_id: int,
+        enabled: bool,
+    ) -> dict:
+        return self.store.set_autonomous_issue_intake(repository_id, enabled)
 
     def state(self) -> dict:
         repositories = []
@@ -493,7 +504,13 @@ class Application:
         repositories = self.store.list_repositories()
         for repository in repositories:
             issues = self.github.list_open_issues(repository["github_repository"])
-            for issue in self._ordered_open_issues(repository, issues):
+            authorized_issues = [
+                issue
+                for issue in issues
+                if repository["autonomous_issue_intake"]
+                or "agent:ready" in issue.labels
+            ]
+            for issue in self._ordered_open_issues(repository, authorized_issues):
                 self.store.create_run(
                     repository["id"],
                     issue.number,

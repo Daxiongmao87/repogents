@@ -45,7 +45,7 @@ a { color: #7fa9ff; }
 <body><main>
 <header><h1>Repogents</h1><p class="lead">Adaptive issue-to-pull-request agents. Track repositories, inspect the Saved agent graph, and follow every issue lifecycle.</p></header>
 <section class="panel"><h2>Track repository</h2>
-<form id="add-form"><input id="repository" required placeholder="owner/repository" aria-label="GitHub repository"><input id="branch" placeholder="target branch (default from GitHub)" aria-label="Target branch"><button type="submit">Add repository</button></form><div id="error" role="alert"></div></section>
+<form id="add-form"><input id="repository" required placeholder="owner/repository" aria-label="GitHub repository"><input id="branch" placeholder="target branch (default from GitHub)" aria-label="Target branch"><label><input id="autonomous-issue-intake" type="checkbox"> Process all open issues</label><button type="submit">Add repository</button></form><div id="error" role="alert"></div></section>
 <section id="poll-failure" role="alert" aria-live="polite"></section><section id="repositories" aria-live="polite"><p class="empty">Loading tracked repositories…</p></section>
 </main>
 <script>
@@ -54,9 +54,9 @@ async function api(path, options = {}) { const response = await fetch(path, {hea
 function renderDependencies(workItems) { const edges = (workItems || []).flatMap(work => (work.dependencies || []).map(dependency => `${esc(dependency)} → ${esc(work.key)}`)); return edges.length ? `<p class="graph-note">Declared execution dependencies: ${edges.join(', ')}.</p>` : '<p class="graph-note">No declared execution dependencies.</p>'; }
 function renderRun(run) { const specs = (run.specifications || []).map(x => `<li>${esc(x.title)}</li>`).join('') || '<li>None yet</li>'; const work = (run.work_items || []).map(x => `<li>${esc(x.title)} — ${esc(x.state)}</li>`).join('') || '<li>None yet</li>'; const pr = run.pull_request ? `<a href="${esc(run.pull_request.url)}" target="_blank" rel="noreferrer">#${esc(run.pull_request.number)}</a>` : 'Not created'; return `<div class="run"><div class="run-head"><strong>Issue #${esc(run.issue_number)}</strong><span class="state">${esc(run.state)}</span></div><p>Branch: ${esc(run.branch || 'Not created')} · Pull request: ${pr}</p><div class="columns"><div><strong>Specifications</strong><ul>${specs}</ul></div><div><strong>Work items</strong><ul>${work}</ul></div></div>${renderDependencies(run.work_items)}</div>`; }
 function renderPollFailure(failure) { return failure ? `<div class="panel"><strong>Background polling failed</strong><p>${esc(failure.type)}: ${esc(failure.message)}</p><small>Last failure: ${esc(failure.occurred_at)}</small></div>` : ''; }
-function renderRepository(repo) { const nodes = (repo.nodes || []).map(node => `<span class="node">${esc(node.classification)} · ${esc(node.persistence)}</span>`).join(''); const runs = (repo.runs || []).map(renderRun).join('') || '<p class="empty">No queued issues.</p>'; return `<article class="repo"><div class="repo-head"><div><h2>${esc(repo.github_repository)}</h2><span>Target: ${esc(repo.target_branch)}</span></div><button class="danger" data-remove="${esc(repo.id)}">Remove</button></div><strong>Saved agent nodes</strong><div class="graph">${nodes}</div><p class="graph-note">Nodes are not ordered by execution; declared execution dependencies appear with each run.</p>${runs}</article>`; }
-async function load() { try { const state = await api('/api/state'); document.querySelector('#poll-failure').innerHTML = renderPollFailure(state.last_poll_failure); document.querySelector('#repositories').innerHTML = state.repositories.length ? state.repositories.map(renderRepository).join('') : '<p class="panel empty">No tracked repositories.</p>'; document.querySelectorAll('[data-remove]').forEach(button => button.onclick = async () => { await api(`/api/repositories/${button.dataset.remove}`, {method:'DELETE'}); await load(); }); } catch (error) { document.querySelector('#error').textContent = error.message; } }
-document.querySelector('#add-form').addEventListener('submit', async event => { event.preventDefault(); const repository = document.querySelector('#repository').value.trim(); const branch = document.querySelector('#branch').value.trim(); try { await api('/api/repositories', {method:'POST', body:JSON.stringify({github_repository:repository, target_branch:branch || null})}); event.target.reset(); document.querySelector('#error').textContent=''; await load(); } catch (error) { document.querySelector('#error').textContent=error.message; } });
+function renderRepository(repo) { const nodes = (repo.nodes || []).map(node => `<span class="node">${esc(node.classification)} · ${esc(node.persistence)}</span>`).join(''); const runs = (repo.runs || []).map(renderRun).join('') || '<p class="empty">No queued issues.</p>'; return `<article class="repo"><div class="repo-head"><div><h2>${esc(repo.github_repository)}</h2><span>Target: ${esc(repo.target_branch)}</span></div><label><input type="checkbox" data-autonomous-issue-intake="${esc(repo.id)}" ${repo.autonomous_issue_intake ? 'checked' : ''}> Process all open issues</label><button class="danger" data-remove="${esc(repo.id)}">Remove</button></div><strong>Saved agent nodes</strong><div class="graph">${nodes}</div><p class="graph-note">Nodes are not ordered by execution; declared execution dependencies appear with each run.</p>${runs}</article>`; }
+async function load() { try { const state = await api('/api/state'); document.querySelector('#poll-failure').innerHTML = renderPollFailure(state.last_poll_failure); document.querySelector('#repositories').innerHTML = state.repositories.length ? state.repositories.map(renderRepository).join('') : '<p class="panel empty">No tracked repositories.</p>'; document.querySelectorAll('[data-autonomous-issue-intake]').forEach(input => input.onchange = async () => { await api(`/api/repositories/${input.dataset.autonomousIssueIntake}`, {method:'PATCH', body:JSON.stringify({autonomous_issue_intake:input.checked})}); await load(); }); document.querySelectorAll('[data-remove]').forEach(button => button.onclick = async () => { await api(`/api/repositories/${button.dataset.remove}`, {method:'DELETE'}); await load(); }); } catch (error) { document.querySelector('#error').textContent = error.message; } }
+document.querySelector('#add-form').addEventListener('submit', async event => { event.preventDefault(); const repository = document.querySelector('#repository').value.trim(); const branch = document.querySelector('#branch').value.trim(); const autonomousIssueIntake = document.querySelector('#autonomous-issue-intake').checked; try { await api('/api/repositories', {method:'POST', body:JSON.stringify({github_repository:repository, target_branch:branch || null, autonomous_issue_intake:autonomousIssueIntake})}); event.target.reset(); document.querySelector('#error').textContent=''; await load(); } catch (error) { document.querySelector('#error').textContent=error.message; } });
 load(); setInterval(load, 3000);
 </script></body></html>"""
 
@@ -119,9 +119,17 @@ class HttpService:
                         not isinstance(target_branch, str) or not target_branch.strip()
                     ):
                         raise ValueError("target_branch must be a nonempty string or null")
+                    autonomous_issue_intake = payload.get(
+                        "autonomous_issue_intake", False
+                    )
+                    if not isinstance(autonomous_issue_intake, bool):
+                        raise ValueError(
+                            "autonomous_issue_intake must be boolean"
+                        )
                     added = service.application.add_repository(
                         repository.strip(),
                         None if target_branch is None else target_branch.strip(),
+                        autonomous_issue_intake,
                     )
                     self._send_json(HTTPStatus.CREATED, added)
                 except (ValueError, json.JSONDecodeError) as error:
@@ -142,6 +150,39 @@ class HttpService:
                     self.end_headers()
                 except ValueError as error:
                     self._error(HTTPStatus.BAD_REQUEST, error)
+                except Exception as error:
+                    self._error(HTTPStatus.INTERNAL_SERVER_ERROR, error)
+
+            def do_PATCH(self) -> None:
+                path = urlparse(self.path).path
+                prefix = "/api/repositories/"
+                if not path.startswith(prefix):
+                    self._error(HTTPStatus.NOT_FOUND, "not found")
+                    return
+                try:
+                    repository_id = int(path[len(prefix) :])
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict) or set(payload) != {
+                        "autonomous_issue_intake"
+                    }:
+                        raise ValueError(
+                            "request must contain autonomous_issue_intake"
+                        )
+                    enabled = payload["autonomous_issue_intake"]
+                    if not isinstance(enabled, bool):
+                        raise ValueError(
+                            "autonomous_issue_intake must be boolean"
+                        )
+                    updated = service.application.set_autonomous_issue_intake(
+                        repository_id,
+                        enabled,
+                    )
+                    self._send_json(HTTPStatus.OK, updated)
+                except (ValueError, json.JSONDecodeError) as error:
+                    self._error(HTTPStatus.BAD_REQUEST, error)
+                except KeyError as error:
+                    self._error(HTTPStatus.NOT_FOUND, error)
                 except Exception as error:
                     self._error(HTTPStatus.INTERNAL_SERVER_ERROR, error)
 

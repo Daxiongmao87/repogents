@@ -819,7 +819,7 @@ def test_agent_prompts_request_repository_reusable_capabilities(tmp_path):
         runtime=runtime,
         vectors={classification: [1.0, 0.0]},
     )
-    app.add_repository("acme/widget")
+    app.add_repository("acme/widget", autonomous_issue_intake=True)
     github.issues = [
         GitHubIssue(7, "Reconcile mutations", "Handle uncertain outcomes", "https://issue/7")
     ]
@@ -874,7 +874,7 @@ def test_intake_specify_multi_item_semantic_routing_role_creation_and_deduplicat
         runtime=runtime,
         vectors={"frontend/component": [1.0, 0.0], "database/migration": [0.0, 1.0]},
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     existing = store.create_dynamic_node(
         repository["id"], "frontend/react", [1.0, 0.0], "Handle React work."
     )
@@ -1856,7 +1856,7 @@ def test_dynamic_nodes_run_concurrently_keep_busy_queue_and_hold_validation_barr
         vectors={"domain/a": [1.0, 0.0], "domain/b": [0.0, 1.0]},
         max_workers=4,
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     store.create_dynamic_node(repository["id"], "domain/a", [1.0, 0.0], "A role")
     store.create_dynamic_node(repository["id"], "domain/b", [0.0, 1.0], "B role")
     github.issues = [GitHubIssue(7, "Concurrent", "Run work", "https://issue/7")]
@@ -1954,7 +1954,7 @@ def test_agent_turns_use_gitless_disposable_snapshots_and_import_only_work_delta
         runtime=runtime,
         vectors={classification: [1.0, 0.0]},
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     github.issues = [
         GitHubIssue(
             7,
@@ -2062,7 +2062,7 @@ def test_invalid_work_output_discards_disposable_source_delta(tmp_path):
         runtime=runtime,
         vectors={classification: [1.0, 0.0]},
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     store.create_dynamic_node(
         repository["id"],
         classification,
@@ -2132,7 +2132,7 @@ def test_failed_work_creates_adaptive_failure_pass_without_validation_or_publica
         runtime=runtime,
         vectors={classification: [1.0, 0.0]},
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     store.create_dynamic_node(
         repository["id"],
         classification,
@@ -2207,7 +2207,7 @@ def test_failed_work_preserves_and_executes_independent_sibling_before_replannin
         runtime=runtime,
         vectors={classification: [1.0, 0.0]},
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     store.create_dynamic_node(
         repository["id"],
         classification,
@@ -2342,7 +2342,7 @@ def test_concurrent_disposable_work_preserves_disjoint_deltas_and_rejects_stale_
         vectors=vectors,
         max_workers=4,
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     for key, classification in classifications.items():
         store.create_dynamic_node(
             repository["id"],
@@ -2448,7 +2448,7 @@ def test_successful_work_replaces_read_only_file_and_preserves_read_only_modes(
         runtime=runtime,
         vectors={classification: [1.0, 0.0]},
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     store.create_dynamic_node(
         repository["id"],
         classification,
@@ -2521,7 +2521,7 @@ def test_work_delta_with_unsafe_symlink_rejects_the_entire_import(
         runtime=runtime,
         vectors={classification: [1.0, 0.0]},
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     store.create_dynamic_node(
         repository["id"],
         classification,
@@ -2590,7 +2590,7 @@ def test_complete_work_failure_rolls_back_the_entire_imported_source_delta(
         runtime=runtime,
         vectors={classification: [1.0, 0.0]},
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     store.create_dynamic_node(
         repository["id"],
         classification,
@@ -3253,7 +3253,7 @@ def test_validation_failure_feedback_reentry_same_pr_update_and_merge_completion
         vectors={"backend/api": [1.0, 0.0]},
         promotion_threshold=3,
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     github.issues = [GitHubIssue(7, "API", "Build endpoint", "https://issue/7")]
 
     drive_until(app, lambda: store.list_runs(repository["id"])[0]["state"] == "PR_LISTENING")
@@ -3364,7 +3364,7 @@ def test_feedback_validation_failure_then_two_successful_same_pr_passes(tmp_path
         runtime=runtime,
         vectors={"backend/api": [1.0, 0.0]},
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     github.publish_head_shas.extend(
         [
             "initial-head-sha",
@@ -3622,7 +3622,7 @@ def test_feedback_publication_addresses_only_feedback_claimed_by_feedback_pass(
         runtime=runtime,
         vectors={"backend/api": [1.0, 0.0]},
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     github.publish_head_shas.extend(
         ["initial-head-sha", "claimed-feedback-head-sha"]
     )
@@ -3832,7 +3832,7 @@ def test_continue_work_handoff_reclassifies_through_another_dynamic_node(tmp_pat
         runtime=runtime,
         vectors={"backend/api": [1.0, 0.0], "testing/integration": [0.0, 1.0]},
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     github.issues = [GitHubIssue(7, "API", "Implement and verify", "https://issue/7")]
 
     drive_until(app, lambda: store.list_runs(repository["id"])[0]["state"] == "PR_LISTENING")
@@ -5480,7 +5480,7 @@ def test_mixed_feedback_scope_outcomes_order_links_and_filter_downstream_context
         vectors={"backend/api": [1.0, 0.0]},
         clock=clock,
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     github.issues = [
         GitHubIssue(7, "API", "Build endpoint", "https://github.test/issues/7")
     ]
@@ -6080,7 +6080,7 @@ def test_feedback_origin_survives_consecutive_validation_failure_passes(
         runtime=runtime,
         vectors={"backend/api": [1.0, 0.0]},
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     github.issues = [
         GitHubIssue(7, "API", "Build endpoint", "https://github.test/issues/7")
     ]
@@ -6188,7 +6188,7 @@ def test_complete_candidate_diff_review_finding_blocks_then_clean_review_publish
         vectors={"backend/api": [1.0, 0.0]},
     )
     github.mutate_candidate_workspace = True
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     github.issues = [
         GitHubIssue(7, "API", "Build endpoint", "https://github.test/issues/7")
     ]
@@ -6317,7 +6317,7 @@ def test_publication_candidate_movement_revalidates_before_publish(tmp_path):
         ]
     )
     github.publish_prepared_overrides.append(None)
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     github.issues = [
         GitHubIssue(7, "API", "Build endpoint", "https://github.test/issues/7")
     ]
@@ -6441,7 +6441,7 @@ def test_feedback_publication_revalidation_retains_origin_and_addresses_only_tha
     github.publish_head_shas.extend(
         ["initial-head-sha", "feedback-head-sha"]
     )
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     github.issues = [
         GitHubIssue(7, "API", "Build endpoint", "https://github.test/issues/7")
     ]
@@ -6559,6 +6559,30 @@ class DeferredExecutor:
         return future
 
 
+def test_issue_intake_defaults_to_explicit_label_authorization(tmp_path):
+    app, store, github, runtime = make_app(tmp_path)
+    repository = app.add_repository("acme/widget")
+    github.issues = [
+        GitHubIssue(7, "Unlabeled", "Not authorized", "https://issue/7"),
+        GitHubIssue(
+            8,
+            "Authorized",
+            "Explicitly ready",
+            "https://issue/8",
+            ("agent:ready",),
+        ),
+    ]
+
+    app.poll_once()
+
+    assert repository["autonomous_issue_intake"] is False
+    assert [run["issue_number"] for run in store.list_runs(repository["id"])] == [8]
+    assert not any(
+        call["payload"]["kind"] == "issue_order" for call in runtime.calls
+    )
+    app.close()
+
+
 def test_out_of_graph_agent_orders_all_open_issues_by_evidenced_dependency(
     tmp_path,
 ):
@@ -6568,7 +6592,9 @@ def test_out_of_graph_agent_orders_all_open_issues_by_evidenced_dependency(
         issue_order(8, 7, dependencies={7: [8]}),
     )
     app, store, github, runtime = make_app(tmp_path, runtime=runtime)
-    repository = app.add_repository("acme/widget")
+    repository = app.add_repository(
+        "acme/widget", autonomous_issue_intake=True
+    )
     github.issues = [
         GitHubIssue(
             7,

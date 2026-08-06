@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS repositories (
     github_repository TEXT NOT NULL UNIQUE,
     target_branch TEXT NOT NULL,
     similarity_threshold REAL NOT NULL,
+    autonomous_issue_intake INTEGER NOT NULL DEFAULT 0
+        CHECK (autonomous_issue_intake IN (0, 1)),
     tracked INTEGER NOT NULL DEFAULT 1 CHECK (tracked IN (0, 1))
 );
 
@@ -194,6 +196,18 @@ class Store:
         try:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
+            repository_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(repositories)")
+            }
+            if "autonomous_issue_intake" not in repository_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE repositories
+                    ADD COLUMN autonomous_issue_intake INTEGER NOT NULL DEFAULT 0
+                        CHECK (autonomous_issue_intake IN (0, 1))
+                    """
+                )
             self._migrate_runs_pending_merge(connection)
             run_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(runs)")
@@ -395,7 +409,10 @@ class Store:
 
     @classmethod
     def _repository_row(cls, row: sqlite3.Row | None) -> dict[str, Any] | None:
-        return cls._decode(row, bool_fields=("tracked",))
+        return cls._decode(
+            row,
+            bool_fields=("autonomous_issue_intake", "tracked"),
+        )
 
     @classmethod
     def _node_row(cls, row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -598,16 +615,26 @@ class Store:
         github_repository: str,
         target_branch: str,
         similarity_threshold: float,
+        autonomous_issue_intake: bool = False,
     ) -> dict:
         self._nonempty_string(github_repository, "github_repository")
         self._nonempty_string(target_branch, "target_branch")
+        if not isinstance(autonomous_issue_intake, bool):
+            raise ValueError("autonomous_issue_intake must be boolean")
         with self._transaction() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO repositories(github_repository, target_branch, similarity_threshold)
-                VALUES (?, ?, ?)
+                INSERT INTO repositories(
+                    github_repository, target_branch, similarity_threshold,
+                    autonomous_issue_intake
+                ) VALUES (?, ?, ?, ?)
                 """,
-                (github_repository, target_branch, float(similarity_threshold)),
+                (
+                    github_repository,
+                    target_branch,
+                    float(similarity_threshold),
+                    int(autonomous_issue_intake),
+                ),
             )
             repository_id = cursor.lastrowid
             connection.executemany(
@@ -642,6 +669,33 @@ class Store:
             connection.execute(
                 "UPDATE repositories SET tracked = 0 WHERE id = ?", (repository_id,)
             )
+
+    def set_autonomous_issue_intake(
+        self,
+        repository_id: int,
+        enabled: bool,
+    ) -> dict:
+        if not isinstance(enabled, bool):
+            raise ValueError("autonomous_issue_intake must be boolean")
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE repositories SET autonomous_issue_intake = ?
+                WHERE id = ? AND tracked = 1
+                """,
+                (int(enabled), repository_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(repository_id)
+            row = self._fetch_one(
+                connection,
+                "SELECT * FROM repositories WHERE id = ?",
+                (repository_id,),
+            )
+        repository = self._repository_row(row)
+        if repository is None:
+            raise RuntimeError("repository disappeared while updating intake")
+        return repository
 
     def get_issue_order_plan(self, repository_id: int) -> dict | None:
         with self._reader() as connection:
