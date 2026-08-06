@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
+import os
+import re
 import shutil
+import sys
 import subprocess
 import threading
 import time
@@ -223,19 +228,17 @@ def test_build_service_passes_configured_pr_silence_seconds(monkeypatch, tmp_pat
         def __init__(self, *args):
             self.config = args[-1]
 
-    monkeypatch.setattr(main_module, "Store", lambda path: object())
+    monkeypatch.setattr("repogents.store.Store", lambda path: object())
     monkeypatch.setattr(
-        main_module,
-        "GitHubClient",
+        "repogents.github.GitHubClient",
         lambda token, **kwargs: object(),
     )
-    monkeypatch.setattr(main_module, "MiniSweRuntime", lambda config: object())
-    monkeypatch.setattr(main_module, "SentenceTransformerEmbedder", lambda: object())
-    monkeypatch.setattr(main_module, "SemanticRouter", lambda embedder: object())
-    monkeypatch.setattr(main_module, "Application", ComposedApplication)
+    monkeypatch.setattr("repogents.agent_runtime.MiniSweRuntime", lambda config: object())
+    monkeypatch.setattr("repogents.semantic.SentenceTransformerEmbedder", lambda: object())
+    monkeypatch.setattr("repogents.semantic.SemanticRouter", lambda embedder: object())
+    monkeypatch.setattr("repogents.application.Application", ComposedApplication)
     monkeypatch.setattr(
-        main_module,
-        "HttpService",
+        "repogents.http_api.HttpService",
         lambda application, *args, **kwargs: application,
     )
     config = ServiceConfig(
@@ -469,3 +472,25 @@ def test_poll_failure_logs_distinct_private_diagnostics(caplog):
         "Background poll failed: GitHub response has invalid node ID",
     ]
     assert service.state()["poll_failure"]["message"] == "poll failure details withheld"
+
+
+def test_main_version_prints_project_version_without_configuration():
+    project_root = Path(__file__).resolve().parents[1]
+    pyproject = (project_root / "pyproject.toml").read_text(encoding="utf-8")
+    expected_version = re.search(r'^version = "([^"]+)"$', pyproject, re.MULTILINE).group(1)
+    environment = os.environ.copy()
+    for name in _ENV_NAMES:
+        environment.pop(name, None)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "repogents.main", "--version"],
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == f"{expected_version}\n"
+    assert result.stderr == ""
