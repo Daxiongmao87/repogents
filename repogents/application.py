@@ -3039,7 +3039,8 @@ class Application:
                     trajectory_path=self._trajectory(
                         run["id"],
                         f"work-specify-{execution_pass['id']}-{work_area['key']}"
-                        f"-attempt-{len(prior_rejections) + 1}",
+                        "-attempt-"
+                        f"{len(prior_rejections) + len(prior_package_rejections) + 1}",
                     ),
                 )
                 try:

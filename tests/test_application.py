@@ -4085,11 +4085,16 @@ def test_declared_private_evidence_survives_restart_and_reaches_dependent_only(
         )
 
     runtime.queue_workspace_action("work", write_evidence)
-    app, store, github, runtime = make_app(
-        tmp_path,
-        runtime=runtime,
-        vectors={classification: [1.0, 0.0]},
-        max_workers=1,
+    store = Store(tmp_path / "state.sqlite3")
+    github = FakeGitHub()
+    executor = DeferredExecutor()
+    app = Application(
+        store,
+        github,
+        runtime,
+        SemanticRouter(MapEmbedder({classification: [1.0, 0.0]})),
+        ApplicationConfig(data_dir=tmp_path / "runtime", max_workers=1),
+        executor=executor,
     )
     repository = app.add_repository("acme/widget", autonomous_issue_intake=True)
     github.issues = [
@@ -4097,18 +4102,23 @@ def test_declared_private_evidence_survives_restart_and_reaches_dependent_only(
     ]
     drive_until(
         app,
-        lambda: any(
-            item["key"] == "retrieve-evidence" and item["state"] == "COMPLETED"
-            for run in store.list_runs(repository["id"])
-            for item in store.list_work_items(run["id"])
-        ),
+        lambda: len(executor.submissions) == 1,
     )
+    function, args = executor.submissions[0]
+    function(*args)
+    executor.futures[0].completed = True
     run = store.list_runs(repository["id"])[0]
     provider = next(
         item
         for item in store.list_work_items(run["id"])
         if item["key"] == "retrieve-evidence"
     )
+    assert provider["state"] == "COMPLETED"
+    assert next(
+        item
+        for item in store.list_work_items(run["id"])
+        if item["key"] == "consume-evidence"
+    )["state"] == "QUEUED"
     app.close()
 
     evidence_root = (
@@ -8298,6 +8308,10 @@ def test_cross_area_package_rejection_retries_focused_specifiers(tmp_path):
     assert all(
         call["payload"]["context"]["prior_package_rejections"]
         == rejections
+        for call in retry_calls
+    )
+    assert all(
+        call["trajectory_path"].endswith("-attempt-2.json")
         for call in retry_calls
     )
     saved = store.list_work_items(run["id"], execution_pass["id"])
