@@ -127,6 +127,39 @@ def test_real_landlock_environment_clears_inherited_credentials_and_returns_resu
     assert result == {"credential_exposed": False, "status": "returned"}
 
 
+def test_real_landlock_executes_installed_software_reached_through_opt(tmp_path):
+    executable = Path("/usr/bin/google-chrome")
+    if not executable.exists() or not executable.resolve().is_relative_to(
+        Path("/opt").resolve()
+    ):
+        pytest.skip("no installed executable resolves through /opt")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = agent_runtime.LandlockEnvironment(cwd=str(workspace), timeout=10)
+    try:
+        execution = environment.execute(
+            {"command": f"{shlex.quote(str(executable))} --version"}
+        )
+        assert execution["returncode"] == 0, execution
+        assert execution["output"].strip()
+        assert "Permission denied" not in execution["output"]
+        rendering = environment.execute(
+            {
+                "command": (
+                    "google-chrome --headless --no-sandbox --disable-gpu "
+                    "--disable-dev-shm-usage --user-data-dir=\"$TMPDIR/chrome\" "
+                    "--screenshot=browser.png --window-size=800,600 "
+                    "'data:text/html,<h1>Sandbox render</h1>' "
+                    ">\"$TMPDIR/chrome.log\" 2>&1 && test -s browser.png"
+                )
+            }
+        )
+        assert rendering["returncode"] == 0, rendering
+        assert (workspace / "browser.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    finally:
+        environment.cleanup()
+
+
 def test_each_run_uses_a_fresh_direct_local_landlock_agent(monkeypatch, tmp_path):
     records = _install_factories(monkeypatch, lambda call: json.dumps({"call": call}))
     workspace = tmp_path / "workspace"

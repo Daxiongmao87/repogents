@@ -14,6 +14,14 @@ and direct runtime use execute `true` through the complete Landlock command
 wrapper before creating an agent. If that preflight fails, execution fails
 closed; Repogents never runs the command without the sandbox.
 
+System software remains read/execute-only from standard installation roots,
+including `/usr`, `/opt`, and their resolved mount locations. Repository agents
+retain write access only to their workspace and command temporary directory.
+`HOME`, `TMPDIR`, and XDG state paths point into that private temporary directory
+so tools can initialize without access to the controller user's home directory.
+Read-only operating-system runtime metadata such as `/proc`, `/dev`, and `/sys`
+remains available to installed tools.
+
 The environment must:
 
 - clear the controller process environment before running agent commands;

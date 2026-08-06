@@ -38,7 +38,12 @@ class LandlockEnvironment:
             }
         env = {
             "PATH": "/usr/local/bin:/usr/sbin:/usr/bin:/bin",
+            "HOME": str(self.working_dir),
             "TMPDIR": str(self.working_dir),
+            "XDG_CACHE_HOME": str(self.working_dir / ".cache"),
+            "XDG_CONFIG_HOME": str(self.working_dir / ".config"),
+            "XDG_DATA_HOME": str(self.working_dir / ".local" / "share"),
+            "XDG_RUNTIME_DIR": str(self.working_dir / ".runtime"),
         }
 
         try:

@@ -204,12 +204,14 @@ def main(argv: list[str]) -> None:
             Path,
             (
                 "/usr",
+                "/opt",
                 "/bin",
                 "/lib",
                 "/lib64",
                 "/etc",
                 "/dev",
                 "/proc",
+                "/sys",
                 "/run/systemd/resolve",
             ),
         )
