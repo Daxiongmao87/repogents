@@ -316,37 +316,46 @@ def test_http_service_reports_sanitized_poll_failures_and_recovers():
         def __init__(self):
             super().__init__()
             self.failed = threading.Event()
+            self.allow_recovery = threading.Event()
 
         def poll_once(self):
-            self.poll_calls += 1
-            if self.poll_calls == 1:
+            if not self.failed.is_set():
                 self.failed.set()
                 raise RuntimeError(
-                    'upstream session_credential=browser-must-not-see-session-secret\ntraceback details'
+                    'upstream session_credential=browser-must-not-see-session-secret\\ntraceback details'
                 )
+            assert self.allow_recovery.wait(timeout=3)
 
     application = FailingThenHealthyApplication()
     service = HttpService(application, "127.0.0.1", 0, 0.05)
     thread = threading.Thread(target=service.serve_forever, daemon=True)
     thread.start()
     host, port = service.address
+
+    def wait_for_poll_failure(predicate, description):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            _, state = request_json(f"http://{host}:{port}/api/state")
+            if predicate(state["poll_failure"]):
+                return state
+            time.sleep(0.01)
+        pytest.fail(f"poll failure did not {description}")
+
     try:
-        assert application.failed.wait(timeout=3)
-        _, failed_state = request_json(f"http://{host}:{port}/api/state")
+        failed_state = wait_for_poll_failure(
+            lambda failure: failure is not None, "appear in service state"
+        )
         failure = failed_state["poll_failure"]
         assert failure["type"] == "RuntimeError"
         assert failure["message"] == "poll failure details withheld"
         assert "traceback" not in failure["message"]
         assert "browser-must-not-see-session-secret" not in json.dumps(failed_state)
-        assert "browser-must-not-see-session-secret" not in json.dumps(failed_state)
         assert failure["occurred_at"].endswith("+00:00")
 
-        for _ in range(100):
-            if application.poll_calls >= 2:
-                break
-            time.sleep(0.01)
-        assert application.poll_calls >= 2
-        _, recovered_state = request_json(f"http://{host}:{port}/api/state")
+        application.allow_recovery.set()
+        recovered_state = wait_for_poll_failure(
+            lambda failure: failure is None, "clear from service state"
+        )
         assert recovered_state["poll_failure"] is None
 
         with urllib.request.urlopen(f"http://{host}:{port}/", timeout=3) as response:
@@ -357,5 +366,6 @@ def test_http_service_reports_sanitized_poll_failures_and_recovers():
         assert '${esc(failure.type)}: ${esc(failure.message)}' in html
         assert 'Last failure: ${esc(failure.occurred_at)}' in html
     finally:
+        application.allow_recovery.set()
         service.shutdown()
         thread.join(timeout=3)
