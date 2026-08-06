@@ -7876,6 +7876,31 @@ def test_focused_workflow_persists_traceability_through_issue_validation(tmp_pat
     assert "do not disposition any other issue requirement" in (
         focused_validation_call["payload"]["instruction"]
     )
+    assert "corroborate that it actually occurred" in (
+        focused_validation_call["payload"]["instruction"]
+    )
+    issue_specification_call = next(
+        call
+        for call in runtime.stage_calls
+        if call["payload"]["kind"] == "issue_specify"
+    )
+    assert "must themselves be evidenced" in (
+        issue_specification_call["payload"]["instruction"]
+    )
+    work_specification_call = next(
+        call
+        for call in runtime.stage_calls
+        if call["payload"]["kind"] == "work_specify"
+    )
+    assert "require direct execution evidence" in (
+        work_specification_call["payload"]["instruction"]
+    )
+    work_call = next(
+        call for call in runtime.stage_calls if call["payload"]["kind"] == "work"
+    )
+    assert "actually perform it and preserve direct execution evidence" in (
+        work_call["payload"]["instruction"]
+    )
     assert store.get_issue_specification(run["id"], execution_pass["id"]) == (
         focused_issue_specification()
     )

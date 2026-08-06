@@ -32,6 +32,11 @@ within-area dependencies. Every applicable requirement and criterion must map
 to work. The controller validates and persists each area independently, so a
 restart does not discard completed specification work or rerun it.
 
+When an issue mandates a method or interaction with an external system, source,
+tool, or environment, the specification must require direct execution evidence
+that distinguishes performing the method from merely producing a plausible
+artifact. This is an evidence rule, not a taxonomy of methods or tools.
+
 ## Work Agents
 
 Each Work Agent chooses its own repository-appropriate procedure. A result may
@@ -50,7 +55,9 @@ artifacts, and execution evidence. It does not receive the complete issue
 specification. Its result template names every exact key it must disposition,
 and it must return those keys exactly once with concrete evidence. It cannot
 disposition unrelated requirements, judge unrelated work, or implement
-corrections.
+corrections. A mandated method or external interaction is unsupported unless
+the execution trajectory directly corroborates that it occurred; artifact
+content, citations, and the worker's own claim are not substitutes.
 
 An accepted result may be imported and completed. A rejected result is
 persisted with its validation findings, its source delta is discarded, and the

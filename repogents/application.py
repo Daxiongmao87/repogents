@@ -2600,7 +2600,11 @@ class Application:
                     "Interpret the complete current issue objective and this pass's "
                     "durable evidence. Produce explicit, independently identifiable "
                     "requirements covering every required outcome, constraint, and "
-                    "required method. Cite concrete evidence for every requirement. "
+                    "required method. Preserve explicit requirements to use an "
+                    "external system, source, tool, or environment as methods that "
+                    "must themselves be evidenced, rather than treating a plausible "
+                    "artifact as proof that the method occurred. Cite concrete "
+                    "evidence for every requirement. "
                     "Organize all requirements into strategic work areas that describe "
                     "what must be achieved without prescribing implementation steps. "
                     "Include only causally necessary dependencies, each with a reason "
@@ -2641,7 +2645,10 @@ class Application:
                         "Specify only the supplied strategic work area. Derive "
                         "observable acceptance criteria and focused work items that "
                         "retain traceability to every applicable issue requirement. "
-                        "State the evidence each work item must produce. Assign an "
+                        "State the evidence each work item must produce. For every "
+                        "mandated method or external interaction, require direct "
+                        "execution evidence that can distinguish actually performing "
+                        "it from producing the same artifact without it. Assign an "
                         "agent classification using repository evidence. Add only "
                         "causally necessary within-area dependencies, each supported "
                         "by a reason and concrete evidence. Define required outcomes "
@@ -3695,6 +3702,7 @@ class Application:
                     self._task(
                         "work",
                         "Use your tools and judgment flexibly to complete this bounded work. Return ready_for_validation when no more agent work is needed, or continue_work with the next classification and handoff context. For continue_work, blocking must be null or a JSON object, never a string. "
+                        "Satisfy every evidence requirement in the work item. When an assigned requirement mandates a method or external interaction, actually perform it and preserve direct execution evidence; an artifact that could have been produced without that method is not evidence that it occurred. "
                         + _CLASSIFICATION_GUIDANCE,
                         work_context,
                     ),
@@ -3757,6 +3765,11 @@ class Application:
                                 "disposition every assigned issue requirement and "
                                 "acceptance criterion using concrete evidence. Verify "
                                 "required evidence, dependency outputs, and claimed tests. "
+                                "For any assigned method or external interaction, "
+                                "corroborate that it actually occurred from the "
+                                "execution trajectory; do not accept artifact content, "
+                                "citations, or the proposal's claim as a substitute for "
+                                "direct execution evidence. "
                                 "Return exactly the supplied requirement and criterion "
                                 "keys once each; do not disposition any other issue "
                                 "requirement or criterion. "
