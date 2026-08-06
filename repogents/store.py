@@ -1164,6 +1164,34 @@ class Store:
             for row in rows
         ]
 
+    def clear_work_specification_results(
+        self,
+        run_id: int,
+        pass_id: int,
+    ) -> None:
+        with self._transaction() as connection:
+            execution_pass = self._fetch_one(
+                connection,
+                "SELECT id FROM execution_passes WHERE id = ? AND run_id = ?",
+                (pass_id, run_id),
+            )
+            if execution_pass is None:
+                raise ValueError("pass does not belong to run")
+            persisted_package = self._fetch_one(
+                connection,
+                "SELECT id FROM specifications WHERE run_id = ? AND pass_id = ?",
+                (run_id, pass_id),
+            )
+            if persisted_package is not None:
+                raise ValueError(
+                    "cannot clear work specifications after package persistence"
+                )
+            connection.execute(
+                "DELETE FROM work_specification_results "
+                "WHERE run_id = ? AND pass_id = ?",
+                (run_id, pass_id),
+            )
+
     def _record_pass_result(
         self, table: str, run_id: int, pass_id: int, result: dict
     ) -> dict:

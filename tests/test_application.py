@@ -8168,6 +8168,143 @@ def test_rejected_work_specification_is_durable_corrective_context(tmp_path):
     app.close()
 
 
+def test_cross_area_package_rejection_retries_focused_specifiers(tmp_path):
+    issue_specification = {
+        "requirements": [
+            {
+                "key": "requirement-1",
+                "statement": "Produce the first outcome.",
+                "evidence": ["The issue requires the first outcome."],
+            },
+            {
+                "key": "requirement-2",
+                "statement": "Produce the second outcome.",
+                "evidence": ["The issue requires the second outcome."],
+            },
+        ],
+        "work_areas": [
+            {
+                "key": "area-1",
+                "title": "First outcome",
+                "description": "Establish the first outcome.",
+                "requirement_keys": ["requirement-1"],
+                "dependencies": [],
+                "dependency_evidence": [],
+            },
+            {
+                "key": "area-2",
+                "title": "Second outcome",
+                "description": "Establish the second outcome.",
+                "requirement_keys": ["requirement-2"],
+                "dependencies": [],
+                "dependency_evidence": [],
+            },
+        ],
+    }
+
+    def focused(area: int, work_key: str) -> dict:
+        return {
+            "work_area_key": f"area-{area}",
+            "specification": {
+                "key": f"area-{area}",
+                "title": f"Outcome {area}",
+                "description": f"Produce outcome {area}.",
+                "requirement_keys": [f"requirement-{area}"],
+                "acceptance_criteria": [
+                    {
+                        "key": f"criterion-{area}",
+                        "description": f"Outcome {area} is observable.",
+                        "requirement_keys": [f"requirement-{area}"],
+                    }
+                ],
+                "work_items": [
+                    {
+                        "key": work_key,
+                        "title": f"Produce outcome {area}",
+                        "description": f"Create bounded outcome {area}.",
+                        "classification": "change/repository",
+                        "requirement_keys": [f"requirement-{area}"],
+                        "acceptance_criteria": [f"criterion-{area}"],
+                        "evidence_requirements": [
+                            f"Direct evidence for outcome {area}."
+                        ],
+                        "dependencies": [],
+                        "dependency_evidence": [],
+                    }
+                ],
+            },
+        }
+
+    runtime = ScriptedRuntime()
+    conflicting = [focused(1, "shared-work"), focused(2, "shared-work")]
+    corrected = [focused(1, "first-work"), focused(2, "second-work")]
+    runtime.queue("work_specify", *conflicting, *corrected)
+    app, store, _, _ = make_app(tmp_path, runtime=runtime)
+    repository = store.add_repository("acme/widget", "main", 0.75)
+    run, _ = store.create_run(
+        repository["id"],
+        7,
+        {"number": 7, "title": "Compose work", "body": "Produce both outcomes."},
+    )
+    execution_pass = store.create_pass(run["id"], "issue", run["issue_json"])
+    store.record_issue_specification(
+        run["id"], execution_pass["id"], issue_specification
+    )
+    source_workspace = tmp_path / "focused-source"
+    source_workspace.mkdir()
+
+    assert app._run_focused_specification(
+        repository,
+        run,
+        execution_pass,
+        source_workspace,
+    ) is False
+    assert store.list_work_specification_results(
+        run["id"], execution_pass["id"]
+    ) == []
+    rejection_path = (
+        tmp_path
+        / "runtime"
+        / "trajectories"
+        / str(run["id"])
+        / f"work-specify-{execution_pass['id']}-package-rejections.json"
+    )
+    rejections = json.loads(rejection_path.read_text(encoding="utf-8"))
+    assert len(rejections) == 1
+    assert rejections[0]["rejected_result"] == {
+        "specifications": [
+            Application._validated_work_specification(
+                result,
+                issue_specification,
+                issue_specification["work_areas"][index],
+            )["specification"]
+            for index, result in enumerate(conflicting)
+        ]
+    }
+    assert rejections[0]["error"] == "work keys must be unique"
+
+    assert app._run_focused_specification(
+        repository,
+        run,
+        execution_pass,
+        source_workspace,
+    ) is True
+    retry_calls = [
+        call
+        for call in runtime.stage_calls
+        if call["payload"]["kind"] == "work_specify"
+    ][2:]
+    assert len(retry_calls) == 2
+    assert all(
+        call["payload"]["context"]["prior_package_rejections"]
+        == rejections
+        for call in retry_calls
+    )
+    saved = store.list_work_items(run["id"], execution_pass["id"])
+    assert [item["key"] for item in saved] == ["first-work", "second-work"]
+    app.close()
+
+
 def test_focused_workflow_persists_traceability_through_issue_validation(tmp_path):
     runtime = ScriptedRuntime()
     runtime.queue("issue_specify", focused_issue_specification())

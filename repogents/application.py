@@ -2977,6 +2977,13 @@ class Application:
                 run["id"], execution_pass["id"]
             )
         }
+        package_rejection_path = self._trajectory(
+            run["id"],
+            f"work-specify-{execution_pass['id']}-package-rejections",
+        )
+        prior_package_rejections = self._stage_rejections(
+            package_rejection_path
+        )
         specifications = []
         for work_area in issue_specification["work_areas"]:
             focused = persisted.get(work_area["key"])
@@ -2997,6 +3004,10 @@ class Application:
                 }
                 if prior_rejections:
                     work_context["prior_specification_rejections"] = prior_rejections
+                if prior_package_rejections:
+                    work_context["prior_package_rejections"] = (
+                        prior_package_rejections
+                    )
                 focused = self.runtime.run(
                     self._task(
                         "work_specify",
@@ -3016,6 +3027,10 @@ class Application:
                         "evidence instead of enumerating only the latest example. "
                         "Correct every supplied prior specification rejection without "
                         "dropping any requirement from the current work area. "
+                        "Keep work keys independently identifiable and unique across "
+                        "the complete issue specification. Correct every supplied "
+                        "package rejection while changing only this work area's "
+                        "specification. "
                         + _CLASSIFICATION_GUIDANCE,
                         work_context,
                     ),
@@ -3045,11 +3060,23 @@ class Application:
                     focused, issue_specification, work_area
                 )
             specifications.append(focused["specification"])
-        self.store.save_specification_package(
-            run["id"],
-            execution_pass["id"],
-            {"specifications": specifications},
-        )
+        package = {"specifications": specifications}
+        try:
+            self.store.save_specification_package(
+                run["id"],
+                execution_pass["id"],
+                package,
+            )
+        except (TypeError, ValueError) as error:
+            self._record_stage_rejection(
+                package_rejection_path,
+                package,
+                error,
+            )
+            self.store.clear_work_specification_results(
+                run["id"], execution_pass["id"]
+            )
+            return False
         return True
 
     @staticmethod

@@ -43,6 +43,13 @@ attempt evidence. The run remains in specification, and the next unbounded
 attempt receives those rejections as corrective context; execution stays closed
 until every strategic area has a valid persisted specification.
 
+After all focused results validate independently, the controller validates their
+composition as one package. A composition failure is retained with the complete
+conflicting package and exact validator error. The staged focused results are
+then invalidated atomically and retried with that durable package rejection as
+corrective context. A composition error must not escape as a polling failure or
+open execution, and retries remain unbounded.
+
 When an issue mandates a method or interaction with an external system, source,
 tool, or environment, the specification must require direct execution evidence
 that distinguishes performing the method from merely producing a plausible
